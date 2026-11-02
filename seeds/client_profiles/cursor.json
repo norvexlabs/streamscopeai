@@ -1,0 +1,39 @@
+{
+  "id": "cursor",
+  "label": "Cursor",
+  "targeted_client_version": "schema reviewed 2026-06",
+  "homepage": "https://docs.cursor.com/context/model-context-protocol",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "templates": [
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.cursor/mcp.json",
+      "format": "json",
+      "title": "Cursor · MCP server (static key)",
+      "instructions": "Place at ~/.cursor/mcp.json (global) or .cursor/mcp.json (project). Reload Cursor after editing.",
+      "mcp_auth_mode": "static",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"http\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"Bearer {{api_key}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.cursor/mcp.json",
+      "format": "json",
+      "title": "Cursor · MCP server (OAuth)",
+      "instructions": "Place at ~/.cursor/mcp.json. On first MCP tool use Cursor will open a browser tab to authorize against the Streamscope gateway.",
+      "mcp_auth_mode": "spec_oauth",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"http\",\n      \"url\": \"{{url}}\"\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+    },
+    {
+      "kind": "instructions",
+      "protocol": null,
+      "filename": null,
+      "format": "text",
+      "title": "Cursor · Custom LLM (UI setup)",
+      "instructions": "Cursor's LLM provider config is UI-driven, not file-driven. To point Cursor at the Streamscope gateway:\n\n1. Open Cursor → Settings (⌘,) → Models.\n2. Scroll to **OpenAI API Key** and toggle on **Override OpenAI Base URL**.\n3. Paste the base URL: `{{base_url}}`\n4. Paste the API key: `{{api_key}}`\n5. Under **Add model**, add an entry for `{{model_alias}}`.\n6. Click **Save** then **Verify** — Cursor sends a probe request through the gateway.\n\nVision and tool calling are auto-detected from request content; no explicit capability flag is needed on the Cursor side.",
+      "body": ""
+    }
+  ]
+}

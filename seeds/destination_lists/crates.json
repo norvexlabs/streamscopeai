@@ -1,0 +1,11 @@
+{
+  "key": "crates",
+  "name": "crates.io",
+  "description": "The Rust package index and its downloads.",
+  "entries": [
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io"
+  ],
+  "sandbox_default": "allow"
+}

@@ -1,0 +1,39 @@
+# NO `!` NEGATIONS IN THIS FILE — every rule is a plain exclusion, and that is
+# load-bearing. With a negation present buildkit must walk an excluded tree to decide
+# whether anything inside it is re-included, so it stats directories the exclusion was
+# meant to skip. A privileged container can leave 0700 root-owned directories in the
+# tree, and the context sender then dies with "permission denied" on a path no image
+# would ever have copied — a build failure caused entirely by an ignore rule that
+# looked like it was doing its job. Keep the excludes broad enough that nothing has
+# to be added back.
+
+.git
+.github
+.env*
+.pytest_cache/
+
+# Build output
+target/
+dist/
+build/
+node_modules/
+**/node_modules/
+# vitest's HTML coverage report — hundreds of files no COPY reads, written only
+# when someone runs the tier with --coverage locally.
+**/coverage/
+.svelte-kit/
+**/.svelte-kit/
+**/.bundled-packages.json
+
+# Docs: the screenshots and the generated spec are megabytes no image copies.
+docs/
+
+**/__pycache__/
+
+# Private keys. Gitignored, so they exist only on a publisher's or developer's machine —
+# but a build context is uploaded to the daemon and cached, and no image copies any of
+# them, so they have no business leaving the working tree. `.backup-recipient.key` is an
+# age SECRET key despite the "recipient" in its name, and a `caddy-local-pki` directory
+# holds a local CA's private root (root-owned 0600).
+.backup-recipient*.key
+**/caddy-local-pki/

@@ -1,0 +1,8 @@
+{
+  "id": "claude-code",
+  "name": "Claude Code",
+  "description": "Anthropic's CLI coding agent for terminal-based AI development",
+  "url": "https://github.com/anthropics/claude-code",
+  "ua_patterns": ["claude-code", "claude-cli"],
+  "referer_patterns": ["claude.ai"]
+}

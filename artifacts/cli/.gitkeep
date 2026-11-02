@@ -1,0 +1,6 @@
+# Drop a macOS (Apple Silicon) CLI build here as `ssai-darwin-arm64` before
+# building the admin-api image to have the gateway serve it from
+# /api/v1/cli/download/darwin-arm64. Build it on an arm64 Mac as CONTRIBUTING.md
+# says (with its third-party licence list embedded; the binary lands at
+# target/aarch64-apple-darwin/release/ssai), then copy it here.
+# Absent ⇒ the macOS download target 404s; the Linux build is unaffected.

@@ -1,0 +1,42 @@
+# Rust
+target/
+# Proptest failure seeds — regenerated on demand; the property is the guard.
+*.proptest-regressions
+proptest-regressions/
+
+# Node
+node_modules/
+# vitest coverage output (regenerate with `npx vitest run --coverage` in admin-ui/)
+coverage/
+dist/
+build/
+.svelte-kit/
+# the admin-ui build's record of the packages it bundled (vite.config.js)
+.bundled-packages.json
+
+# Local environment and secret files
+.env*
+
+# Out-of-band CLI artifacts (e.g. the macOS build) dropped in before the
+# admin-api image build. Track only the placeholder, never the binaries.
+artifacts/cli/*
+!artifacts/cli/.gitkeep
+
+# A local CA's private root, wherever a dev frontend writes it
+caddy-local-pki/
+# Operator-escrow age private keys for backup encryption
+.backup-recipient*.key
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+__pycache__/
+.pytest_cache/
+
+# Docker image exports
+*.tar

@@ -1,0 +1,46 @@
+{{- $fullname := include "streamscope.fullname" . -}}
+{{- if .Values.proxy.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullname }}-proxy
+  minReplicas: {{ .Values.proxy.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.proxy.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.proxy.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.adminApi.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullname }}-admin-api
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullname }}-admin-api
+  minReplicas: {{ .Values.adminApi.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.adminApi.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.adminApi.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

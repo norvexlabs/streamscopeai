@@ -1,0 +1,198 @@
+{{- /*
+  CloudNativePG Cluster — in-cluster HA Postgres (mode=cnpg). Requires the
+  CloudNativePG operator installed in the cluster (its CRDs must exist).
+
+  Two login roles, as on every shape: the database owner `streamscope` runs the
+  migrations (its password the release's POSTGRES_PASSWORD), and the runtime
+  role `streamscope_app` (NOBYPASSRLS, its password the release's
+  POSTGRES_APP_PASSWORD) serves. Both passwords are the release's, never ones
+  CloudNativePG generates with the cluster, so a cluster created again from a
+  backup takes the credentials admin-api already holds. The cluster declares the special roles the
+  schema needs: the runtime role holds streamscope_global and
+  streamscope_ingest without inheriting them (`inherit: false` — PostgreSQL 16+
+  makes a membership granted to a NOINHERIT role non-inheriting), and only the
+  migration role is a member of streamscope_lookup, which owns the lookup
+  functions. admin-api refuses to start on any other arrangement. NO superuser
+  is required (enableSuperuserAccess stays off). cnpg owns failover, and
+  backups through its Barman Cloud Plugin: `postgres.cnpg.backup` names the
+  plugin's ObjectStore spec, which the chart renders as given, with the
+  cluster's WAL archiver and a ScheduledBackup; `postgres.cnpg.recovery`
+  bootstraps the cluster from such a store instead of initdb.
+*/ -}}
+{{- if eq .Values.postgres.mode "cnpg" -}}
+{{- $cnpg := .Values.postgres.cnpg -}}
+{{- $cluster := include "streamscope.pgServiceName" . -}}
+{{- $plugin := "barman-cloud.cloudnative-pg.io" -}}
+{{- $backup := $cnpg.backup | default dict -}}
+{{- $recovery := $cnpg.recovery | default dict -}}
+{{- $backupOn := not (empty $backup.objectStore) -}}
+{{- $recoveryOn := not (empty $recovery.objectStore) -}}
+{{- if and (or $backupOn $recoveryOn) (not (.Capabilities.APIVersions.Has "barmancloud.cnpg.io/v1/ObjectStore")) }}
+{{- fail "postgres.cnpg.backup and postgres.cnpg.recovery need CloudNativePG's Barman Cloud Plugin (the barmancloud.cnpg.io/v1 ObjectStore resource): install it beside the operator first" }}
+{{- end }}
+{{- if and $recoveryOn (empty $recovery.serverName) }}
+{{- fail "postgres.cnpg.recovery.serverName is required: the folder the backups to restore were archived under (the old cluster's backup.serverName, or its name)" }}
+{{- end }}
+{{- $archiveAs := $backup.serverName | default $cluster -}}
+{{- /* An archive is the store's endpoint, its destination path (without a
+  trailing slash) and the server name: the restored cluster may archive into
+  the store it restores from under another name, or under the same name into
+  another store — never into the very folder it reads, which CloudNativePG
+  refuses ("Expected empty archive"), leaving the cluster in setup. */ -}}
+{{- $backupCfg := dig "configuration" dict ($backup.objectStore | default dict) -}}
+{{- $recoveryCfg := dig "configuration" dict ($recovery.objectStore | default dict) -}}
+{{- $archiveTo := list ($backupCfg.endpointURL | default "" | toString) ($backupCfg.destinationPath | default "" | toString | trimSuffix "/") $archiveAs -}}
+{{- $restoreFrom := list ($recoveryCfg.endpointURL | default "" | toString) ($recoveryCfg.destinationPath | default "" | toString | trimSuffix "/") ($recovery.serverName | toString) -}}
+{{- if and $backupOn $recoveryOn (eq (toJson $archiveTo) (toJson $restoreFrom)) }}
+{{- fail (printf "postgres.cnpg.backup.serverName: the restored cluster would archive into %s in %s, the folder it restores from, which CloudNativePG refuses; give it a new name" $archiveAs ($backupCfg.destinationPath | default "")) }}
+{{- end }}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $cluster }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  instances: {{ $cnpg.instances }}
+  {{- with $cnpg.imageName }}
+  imageName: {{ . | quote }}
+  {{- end }}
+  bootstrap:
+    {{- if $recoveryOn }}
+    recovery:
+      source: origin
+      database: {{ $cnpg.database | quote }}
+      owner: streamscope
+      secret:
+        name: {{ include "streamscope.cnpgOwnerSecretName" . }}
+      {{- with $recovery.recoveryTarget }}
+      recoveryTarget:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- else }}
+    initdb:
+      database: {{ $cnpg.database | quote }}
+      owner: streamscope
+      secret:
+        name: {{ include "streamscope.cnpgOwnerSecretName" . }}
+      # The database's locale, the same on every shape (admin-api refuses to
+      # boot on another): the built-in provider's PG_UNICODE_FAST (code-point
+      # order, full Unicode case mapping, no libc or ICU version), UTF-8, and a
+      # Unicode character classification (LC_CTYPE C.UTF-8), which pg_trgm
+      # reads to keep non-ASCII letters in a trigram.
+      encoding: UTF8
+      localeProvider: builtin
+      builtinLocale: PG_UNICODE_FAST
+      localeCollate: C
+      localeCType: C.UTF-8
+    {{- end }}
+  {{- if $recoveryOn }}
+  externalClusters:
+    - name: origin
+      plugin:
+        name: {{ $plugin }}
+        parameters:
+          barmanObjectName: {{ printf "%s-recovery" $cluster }}
+          serverName: {{ $recovery.serverName | quote }}
+  {{- end }}
+  {{- if $backupOn }}
+  plugins:
+    - name: {{ $plugin }}
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: {{ printf "%s-backup" $cluster }}
+        serverName: {{ $archiveAs | quote }}
+  {{- end }}
+  managed:
+    roles:
+      - name: streamscope_global
+        login: false
+      - name: streamscope_ingest
+        login: false
+      - name: streamscope_lookup
+        login: false
+      - name: streamscope_app
+        login: true
+        inherit: false
+        inRoles: [streamscope_global, streamscope_ingest]
+        passwordSecret:
+          name: {{ include "streamscope.cnpgRuntimeSecretName" . }}
+      - name: streamscope
+        login: true
+        inRoles: [streamscope_app, streamscope_lookup]
+        passwordSecret:
+          name: {{ include "streamscope.cnpgOwnerSecretName" . }}
+  storage:
+    size: {{ $cnpg.storage.size }}
+    {{- with $cnpg.storage.className }}
+    storageClass: {{ . }}
+    {{- end }}
+{{- /* The two roles' credentials, in the form cnpg reads a managed role's
+  password from: the release's own POSTGRES_PASSWORD and POSTGRES_APP_PASSWORD,
+  read from the release Secret the installer writes before it installs the
+  chart. Without them (a render with no cluster, or the Secret not written) the
+  managed roles would name Secrets that do not exist and admin-api could never
+  sign in, so the render fails instead. */ -}}
+{{- $s := lookup "v1" "Secret" .Release.Namespace (include "streamscope.secretName" .) -}}
+{{- range $k := list "POSTGRES_PASSWORD" "POSTGRES_APP_PASSWORD" }}
+{{- if not (and $s (index ($s.data | default dict) $k)) }}
+{{- fail (printf "postgres.mode=cnpg needs the release Secret %s with %s in the cluster: install with ssai-stow k8s install" (include "streamscope.secretName" $) $k) }}
+{{- end }}
+{{- end }}
+{{- range $role := list (list (include "streamscope.cnpgOwnerSecretName" .) "streamscope" "POSTGRES_PASSWORD") (list (include "streamscope.cnpgRuntimeSecretName" .) "streamscope_app" "POSTGRES_APP_PASSWORD") }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ index $role 0 }}
+  labels:
+    {{- include "streamscope.labels" $ | nindent 4 }}
+    cnpg.io/reload: "true"
+type: kubernetes.io/basic-auth
+data:
+  username: {{ index $role 1 | b64enc }}
+  password: {{ index $s.data (index $role 2) }}
+{{- end }}
+{{- if $backupOn }}
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ printf "%s-backup" $cluster }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  {{- toYaml $backup.objectStore | nindent 2 }}
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: {{ printf "%s-backup" $cluster }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  schedule: {{ required "postgres.cnpg.backup.schedule is required with backup.objectStore" $backup.schedule | quote }}
+  immediate: true
+  backupOwnerReference: self
+  cluster:
+    name: {{ $cluster }}
+  method: plugin
+  pluginConfiguration:
+    name: {{ $plugin }}
+{{- end }}
+{{- if $recoveryOn }}
+---
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ printf "%s-recovery" $cluster }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  {{- toYaml $recovery.objectStore | nindent 2 }}
+{{- end }}
+{{- end -}}

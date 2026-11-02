@@ -1,0 +1,111 @@
+{{- /*
+  Embedded Postgres — EVALUATION ONLY (single pod, no HA). Production uses
+  managed PG (mode=external) or CloudNativePG (mode=cnpg). The superuser role
+  is the migration role here; migration 001 creates streamscope_app and
+  DB_MANAGE_APP_ROLE=true syncs its password from DATABASE_URL. Both passwords
+  are the release's generated secrets.
+*/ -}}
+{{- if eq .Values.postgres.mode "embedded" -}}
+{{- $pg := .Values.postgres.embedded -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "streamscope.pgServiceName" . }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ include "streamscope.pgServiceName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "streamscope.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      {{- include "streamscope.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "streamscope.podSecurityContext" (dict "root" . "ctx" (dict "fsGroup" 999 "runAsUser" 999 "runAsNonRoot" true "seccompProfile" (dict "type" "RuntimeDefault"))) | nindent 8 }}
+      containers:
+        - name: postgres
+          image: {{ include "streamscope.image" (dict "root" . "key" "postgres") }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: streamscope
+            - name: POSTGRES_DB
+              value: {{ $pg.database | quote }}
+            # The same key admin-api builds its migration URL from, so the two
+            # always agree.
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            # The database's locale, the same on every shape (admin-api refuses
+            # to boot on another): keep equal to the Docker shape's.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF8 --locale-provider=builtin --builtin-locale=PG_UNICODE_FAST --lc-collate=C --lc-ctype=C.UTF-8"
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "streamscope"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "streamscope"]
+            periodSeconds: 15
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              # The image's own volume; its data directory is a versioned
+              # folder inside it (PGDATA /var/lib/postgresql/<major>/docker).
+              mountPath: /var/lib/postgresql
+            - name: shm
+              mountPath: /dev/shm
+      # Parallel queries share hash tables through /dev/shm; the runtime's 64 MB
+      # default fails them ("could not resize shared memory segment"). Counted
+      # inside the memory limit.
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $pg.storage.className }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pg.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "streamscope.pgServiceName" . }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  # Headless: the StatefulSet's governing Service gives stable per-pod DNS.
+  clusterIP: None
+  selector:
+    {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "postgres") | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+{{- end -}}

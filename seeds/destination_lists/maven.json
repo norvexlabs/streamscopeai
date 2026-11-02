@@ -1,0 +1,13 @@
+{
+  "key": "maven",
+  "name": "Maven Central and Gradle",
+  "description": "Maven Central and the Gradle distribution and plugin portal.",
+  "entries": [
+    "repo.maven.apache.org",
+    "repo1.maven.org",
+    "services.gradle.org",
+    "plugins.gradle.org",
+    "downloads.gradle.org"
+  ],
+  "sandbox_default": "allow"
+}

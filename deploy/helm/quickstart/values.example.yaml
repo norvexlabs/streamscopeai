@@ -1,0 +1,73 @@
+# Streamscope on Kubernetes — production values template.
+#
+# Copy this file, fill in the fields marked REQUIRED, then install with the
+# installer, which writes the release's Secret (its generated secrets and the
+# inputs it asks for) and runs the chart with these values:
+#
+#   ssai-stow k8s install --values values.yaml
+#
+# The installer names the release's images by digest; this file holds the rest (hostnames, TLS issuer, database mode, scaling).
+#
+# This template is the managed-Postgres production shape. For an in-cluster
+# evaluation database instead, set `postgres.mode: embedded` (single-pod, no HA).
+
+# Pull Secrets (kubernetes.io/dockerconfigjson), for a mirror of your own that
+# asks for a sign-in. The public release needs none.
+imagePullSecrets: []
+  # - name: registry-pull
+
+# ────────────────────────────────────────────────────────────────────────
+# PUBLIC HOSTNAMES — the admin console and the LLM/MCP gateway. Point DNS for
+# both at your Ingress controller's address.
+# ────────────────────────────────────────────────────────────────────────
+hostnames:
+  adminUi: admin.streamscope.example.com      # REQUIRED — the console
+  proxy: gateway.streamscope.example.com      # REQUIRED — the gateway
+  adminApi: ""                                # optional — co-hosted behind the UI origin when empty
+
+# ────────────────────────────────────────────────────────────────────────
+# INGRESS + TLS — cert-manager issues the certificates (Caddy is not used on
+# Kubernetes). Set the issuer you configured in the cluster.
+# ────────────────────────────────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx                      # your Ingress controller's class
+  annotations: {}
+  tls:
+    enabled: true
+    certManager:
+      enabled: true
+      issuerName: letsencrypt-prod      # REQUIRED — your cert-manager (Cluster)Issuer
+      issuerKind: ClusterIssuer         # ClusterIssuer | Issuer
+
+# ────────────────────────────────────────────────────────────────────────
+# POSTGRES — managed, outside the cluster (production default). The two URLs
+# are secret inputs the installer asks for (MIGRATION_DATABASE_URL,
+# DATABASE_URL); the chart reads them from the release's Secret. With
+# mode=external the chart never touches the runtime role.
+#
+# Prepare the database once, as a DBA, before installing (the migration role
+# may be a NON-superuser on managed Postgres):
+#
+#   CREATE ROLE streamscope_app LOGIN PASSWORD '<strong>' NOBYPASSRLS;  -- runtime role
+#   GRANT streamscope_app TO <migration_role>;        -- migrations hand table ownership to the app role
+#   ALTER SCHEMA public OWNER TO <migration_role>;     -- (or grant CREATE on the schema)
+#   GRANT CREATE ON DATABASE <db> TO <migration_role>; -- install the trusted pg_trgm extension
+# ────────────────────────────────────────────────────────────────────────
+postgres:
+  mode: external
+
+# ────────────────────────────────────────────────────────────────────────
+# SCALING — the gateway autoscales by default; the control plane can opt in.
+# Replicas coordinate through the database; defaults are sane to start.
+# ────────────────────────────────────────────────────────────────────────
+adminApi:
+  replicas: 2
+proxy:
+  replicas: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+adminUi:
+  replicas: 2

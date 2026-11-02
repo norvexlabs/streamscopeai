@@ -1,0 +1,173 @@
+{{- $component := "admin-api" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "streamscope.fullname" . }}-admin-api
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  {{- if not .Values.adminApi.autoscaling.enabled }}
+  replicas: {{ .Values.adminApi.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  # maxSurge:1 / maxUnavailable:0 keeps full capacity during a rolling upgrade;
+  # forward-compatible migrations make old+new admin-api binaries coexist safely.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "streamscope.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      # No pod here calls the Kubernetes API — don't hand it a usable SA token.
+      automountServiceAccountToken: false
+      {{- include "streamscope.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "streamscope.podSecurityContext" (dict "root" . "ctx" .Values.podSecurityContext) | nindent 8 }}
+      # Graceful drain: HTTP + background workers before SIGKILL.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: admin-api
+          image: {{ include "streamscope.image" (dict "root" . "key" "admin-api") }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.adminApi.port }}
+            {{- if .Values.metrics.port }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
+          env:
+            - name: PORT
+              value: {{ .Values.adminApi.port | quote }}
+            {{- if .Values.metrics.port }}
+            - name: METRICS_PORT
+              value: {{ .Values.metrics.port | quote }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.adminApi.rustLog | quote }}
+            {{- if .Values.adminApi.workerThreads }}
+            - name: WORKER_THREADS
+              value: {{ .Values.adminApi.workerThreads | quote }}
+            {{- end }}
+            {{- include "streamscope.dbUrlEnv" . | nindent 12 }}
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: ENCRYPTION_KEY
+            - name: AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: AUTH_SECRET
+            # The verify-only slot while AUTH_SECRET rotates: the staged next
+            # secret, then the outgoing one after the swap. The installer keeps
+            # the key in the Secret, empty outside a rotation.
+            - name: AUTH_SECRET_SECONDARY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: AUTH_SECRET_ACCEPTED
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: INTERNAL_SERVICE_SECRET
+            - name: EDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: EDGE_TOKEN
+            # The expert/agent worker (admin-api) reaches the gateway at the
+            # in-cluster proxy Service to run its analysis; the product default
+            # ("http://proxy:8080") only resolves on the VM/compose deploy.
+            - name: AGENT_PROXY_URL
+              value: {{ printf "http://%s-proxy:%v" (include "streamscope.fullname" .) .Values.proxy.port | quote }}
+            {{- with .Values.adminApi.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "streamscope.fullname" . }}-config
+          # admin-api runs migrations BEFORE binding its listener: a slow
+          # migration yields connection-refused (not 503), so the startupProbe
+          # holds liveness/readiness off until the first success — a long
+          # migration is never liveness-killed. Once serving, /health is
+          # always-200 liveness and /ready is 503 until PG is reachable, the
+          # gateway config cache is built and the boot is not degraded
+          # (MIGRATION_FAILED keeps the pod out of rotation).
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.adminApi.resources | nindent 12 }}
+          # readOnlyRootFilesystem → a writable /tmp is the only scratch needed.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          {{- include "streamscope.podAntiAffinity" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 10 }}
+        {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "streamscope.fullname" . }}-admin-api
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.adminApi.port }}
+      targetPort: http
+    {{- if .Values.metrics.port }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+    {{- end }}

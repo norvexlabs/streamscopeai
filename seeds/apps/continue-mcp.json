@@ -1,0 +1,8 @@
+{
+  "id": "continue-mcp",
+  "name": "Continue MCP",
+  "description": "Continue's MCP client — sets `continue-mcp/<version>` UA",
+  "url": "https://continue.dev",
+  "ua_patterns": ["continue-mcp/"],
+  "referer_patterns": []
+}

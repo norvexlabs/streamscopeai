@@ -1,0 +1,10 @@
+{
+  "key": "pypi",
+  "name": "PyPI",
+  "description": "The Python Package Index and its file host.",
+  "entries": [
+    "pypi.org",
+    "files.pythonhosted.org"
+  ],
+  "sandbox_default": "allow"
+}

@@ -1,0 +1,135 @@
+Streamscope AI
+Copyright (c) 2026 Streamscope AI
+
+Streamscope AI is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License, version 3, as published by
+the Free Software Foundation (see LICENSE). It is also available under a
+commercial licence (see COMMERCIAL.md).
+
+-------------------------------------------------------------------------------
+Trademarks
+-------------------------------------------------------------------------------
+"Streamscope" and "Streamscope AI" are trademarks of the copyright holder. The
+licence grants no right to use them (AGPL-3.0, section 7(e)), and a modified
+version must be marked as changed from the original (section 7(c)): it must
+not use the names or logo in a way that suggests it is the original product or
+endorsed by its authors. Names of AI clients, model
+providers and other vendors that appear in the product and its seed data are
+used only to identify the products they name.
+
+-------------------------------------------------------------------------------
+Container images and VM disk images
+-------------------------------------------------------------------------------
+The published container images are built on Alpine Linux, pinned by digest in
+the Dockerfiles that build them; the console (admin-ui) also carries the Node.js
+runtime, copied from the official Node.js image, with Node.js's licence beside it
+(NODEJS_LICENSE). The database runs the official PostgreSQL image, pinned by
+digest in stowage.yaml. The VM disk images are built on the Kairos operating
+system. Each image names its base in its org.opencontainers.image.base.name label
+and carries this NOTICE and the LICENSE under /usr/share/licenses/streamscopeai/,
+beside a THIRD_PARTY_LICENSES list of the libraries it bundles (the proxy,
+admin-api and admin-ui images; `ssai licenses` prints the CLI's).
+These bases contain software under the GNU GPL and other licences; their
+corresponding sources are published by their projects (Alpine aports, Node.js,
+the PostgreSQL official image, Kairos and its Ubuntu base).
+
+This product includes data derived from third-party open-source projects.
+
+-------------------------------------------------------------------------------
+Microsoft Presidio
+-------------------------------------------------------------------------------
+The PII recognizer patterns in seeds/pii/recognizers.json are adapted from
+Microsoft Presidio's predefined recognizers
+(https://github.com/microsoft/presidio), licensed under the MIT License.
+
+The patterns have been rewritten to be compatible with the Rust `regex` crate
+(which does not support lookaround or backreferences) and re-scored for this
+gateway's threshold model.
+
+    MIT License
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+-------------------------------------------------------------------------------
+models.dev
+-------------------------------------------------------------------------------
+The model pricing and capability data in seeds/models/models.json is derived from
+models.dev (https://github.com/anomalyco/models.dev), licensed under the MIT
+License.
+
+Entries are filtered to the providers this gateway supports and mapped onto this
+project's capability flags.
+
+    MIT License
+
+    Copyright (c) 2025 models.dev
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+-------------------------------------------------------------------------------
+Remote MCP server catalog
+-------------------------------------------------------------------------------
+The MCP server catalog in seeds/mcp_servers/catalog.json is derived from the
+curated table of vendor-hosted servers in awesome-remote-mcp-servers
+(https://github.com/jaw9c/awesome-remote-mcp-servers), licensed under the MIT
+License.
+
+Entries are classified by authentication mode and checked for liveness before
+they are included; for servers that answer without credentials, the tool list
+each server advertised when it was checked is included as well.
+
+    MIT License
+
+    Copyright (c) 2024 Awesome Remote MCP Servers Contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.

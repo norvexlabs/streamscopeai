@@ -1,0 +1,38 @@
+# Tenant isolation is a property of the TYPES: the database is reached only through the doors in
+# `src/db/` (TenantConn, TenantTx, IngestTx, the maintenance connection, the global pool). Naming a
+# raw pool, connection or transaction anywhere else is a compile error under the build's
+# `-D warnings`; `src/db/` alone carries the `#[allow]`.
+disallowed-types = [
+    { path = "sqlx::Pool", reason = "reach the database through crate::db's doors" },
+    { path = "sqlx::PgPool", reason = "reach the database through crate::db's doors" },
+    { path = "sqlx::pool::PoolOptions", reason = "the pool is built once, in db::create_pool" },
+    { path = "sqlx::postgres::PgPoolOptions", reason = "the pool is built once, in db::create_pool" },
+    { path = "sqlx::pool::PoolConnection", reason = "acquire through a crate::db door" },
+    { path = "sqlx::PgConnection", reason = "take `&mut impl Scoped` (or another crate::db door)" },
+    { path = "sqlx::Transaction", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::PgTransaction", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::postgres::PgListener", reason = "use crate::db::listener" },
+    { path = "sqlx::Executor", reason = "a tenant reader takes `&mut Scoped`; a generic executor would accept an unscoped pool" },
+    { path = "sqlx::PgExecutor", reason = "a tenant reader takes `&mut Scoped`; a generic executor would accept an unscoped pool" },
+]
+disallowed-methods = [
+    { path = "sqlx::pool::PoolOptions::new", reason = "the pool is built once, in db::create_pool" },
+    { path = "sqlx::Pool::connect", reason = "the pool is built once, in db::create_pool" },
+    { path = "sqlx::Pool::connect_lazy", reason = "the pool is built once, in db::create_pool" },
+    { path = "sqlx::Connection::connect", reason = "reach the database through crate::db's doors" },
+    { path = "sqlx::ConnectOptions::connect", reason = "reach the database through crate::db's doors" },
+    { path = "sqlx::Pool::begin", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Pool::begin_with", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Pool::try_begin_with", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Connection::begin_with", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Connection::transaction", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Transaction::begin", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::postgres::PgListener::connect", reason = "use crate::db::listener" },
+    { path = "sqlx::postgres::PgListener::connect_with", reason = "use crate::db::listener" },
+    { path = "sqlx::Pool::acquire", reason = "acquire through a crate::db door" },
+    { path = "sqlx::Pool::try_begin", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Pool::try_acquire", reason = "acquire through a crate::db door" },
+    { path = "sqlx::Connection::begin", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Acquire::begin", reason = "begin a TenantTx through crate::db" },
+    { path = "sqlx::Acquire::acquire", reason = "acquire through a crate::db door" },
+]

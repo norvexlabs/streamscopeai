@@ -1,0 +1,8 @@
+{
+  "id": "aider",
+  "name": "Aider",
+  "description": "Terminal-based AI pair programming tool with git integration",
+  "url": "https://aider.chat",
+  "ua_patterns": ["aider/"],
+  "referer_patterns": ["aider.chat"]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "claude-desktop",
+  "name": "Claude Desktop",
+  "description": "Anthropic's desktop client — connects to MCP servers via /mcp/<slug> with spec-OAuth or static keys",
+  "url": "https://claude.ai/download",
+  "ua_patterns": ["claude-desktop/", "Claude/"],
+  "referer_patterns": []
+}

@@ -1,0 +1,25 @@
+[package]
+name = "streamscope-client-templates"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+yaml_serde = { workspace = true }
+toml = { workspace = true }
+handlebars = { workspace = true }
+thiserror = { workspace = true }
+utoipa = { workspace = true, optional = true }
+
+[features]
+# OpenAPI schema derives for the wire types. Enabled by streamscope-admin so
+# the types register in its utoipa spec; the CLI builds without it (and thus
+# without utoipa in its dependency tree).
+openapi = ["dep:utoipa"]
+
+[dev-dependencies]
+proptest = "1"

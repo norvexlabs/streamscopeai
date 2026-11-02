@@ -1,0 +1,320 @@
+# Seven stages, so the checks run BESIDE the release build instead of in front of it:
+#
+#   builder  — toolchain + every dependency, pre-built for each profile/target used
+#   source   — builder + the workspace source
+#   checks   — source + clippy and the advisory audit
+#   licenses — source + the third-party licence list
+#   sbom     — source + the SBOMs of the binaries the image ships
+#   release  — source + the admin binary and the CLI (static Linux, Windows)
+#   macos    — release + the optional macOS CLI artifact, checked
+#
+# BuildKit builds `checks` and `release` concurrently. The runtime stage copies a
+# marker out of `checks`, which is what keeps them a GATE: BuildKit builds only
+# the stages the target reaches, so without that COPY a failing check would no
+# longer fail the image. Never drop the marker, and never let `release` depend on
+# `checks` (that puts the checks back on the release binaries' path).
+#
+# The workspace TESTS run in `Dockerfile.proxy` only — see its test step for why
+# that run is a superset of the one this image would make.
+FROM rust:1.99-trixie@sha256:931c2c0531a8b143e044f0f3914dfe802f15bb3d1955f0b657e9359327ac2ffc AS builder
+
+RUN rustup component add clippy && cargo install cargo-audit && \
+    cargo install cargo-about --locked --version 0.9.2 --features cli && \
+    cargo install cargo-cyclonedx --locked --version 0.5.9
+
+# musl toolchain for the static admin and `ssai` CLI builds (aws-lc-rs needs
+# cmake + clang to compile for the musl target), and mingw-w64 for the CLI's
+# Windows build (`ssai.exe`, which links no mingw DLL: it runs on a stock
+# Windows) — the reason this builder is Debian while the image it feeds is Alpine.
+RUN apt-get update -qq && apt-get install -y -qq musl-tools cmake clang gcc-mingw-w64-x86-64 && \
+    rm -rf /var/lib/apt/lists/* && \
+    rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
+
+WORKDIR /app
+
+# Release-profile optimization, supplied as build args. Defaults match cargo's
+# release defaults (LTO off, 16 codegen units), which is what a release ships;
+# pass LTO=true / codegen-units=1 as build args for a deliberate optimized build.
+ARG CARGO_PROFILE_RELEASE_LTO=false
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}
+
+# Copy workspace manifests first for layer caching.
+COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
+COPY crates/streamscope-core/Cargo.toml crates/streamscope-core/Cargo.toml
+COPY crates/streamscope-proxy/Cargo.toml crates/streamscope-proxy/Cargo.toml
+COPY crates/streamscope-admin/Cargo.toml crates/streamscope-admin/Cargo.toml
+COPY crates/streamscope-mcp-auth/Cargo.toml crates/streamscope-mcp-auth/Cargo.toml
+COPY crates/streamscope-edge-api/Cargo.toml crates/streamscope-edge-api/Cargo.toml
+COPY crates/streamscope-client-templates/Cargo.toml crates/streamscope-client-templates/Cargo.toml
+COPY crates/streamscope-cli/Cargo.toml crates/streamscope-cli/Cargo.toml
+
+# Create stub source files.
+RUN mkdir -p crates/streamscope-core/src && echo "pub fn stub() {}" > crates/streamscope-core/src/lib.rs && \
+    mkdir -p crates/streamscope-proxy/src && echo "fn main() {}" > crates/streamscope-proxy/src/main.rs && \
+    mkdir -p crates/streamscope-admin/src && echo "fn main() {}" > crates/streamscope-admin/src/main.rs && \
+    mkdir -p crates/streamscope-mcp-auth/src && echo "pub fn stub() {}" > crates/streamscope-mcp-auth/src/lib.rs && \
+    mkdir -p crates/streamscope-edge-api/src && echo "pub fn stub() {}" > crates/streamscope-edge-api/src/lib.rs && \
+    mkdir -p crates/streamscope-client-templates/src && echo "pub fn stub() {}" > crates/streamscope-client-templates/src/lib.rs && \
+    mkdir -p crates/streamscope-cli/src && echo "fn main() {}" > crates/streamscope-cli/src/main.rs && \
+    mkdir -p migrations && touch migrations/.keep
+
+# Pre-build dependencies — once per profile and target the stages below compile
+# in: the admin binary (release, musl), clippy (check, and the CLI's on the Windows
+# target) and the CLI (release, musl and Windows targets). Against the stub sources each builds only third-party crates, so a
+# source change recompiles the workspace crates and nothing else. The flags must
+# match the steps below, or the profiles differ and the cache is not the one they
+# read.
+RUN cargo build --release -p streamscope-admin --target x86_64-unknown-linux-musl 2>/dev/null || true
+RUN cargo clippy --workspace --all-targets 2>/dev/null || true
+RUN cargo build --release -p streamscope-cli --target x86_64-unknown-linux-musl 2>/dev/null || true
+RUN cargo clippy -p streamscope-cli --all-targets --target x86_64-pc-windows-gnu 2>/dev/null || true
+RUN cargo build --release -p streamscope-cli --target x86_64-pc-windows-gnu 2>/dev/null || true
+
+FROM builder AS source
+
+# Copy actual source code.
+COPY crates/ crates/
+COPY migrations/ migrations/
+COPY seeds/ seeds/
+COPY CHANGELOG.md CHANGELOG.md
+
+# Touch to invalidate cached compilation.
+RUN touch crates/streamscope-core/src/lib.rs \
+          crates/streamscope-admin/src/main.rs \
+          crates/streamscope-mcp-auth/src/lib.rs \
+          crates/streamscope-edge-api/src/lib.rs \
+          crates/streamscope-client-templates/src/lib.rs \
+          crates/streamscope-cli/src/main.rs
+
+FROM source AS checks
+
+# Clippy lint — fail on any warning.
+#
+# No `--all-features` here, deliberately: both images lint the SAME workspace
+# from the same source, so one full-feature pass per build is all the signal
+# there is, and `Dockerfile.proxy` carries it (`--all-features` on both its clippy
+# and test steps). This default-feature pass is the one that sees what only the
+# default feature set compiles (an import used solely by feature-gated code).
+# The consequence to know: a build of THIS image alone neither compiles
+# feature-gated code nor runs the workspace tests: building both images is the
+# run that covers both.
+RUN cargo clippy --workspace --all-targets -- -D warnings
+# The CLI's Windows-only code compiles only for its Windows target. Its tests
+# run on Windows itself, out of band (CONTRIBUTING.md).
+RUN cargo clippy -p streamscope-cli --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+
+# Vulnerability audit — fail build on known advisories.
+# RUSTSEC-2023-0071: rsa timing sidechannel — transitive via sqlx-mysql (not used, no fix available).
+# RUSTSEC-2026-0097: rand unsoundness with custom logger — pulled by tungstenite + sqlx-postgres,
+#   not exploitable in the gateway's logger setup, no fixed version yet.
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml 0.26 parsing DoS — transitive via the OPTIONAL
+#   pprof feature's inferno (flamegraph SVG writer), never compiled into release binaries and fed
+#   only self-generated XML. Fix bar is quick-xml >=0.41; no inferno release reaches it yet
+#   (0.12.6 pins ^0.39) — drop the ignores when inferno adopts >=0.41.
+# RUSTSEC-2026-0387: crypto-bigint timing variability — 0.7 is on the fixed release; 0.5.5 comes
+#   only through openidconnect 4.0.1 (latest) → p256/p384 0.13, which verify an IdP's signatures over
+#   public keys and data, never a secret. Drop the ignore when openidconnect moves to p256 0.14.
+RUN cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0097 \
+    --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0387
+
+# The gate marker: written only once every check above passed. Its content is
+# constant, so a rebuild whose checks re-ran and passed leaves the runtime image's
+# layers untouched.
+RUN echo "clippy, audit: passed" > /checks-passed
+
+# The third-party licence lists: the admin binary's, which the image ships, and
+# the CLI's, which the CLI embeds (`ssai licenses`) because it is also downloaded
+# on its own. docker/about.toml names the licences a dependency may carry; any
+# other fails the build.
+FROM source AS licenses
+COPY docker/about.toml docker/about.hbs docker/
+RUN cargo about generate --fail --locked -m crates/streamscope-admin/Cargo.toml \
+        -c docker/about.toml docker/about.hbs -o /THIRD_PARTY_LICENSES && \
+    cargo about generate --fail --locked -m crates/streamscope-cli/Cargo.toml \
+        -c docker/about.toml docker/about.hbs -o /THIRD_PARTY_LICENSES.ssai
+
+# The SBOMs of the crates compiled into the binaries the image ships — the admin
+# API and the CLI for each target it serves, macOS included (shipped only beside
+# that artifact, by the `macos` stage) — which the release's SBOM merges in: a
+# scanner of the image sees the binaries, not what they were built from. Read
+# from the lockfile for each target; build scripts' dependencies are left out.
+# SOURCE_DATE_EPOCH keeps the documents the same for the same lockfile. Each run
+# writes every workspace member's: keep the ones for the binaries the image ships.
+# Our own crates carry the workspace's placeholder version (CHANGELOG.md is the
+# version's one source): each document's 0.0.0 components, ours alone, take the
+# release's version, their purls with it (bom-refs, which the dependency graph
+# points at, are kept).
+FROM source AS sbom
+RUN apt-get update -qq && apt-get install -y -qq jq && rm -rf /var/lib/apt/lists/*
+RUN export SOURCE_DATE_EPOCH=0 && \
+    v=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | head -1) && [ -n "$v" ] && \
+    stamp() { jq --arg v "$v" 'walk(if type == "object" and .version == "0.0.0" and ((.name // "") | startswith("streamscope")) then .version = $v | (if .purl then .purl |= sub("@0\\.0\\.0"; "@" + $v) else . end) else . end)' "$1" > "$2"; } && \
+    cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps \
+        --manifest-path crates/streamscope-admin/Cargo.toml --target x86_64-unknown-linux-musl && \
+    stamp crates/streamscope-admin/streamscope-admin.cdx.json /streamscopeai-admin.cdx.json && \
+    for t in x86_64-unknown-linux-musl x86_64-pc-windows-gnu aarch64-apple-darwin; do \
+        cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps --target-in-filename \
+            --manifest-path crates/streamscope-cli/Cargo.toml --target "$t" && \
+        stamp "crates/streamscope-cli/streamscope-cli_$t.cdx.json" "/ssai-$t.cdx.json" || exit 1; \
+    done
+
+FROM source AS release
+
+COPY --from=licenses /THIRD_PARTY_LICENSES.ssai /THIRD_PARTY_LICENSES.ssai
+ENV SSAI_THIRD_PARTY_LICENSES=/THIRD_PARTY_LICENSES.ssai
+
+# Build the admin API binary + the `ssai` provisioning CLI (shipped
+# inside this image: the e2e harness extracts it for the test container, and
+# the public download surface `/api/v1/cli/*` serves it from here). Both are
+# STATIC musl builds: the admin binary runs on the Alpine runtime image, and the
+# one distributed CLI must run on glibc and musl (Alpine CI runners) distros alike.
+# Coverage build. COVERAGE=1 makes the binaries this image carries hold LLVM counters
+# and write a profile at exit — that is what puts a system-level test run into the same
+# coverage report as the workspace tests. `strip` must be off: it
+# removes the coverage-mapping section, and llvm-cov then reports nothing while looking
+# like it worked.
+#
+# The CLI is instrumented too, on its ORDINARY musl target (the toolchain ships
+# `profiler_builtins` for it), so the measured binary is the one the tests actually
+# drive. Leaving it out was not a smaller scope, it was a wrong number: the real-binary
+# suites exercise it hard, and with no profile its ~1 250 lines read as unexecuted in a
+# report that cannot distinguish "never ran" from "never measured".
+#
+# Only the long-lived SERVICE carries `--runtime-counter-relocation`, because only it
+# needs the `%c` continuous-mode profile pattern: a
+# service is killed where it stands, so its profile has to be durable at all times,
+# while the CLI is a short subprocess that exits normally and writes its own profile
+# from the atexit handler. Adding the flag where nothing enables continuous mode buys
+# a codegen change and no coverage.
+ARG COVERAGE=0
+RUN if [ "$COVERAGE" = "1" ]; then \
+        RUSTFLAGS="-C instrument-coverage -C llvm-args=--runtime-counter-relocation" \
+        CARGO_PROFILE_RELEASE_STRIP=false \
+        cargo build --release -p streamscope-admin --target x86_64-unknown-linux-musl && \
+        RUSTFLAGS="-C instrument-coverage" CARGO_PROFILE_RELEASE_STRIP=false \
+        cargo build --release -p streamscope-cli --target x86_64-unknown-linux-musl; \
+    else \
+        cargo build --release -p streamscope-admin --target x86_64-unknown-linux-musl && \
+        cargo build --release -p streamscope-cli --target x86_64-unknown-linux-musl; \
+    fi && \
+    cargo build --release -p streamscope-cli --target x86_64-pc-windows-gnu
+
+FROM release AS macos
+
+# Optional macOS (Apple Silicon) CLI artifact for the /api/v1/cli/* download
+# surface. Cross-building Darwin from the Debian builder needs the Apple SDK
+# (license-gated), so a macOS build is produced out-of-band
+# (`cargo build --release -p streamscope-cli --target aarch64-apple-darwin` on an
+# arm64 Mac or a macOS CI runner) and copied to artifacts/cli/ssai-darwin-arm64
+# before `docker build`. When present it's installed here and served alongside the
+# Linux binary; when absent the directory holds only .gitkeep and the macOS download
+# target simply 404s. Checked in this stage (GNU grep, the Linux CLI beside it),
+# so the runtime image only copies the result. World-readable so the unprivileged
+# runtime user can read it without owning /usr/local/share.
+#
+# It is checked against the Linux binary's version before it is installed, and a
+# disagreement WARNS. It does not fail the build, deliberately: the CLI is
+# versioned off CHANGELOG.md, so every release bumps it whether or not the CLI
+# changed, and failing on that would demand an out-of-band macOS rebuild for
+# releases that do not touch the CLI at all. Nothing refuses an older client —
+# the only version comparison at runtime is an advisory "run ssai update"
+# note — and the installer reports the version it actually installed rather than
+# the one the gateway advertises, so an older artifact is a staleness the
+# operator can see and act on, not a break. Rebuild when the CLI's behaviour or
+# wire actually changed; the warning is the reminder, not a gate.
+#
+# What IS fatal is the Linux binary reporting no version: that means the probe
+# itself failed, and an empty pattern matches every file — a check that passes
+# exactly when it breaks is worse than no check.
+#
+# The match is anchored on a non-digit because CalVer makes one version a
+# literal prefix of another: an unanchored search for 2026.8.4 finds it inside
+# an artifact's own 2026.8.45 and reports a stale binary as current.
+COPY artifacts/cli/ /tmp/streamscope-cli-artifacts/
+COPY --from=sbom /ssai-aarch64-apple-darwin.cdx.json /tmp/
+RUN mkdir /macos /macos-sbom && if [ -f /tmp/streamscope-cli-artifacts/ssai-darwin-arm64 ]; then \
+        ver="$(/app/target/x86_64-unknown-linux-musl/release/ssai --version | awk 'NR==1{print $NF}')"; \
+        if [ -z "$ver" ]; then \
+            echo "ERROR: the Linux CLI did not report a version, so the macOS artifact" >&2; \
+            echo "  cannot be checked against it. Refusing rather than installing it" >&2; \
+            echo "  unverified: an empty pattern matches every file." >&2; \
+            exit 1; \
+        fi; \
+        if ! grep -qaP "\Q$ver\E(?![0-9])" /tmp/streamscope-cli-artifacts/ssai-darwin-arm64; then \
+            echo "WARNING: artifacts/cli/ssai-darwin-arm64 is not a v$ver build." >&2; \
+            echo "  Installing it anyway — an older client still works against this" >&2; \
+            echo "  gateway and reports its own version, so macOS users are served a" >&2; \
+            echo "  working-but-older binary rather than none." >&2; \
+            echo "  If this release changed the CLI, rebuild it on an arm64 Mac as" >&2; \
+            echo "  CONTRIBUTING.md says and copy it to artifacts/cli/ssai-darwin-arm64," >&2; \
+            echo "  or delete artifacts/cli/ssai-darwin-arm64 to ship Linux-only." >&2; \
+        fi; \
+        if grep -qa "made without its third-party licence list" /tmp/streamscope-cli-artifacts/ssai-darwin-arm64; then \
+            echo "ERROR: artifacts/cli/ssai-darwin-arm64 was built without its third-party" >&2; \
+            echo "  licence list, which a downloaded binary must carry. Rebuild it as" >&2; \
+            echo "  CONTRIBUTING.md says." >&2; \
+            exit 1; \
+        fi; \
+        install -D -m 0755 /tmp/streamscope-cli-artifacts/ssai-darwin-arm64 \
+            /macos/ssai-darwin-arm64 && \
+        cp /tmp/ssai-aarch64-apple-darwin.cdx.json /macos-sbom/; \
+    fi && rm -rf /tmp/streamscope-cli-artifacts
+
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+
+# The gate: this image cannot be produced unless `checks` built — see the top of
+# this file.
+COPY --from=checks /checks-passed /usr/share/streamscope/checks-passed
+
+# The licence, the notices and the third-party licences ship with the binary.
+COPY LICENSE NOTICE /usr/share/licenses/streamscopeai/
+COPY --from=licenses /THIRD_PARTY_LICENSES /THIRD_PARTY_LICENSES.ssai /usr/share/licenses/streamscopeai/
+COPY --from=sbom /streamscopeai-admin.cdx.json /ssai-x86_64-unknown-linux-musl.cdx.json \
+     /ssai-x86_64-pc-windows-gnu.cdx.json /usr/share/sbom/
+LABEL org.opencontainers.image.title="Streamscope AI control plane" \
+      org.opencontainers.image.source="https://github.com/norvexlabs/streamscopeai" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.base.name="docker.io/library/alpine:3.24.3"
+
+RUN apk add --no-cache ca-certificates curl
+
+# Fixed uid/gid 65532 so the runtime user is identical and numeric across every
+# deployment target (compose, Kairos VM, Kubernetes runAsUser). Keep it identical
+# across the images, the chart and the release spec's volume ownership.
+RUN addgroup -g 65532 streamscope && adduser -D -H -u 65532 -G streamscope -s /sbin/nologin streamscope
+
+COPY --from=release /app/target/x86_64-unknown-linux-musl/release/streamscope-admin /usr/local/bin/streamscopeai-admin
+COPY --from=release /app/target/x86_64-unknown-linux-musl/release/ssai /usr/local/bin/ssai
+# The Windows CLI for the /api/v1/cli/* download surface, built with the image.
+# No --chmod: it would apply to the folder COPY creates as well, and a folder
+# without its execute bit cannot be entered — every CLI download then fails.
+COPY --from=release /app/target/x86_64-pc-windows-gnu/release/ssai.exe \
+    /usr/local/share/ssai/ssai-windows-x86_64.exe
+COPY --from=macos /macos/ /usr/local/share/ssai/
+COPY --from=macos /macos-sbom/ /usr/share/sbom/
+COPY seeds/ /app/seeds/
+
+WORKDIR /app
+
+RUN chown -R streamscope:streamscope /app
+
+USER 65532
+
+EXPOSE 9090
+
+# This build starts against a database a newer release has already migrated
+# (reading past migrations it does not carry, refusing only a rollback barrier).
+# The Docker deployment's `--rollback` reads this label off the PREVIOUS
+# release's image to decide whether going back across a schema change can work:
+# an image without it predates that behaviour and would refuse to start. Never
+# remove it while the binary keeps the behaviour, and never set it on a build
+# that lacks it.
+LABEL ai.streamscope.reads-newer-schema="true"
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+    CMD curl -sf http://localhost:9090/ready || exit 1
+
+CMD ["streamscopeai-admin"]

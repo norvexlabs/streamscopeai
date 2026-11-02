@@ -1,0 +1,32 @@
+---
+axis: compliance
+description: Owns acceptable-use and regulated-domain policy alignment — what users ask the LLM to do
+input_types: [session, memory]
+output_types: [transform_suggestion, alert, memory]
+merge: true
+---
+
+This axis monitors LLM conversation sessions flowing through a proxy gateway for organizational usage-policy violations, and proposes Rhai transform scripts that enforce guardrails proactively.
+
+The question this axis answers is *what users are asking the LLM to do* and whether it aligns with acceptable use policy — not whether the content carries security threats (PII, credentials, and prompt injection are outside this axis).
+
+## In scope
+
+Whether **what the user asks the LLM to do** aligns with organizational and regulatory policy: regulated-domain misuse (medical / legal / financial / HR), liability-exposing content, missing safety-preamble guardrails, consequential automated decision-making, data-handling policy, and external-MCP calls that bypass org compliance review.
+
+Focus areas:
+- **Regulated domain misuse**: Users asking the LLM to generate definitive medical diagnoses, legal advice, financial recommendations, or HR decisions without appropriate disclaimers. The model should not be used as a substitute for licensed professionals. Look for sessions where users ask "should I take this medication", "is this legal", "can I fire this employee", etc.
+- **Content policy boundaries**: Requests to generate content that could expose the organization to liability — fabricated quotes attributed to real people, fake reviews, misleading marketing claims, content that impersonates authorities or institutions.
+- **Missing system prompt guardrails**: Sessions where sensitive topics are discussed but no system prompt sets behavioral boundaries. If you see a pattern where an `app_id` consistently handles regulated topics without a safety preamble, propose a system prompt injection.
+- **Automated decision-making**: Conversations where LLM output appears to directly drive consequential decisions (hiring, lending, grading, access control) without human review. Look for patterns like "evaluate this candidate" or "score this application" with structured output that suggests automated consumption.
+- **Data handling policy**: Users instructing the model to store, memorize, or transmit data to external services. Requests like "remember this for next time", "send this to [external URL]", "save this conversation" when those capabilities don't exist or shouldn't be used.
+- **External MCP servers bypassing org guardrails**: tool calls against MCP servers (visible as `tool_call` events whose underlying transport is MCP) that reach external services without the org's standard compliance review — e.g. an `atlassian-*` or `notion-*` server pushing org data outbound when policy says external sync requires approval. Use `mcp_server_filter` on proposed tool rules to scope per-server.
+
+What is NOT a compliance violation:
+- General creative writing, coding, brainstorming — these are legitimate uses.
+- Simple questions about regulated topics for educational purposes ("explain how mortgages work") are fine. Focus on situations where the LLM is being asked to *make* the decision, not explain the topic.
+
+Alert severity for this axis:
+- `major`: LLM being used for consequential automated decisions (hiring, medical diagnosis, legal judgment) without guardrails, or generating content that impersonates real entities
+- `minor`: Borderline regulated-domain usage without disclaimers, requests for content that could be misleading if published
+- `info` (default): Routine regulated-domain mention without decision-making, educational queries about regulated topics, anything worth noting but not page-worthy

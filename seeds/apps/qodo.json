@@ -1,0 +1,8 @@
+{
+  "id": "qodo",
+  "name": "Qodo",
+  "description": "AI coding assistant for code quality, testing, and review",
+  "url": "https://qodo.ai",
+  "ua_patterns": ["qodo"],
+  "referer_patterns": ["qodo.ai"]
+}

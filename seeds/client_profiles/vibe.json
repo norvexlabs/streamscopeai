@@ -1,0 +1,35 @@
+{
+  "id": "vibe",
+  "label": "Mistral Vibe",
+  "targeted_client_version": "2.15.0",
+  "homepage": "https://docs.mistral.ai/mistral-vibe/",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "launch_command": "vibe",
+  "templates": [
+    {
+      "kind": "combined",
+      "protocol": "chat_completions",
+      "route_tag": "vibe",
+      "filename": "~/.vibe/config.toml",
+      "format": "toml",
+      "title": "Mistral Vibe · config.toml",
+      "instructions": "Place at ~/.vibe/config.toml (or merge into your existing one). Vibe speaks the OpenAI wire format; the gateway translates it to whatever the upstream natively speaks, so any route works. The provider's `api_key_env_var` names the environment variable Vibe reads the gateway key from — put `STREAMSCOPE_API_KEY=<your gateway key>` in ~/.vibe/.env (Vibe auto-loads it) or export it in your shell. Then run `vibe` in your project. Telemetry and crash reports to Mistral, and the update check, are off (`enable_telemetry`, `enable_update_checks`, `enable_auto_update`); an admin who wants them back can edit this template.",
+      "companions": [
+        {
+          "path": "~/.vibe/.env",
+          "format": "shell",
+          "title": "Mistral Vibe · .env",
+          "instructions": "config.toml names the environment variable Vibe reads the key from; the value itself goes here. Vibe auto-loads ~/.vibe/.env.",
+          "body": "STREAMSCOPE_API_KEY={{api_key}}\n"
+        }
+      ],
+      "keyed_arrays": {
+        "/providers": "name",
+        "/models": "name",
+        "/mcp_servers": "name"
+      },
+      "body": "active_model = \"{{model_alias}}\"\nenable_telemetry = false\nenable_update_checks = false\nenable_auto_update = false\n\n[[providers]]\nname = \"streamscope\"\napi_base = \"{{base_url}}\"\napi_key_env_var = \"STREAMSCOPE_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n\n[[models]]\nname = \"{{model_alias}}\"\nprovider = \"streamscope\"\nalias = \"{{model_alias}}\"\n{{#each mcp_servers}}\n[[mcp_servers]]\nname = \"{{slug}}\"\ntransport = \"streamable-http\"\nurl = \"{{url}}\"\nauth = { type = \"static\", headers = { \"Authorization\" = \"Bearer {{api_key}}\" } }\n{{/each}}"
+    }
+  ]
+}

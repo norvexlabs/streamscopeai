@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 450" width="1200" height="450" role="img" aria-label="A coding agent in a sandbox on macOS or Linux talks only to the Streamscope AI gateway, which applies tool policy, budgets, QoS and audit, scans the request to the model for PII and the web content coming back for prompt injection, and forwards to the Anthropic API, to internal vLLM endpoints, and to the web.">
+<title>How Streamscope AI fits</title>
+<style>
+  .card{fill:#142c38;stroke:#24404e;stroke-width:1.5}
+  .h{font:600 17px system-ui,-apple-system,Segoe UI,sans-serif;fill:#f4f6f5}
+  .s{font:13px system-ui,-apple-system,Segoe UI,sans-serif;fill:#a9b8bf}
+  .m{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#a9b8bf}
+  .k{font:600 11px system-ui,-apple-system,Segoe UI,sans-serif;fill:#8697a0;letter-spacing:.12em}
+  .chip{font:600 12px system-ui,-apple-system,Segoe UI,sans-serif}
+  .wire{fill:none;stroke:#5ab4e6;stroke-width:2;stroke-opacity:.45}
+  .flow{fill:none;stroke:#9cd2f0;stroke-width:2;stroke-linecap:round;stroke-dasharray:2 22;animation:f 2.4s linear infinite}
+  .flow.web{stroke:#6fe0bb}
+  @keyframes f{to{stroke-dashoffset:-48}}
+  @media (prefers-reduced-motion:reduce){.flow{animation:none}}
+</style>
+<defs>
+  <linearGradient id="gw" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9cd2f0"/><stop offset="1" stop-color="#2b78a8"/></linearGradient>
+  <filter id="glow" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="10"/></filter>
+</defs>
+<rect width="1200" height="450" rx="18" fill="#0e1b24"/>
+
+<!-- wires -->
+<path id="w1" class="wire" d="M326 206 H432"/>
+<path class="flow" d="M326 206 H432"/>
+<path class="wire" d="M768 180 H800 C840 180 840 92 882 92"/>
+<path class="flow" d="M768 180 H800 C840 180 840 92 882 92"/>
+<path class="wire" d="M768 180 H800 C840 180 840 220 882 220"/>
+<path class="flow" d="M768 180 H800 C840 180 840 220 882 220"/>
+<path class="wire" d="M768 250 H790 C840 250 840 348 882 348" style="stroke:#24ab7e"/>
+<path class="flow web" d="M882 348 C840 348 840 250 790 250 H768"/>
+
+<!-- machine -->
+<text x="40" y="58" class="k">YOUR MACHINE · MACOS / LINUX</text>
+<rect x="24" y="72" width="302" height="268" rx="14" class="card"/>
+<rect x="48" y="104" width="254" height="176" rx="12" fill="none" stroke="#34c778" stroke-opacity=".7" stroke-width="1.5" stroke-dasharray="6 6"/>
+<text x="64" y="128" class="chip" fill="#86ddaa">sandbox</text>
+<rect x="133" y="146" width="84" height="64" rx="12" fill="#1c3a49" stroke="#24404e"/>
+<text x="175" y="186" text-anchor="middle" style="font:700 22px ui-monospace,SFMono-Regular,Menlo,monospace" fill="#9cd2f0">&gt;_</text>
+<text x="175" y="236" text-anchor="middle" class="h">coding agent</text>
+<text x="175" y="258" text-anchor="middle" class="m">ssai run</text>
+<text x="175" y="306" text-anchor="middle" class="s">files: its project only</text>
+<text x="175" y="326" text-anchor="middle" class="s">network: the gateway only</text>
+
+<!-- gateway -->
+<rect x="432" y="108" width="336" height="196" rx="16" fill="#5ab4e6" opacity=".35" filter="url(#glow)"/>
+<rect x="432" y="108" width="336" height="196" rx="16" fill="#142c38" stroke="url(#gw)" stroke-width="2"/>
+<g transform="translate(452 126) scale(1.6)" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.36 9.6 L12 4.32 L20.64 9.6" stroke="#5ab4e6"/><path d="M3.36 14.88 Q7.68 12 12 14.88 T20.64 14.88" stroke="#f4f6f5"/><path d="M3.36 19.68 Q7.68 16.8 12 19.68 T20.64 19.68" stroke="#8697a0"/></g>
+<text x="496" y="152" class="h" style="font-size:19px">Streamscope AI</text>
+<text x="496" y="171" class="s">gateway</text>
+<g class="chip">
+  <rect x="452" y="196" width="94" height="28" rx="14" fill="#592321" fill-opacity=".45" stroke="#f06a5b" stroke-opacity=".6"/>
+  <text x="499" y="215" text-anchor="middle" fill="#f7a79d">tool policy</text>
+  <rect x="554" y="196" width="102" height="28" rx="14" fill="#433305" fill-opacity=".45" stroke="#e8c547" stroke-opacity=".6"/>
+  <text x="605" y="215" text-anchor="middle" fill="#f0d77e">budgets · QoS</text>
+  <rect x="664" y="196" width="84" height="28" rx="14" fill="#1b4a66" fill-opacity=".5" stroke="#5ab4e6" stroke-opacity=".6"/>
+  <text x="706" y="215" text-anchor="middle" fill="#9cd2f0">audit</text>
+</g>
+<text x="600" y="256" text-anchor="middle" class="s">every call checked, routed and recorded</text>
+<text x="600" y="280" text-anchor="middle" class="m">provider keys stay here</text>
+
+<!-- lenses on the wires -->
+<g transform="translate(806 180)">
+  <circle r="17" fill="#0e1b24" stroke="#c2adff" stroke-width="2"/>
+  <circle cx="-2" cy="-2" r="6" fill="none" stroke="#c2adff" stroke-width="2"/><path d="M2.5 2.5 L8 8" stroke="#c2adff" stroke-width="2" stroke-linecap="round"/>
+  <text y="-26" text-anchor="middle" class="chip" fill="#c2adff">PII</text>
+</g>
+<g transform="translate(839 299)">
+  <circle r="17" fill="#0e1b24" stroke="#6fe0bb" stroke-width="2"/>
+  <circle cx="-2" cy="-2" r="6" fill="none" stroke="#6fe0bb" stroke-width="2"/><path d="M2.5 2.5 L8 8" stroke="#6fe0bb" stroke-width="2" stroke-linecap="round"/>
+  <text x="-29" y="37" text-anchor="middle" class="chip" fill="#6fe0bb">injection</text>
+  <text x="-29" y="52" text-anchor="middle" class="chip" fill="#6fe0bb">classifier</text>
+</g>
+
+<!-- Anthropic -->
+<rect x="882" y="40" width="294" height="104" rx="14" class="card"/>
+<g transform="translate(902 62)" fill="none" stroke="#ffb49a" stroke-width="2" stroke-linejoin="round"><path d="M6 22 a7 7 0 0 1 1-14 a9 9 0 0 1 17-2 a7 7 0 0 1 4 16 Z"/></g>
+<text x="944" y="80" class="h">Anthropic API</text>
+<text x="902" y="112" class="s">tenant budget</text>
+<text x="1156" y="112" text-anchor="end" class="m" style="fill:#f0d77e">$412 / $500</text>
+<rect x="902" y="122" width="254" height="7" rx="3.5" fill="#1c3a49"/>
+<rect x="902" y="122" width="209" height="7" rx="3.5" fill="#e8c547"/>
+
+<!-- vLLM -->
+<rect x="882" y="168" width="294" height="112" rx="14" class="card"/>
+<g transform="translate(902 190)" fill="none" stroke="#cad7fd" stroke-width="2"><rect x="2" y="2" width="26" height="9" rx="2"/><rect x="2" y="15" width="26" height="9" rx="2"/></g>
+<text x="944" y="208" class="h">vLLM · internal</text>
+<circle cx="909" cy="236" r="5" fill="#34c778"/><circle cx="927" cy="236" r="5" fill="#34c778"/><circle cx="945" cy="236" r="5" fill="#34c778"/>
+<text x="960" y="240" class="m">3 endpoints · QoS</text>
+<rect x="902" y="250" width="214" height="22" rx="11" fill="#21335b" fill-opacity=".5" stroke="#5870c9" stroke-opacity=".6"/>
+<text x="1009" y="265" text-anchor="middle" class="chip" style="font-size:11px" fill="#cad7fd">Anthropic ⇄ OpenAI, translated</text>
+
+<!-- Web -->
+<rect x="882" y="296" width="294" height="104" rx="14" class="card"/>
+<g transform="translate(902 318)" fill="none" stroke="#6fe0bb" stroke-width="2"><circle cx="14" cy="14" r="12"/><ellipse cx="14" cy="14" rx="5" ry="12"/><path d="M2 14 H26"/></g>
+<text x="944" y="336" class="h">The web</text>
+<text x="902" y="370" class="m">web_search · web_fetch</text>
+<text x="902" y="388" class="s">behind an SSRF guard</text>
+
+<!-- footer -->
+<path d="M24 424 H1176" stroke="#24404e"/>
+<text x="600" y="442" text-anchor="middle" class="k">EVERY TURN AUDITED · SESSIONS REPLAYED · AI EXPERTS RAISE ALERTS</text>
+</svg>

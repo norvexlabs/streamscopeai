@@ -1,0 +1,8 @@
+{
+  "id": "amp",
+  "name": "Amp",
+  "description": "Sourcegraph's agentic coding tool",
+  "url": "https://sourcegraph.com/amp",
+  "ua_patterns": ["amp/"],
+  "referer_patterns": ["sourcegraph.com"]
+}

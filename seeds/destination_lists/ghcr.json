@@ -1,0 +1,10 @@
+{
+  "key": "ghcr",
+  "name": "GitHub Container Registry",
+  "description": "Pull and push images on ghcr.io and its blob storage.",
+  "entries": [
+    "ghcr.io",
+    "pkg-containers.githubusercontent.com"
+  ],
+  "sandbox_default": "allow"
+}

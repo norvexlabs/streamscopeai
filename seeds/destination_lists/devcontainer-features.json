@@ -1,0 +1,9 @@
+{
+  "key": "devcontainer-features",
+  "name": "Dev Container features",
+  "description": "Dev Container features, which ship as OCI artefacts on ghcr.io.",
+  "entries": [
+    "ghcr.io",
+    "pkg-containers.githubusercontent.com"
+  ]
+}

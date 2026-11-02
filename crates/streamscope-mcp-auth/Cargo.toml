@@ -1,0 +1,31 @@
+[package]
+name = "streamscope-mcp-auth"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+jsonwebtoken.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+p256.workspace = true
+rand.workspace = true
+base64.workspace = true
+subtle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net"] }
+url = { workspace = true }
+utoipa.workspace = true
+arc-swap.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

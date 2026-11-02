@@ -1,0 +1,179 @@
+{{- /*
+  Default-deny posture for the three app tiers. Each component below is selected
+  by a policy, so any traffic not explicitly allowed is denied. Pods the chart
+  does NOT select (e.g. the CloudNativePG cluster) keep their own networking —
+  NetworkPolicy is additive, an unselected pod stays fully open.
+
+  Ingress is locked to the real callers; egress is scoped by PORT to any
+  destination (mode-agnostic, never breaks managed/cnpg Postgres or arbitrary
+  LLM/MCP/web upstreams). The hardening is the closed ingress + the closed
+  non-web/non-DB egress ports. Custom egress (e.g. an MCP upstream on a
+  non-standard port) goes in networkPolicy.extraEgress.
+*/ -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- $ns := .Values.networkPolicy.ingressNamespace -}}
+# --- admin-api: control plane ------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "streamscope.fullname" . }}-admin-api
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "admin-api") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Reached by the proxy (edge protocol), the console SSR and the installer's provision Job — plus
+    # the ingress controller when a distinct admin-api host is exposed.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "proxy") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "admin-ui") | nindent 14 }}
+        # The installer's provision Job, by the labels it gives its pod.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: stowage
+              app.kubernetes.io/part-of: streamscopeai
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: stowage-provision
+        {{- if .Values.hostnames.adminApi }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.adminApi.port }} }
+    {{- if and .Values.metrics.port .Values.metrics.scrapeNamespaceSelector }}
+    # Prometheus scrape of the dedicated metrics port, from the allowlisted
+    # monitoring namespace only (fail-closed when no selector is set).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.metrics.scrapeNamespaceSelector | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.metrics.port }} }
+    {{- end }}
+  egress:
+    # DNS.
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Postgres (managed / embedded / cnpg — any 5432 destination).
+    - ports:
+        - { protocol: TCP, port: 5432 }
+    # OIDC, model sync, notifiers, webhooks.
+    - ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 80 }
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+---
+# --- proxy: the edge/gateway -------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "streamscope.fullname" . }}-proxy
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "proxy") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Public gateway traffic arrives only through the ingress controller.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.proxy.port }} }
+    {{- if and .Values.metrics.port .Values.metrics.scrapeNamespaceSelector }}
+    # Prometheus scrape of the dedicated metrics port, from the allowlisted
+    # monitoring namespace only (fail-closed when no selector is set).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.metrics.scrapeNamespaceSelector | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.metrics.port }} }
+    {{- end }}
+  egress:
+    # DNS.
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # admin-api edge protocol (config sync and audit ingest).
+    - ports:
+        - { protocol: TCP, port: {{ .Values.adminApi.port }} }
+    # Upstream LLM / MCP / built-in web fetch.
+    - ports:
+        - { protocol: TCP, port: 443 }
+        - { protocol: TCP, port: 80 }
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+---
+# --- admin-ui: the console ---------------------------------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "streamscope.fullname" . }}-admin-ui
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "admin-ui") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.adminUi.port }} }
+  egress:
+    # DNS.
+    - ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # Server-side render calls admin-api only.
+    - ports:
+        - { protocol: TCP, port: {{ .Values.adminApi.port }} }
+{{- if eq .Values.postgres.mode "embedded" }}
+---
+# --- embedded Postgres: only admin-api may reach it --------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "streamscope.fullname" . }}-postgres
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "postgres") | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "admin-api") | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 5432 }
+{{- end }}
+{{- end -}}

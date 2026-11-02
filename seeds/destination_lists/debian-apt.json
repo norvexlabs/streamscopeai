@@ -1,0 +1,9 @@
+{
+  "key": "debian-apt",
+  "name": "Debian packages",
+  "description": "Debian's package archives, over HTTP and HTTPS.",
+  "entries": [
+    "deb.debian.org:80,443",
+    "security.debian.org:80,443"
+  ]
+}

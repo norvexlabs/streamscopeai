@@ -1,0 +1,16 @@
+{
+  "id": "opencode",
+  "name": "OpenCode",
+  "description": "Open-source CLI coding agent",
+  "url": "https://opencode.ai",
+  "ua_patterns": [
+    "opencode/",
+    "runtime/bun"
+  ],
+  "referer_patterns": [
+    "opencode.ai"
+  ],
+  "prompt_patterns": [
+    "you are opencode"
+  ]
+}

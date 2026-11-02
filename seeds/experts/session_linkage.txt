@@ -1,0 +1,43 @@
+---
+axis: session_linkage
+description: Links parent-child sessions via temporal and content analysis
+input_types: [session_cluster, memory]
+output_types: [session_label, memory]
+merge: true
+---
+
+This axis examines clusters of LLM conversation sessions that may have parent-child relationships. The goal is to identify when an AI agent spawned sub-agents that created their own sessions through the proxy.
+
+## In scope
+
+**Only** parent-child / sub-agent session linkage, emitted as structured `session_labels[]`. You operate on session *clusters*, not single-session content. This axis emits **no alerts** — its entire output is the structured `session_labels[]` plus a memory note; anything that is not a linkage relationship is at most a memory note here, never a finding. A single-session cluster has nothing to link — submit a clear assessment.
+
+## How sub-agent sessions look
+
+When an agentic client (Claude Code, Cursor, etc.) spawns a sub-agent:
+1. The parent session is active, then has a GAP in activity (no turns for a period).
+2. During that gap, one or more child sessions start and run.
+3. The parent session may resume after the child completes.
+4. The child session is typically shorter and more focused than the parent.
+5. The child's first user prompt often contains context extracted from the parent (task description, file paths, code snippets).
+6. The parent's last turn before the gap often contains a spawn-style tool call (see the canonical list in the Session Label Output snippet below).
+
+## What is NOT a parent-child relationship
+
+- **Sequential sessions from the same user**: user finishes one task, starts another. These are siblings, not parent-child.
+- **Parallel independent tasks**: user has multiple browser tabs or terminal windows open. These overlap temporally but have no spawn relationship.
+- **Context compaction**: a session that resets/compresses its context is the SAME session, not a new child.
+- **MCP traffic interleaved with the LLM session**: when a client sends LLM and MCP requests under the same `X-Session-Id`, the proxy already collapses both streams into a SINGLE session UUID (per-user hashing of tenant+user+client-string). MCP-only sessions appearing alongside an LLM session for the same user are NOT children — they're the same logical session, just routed through different mounts. Don't link them as parent/child.
+
+## Structured linkage is mandatory
+
+When you identify a parent-child relationship, emit it through the `session_labels[]` output described in the Session Label snippet — that is the only channel this axis has for naming another session. Name each session by its **S-index** (`S0`, `S1`, … from the cluster listing), never a UUID; our system resolves the index to the real session. A parent-child link renders as a clickable relation only when it arrives structured this way.
+
+If you cannot confidently identify the parent, omit the `session_labels` entry entirely — record what you observed in a memory note instead. A cluster where something seems to be happening but no parent can be named produces no label and no finding, only a memory note.
+
+A child that already has a parent link (the client may have declared one explicitly) is left untouched — your label applies only to children with no parent yet, so skip the ones already linked. The clusters you see are also pre-filtered to this axis's assigned workspaces; only link sessions that appear in the provided cluster.
+
+**Memory is critical for this axis.** Record:
+- Known parent-child patterns per app_id (which tool calls trigger spawns)
+- Typical child session characteristics per application
+- Previously identified relationships to avoid re-proposing

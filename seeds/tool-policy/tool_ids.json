@@ -1,0 +1,43 @@
+[
+  {"id": "read_file",      "category": "filesystem",   "description": "Read file contents from local disk"},
+  {"id": "write_file",     "category": "filesystem",   "description": "Create or overwrite a file on local disk"},
+  {"id": "edit_file",      "category": "filesystem",   "description": "Modify an existing file (diff / patch / replace)"},
+  {"id": "delete_file",    "category": "filesystem",   "description": "Remove a file from local disk"},
+  {"id": "move_file",      "category": "filesystem",   "description": "Rename or move a file"},
+  {"id": "list_files",     "category": "filesystem",   "description": "List directory contents"},
+  {"id": "search_files",   "category": "filesystem",   "description": "Grep / glob / search for files by content or name"},
+  {"id": "notebook_edit",  "category": "filesystem",   "description": "Edit a Jupyter notebook cell"},
+
+  {"id": "shell_exec",     "category": "process",      "description": "Execute a shell command (bash, zsh, sh, etc.)"},
+  {"id": "code_exec",      "category": "process",      "description": "Run a script in the client's own interpreter (e.g. OpenCode Code Mode), which can call tools and fetch URLs"},
+
+  {"id": "web_fetch",      "category": "web",          "description": "Fetch a single URL and return its content"},
+  {"id": "web_search",     "category": "web",          "description": "Search the web via a search engine"},
+  {"id": "browser_action", "category": "web",          "description": "Drive a browser (navigate, click, screenshot)"},
+
+  {"id": "db_query",       "category": "database",     "description": "Execute a read-only SQL / NoSQL query"},
+  {"id": "db_write_query", "category": "database",     "description": "Execute a mutating SQL / NoSQL statement"},
+
+  {"id": "git_status",     "category": "vcs",          "description": "Show working tree status"},
+  {"id": "git_diff",       "category": "vcs",          "description": "Show changes between commits / working tree"},
+  {"id": "git_log",        "category": "vcs",          "description": "Show commit history"},
+  {"id": "git_commit",     "category": "vcs",          "description": "Create a new commit"},
+  {"id": "git_op",         "category": "vcs",          "description": "Generic git operation not covered by a more specific id"},
+
+  {"id": "send_email",     "category": "comms",        "description": "Send an email"},
+  {"id": "send_message",   "category": "comms",        "description": "Send a chat / instant message (Slack, Discord, etc.)"},
+
+  {"id": "deploy",         "category": "ops",          "description": "Trigger a production deployment"},
+  {"id": "publish",        "category": "ops",          "description": "Publish a package / release artifact"},
+  {"id": "release",        "category": "ops",          "description": "Cut a versioned release"},
+
+  {"id": "agent_spawn",    "category": "agent",        "description": "Spawn a sub-agent / delegate task to another model"},
+  {"id": "task_create",    "category": "agent",        "description": "Create or update a task in the agent's task list"},
+  {"id": "skill_invoke",   "category": "agent",        "description": "Invoke a named skill / slash command"},
+  {"id": "ask_user",       "category": "agent",        "description": "Ask the user a structured question"},
+
+  {"id": "agent_analysis_submit", "category": "internal", "description": "Streamscope agent's submit_analysis tool"},
+  {"id": "lsp_query",      "category": "internal",     "description": "Language Server Protocol query (hover, definition, references, diagnostics)"},
+
+  {"id": "unknown",        "category": "misc",         "description": "Explicit catch-all assigned by an operator when no other id fits"}
+]

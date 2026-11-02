@@ -1,0 +1,8 @@
+{
+  "id": "cursor",
+  "name": "Cursor",
+  "description": "AI-native code editor with built-in chat, autocomplete, and agent mode",
+  "url": "https://cursor.com",
+  "ua_patterns": ["cursor/"],
+  "referer_patterns": ["cursor.sh", "cursor.com"]
+}

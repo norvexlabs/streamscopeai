@@ -1,0 +1,10 @@
+{
+  "key": "npm",
+  "name": "npm and Yarn",
+  "description": "The npm and Yarn package registries.",
+  "entries": [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com"
+  ],
+  "sandbox_default": "allow"
+}

@@ -1,0 +1,106 @@
+{
+  "id": "claude-code",
+  "label": "Claude Code",
+  "targeted_client_version": "2.1.308",
+  "homepage": "https://code.claude.com/docs/en/llm-gateway",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "launch_command": "claude",
+  "templates": [
+    {
+      "kind": "combined",
+      "protocol": "anthropic_messages",
+      "route_tag": "claude-code",
+      "filename": "~/.claude/settings.json",
+      "project_filename": ".claude/settings.json",
+      "format": "json",
+      "title": "Claude Code (static MCP key)",
+      "instructions": "Place at the path above (or merge into your existing settings.json){{#if mcp_servers}}; the MCP servers are added with the commands below{{/if}}. Restart `claude` to pick up the changes.{{#if forward_auth}} This is a BYOK setup — only `ANTHROPIC_BASE_URL` is set, so Claude Code keeps using your existing Anthropic login and model selection; requests now route through the gateway (for audit and policy) and your native Anthropic models pass through unchanged.{{else}} `ANTHROPIC_AUTH_TOKEN` is used (not `ANTHROPIC_API_KEY`) because gateway-issued tokens don't follow the `sk-ant-*` shape Anthropic's SDK validates on. `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL` point Claude Code's `sonnet`, `opus` and `haiku` model choices at the gateway's default, plan and fast models — `opus` also serves the plan phase of `opusplan`, and `haiku` Claude Code's background tasks — so none of them reaches for a model the gateway does not serve. Optional: set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` (Claude Code 2.1.129+) so the CLI fetches the model list from the gateway's `/v1/models` endpoint.{{/if}} Vision is auto-detected from request content — no explicit capability flag is needed. One variable in `env` turns off what Claude Code sends Anthropic beside your requests (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: telemetry, error reports, auto-updates, feedback, release notes); an admin who wants it back can edit this template.",
+      "mcp_auth_mode": "static",
+      "keyed_arrays": {
+        "/enabledMcpjsonServers": "="
+      },
+      "companions": [
+        {
+          "project_path": ".mcp.json",
+          "format": "json",
+          "title": "Claude Code · project MCP servers (.mcp.json)",
+          "instructions": "Claude Code reads a project's MCP servers from `.mcp.json` at the project root, and loads them without asking once you trust the folder: the project's settings enable each by name. {{#unless forward_auth}}The key is not in this file: each server reads it from `STREAMSCOPE_MCP_KEY`, which the project's settings set.{{/unless}}",
+          "body": "{{#if mcp_servers}}{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"http\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"{{#if ../forward_auth}}Bearer {{api_key}}{{else}}Bearer ${STREAMSCOPE_MCP_KEY}{{/if}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n{{/if}}"
+        },
+        {
+          "format": "text",
+          "title": "Claude Code · add the MCP servers",
+          "instructions": "Claude Code keeps its MCP servers for every folder in `~/.claude.json`, a file it also keeps its own state in, so they are added with its own command — run these once in a POSIX shell (on Windows, the Git Bash Claude Code runs in), and again when your servers change: each replaces a server of that name. Remove one with `claude mcp remove --scope user <name>`. {{#unless forward_auth}}The key is not in the commands: each server reads it from `STREAMSCOPE_MCP_KEY`, which `settings.json` sets — a new key reaches the servers with no re-run.{{/unless}}",
+          "body": "{{#unless project_scope}}{{#each mcp_servers}}claude mcp remove --scope user {{slug}} >/dev/null 2>&1; claude mcp add-json --scope user {{slug}} '{\"type\":\"http\",\"url\":\"{{url}}\",\"headers\":{\"Authorization\":\"{{#if ../forward_auth}}Bearer {{api_key}}{{else}}Bearer ${STREAMSCOPE_MCP_KEY}{{/if}}\"}}'\n{{/each}}{{/unless}}"
+        }
+      ],
+      "body": "{\n  \"env\": {\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\",\n    \"ANTHROPIC_BASE_URL\": \"{{base_url}}\"{{#unless forward_auth}},\n    \"ANTHROPIC_AUTH_TOKEN\": \"{{api_key}}\",\n    \"ANTHROPIC_MODEL\": \"{{model_alias}}\",\n    \"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"{{model_slot_default}}\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"{{model_slot_plan}}\",\n    \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"{{model_slot_fast}}\"{{/unless}}{{#each mcp_servers}}{{#if @first}}{{#unless ../forward_auth}},\n    \"STREAMSCOPE_MCP_KEY\": \"{{api_key}}\"{{/unless}}{{/if}}{{/each}}\n  }{{#if project_scope}}{{#if mcp_servers}},\n  \"enabledMcpjsonServers\": [{{#each mcp_servers}}\"{{slug}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{/if}}{{/if}}\n}\n"
+    },
+    {
+      "kind": "combined",
+      "protocol": "anthropic_messages",
+      "route_tag": "claude-code",
+      "filename": "~/.claude/settings.json",
+      "project_filename": ".claude/settings.json",
+      "format": "json",
+      "title": "Claude Code (MCP via OAuth)",
+      "instructions": "Place at the path above (or merge into your existing settings.json){{#if mcp_servers}}; the MCP servers are added with the commands below{{/if}}. Restart `claude` to pick up the changes.{{#if forward_auth}} This is a BYOK setup — only `ANTHROPIC_BASE_URL` is set, so Claude Code keeps using your existing Anthropic login and models; requests route through the gateway.{{/if}} One variable in `env` turns off what Claude Code sends Anthropic beside your requests (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: telemetry, error reports, auto-updates, feedback, release notes); an admin who wants it back can edit this template.",
+      "mcp_auth_mode": "spec_oauth",
+      "keyed_arrays": {
+        "/enabledMcpjsonServers": "="
+      },
+      "companions": [
+        {
+          "project_path": ".mcp.json",
+          "format": "json",
+          "title": "Claude Code · project MCP servers (.mcp.json)",
+          "instructions": "Claude Code reads a project's MCP servers from `.mcp.json` at the project root, and loads them without asking once you trust the folder: the project's settings enable each by name.",
+          "body": "{{#if mcp_servers}}{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"http\",\n      \"url\": \"{{url}}\"\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n{{/if}}"
+        },
+        {
+          "format": "text",
+          "title": "Claude Code · add the MCP servers",
+          "instructions": "Claude Code keeps its MCP servers for every folder in `~/.claude.json`, a file it also keeps its own state in, so they are added with its own command — run these once in a POSIX shell (on Windows, the Git Bash Claude Code runs in), and again when your servers change: each replaces a server of that name. Remove one with `claude mcp remove --scope user <name>`. On first MCP tool use Claude Code opens a browser tab to authorize against the gateway — sign in with your portal account.",
+          "body": "{{#unless project_scope}}{{#each mcp_servers}}claude mcp remove --scope user {{slug}} >/dev/null 2>&1; claude mcp add-json --scope user {{slug}} '{\"type\":\"http\",\"url\":\"{{url}}\"}'\n{{/each}}{{/unless}}"
+        }
+      ],
+      "body": "{\n  \"env\": {\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\",\n    \"ANTHROPIC_BASE_URL\": \"{{base_url}}\"{{#unless forward_auth}},\n    \"ANTHROPIC_AUTH_TOKEN\": \"{{api_key}}\",\n    \"ANTHROPIC_MODEL\": \"{{model_alias}}\",\n    \"ANTHROPIC_DEFAULT_SONNET_MODEL\": \"{{model_slot_default}}\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"{{model_slot_plan}}\",\n    \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"{{model_slot_fast}}\"{{/unless}}\n  }{{#if project_scope}}{{#if mcp_servers}},\n  \"enabledMcpjsonServers\": [{{#each mcp_servers}}\"{{slug}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{/if}}{{/if}}\n}\n"
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.claude/settings.json",
+      "format": "json",
+      "title": "Claude Code · MCP only (static key)",
+      "instructions": "Merge into ~/.claude/settings.json; the MCP servers are added with the commands below. No LLM key is minted in this flow — Claude Code keeps using whatever ANTHROPIC_AUTH_TOKEN is already configured. One variable in `env` turns off what Claude Code sends Anthropic beside your requests (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: telemetry, error reports, auto-updates, feedback, release notes); an admin who wants it back can edit this template.",
+      "companions": [
+        {
+          "format": "text",
+          "title": "Claude Code · add the MCP servers",
+          "instructions": "Claude Code keeps its MCP servers for every folder in `~/.claude.json`, a file it also keeps its own state in, so they are added with its own command — run these once in a POSIX shell (on Windows, the Git Bash Claude Code runs in), and again when your servers change: each replaces a server of that name. Remove one with `claude mcp remove --scope user <name>`. {{#unless forward_auth}}The key is not in the commands: each server reads it from `STREAMSCOPE_MCP_KEY`, which `settings.json` sets — a new key reaches the servers with no re-run.{{/unless}}",
+          "body": "{{#unless project_scope}}{{#each mcp_servers}}claude mcp remove --scope user {{slug}} >/dev/null 2>&1; claude mcp add-json --scope user {{slug}} '{\"type\":\"http\",\"url\":\"{{url}}\",\"headers\":{\"Authorization\":\"{{#if ../forward_auth}}Bearer {{api_key}}{{else}}Bearer ${STREAMSCOPE_MCP_KEY}{{/if}}\"}}'\n{{/each}}{{/unless}}"
+        }
+      ],
+      "body": "{\n  \"env\": {\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\"{{#each mcp_servers}}{{#if @first}}{{#unless ../forward_auth}},\n    \"STREAMSCOPE_MCP_KEY\": \"{{api_key}}\"{{/unless}}{{/if}}{{/each}}\n  }\n}\n"
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.claude/settings.json",
+      "format": "json",
+      "title": "Claude Code · MCP only (OAuth)",
+      "instructions": "Merge into ~/.claude/settings.json; the MCP servers are added with the commands below. No key is minted. One variable in `env` turns off what Claude Code sends Anthropic beside your requests (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`: telemetry, error reports, auto-updates, feedback, release notes); an admin who wants it back can edit this template.",
+      "mcp_auth_mode": "spec_oauth",
+      "companions": [
+        {
+          "format": "text",
+          "title": "Claude Code · add the MCP servers",
+          "instructions": "Claude Code keeps its MCP servers for every folder in `~/.claude.json`, a file it also keeps its own state in, so they are added with its own command — run these once in a POSIX shell (on Windows, the Git Bash Claude Code runs in), and again when your servers change: each replaces a server of that name. Remove one with `claude mcp remove --scope user <name>`. On first MCP tool use Claude Code opens a browser tab to authorize against the gateway — sign in with your portal account.",
+          "body": "{{#unless project_scope}}{{#each mcp_servers}}claude mcp remove --scope user {{slug}} >/dev/null 2>&1; claude mcp add-json --scope user {{slug}} '{\"type\":\"http\",\"url\":\"{{url}}\"}'\n{{/each}}{{/unless}}"
+        }
+      ],
+      "body": "{\n  \"env\": {\n    \"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC\": \"1\"\n  }\n}\n"
+    }
+  ]
+}

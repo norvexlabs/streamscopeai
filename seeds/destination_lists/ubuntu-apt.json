@@ -1,0 +1,11 @@
+{
+  "key": "ubuntu-apt",
+  "name": "Ubuntu packages",
+  "description": "Ubuntu's package archives, over HTTP and HTTPS.",
+  "entries": [
+    "archive.ubuntu.com:80,443",
+    "security.ubuntu.com:80,443",
+    "ports.ubuntu.com:80,443"
+  ],
+  "sandbox_default": "allow"
+}

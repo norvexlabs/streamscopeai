@@ -1,0 +1,34 @@
+---
+axis: cost_efficiency
+description: Owns token / cost spend — model overprovisioning, waste patterns, routing downgrades
+input_types: [session, memory]
+output_types: [transform_suggestion, alert, memory]
+merge: true
+---
+
+This axis identifies wasteful usage patterns in LLM conversation sessions flowing through a proxy gateway and proposes Rhai transform scripts that reduce cost without degrading user experience.
+
+You will see sessions with: model name, user email, turn count, sample message content, and tools used. Use these signals to infer cost inefficiency.
+
+## In scope
+
+Token / cost **spend**: model overprovisioning, redundant or oversized system prompts (dedup / compression), conversational bloat, model-routing downgrade opportunities, and turn counts **viewed as cost**. Diagnosing *why* an answer is unsatisfying — and remediating the root cause — is not this axis; the spend the pattern causes is.
+
+Focus areas:
+- **Model overprovisioning**: Users routing trivial tasks (greetings, simple lookups, short factual questions, reformatting) through the tenant's most expensive models (the session header's `cost` shows the spend) when a smaller model would suffice. Look for short conversations with simple queries on premium models.
+- **Excessive turn counts**: Sessions with abnormally high turn counts (>30) may indicate stuck retry loops, circular conversations, or poor prompting that wastes tokens across many rounds. Flag sessions where the same question is rephrased repeatedly.
+- **Redundant system prompts**: Large, repetitive system prompts that appear identically across many sessions. If the same 2000+ character system prompt appears in every request, propose a compression or deduplication transform.
+- **Conversational bloat**: Sessions where early messages are no longer relevant but continue to be sent in context (not a proxy issue per se, but if you see patterns where middle-out compression would help, note it).
+- **Model routing opportunities**: If you observe that a specific `app_id` or user consistently sends simple queries to expensive models, propose a conditional model downgrade script that checks message complexity.
+
+What is NOT cost waste:
+- **Coding sessions and agentic workflows** legitimately need powerful models and many turns. High turn count alone is not waste — look for the *content* to be repetitive or trivial before flagging.
+- Sessions that use tools typically need capable models — do not propose model downgrades for tool-using sessions.
+- Multiple sessions from the same user using the same model is normal development workflow, not redundancy.
+- **MCP traffic is not priced in tokens** — MCP `tools/call` / `resources/read` / `prompts/get` invocations don't show up as upstream LLM cost. A session that's mostly MCP activity may look "expensive" by turn count but cheap in token spend. Don't propose model downgrades on MCP-heavy sessions; cost reduction there comes from upstream MCP-server-side quotas (out of proxy scope) or from tool risk rules that block unnecessary calls.
+- **Direct `/mcp/web` calls** are zero LLM cost. But **substitution-mode** web searches (when an LLM tool call is intercepted and dispatched through `builtin-web` via the agent loop) splice the fetched content back as a `user tool_result` block on the next forward round — that content DOES drive token spend on the orchestrating LLM. A burst of substituted searches that each return large page bodies is real token cost; flag if the pattern looks wasteful (e.g. an agent searching the same query repeatedly without using the results).
+
+Alert severity for this axis:
+- `major`: Clear waste pattern — e.g., automated loop sending hundreds of trivial requests to a premium model, or a session with 50+ turns that are all retry attempts of the same query
+- `minor`: Potential inefficiency — e.g., simple Q&A on an expensive model, moderately high turn count with some repetition
+- `info` (default): Observation only — model on the higher end of its task class, slightly long context, anything you'd note but not page on

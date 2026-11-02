@@ -1,0 +1,38 @@
+Streamscope AI is installing (release {{ .Release.Name }}, chart {{ .Chart.Version }}, app {{ .Chart.AppVersion }}).
+
+Console:  https://{{ .Values.hostnames.adminUi }}
+Gateway:  https://{{ .Values.hostnames.proxy }}
+{{- if .Values.hostnames.adminApi }}
+API:      https://{{ .Values.hostnames.adminApi }}
+{{- end }}
+
+Postgres mode: {{ .Values.postgres.mode }}{{ if eq .Values.postgres.mode "embedded" }}  (EVALUATION ONLY — single pod, no HA){{ end }}
+DB_MANAGE_APP_ROLE: {{ include "streamscope.manageAppRole" . }}
+
+Watch the rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "streamscope.fullname" . }}-admin-api
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+{{- if eq .Values.postgres.mode "cnpg" }}
+
+The two DB URLs reach the CloudNativePG cluster's read-write service with the
+release's own two passwords, which the cluster's managed roles take.
+{{- if (.Values.postgres.cnpg.backup | default dict).objectStore }}
+Backups: WAL archive + base backups through the Barman Cloud Plugin
+({{ include "streamscope.pgServiceName" . }}-backup).
+{{- else }}
+Backups: off — set postgres.cnpg.backup to archive the database.
+{{- end }}
+{{- end }}
+
+admin-api binds only after migrations apply — a fresh install shows the pod
+Pending/NotReady until the startupProbe (/ready) first succeeds. A degraded
+boot (failed migration) stays Running with /ready=503 (MIGRATION_FAILED) so it
+never serves traffic; check logs and roll back if so.
+
+First administrator:
+  Once the release is ready, ssai-stow runs provisioning: the platform
+  administrator, the organisation, its administrator and the first user. Their
+  generated passwords and keys are in the Secret {{ .Release.Name }}-stowage-provision:
+    kubectl -n {{ .Release.Namespace }} get secret {{ .Release.Name }}-stowage-provision \
+      -o jsonpath='{.data.SETUP_ADMIN_PASSWORD}' | base64 -d

@@ -1,0 +1,9 @@
+{
+  "key": "gitlab-com",
+  "name": "GitLab.com",
+  "description": "Git over HTTPS and SSH and the container registry on gitlab.com.",
+  "entries": [
+    "gitlab.com:443,22",
+    "registry.gitlab.com"
+  ]
+}

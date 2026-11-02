@@ -1,0 +1,116 @@
+{{- $component := "admin-ui" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "streamscope.fullname" . }}-admin-ui
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  replicas: {{ .Values.adminUi.replicas }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "streamscope.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "streamscope.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "streamscope.podSecurityContext" (dict "root" . "ctx" .Values.podSecurityContext) | nindent 8 }}
+      containers:
+        - name: admin-ui
+          image: {{ include "streamscope.image" (dict "root" . "key" "admin-ui") }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.adminUi.port }}
+          env:
+            - name: PORT
+              value: {{ .Values.adminUi.port | quote }}
+            - name: ORIGIN
+              value: {{ include "streamscope.adminUiOrigin" . | quote }}
+            - name: ADMIN_API_URL
+              value: {{ include "streamscope.adminApiUrl" . | quote }}
+            - name: AUTH_MODE
+              value: {{ .Values.adminApi.authMode | quote }}
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: INTERNAL_SERVICE_SECRET
+          {{- with .Values.adminUi.extraEnv }}
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # Every probe is /api/live: 200 whenever the server answers, touching
+          # no page loader and no admin-api call. Never a page — a probe on
+          # /login follows its redirect into the only organisation's sign-in,
+          # whose loader calls admin-api's pre-login surface every few seconds.
+          # Never admin-api's readiness either: a backend outage must not empty
+          # the console's Service (it answers "unavailable" itself) nor block a
+          # drain through its PodDisruptionBudget. The startupProbe holds
+          # liveness off until the server answers, so a slow cold start under
+          # image-pull/CPU contention isn't killed.
+          startupProbe:
+            httpGet:
+              path: /api/live
+              port: http
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /api/live
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /api/live
+              port: http
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.adminUi.resources | nindent 12 }}
+          # readOnlyRootFilesystem → a writable /tmp is the only scratch needed.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          {{- include "streamscope.podAntiAffinity" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 10 }}
+        {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "streamscope.fullname" . }}-admin-ui
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.adminUi.port }}
+      targetPort: http

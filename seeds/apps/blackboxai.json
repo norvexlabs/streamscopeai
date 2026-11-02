@@ -1,0 +1,8 @@
+{
+  "id": "blackboxai",
+  "name": "BLACKBOXAI",
+  "description": "AI agent for builders with code generation and search",
+  "url": "https://blackbox.ai",
+  "ua_patterns": ["blackbox"],
+  "referer_patterns": ["blackbox.ai"]
+}

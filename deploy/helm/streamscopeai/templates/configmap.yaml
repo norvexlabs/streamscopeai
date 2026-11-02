@@ -1,0 +1,34 @@
+{{- /* Non-secret tunables shared across admin-api / admin-ui. */ -}}
+{{- /* Header auth means an identity header IS the credential, so the deployment
+       is only as closed as whatever sits in front of it — and this chart ships
+       no ingress authentication. Refuse to render rather than hand someone a
+       running, internet-reachable install that signs in anyone who names an
+       existing account. The gateway makes the same refusal at boot; this one
+       arrives before anything is applied. */}}
+{{- if and (eq .Values.adminApi.authMode "header") (not .Values.adminApi.headerAuthTrustedProxy) }}
+{{- fail "adminApi.authMode=header requires adminApi.headerAuthTrustedProxy. In header mode an X-Auth-Request-* header is accepted as proof of identity, so anything that can reach the API can sign in as any existing account — and this chart adds no authentication to the ingress. Set headerAuthTrustedProxy to the reverse proxy that authenticates your users, and put it in front of BOTH the console and api ingress hosts. That proxy MUST also discard any inbound X-Auth-Request-User/Email/Groups and X-Tenant-Slug before setting its own, or a caller supplies its own identity; unlike the VM appliance, which strips them at its own edge, nothing in this chart does that for you. For SSO without a front proxy, use authMode=standard with OIDC." }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "streamscope.fullname" . }}-config
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+data:
+  AUTH_MODE: {{ .Values.adminApi.authMode | quote }}
+  {{- /* header auth only: the reverse proxy proves WHO; these say which tenant
+         that identity belongs to, and therefore what it can reach — so it is
+         never taken from the request. */}}
+  HEADER_AUTH_TRUSTED_PROXY: {{ .Values.adminApi.headerAuthTrustedProxy | quote }}
+  HEADER_AUTH_TENANT_SLUG: {{ .Values.adminApi.headerAuthTenantSlug | quote }}
+  HEADER_AUTH_TRUST_TENANT_HEADER: {{ .Values.adminApi.headerAuthTrustTenantHeader | quote }}
+  DB_MANAGE_APP_ROLE: {{ include "streamscope.manageAppRole" . | quote }}
+  # The in-memory rate limiter divides configured limits by this count so the
+  # fleet enforces one aggregate limit. Tracks the admin-api upper bound
+  # (maxReplicas under HPA, else replicas) — see streamscope.rateLimitInstanceCount.
+  RATE_LIMIT_INSTANCE_COUNT: {{ include "streamscope.rateLimitInstanceCount" . | quote }}
+  BOOTSTRAP_PROXY_PUBLIC_URL: {{ include "streamscope.proxyPublicUrl" . | quote }}
+  BOOTSTRAP_ADMIN_PUBLIC_URL: {{ include "streamscope.adminUiOrigin" . | quote }}
+  {{- if .Values.hostnames.adminApi }}
+  BOOTSTRAP_API_PUBLIC_URL: {{ printf "https://%s" .Values.hostnames.adminApi | quote }}
+  {{- end }}

@@ -1,0 +1,8 @@
+{
+  "id": "zed",
+  "name": "Zed",
+  "description": "High-performance collaborative code editor with AI integration",
+  "url": "https://zed.dev",
+  "ua_patterns": ["zed/"],
+  "referer_patterns": ["zed.dev"]
+}

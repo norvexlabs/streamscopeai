@@ -1,0 +1,8 @@
+{
+  "id": "codebuff",
+  "name": "Codebuff",
+  "description": "Self-improving CLI coding agent",
+  "url": "https://codebuff.com",
+  "ua_patterns": ["codebuff"],
+  "referer_patterns": []
+}

@@ -1,0 +1,12 @@
+[
+  {"id": "system_message",   "category": "instructions",  "description": "System-level prompt that establishes role / persona / guardrails"},
+  {"id": "coding_rules",     "category": "instructions",  "description": "Coding style / convention prompt"},
+  {"id": "review_checklist", "category": "instructions",  "description": "Review / QA checklist prompt"},
+  {"id": "planning_prompt",  "category": "planning",      "description": "Planning / decomposition prompt (PRD, ADR, design doc)"},
+  {"id": "summarize",        "category": "summarization", "description": "Summarisation / TL;DR prompt"},
+  {"id": "translate",        "category": "translation",   "description": "Translation prompt"},
+  {"id": "evaluation",       "category": "evaluation",    "description": "Evaluation / grading prompt (rubric, scorecard)"},
+  {"id": "agent_directive",  "category": "agent",         "description": "Agent-mode directive / orchestration prompt"},
+
+  {"id": "unknown",          "category": "misc",          "description": "Explicit catch-all assigned by an operator when no other id fits"}
+]

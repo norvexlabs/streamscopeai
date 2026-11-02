@@ -1,0 +1,88 @@
+[package]
+name = "streamscope-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ssai"
+path = "src/main.rs"
+
+[dependencies]
+streamscope-client-templates = { path = "../streamscope-client-templates" }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+# Styled interactive prompts (select / multi-select / confirm / input) on a
+# TTY; the plain numbered prompts in commands/session.rs remain the
+# non-interactive path. `console` is demand's own terminal layer (same 0.16
+# line, so colour detection is shared) and styles the CLI's output.
+demand = "2.4"
+console = "0.16"
+# demand themes are `termcolor::ColorSpec`s (the brand palette in ui.rs).
+termcolor = "1"
+rand = { workspace = true }
+reqwest = { workspace = true }
+# Read only to recognise a refused certificate's kind in an error chain; the
+# TLS stack itself is reqwest's.
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# JSONC: the comments and trailing commas several tools accept in their JSON
+# configs. `cst` edits such a file in place, so a merge keeps the user's
+# comments and layout.
+jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
+# YAML structured merge (Aider / Continue). Value-level round-trip — the
+# user's comments are not preserved (documented in writer/yaml.rs); only
+# TOML gets in-place comment-preserving edits via toml_edit.
+yaml_serde = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+# Structured TOML merge that preserves the user's comments and formatting —
+# the plain `toml` crate (used for render validation) round-trips values only.
+toml_edit = "0.25"
+# Canonical paths without Windows' verbatim `\\?\` prefix (recorded in the
+# manifest and written into client configs, which do not all read it); the
+# same as `std::fs::canonicalize` elsewhere.
+dunce = "1"
+url = { workspace = true }
+uuid = { workspace = true }
+
+# Sandbox backend (`ssai run`) — unprivileged, Linux-only. `landlock`
+# confines filesystem + TCP-connect (kernel ≥5.13 FS, ≥6.7 net); `seccompiler`
+# (AWS Firecracker) installs the syscall filter that closes non-TCP egress and
+# blocks the dangerous syscall set. Both are no-ops off Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+
+# Signals to the sandboxed engine (`ssai run`), on both sandbox backends.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+# The SIGINT action kept alongside demand's prompts (ui.rs) — registered
+# through the same registry demand's own Ctrl-C handler uses.
+signal-hook = "0.4"
+
+# Windows API calls of the Windows build.
+[target.'cfg(windows)'.dependencies]
+# The Windows root store as PEM, the base `run --ca-file` adds to (Windows has
+# no bundle file).
+rustls-native-certs = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+# PKCE cross-check: the CLI hand-rolls verifier/challenge generation to keep
+# the server crates out of its dependency tree; this test-only dep asserts it
+# against the server's verifier.
+streamscope-mcp-auth = { path = "../streamscope-mcp-auth" }
+proptest = "1"

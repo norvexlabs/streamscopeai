@@ -1,0 +1,14 @@
+{
+  "id": "gemini-cli",
+  "name": "Gemini CLI",
+  "description": "Google's terminal AI agent with generous free tier",
+  "url": "https://github.com/google-gemini/gemini-cli",
+  "ua_patterns": [
+    "geminicli",
+    "gemini-cli"
+  ],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "you are gemini cli"
+  ]
+}

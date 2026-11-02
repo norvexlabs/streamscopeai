@@ -1,0 +1,8 @@
+{
+  "id": "openai-sdk",
+  "name": "OpenAI SDK",
+  "description": "Direct OpenAI Python/TypeScript SDK usage (not a specific app)",
+  "url": "https://platform.openai.com",
+  "ua_patterns": ["openai-python", "openai-node"],
+  "referer_patterns": []
+}

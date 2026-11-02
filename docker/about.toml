@@ -1,0 +1,22 @@
+# cargo-about: the licences the Rust images may ship. A dependency under any other
+# licence fails the image build; adding one here is a licensing decision, read in
+# review.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+# The workspace's own crates are this project, under its LICENSE; dev- and
+# build-dependencies are not in a shipped binary.
+private = { ignore = true }
+ignore-dev-dependencies = true
+ignore-build-dependencies = true

@@ -1,0 +1,31 @@
+{{- /*
+  Prometheus Operator ServiceMonitors for the two /metrics surfaces (proxy +
+  admin-api). Opt-in: requires the ServiceMonitor CRD in the cluster. The
+  scrape targets the named `metrics` Service port, so it follows
+  .Values.metrics.port automatically. Remember to also allowlist the
+  monitoring namespace via metrics.scrapeNamespaceSelector when the
+  NetworkPolicy is enabled.
+*/ -}}
+{{- if and .Values.metrics.port .Values.metrics.serviceMonitor.enabled -}}
+{{- range $component := list "proxy" "admin-api" }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "streamscope.fullname" $ }}-{{ $component }}
+  labels:
+    {{- include "streamscope.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+    {{- with $.Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" $.Release "Chart" $.Chart "Values" $.Values "component" $component) | nindent 6 }}
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $.Values.metrics.serviceMonitor.interval }}
+---
+{{- end }}
+{{- end }}

@@ -1,0 +1,245 @@
+[
+  {
+    "id": "OWASP-LLM01",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Prompt Injection",
+    "summary": "Crafted prompts cause the LLM to behave in ways unintended by the system designer — bypassing safety policies, leaking system prompts, or executing attacker-controlled instructions that arrived as data. Indirect prompt injection propagates via tool outputs the model ingests.",
+    "tool_risk_hints": [
+      "tools that fetch untrusted URLs into context (web_fetch, read_webpage)",
+      "tools that read user-uploaded files without sanitization",
+      "MCP servers exposing arbitrary prompt/context manipulation",
+      "shell tools invoked with user-supplied arguments that end up in stdout"
+    ]
+  },
+  {
+    "id": "OWASP-LLM02",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Sensitive Information Disclosure",
+    "summary": "The LLM reveals credentials, PII, internal system prompts, training data, or proprietary business logic through its outputs — either in the direct response or leaked through tool arguments.",
+    "tool_risk_hints": [
+      "file-read tools with access to credential paths (.ssh, .aws, .env)",
+      "shell commands that echo environment variables",
+      "database tools without row-level authorization",
+      "tools that serialize full user records into model context"
+    ]
+  },
+  {
+    "id": "OWASP-LLM03",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Supply Chain",
+    "summary": "Malicious dependencies, untrusted pre-trained models, plugins, or datasets introduce vulnerabilities into the LLM system.",
+    "tool_risk_hints": [
+      "package install tools (pip, npm, cargo, gem) executed during agent runs",
+      "tools that fetch and run remote scripts (curl|sh patterns)",
+      "MCP server installation / auto-enablement without review"
+    ]
+  },
+  {
+    "id": "OWASP-LLM04",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Data and Model Poisoning",
+    "summary": "Training data, fine-tuning data, or retrieval corpora are manipulated to introduce back-doored behavior, biased outputs, or toxic content.",
+    "tool_risk_hints": [
+      "tools that write into RAG knowledge bases without review",
+      "tools that modify embedding stores",
+      "tools that fetch and persist untrusted documents"
+    ]
+  },
+  {
+    "id": "OWASP-LLM05",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Improper Output Handling",
+    "summary": "Downstream systems trust LLM output without validation, enabling XSS, SQL injection, SSRF, or remote code execution when the model emits code, URLs, or structured data.",
+    "tool_risk_hints": [
+      "SQL execution tools that take the model's raw string",
+      "HTTP clients issuing arbitrary outbound requests",
+      "shell/exec tools that run the model's command verbatim"
+    ]
+  },
+  {
+    "id": "OWASP-LLM06",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Excessive Agency",
+    "summary": "The agent has more tools, permissions, or autonomy than the task requires, enabling unintended destructive actions when prompts, inputs, or outputs go wrong.",
+    "tool_risk_hints": [
+      "delete / drop / destroy tools exposed without a confirmation gate",
+      "production-write tools available in dev/test agent sessions",
+      "privilege-escalation tools (sudo, doas) reachable by the agent"
+    ]
+  },
+  {
+    "id": "OWASP-LLM07",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "System Prompt Leakage",
+    "summary": "The system prompt is exposed to users or attackers, revealing business logic, policy, credentials embedded in prompts, or tool-routing hints that aid future attacks.",
+    "tool_risk_hints": [
+      "debug / introspection tools that echo the system prompt",
+      "tools that serialize the full chat transcript"
+    ]
+  },
+  {
+    "id": "OWASP-LLM08",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Vector and Embedding Weaknesses",
+    "summary": "RAG pipelines are manipulated via poisoned vector stores, embedding inversions, or retrieval of attacker-controlled chunks that alter model behavior.",
+    "tool_risk_hints": [
+      "tools that bulk-ingest untrusted text into vector stores",
+      "retrieval tools without source attribution or tenant filtering"
+    ]
+  },
+  {
+    "id": "OWASP-LLM09",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Misinformation",
+    "summary": "The model emits confidently-stated but incorrect information, causing downstream decisions to rely on hallucinated data — especially dangerous in tool-enabled agents that take action on that output.",
+    "tool_risk_hints": [
+      "tools that act on LLM-generated identifiers (IDs, emails, URLs) without validation",
+      "tools that commit transactions based on unverified model claims"
+    ]
+  },
+  {
+    "id": "OWASP-LLM10",
+    "framework": "OWASP-LLM-TOP-10",
+    "version": "2025",
+    "title": "Unbounded Consumption",
+    "summary": "Tool-enabled agents make unlimited API calls, incur runaway costs, exfiltrate large volumes of data, or trigger DoS on downstream systems.",
+    "tool_risk_hints": [
+      "HTTP tools invoked in loops without rate limit",
+      "file-read tools that walk unbounded directory trees",
+      "database tools issuing SELECT * without limits"
+    ]
+  },
+  {
+    "id": "MITRE-ATLAS-AML-T0048",
+    "framework": "MITRE-ATLAS",
+    "version": "v4.10",
+    "title": "External Harms",
+    "summary": "Attackers use an ML-enabled agent to cause harms outside the target system — e.g. spamming third parties, sending phishing, or launching network attacks against external infrastructure.",
+    "tool_risk_hints": [
+      "email / messaging tools (send_email, slack_post, sms_send)",
+      "HTTP tools able to target arbitrary external URLs",
+      "tools that trigger outbound notifications to user-controlled addresses"
+    ]
+  },
+  {
+    "id": "MITRE-ATLAS-AML-T0049",
+    "framework": "MITRE-ATLAS",
+    "version": "v4.10",
+    "title": "Exfiltration via ML Inference API",
+    "summary": "Adversaries abuse LLM outputs or tool-invocation side effects to move sensitive data out of the target environment through the inference / tool pipeline.",
+    "tool_risk_hints": [
+      "tools that upload files to external services",
+      "DNS lookup / network tools that can encode data into hostnames",
+      "webhook / outbound HTTP tools"
+    ]
+  },
+  {
+    "id": "MITRE-ATLAS-AML-T0051",
+    "framework": "MITRE-ATLAS",
+    "version": "v4.10",
+    "title": "LLM Prompt Injection",
+    "summary": "MITRE's complement to OWASP LLM01 — adversaries craft user prompts or poisoned tool outputs that redirect the model's behavior.",
+    "tool_risk_hints": [
+      "tools that ingest untrusted content (web pages, emails, files)",
+      "retrieval tools without provenance tagging"
+    ]
+  },
+  {
+    "id": "MITRE-ATLAS-AML-T0053",
+    "framework": "MITRE-ATLAS",
+    "version": "v4.10",
+    "title": "LLM Plugin Compromise",
+    "summary": "A compromised or malicious plugin / tool / MCP server is invoked by the agent, executing attacker-controlled code or exfiltrating data.",
+    "tool_risk_hints": [
+      "tools served by third-party MCP servers without attestation",
+      "plugins with overly broad OAuth scopes",
+      "tool handlers that execute plugin-provided shell fragments"
+    ]
+  },
+  {
+    "id": "MITRE-ATLAS-AML-T0054",
+    "framework": "MITRE-ATLAS",
+    "version": "v4.10",
+    "title": "LLM Jailbreak",
+    "summary": "Adversary bypasses safety policies baked into the model or system prompt, enabling tool invocations or outputs the deployer intended to forbid.",
+    "tool_risk_hints": [
+      "high-risk destructive tools that rely on model-side refusal",
+      "tools gated only by system-prompt instructions, no server-side policy"
+    ]
+  },
+  {
+    "id": "CWE-78",
+    "framework": "CWE",
+    "version": "4.14",
+    "title": "OS Command Injection",
+    "summary": "User-controlled data reaches a shell invocation without sanitization. In LLM agent contexts, this is triggered when the model emits shell commands built from attacker-supplied input.",
+    "tool_risk_hints": [
+      "Bash / shell / exec tools with user-derived arguments",
+      "tools that concatenate strings into subprocess invocations"
+    ]
+  },
+  {
+    "id": "CWE-22",
+    "framework": "CWE",
+    "version": "4.14",
+    "title": "Path Traversal",
+    "summary": "Relative paths (../) or absolute paths into sensitive directories bypass access controls on file-read/write tools.",
+    "tool_risk_hints": [
+      "Read / Write / Edit tools with no path allow-list",
+      "file-upload tools that preserve attacker-supplied filenames"
+    ]
+  },
+  {
+    "id": "CWE-918",
+    "framework": "CWE",
+    "version": "4.14",
+    "title": "Server-Side Request Forgery (SSRF)",
+    "summary": "Tools issuing HTTP requests to URLs derived from untrusted input can probe internal networks or cloud metadata endpoints.",
+    "tool_risk_hints": [
+      "web_fetch / http_get tools without URL allow-list",
+      "tools that resolve user-supplied hostnames"
+    ]
+  },
+  {
+    "id": "CWE-502",
+    "framework": "CWE",
+    "version": "4.14",
+    "title": "Deserialization of Untrusted Data",
+    "summary": "Tools that deserialize pickle, YAML, or binary formats from attacker-controlled sources enable arbitrary code execution.",
+    "tool_risk_hints": [
+      "tools that load Python pickle / Ruby Marshal / PHP serialize",
+      "MCP servers that accept serialized plugin state"
+    ]
+  },
+  {
+    "id": "CWE-89",
+    "framework": "CWE",
+    "version": "4.14",
+    "title": "SQL Injection",
+    "summary": "The LLM emits or concatenates SQL text containing attacker-controlled data, reaching a database tool that executes it verbatim.",
+    "tool_risk_hints": [
+      "database query tools accepting raw SQL strings",
+      "tools building queries from model output without parameterization"
+    ]
+  },
+  {
+    "id": "CWE-798",
+    "framework": "CWE",
+    "version": "4.14",
+    "title": "Use of Hard-coded Credentials",
+    "summary": "Tools that read or print credential files, or agent runs that embed secrets in tool arguments.",
+    "tool_risk_hints": [
+      "file-read tools with access to .env / credentials",
+      "shell tools that echo KEY=VALUE env exports"
+    ]
+  }
+]

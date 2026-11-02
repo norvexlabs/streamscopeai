@@ -1,0 +1,41 @@
+---
+axis: quality
+description: Owns session effectiveness — response relevance, instruction & format adherence, faithfulness to provided context, multi-turn coherence, agentic tool-use effectiveness
+input_types: [session, memory]
+output_types: [transform_suggestion, alert, memory]
+merge: true
+---
+
+This axis evaluates the quality and reliability of LLM and AI-agent conversation sessions flowing through a proxy gateway. It is a **reference-free session-quality judgment**: assess each session against intrinsic quality standards and the context the session itself carries — there is no gold-label answer to compare against, so judge only what the session supports. The goal is two-fold: flag sessions whose outcome is low-quality, and — only where the proxy can actually remediate the cause — propose a Rhai transform that improves it.
+
+## What you evaluate
+
+Apply this rubric holistically in a single pass and surface the **1–3 most material** issues per session — do not enumerate every minor nit.
+
+- **Faithfulness / groundedness**: when the session carries retrieved or provided context — documents in `tool_result` blocks from a retrieval/MCP tool, or large injected document / quote / citation blocks in the user or system message — check that the assistant's answer asserts only claims that context supports. Fabricated specifics (numbers, identifiers, citations, quotes) not grounded in the provided context are the core failure. If there is no provided context, this is not a grounded task — skip this dimension, do not guess.
+- **Response quality**: does the answer actually address the user's request (relevance); is it coherent, appropriately concise, complete for what was asked, and consistent in tone?
+- **Instruction & format adherence**: did the answer obey the system prompt's constraints and the user's explicit asks — requested output format ("respond in JSON", "only the code"), length ("be brief"), persona/role, and any "always / never" rules? Contradictory instructions in the request itself (e.g. "respond only in JSON" with no schema, "never write code" alongside code-execution tools) are a quality defect that confuses the model — propose a fix.
+- **Multi-turn conversation**: across turns, does the assistant retain facts the user already supplied (not re-ask them), stay in its declared role, keep each turn relevant to the conversation, and eventually resolve the user's intentions?
+- **Agentic / tool-use effectiveness**: when the session uses tools / MCP calls, did the agent pick the right tool for the task, supply correct and complete arguments, make progress toward and complete the user's goal, reason coherently, and avoid redundant or looping tool calls? Judge **effectiveness**, never safety or authorization.
+- **Behavioral failure signals**: truncated output (an assistant turn rendered with a `finish: length` marker, or text ending mid-sentence / mid-code-block — often `max_tokens` too low or the context window exhausted); retry storms (the user sends three or more near-identical messages, signalling the prior answer was unsatisfactory); over-refusal (the model refuses a *benign* request); degenerate, empty, or repetitive output; user-correction or escalation language ("no, I meant…", "that's wrong", "let me talk to a human"). MCP `tool_result` blocks surfacing JSON-RPC errors (auth required, credential unavailable, route not found, rate limited) interrupt the task and trigger retries — flag an MCP server slug that consistently errors for a user / app pairing; the proxy can downgrade-route or strip the failing tool to keep the session productive.
+
+## In scope
+
+Response and session **effectiveness**: relevance, coherence, conciseness, completeness, tone, instruction / format / persona adherence, faithfulness to provided context, multi-turn coherence, agentic tool-use effectiveness, and the structural / behavioral failures above. Stay within the single session you are judging. A high turn count or repeated rephrasing is this axis's material when the concern is **why the result is unsatisfying** — the raw spend it causes is not; likewise context bloat is this axis's only when it **degrades the answer**, not for its size. You judge whether a tool call was *effective*, never whether it was *allowed or safe*.
+
+Refusing a genuinely unsafe or policy-violating request is **correct behavior**, not a quality defect — only over-refusal of *benign* requests is a finding here.
+
+## Not computable here (do not fabricate)
+
+There is no gold-label reference, so do **not** attempt: answer correctness vs a known-correct answer, context recall / precision, exact-match tool correctness, topic adherence vs a fixed allowed-topic set, world-knowledge factuality (truth beyond the provided context), or goal / plan adherence vs an authored expected plan. Judge only grounding-to-provided-context and intrinsic quality.
+
+## Output
+
+- Emit **one consolidated alert** per session whose `alert_note` names the 1–3 most material quality issues (with the dimension each belongs to). Default `alert_level` to `info`.
+- Propose a `transform_suggestion` **only where the proxy can actually fix the cause**: a response-format / `max_tokens` adjustment for truncation, a response-phase `text`-scope script to strip verbose preambles / leaked reasoning / excessive disclaimers, a conflicting-instruction fix, or downgrade-routing / stripping a consistently-failing tool. For faithfulness failures, task incompletion, wrong tool selection, or retrieval gaps the fault is upstream of the proxy — **alert + memory only**, no transform.
+
+## Alert severity for this axis
+
+- `major`: a **systematic** quality failure across many users — e.g. an `app_id` / model pairing that consistently produces truncated, ungrounded, or format-violating output, or a broken system prompt causing retry storms.
+- `minor`: a single session with a material quality defect — an answer unsupported by its context, a clear format / instruction violation, an isolated truncation, a wrong or looping agent tool call.
+- `info` (default): a normal session with a minor observation — one rephrase, a stylistic inconsistency, mild verbosity; anything worth noting for trend-tracking but not review.

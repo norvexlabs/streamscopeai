@@ -1,0 +1,26 @@
+[
+  {"id": "code_file",        "category": "filesystem",   "description": "Source code file resource (any language)"},
+  {"id": "config_file",      "category": "filesystem",   "description": "Configuration file (.env, .yaml, .toml, .ini, etc.)"},
+  {"id": "secret_resource",  "category": "filesystem",   "description": "File or store entry that contains credentials or other sensitive material"},
+  {"id": "log_file",         "category": "filesystem",   "description": "Log file resource"},
+  {"id": "binary_file",      "category": "filesystem",   "description": "Binary asset (image, archive, executable)"},
+
+  {"id": "db_row",           "category": "database",     "description": "Single row / document fetched from a database"},
+  {"id": "db_table",         "category": "database",     "description": "Table / collection schema or full snapshot"},
+  {"id": "db_query_result",  "category": "database",     "description": "Cached result of a previously-run query"},
+
+  {"id": "memory_entry",     "category": "knowledge",    "description": "Knowledge / memory store entry (a saved note, embedding, fact)"},
+  {"id": "doc_page",         "category": "knowledge",    "description": "Documentation page fetched from a wiki / knowledge base"},
+
+  {"id": "email_message",    "category": "comms",        "description": "Single email message resource"},
+  {"id": "chat_message",     "category": "comms",        "description": "Single chat / IM thread message resource"},
+
+  {"id": "ticket",           "category": "ops",          "description": "Issue tracker ticket / Linear / Jira / GitHub issue"},
+  {"id": "pull_request",     "category": "vcs",          "description": "Pull request / merge request resource"},
+  {"id": "build_artifact",   "category": "ops",          "description": "CI build artifact / release asset"},
+
+  {"id": "metric_series",    "category": "ops",          "description": "Metrics / time-series resource (Prometheus, Grafana, etc.)"},
+  {"id": "trace",            "category": "ops",          "description": "Distributed-trace / APM span resource"},
+
+  {"id": "unknown",          "category": "misc",         "description": "Explicit catch-all assigned by an operator when no other id fits"}
+]

@@ -1,0 +1,21 @@
+# The provision hook's image: provision.sh and what it calls. The installer runs
+# it on every shape — on Kubernetes as a Job, which needs a non-root user.
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+
+# curl and jq drive the provisioning calls; bash is what the script is written
+# for. ca-certificates so an HTTPS API can be provisioned too.
+RUN apk add --no-cache bash curl jq ca-certificates
+
+# Built from the repository root, for the licence and the notices.
+COPY LICENSE NOTICE /usr/share/licenses/streamscopeai/
+LABEL org.opencontainers.image.title="Streamscope AI provisioning hook" \
+      org.opencontainers.image.source="https://github.com/norvexlabs/streamscopeai" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.base.name="docker.io/library/alpine:3.24.3"
+
+COPY deploy/docker/provision.sh /opt/streamscope/provision.sh
+RUN chmod 0755 /opt/streamscope/provision.sh
+
+# Non-root: the Kubernetes Job runs it under runAsNonRoot.
+USER 65532:65532
+CMD ["/bin/bash", "/opt/streamscope/provision.sh"]

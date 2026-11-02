@@ -1,0 +1,13 @@
+{
+  "key": "docker-hub",
+  "name": "Docker Hub",
+  "description": "Pull and push images on Docker Hub: the registry, its token service and its blob CDNs.",
+  "entries": [
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "index.docker.io",
+    "production.cloudfront.docker.com",
+    "production.cloudflare.docker.com"
+  ],
+  "sandbox_default": "allow"
+}

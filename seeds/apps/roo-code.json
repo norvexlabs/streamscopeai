@@ -1,0 +1,8 @@
+{
+  "id": "roo-code",
+  "name": "Roo Code",
+  "description": "AI-powered autonomous coding agent for VS Code",
+  "url": "https://roocode.com",
+  "ua_patterns": ["roo-code", "roocode"],
+  "referer_patterns": ["roocode.com"]
+}

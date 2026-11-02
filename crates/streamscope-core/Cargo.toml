@@ -1,0 +1,104 @@
+[package]
+name = "streamscope-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# HTTP / async
+axum = { workspace = true }
+http-body = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# Not used directly — declared so Cargo feature unification turns on rustls's
+# `prefer-post-quantum` for the outbound TLS stack reqwest builds on. See the
+# rustls entry in the workspace Cargo.toml.
+rustls = { workspace = true }
+
+# SSE codec
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+
+# Auth
+sha2 = { workspace = true }
+bs58 = { workspace = true }
+rand = { workspace = true }
+
+# Encryption
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+hmac = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+memchr = { workspace = true }
+jsonwebtoken = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+# `unbounded_depth`: edge-link JSON nests a client's body a few levels below
+# where the proxy parsed it at serde_json's default of 128;
+# `edge_wire::from_str_bounded` bounds the depth itself before parsing.
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+
+# Config
+arc-swap = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Cache (the screened-content cache)
+moka = { workspace = true }
+
+# Concurrent collections
+dashmap = { workspace = true }
+
+# Scripting
+rhai = { workspace = true }
+regex = { workspace = true }
+
+# Shell tokeniser for tool-risk-rule shell normaliser
+shlex = { workspace = true }
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+utoipa = { workspace = true }
+url = { workspace = true }
+percent-encoding = { workspace = true }
+
+# SSRF guard reused for outbound web_fetch.
+streamscope-mcp-auth = { path = "../streamscope-mcp-auth" }
+streamscope-client-templates = { path = "../streamscope-client-templates" }
+
+# Upstream OAuth client (code exchange + refresh against a third-party IdP).
+# Lives here rather than in `streamscope-mcp-auth` because the guarded
+# transport needs `crate::tls::add_custom_roots`, and that dependency edge
+# only runs this way.
+oauth2 = { workspace = true }
+
+[dev-dependencies]
+# Property-based testing for the canonicalisers in `config::tool_rules_normalize`.
+# They read attacker-chosen bytes, so the defect that matters is never the evasion
+# someone wrote an example for — the generator has to be able to produce what no
+# model would ever emit.
+proptest = "1"
+
+# Constructing `RequestTokenError::Parse` in a test — it is the variant that
+# carries the raw response body, so the "never leak it" guard needs to be
+# demonstrated rather than asserted.
+serde_path_to_error = "0.1"
+
+# Paused time and a one-shot router for the request-body deadline tests.
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
+
+# `rustls` is declared for feature unification only (no direct code reference),
+# so the unused-dependency gate must not flag it. See the comment on the dep above.
+[package.metadata.cargo-machete]
+ignored = ["rustls"]

@@ -1,0 +1,41 @@
+{
+  "id": "gemini-cli",
+  "label": "Gemini CLI",
+  "targeted_client_version": "0.45.2",
+  "homepage": "https://google-gemini.github.io/gemini-cli/docs/get-started/configuration.html",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "launch_command": "gemini",
+  "templates": [
+    {
+      "kind": "combined",
+      "protocol": "google_gemini",
+      "route_tag": "gemini-cli",
+      "filename": "~/.gemini/settings.json",
+      "project_filename": ".gemini/settings.json",
+      "format": "json",
+      "title": "Gemini CLI",
+      "instructions": "Place at the path above (or in a project-local `.gemini/settings.json`). Gemini CLI's settings.json does not have an `env` block — export the two API-key env vars in your shell (or in `~/.gemini/.env`, which the CLI auto-loads):\n\n```\nGEMINI_API_KEY={{api_key}}\nGOOGLE_GEMINI_BASE_URL={{base_url}}\n```\n\n{{#unless forward_auth}}The default model is pinned to `{{model_alias}}` in `settings.json`, so a bare `gemini -p \"...\"` uses it — override per run with `--model`. {{else}}This is a BYOK setup — set `GEMINI_API_KEY` to your own Google key (the gateway forwards it upstream) and your own models pass through; pick one per run with `gemini -p \"...\" --model <model>`. {{/unless}}Run with `gemini -p \"...\" --approval-mode yolo`. Usage statistics to Google and the update check are off (`privacy.usageStatisticsEnabled`, `general.enableAutoUpdate`, `general.enableAutoUpdateNotification`); an admin who wants them back can edit this template.",
+      "mcp_auth_mode": "static",
+      "body": "{\n  \"privacy\": { \"usageStatisticsEnabled\": false },\n  \"general\": { \"enableAutoUpdate\": false, \"enableAutoUpdateNotification\": false },\n  \"security\": { \"auth\": { \"selectedType\": \"gemini-api-key\" } }{{#unless forward_auth}},\n  \"model\": { \"name\": \"{{model_alias}}\" }{{/unless}}{{#if mcp_servers}},\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"httpUrl\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"Bearer {{api_key}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }{{/if}}\n}\n",
+      "companions": [
+        {
+          "path": "~/.gemini/.env",
+          "format": "shell",
+          "title": "Gemini CLI · .env",
+          "instructions": "Gemini CLI reads its base URL (and, in gateway mode, its key) from environment variables only. It auto-loads ~/.gemini/.env, so put them there rather than exporting them per shell.",
+          "body": "{{#unless forward_auth}}GEMINI_API_KEY={{api_key}}\n{{/unless}}GOOGLE_GEMINI_BASE_URL={{base_url}}\n"
+        }
+      ]
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.gemini/settings.json",
+      "format": "json",
+      "title": "Gemini CLI · MCP only (static key)",
+      "instructions": "Merge into ~/.gemini/settings.json alongside any existing `security.auth` / `mcpServers` blocks. No LLM key is minted in this flow — Gemini CLI keeps whatever GEMINI_API_KEY / GOOGLE_GEMINI_BASE_URL is already configured. Usage statistics to Google and the update check are off (`privacy.usageStatisticsEnabled`, `general.enableAutoUpdate`, `general.enableAutoUpdateNotification`); an admin who wants them back can edit this template.",
+      "body": "{\n  \"privacy\": { \"usageStatisticsEnabled\": false },\n  \"general\": { \"enableAutoUpdate\": false, \"enableAutoUpdateNotification\": false },\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"httpUrl\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"Bearer {{api_key}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+    }
+  ]
+}

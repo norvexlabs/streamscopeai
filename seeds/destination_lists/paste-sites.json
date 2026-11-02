@@ -1,0 +1,17 @@
+{
+  "key": "paste-sites",
+  "name": "Paste and file-sharing sites",
+  "description": "Paste bins and anonymous file-sharing sites \u2014 common exfiltration targets, including gists beside an allowed GitHub.",
+  "entries": [
+    "pastebin.com",
+    "gist.github.com",
+    "gist.githubusercontent.com",
+    "paste.ee",
+    "hastebin.com",
+    "transfer.sh",
+    "file.io",
+    "0x0.st",
+    "termbin.com:443,9999"
+  ],
+  "sandbox_default": "block"
+}

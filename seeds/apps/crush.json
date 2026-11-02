@@ -1,0 +1,13 @@
+{
+  "id": "crush",
+  "name": "Crush",
+  "description": "Charmbracelet's terminal AI coding agent",
+  "url": "https://github.com/charmbracelet/crush",
+  "ua_patterns": [
+    "charm-crush"
+  ],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "you are crush, a powerful ai assistant"
+  ]
+}

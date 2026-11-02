@@ -1,0 +1,11 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"skipLibCheck": true
+	},
+	"include": [
+		"src",
+		"server",
+		"vite.config.js"
+	]
+}

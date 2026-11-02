@@ -1,0 +1,9 @@
+{
+  "key": "mcr",
+  "name": "Microsoft Container Registry",
+  "description": "mcr.microsoft.com and its data endpoints.",
+  "entries": [
+    "mcr.microsoft.com",
+    "*.data.mcr.microsoft.com"
+  ]
+}

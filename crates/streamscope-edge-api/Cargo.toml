@@ -1,0 +1,28 @@
+[package]
+name = "streamscope-edge-api"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+streamscope-core = { path = "../streamscope-core" }
+streamscope-mcp-auth = { path = "../streamscope-mcp-auth" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+utoipa = { workspace = true }
+# `FromRow` on the config parts admin-api reads straight from SQL. Enabled by
+# streamscope-admin only; the edge never links the Postgres driver for it.
+sqlx = { workspace = true, optional = true }
+
+[features]
+sqlx = ["dep:sqlx"]
+
+[dev-dependencies]
+proptest = "1"

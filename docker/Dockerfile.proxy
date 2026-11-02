@@ -1,0 +1,206 @@
+# Five stages, so the checks run BESIDE the release build instead of in front of it:
+#
+#   builder  — toolchain + every dependency, pre-built for each profile the build uses
+#   source   — builder + the workspace source
+#   checks   — source + clippy, the workspace tests and the advisory audit
+#   licenses — source + the third-party licence list
+#   release  — source + the release binary
+#
+# BuildKit builds `checks` and `release` concurrently. The runtime stage copies a
+# marker out of `checks`, which is what keeps them a GATE: BuildKit builds only the
+# stages the target reaches, so without that COPY a failing test would no longer
+# fail the image.
+# Never drop the marker, and never let `release` depend on `checks` (that puts
+# the tests back on the release binary's path).
+FROM rust:1.99-alpine3.24@sha256:b1d5dd5a22a09404d3e798c0cf051b689077360374eb505fa5bb93c479693d87 AS builder
+
+RUN apk add --no-cache cmake make g++ perl musl-dev pkgconfig && \
+    rustup component add clippy && cargo install cargo-audit && \
+    cargo install cargo-about --locked --version 0.9.2 --features cli && \
+    cargo install cargo-cyclonedx --locked --version 0.5.9
+
+WORKDIR /app
+
+# Release-profile optimization, supplied as build args. Defaults match cargo's
+# release defaults (LTO off, 16 codegen units), which is what a release ships;
+# pass LTO=true / codegen-units=1 as build args for a deliberate optimized build.
+ARG CARGO_PROFILE_RELEASE_LTO=false
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ENV CARGO_PROFILE_RELEASE_LTO=${CARGO_PROFILE_RELEASE_LTO} \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}
+
+# Copy workspace manifests first for layer caching.
+COPY Cargo.toml Cargo.toml
+COPY Cargo.lock Cargo.lock
+COPY crates/streamscope-core/Cargo.toml crates/streamscope-core/Cargo.toml
+COPY crates/streamscope-proxy/Cargo.toml crates/streamscope-proxy/Cargo.toml
+COPY crates/streamscope-admin/Cargo.toml crates/streamscope-admin/Cargo.toml
+COPY crates/streamscope-mcp-auth/Cargo.toml crates/streamscope-mcp-auth/Cargo.toml
+COPY crates/streamscope-edge-api/Cargo.toml crates/streamscope-edge-api/Cargo.toml
+COPY crates/streamscope-client-templates/Cargo.toml crates/streamscope-client-templates/Cargo.toml
+COPY crates/streamscope-cli/Cargo.toml crates/streamscope-cli/Cargo.toml
+
+# Create stub source files so cargo can resolve dependencies.
+RUN mkdir -p crates/streamscope-core/src && echo "pub fn stub() {}" > crates/streamscope-core/src/lib.rs && \
+    mkdir -p crates/streamscope-proxy/src && echo "fn main() {}" > crates/streamscope-proxy/src/main.rs && \
+    mkdir -p crates/streamscope-admin/src && echo "fn main() {}" > crates/streamscope-admin/src/main.rs && \
+    mkdir -p crates/streamscope-mcp-auth/src && echo "pub fn stub() {}" > crates/streamscope-mcp-auth/src/lib.rs && \
+    mkdir -p crates/streamscope-edge-api/src && echo "pub fn stub() {}" > crates/streamscope-edge-api/src/lib.rs && \
+    mkdir -p crates/streamscope-client-templates/src && echo "pub fn stub() {}" > crates/streamscope-client-templates/src/lib.rs && \
+    mkdir -p crates/streamscope-cli/src && echo "fn main() {}" > crates/streamscope-cli/src/main.rs && \
+    mkdir -p migrations && touch migrations/.keep
+
+# Pre-build dependencies — once per profile the stages below compile in: release
+# (the binary), check (clippy) and test (the workspace tests, dev-dependencies
+# included). Against the stub sources each builds only third-party crates, so a
+# source change recompiles the workspace crates and nothing else. Without the
+# check and test passes here, every source change rebuilt every dependency twice
+# more, in the clippy step and again in the test step. The flags must match the
+# steps below (`--all-features`, `--all-targets`), or the profiles differ and
+# the cache is not the one they read.
+RUN cargo build --release -p streamscope-proxy 2>/dev/null || true
+RUN cargo clippy --workspace --all-targets --all-features 2>/dev/null || true
+RUN cargo test --workspace --all-features --no-run 2>/dev/null || true
+
+FROM builder AS source
+
+# Copy actual source code.
+COPY crates/ crates/
+COPY migrations/ migrations/
+COPY seeds/ seeds/
+COPY CHANGELOG.md CHANGELOG.md
+
+# Touch to invalidate cached compilation of our code.
+RUN touch crates/streamscope-core/src/lib.rs \
+          crates/streamscope-proxy/src/main.rs \
+          crates/streamscope-mcp-auth/src/lib.rs \
+          crates/streamscope-edge-api/src/lib.rs \
+          crates/streamscope-client-templates/src/lib.rs \
+          crates/streamscope-cli/src/main.rs
+
+FROM source AS checks
+
+# Clippy lint — fail on any warning.
+#
+# `--all-features` is what makes this gate cover feature-gated code AT ALL. Without it
+# `streamscope-proxy/pprof` — the `/debug/pprof` flamegraph endpoint profiling relies
+# on — is compiled by nothing in the build: no lint, no test, and no image. Code no
+# gate compiles is not "lightly covered", it is code whose next edit is discovered by
+# whoever next enables the feature. This is the one
+# place the workspace is built with every feature on; the admin image lints the same
+# workspace without them, so do not "align" the two by dropping it here.
+RUN cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Run all workspace tests (fails the build if any test fails). `--all-features` for the
+# same reason as the clippy step above — a feature-gated test that no gate runs is a test
+# that does not exist.
+#
+# This is the ONE run of the workspace tests in the image build: `Dockerfile.admin-api`
+# lints the same workspace but does not test it, because this run is a superset of
+# the one it would make — the same sources and tests, every feature on (no test is
+# gated `cfg(not(feature = …))`), and a build context carrying every file a test
+# reads. Keep all three true, or give the admin image its test step back.
+RUN cargo test --workspace --all-features
+
+# Vulnerability audit — fail build on known advisories.
+# RUSTSEC-2023-0071: rsa timing sidechannel — transitive via sqlx-mysql (not used, no fix available).
+# RUSTSEC-2026-0097: rand unsoundness with custom logger — pulled by tungstenite + sqlx-postgres,
+#   not exploitable in the gateway's logger setup, no fixed version yet.
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195: quick-xml 0.26 parsing DoS — transitive via the OPTIONAL
+#   pprof feature's inferno (flamegraph SVG writer), never compiled into release binaries and fed
+#   only self-generated XML. Fix bar is quick-xml >=0.41; no inferno release reaches it yet
+#   (0.12.6 pins ^0.39) — drop the ignores when inferno adopts >=0.41.
+# RUSTSEC-2026-0387: crypto-bigint timing variability — 0.7 is on the fixed release; 0.5.5 comes
+#   only through openidconnect 4.0.1 (latest) → p256/p384 0.13, which verify an IdP's signatures over
+#   public keys and data, never a secret. Drop the ignore when openidconnect moves to p256 0.14.
+RUN cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0097 \
+    --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0387
+
+# The gate marker: written only once every check above passed. Its content is
+# constant, so a rebuild whose checks re-ran and passed leaves the runtime image's
+# layers untouched.
+RUN echo "clippy, workspace tests, audit: passed" > /checks-passed
+
+# The third-party licence list the image ships. docker/about.toml names the
+# licences a dependency may carry; any other fails the build.
+FROM source AS licenses
+COPY docker/about.toml docker/about.hbs docker/
+RUN cargo about generate --fail --locked -m crates/streamscope-proxy/Cargo.toml \
+        -c docker/about.toml docker/about.hbs -o /THIRD_PARTY_LICENSES
+
+# The SBOM of the crates compiled into the binary, which the release's SBOM
+# merges in: a scanner of the image sees the binary, not what it was built from.
+# Read from the lockfile; build scripts' dependencies are left out;
+# SOURCE_DATE_EPOCH keeps the document the same for the same lockfile. Each run writes every workspace member's: keep the one
+# for the binary the image ships.
+# Our own crates carry the workspace's placeholder version (CHANGELOG.md is the
+# version's one source): each document's 0.0.0 components, ours alone, take the
+# release's version, their purls with it (bom-refs, which the dependency graph
+# points at, are kept).
+FROM source AS sbom
+RUN apk add --no-cache -q jq
+RUN SOURCE_DATE_EPOCH=0 cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps \
+        --manifest-path crates/streamscope-proxy/Cargo.toml && \
+    v=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | head -1) && [ -n "$v" ] && \
+    jq --arg v "$v" 'walk(if type == "object" and .version == "0.0.0" and ((.name // "") | startswith("streamscope")) then .version = $v | (if .purl then .purl |= sub("@0\\.0\\.0"; "@" + $v) else . end) else . end)' crates/streamscope-proxy/streamscope-proxy.cdx.json > /streamscopeai-proxy.cdx.json
+
+FROM source AS release
+
+# Coverage build. COVERAGE=1 makes the binary this image runs carry LLVM counters —
+# that is what puts a system-level test run into the same coverage report as the
+# workspace tests. `strip` must be off: it removes the
+# coverage-mapping section, and llvm-cov then reports nothing while looking like it
+# worked.
+#
+# `--runtime-counter-relocation` is what makes the `%c` (continuous mode) profile
+# profile pattern usable at all: on Linux the counters
+# otherwise live in a section that cannot be mapped onto the profile file, and the
+# runtime then writes a 0-byte file instead of failing. Continuous mode is not a
+# refinement here — a system test SIGKILLs this service mid-run, and a process killed
+# without it writes no profile whatsoever, silently discarding every counter it had
+# accumulated. The two must move together.
+ARG COVERAGE=0
+RUN if [ "$COVERAGE" = "1" ]; then \
+        RUSTFLAGS="-C instrument-coverage -C llvm-args=--runtime-counter-relocation" \
+        CARGO_PROFILE_RELEASE_STRIP=false \
+        cargo build --release -p streamscope-proxy; \
+    else \
+        cargo build --release -p streamscope-proxy; \
+    fi
+
+FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+
+# The gate: this image cannot be produced unless `checks` built — see the top of
+# this file.
+COPY --from=checks /checks-passed /usr/share/streamscope/checks-passed
+
+# The licence, the notices and the third-party licences ship with the binary.
+COPY LICENSE NOTICE /usr/share/licenses/streamscopeai/
+COPY --from=licenses /THIRD_PARTY_LICENSES /usr/share/licenses/streamscopeai/
+COPY --from=sbom /streamscopeai-proxy.cdx.json /usr/share/sbom/streamscopeai-proxy.cdx.json
+LABEL org.opencontainers.image.title="Streamscope AI gateway" \
+      org.opencontainers.image.source="https://github.com/norvexlabs/streamscopeai" \
+      org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.base.name="docker.io/library/alpine:3.24.3"
+
+RUN apk add --no-cache ca-certificates curl
+
+# Fixed uid/gid 65532 so the runtime user is identical and numeric across every
+# deployment target (compose, Kairos VM, Kubernetes runAsUser). DATA_DIR is owned
+# by this user so the proxy writes it natively without depending on a mounted
+# volume's fsGroup. Keep it identical across the images, the chart and the release
+# spec's volume ownership.
+RUN addgroup -g 65532 streamscope && adduser -D -H -u 65532 -G streamscope -s /sbin/nologin streamscope
+
+COPY --from=release /app/target/release/streamscope-proxy /usr/local/bin/streamscopeai
+
+RUN mkdir -p /var/lib/streamscope && chown -R streamscope:streamscope /var/lib/streamscope
+
+USER 65532
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+    CMD curl -sf http://localhost:8080/ready || exit 1
+
+CMD ["streamscopeai"]

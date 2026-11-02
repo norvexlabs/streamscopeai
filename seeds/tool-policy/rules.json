@@ -1,0 +1,453 @@
+[
+  {"id": "ASI02-01b", "title": "Sensitive credential file access", "description": "[ASI02] Reads or writes of /etc/passwd, /etc/shadow, /etc/sudoers, /etc/gshadow and similar credential files via any file tool — credential disclosure / privilege escalation",
+    "risk": "danger", "phase": "response", "scope": "tool_calls", "priority": 10,
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["read_file", "list_files", "search_files", "write_file", "edit_file", "delete_file", "move_file", "notebook_edit"]},
+      {"target": "arg.path", "op": "glob", "value": "/etc/shadow*|/etc/gshadow*|/etc/passwd*|/etc/sudoers|/etc/sudoers.d/*|/etc/master.passwd*|/etc/security/opasswd*"}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06", "OWASP-LLM02"]},
+
+  {"id": "ASI05-01b", "title": "Sensitive credential files via shell", "description": "[ASI05] Shell commands touching /etc/passwd, /etc/shadow, /etc/sudoers and similar credential files — credential disclosure / privilege escalation",
+    "risk": "danger", "phase": "response", "scope": "tool_calls", "priority": 10,
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["/etc/shadow", "/etc/gshadow", "/etc/passwd", "/etc/sudoers", "/etc/master.passwd", "/etc/security/opasswd"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06", "OWASP-LLM02"]},
+
+  {"id": "ASI02-01", "title": "System file reads", "description": "[ASI02] Reads of /etc, /proc, /sys via any read tool — credential and config disclosure",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["read_file", "list_files", "search_files"]},
+      {"target": "arg.path", "op": "glob", "value": "/etc/*|/proc/*|/sys/*"}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-02", "title": "Credential reads", "description": "[ASI02] Reads of SSH keys, AWS configs, GPG keys, env files — credential exfiltration",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["read_file", "search_files"]},
+      {"target": "arg.path", "op": "regex", "value": "(?i)(\\.ssh/|\\.aws/|\\.gnupg/|id_rsa|id_ed25519|credentials|\\.envrc|\\.keychain|\\.keystore|\\.keyring|\\.(env|pem|key)([^\\w]|$))"}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-03", "title": "System file writes", "description": "[ASI02] Writes to /etc, /root — system corruption / privilege escalation",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["write_file", "edit_file", "delete_file", "move_file", "notebook_edit"]},
+      {"target": "arg.path", "op": "glob", "value": "/etc/*|/root/*"}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-04", "title": "Credential writes", "description": "[ASI02] Writes to SSH keys, env files, certificates, credentials — secret tampering / persistence",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["write_file", "edit_file"]},
+      {"target": "arg.path", "op": "regex", "value": "(?i)(\\.ssh/|id_rsa|id_ed25519|credentials|\\.envrc|\\.keychain|\\.keystore|\\.keyring|\\.(env|pem|key)([^\\w]|$))"}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI05-01", "title": "System path access via shell", "description": "[ASI05] Shell commands touching /etc, /proc, /sys — bypasses file tool rules",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["/etc/", "/proc/", "/sys/"]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-05", "title": "Credential access via shell", "description": "[ASI02] Shell commands touching SSH keys, AWS creds, env files, certificates",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "regex", "value": "(?i)(\\.ssh/|\\.aws/|\\.gnupg/|/root/|id_rsa|id_ed25519|credentials|\\.envrc|\\.keychain|\\.keystore|\\.keyring|\\.(env|pem|key)([^\\w]|$))"}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-06", "title": "Destructive commands", "description": "[ASI02] rm -rf, mkfs, dd, shred, chmod 777 — irreversible data loss (matches canonical shell form)",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["rm -rf /", "rm -rf ~", "rm -rf .", "rm -rf *", "mkfs", "dd if=", "shred ", "chmod -R 777", "chmod 777 /", "> /dev/sd"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI05-02", "title": "Privilege escalation", "description": "[ASI05] sudo, doas, su, pkexec, piped curl/wget installs — code execution risk",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "regex", "value": "\\b(curl|wget)\\b[^|\\n]*\\|\\s*\\b(sh|bash|zsh|ksh|dash)\\b|\\b(sudo|doas|pkexec)\\b|\\bsu\\s+(root|-)\\b"}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-07", "title": "Network exfiltration", "description": "[ASI02] Outbound data transfer via curl/wget/netcat — data exfiltration",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["curl -X POST", "curl -d ", "curl --data", "wget --post", "nc ", "ncat ", "netcat "]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-08", "title": "Git destructive operations", "description": "[ASI02] Force push, hard reset — irreversible changes to shared state",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["git push --force", "git push -f ", "git reset --hard", "git clean -fd"]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI04-01", "title": "Package installation", "description": "[ASI04] Package installs — supply chain risk from hallucinated packages",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["pip install ", "npm install ", "yarn add ", "gem install ", "cargo install ", "go install "]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM05"]},
+
+  {"id": "ASI04-04", "title": "Package install from untrusted source", "description": "[ASI04] Installs from git URLs or alternate registries — supply chain risk",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["pip install git+", "pip install -e git+", "pip install --index-url", "pip install --extra-index-url", "npm install http", "npm install git+", "cargo install --git", "gem install --source", "uv tool install --from "]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM05", "MITRE-ATLAS-AML-T0053"]},
+
+  {"id": "ASI04-02", "title": "CI/CD pipeline writes", "description": "[ASI04] Writes to CI/CD configs — pipeline poisoning",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["write_file", "edit_file"]},
+      {"target": "arg.path", "op": "regex", "value": "(?i)(\\.github/workflows|\\.gitlab-ci|jenkinsfile|\\.circleci)"}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM05"]},
+
+  {"id": "ASI02-09", "title": "Infrastructure config writes", "description": "[ASI02] Writes to Docker, reverse proxy, infra configs",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["write_file", "edit_file"]},
+      {"target": "arg.path", "op": "regex", "value": "(?i)(dockerfile|docker-compose|caddyfile|nginx\\.conf|makefile)"}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-18", "title": "Cloud metadata service access", "description": "[ASI02] Cloud metadata endpoint reads — credential theft on AWS/GCP/Azure VMs (URL normaliser aliases metadata.google.internal → 169.254.169.254)",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "web_fetch"},
+      {"target": "arg.url", "op": "contains_any", "value": ["169.254.169.254", "/latest/meta-data/", "/computeMetadata/", "instance-identity"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM02", "CWE-918"]},
+
+  {"id": "ASI02-18b", "title": "Cloud metadata service via shell", "description": "[ASI02] Shell-launched curl/wget against cloud metadata endpoints",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["169.254.169.254", "metadata.google.internal", "metadata.azure.com", "/latest/meta-data/", "/computeMetadata/", "instance-identity"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM02", "CWE-918"]},
+
+  {"id": "ASI02-19", "title": "Public paste-site exfiltration", "description": "[ASI02] Outbound transfer to public paste / file-drop services — data exfiltration channel",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["shell_exec", "web_fetch"]},
+      {"target": "any_arg", "op": "contains_any", "value": ["pastebin.com", "transfer.sh", "file.io", "0x0.st", "bashupload.com", "paste.ee", "ix.io", "termbin.com"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["MITRE-ATLAS-AML-T0049", "OWASP-LLM02"]},
+
+  {"id": "ASI02-20", "title": "Destructive SQL operations", "description": "[ASI02] Schema-destroying or unfiltered-delete SQL — irreversible data loss (SQL normaliser lowercases & strips comments before matching)",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["db_query", "db_write_query"]},
+      {"target": "arg.sql", "op": "contains_any", "value": ["drop table", "drop database", "drop schema", "truncate table", "truncate ", "delete from", "alter user", "grant all"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM05", "CWE-89", "OWASP-LLM06"]},
+
+  {"id": "ASI02-20b", "title": "Destructive SQL via shell", "description": "[ASI02] Destructive SQL keywords in a shell command (psql/mysql/sqlite CLI)",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "regex", "value": "(?i)(drop\\s+table|drop\\s+database|drop\\s+schema|truncate\\s+table|delete\\s+from|alter\\s+user|grant\\s+all)"}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM05", "CWE-89", "OWASP-LLM06"]},
+
+  {"id": "ASI02-21", "title": "Cloud / cluster credential access", "description": "[ASI02] Reads of kubectl, docker, gcloud, azure, terraform credential files — cluster & cloud takeover",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["read_file", "shell_exec"]},
+      {"target": "any_arg", "op": "contains_any", "value": [".kube/config", ".docker/config.json", ".config/gcloud", ".azure/credentials", ".azure/accessTokens", ".terraform.d/credentials", ".helm/repository/auth"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM02", "CWE-798"]},
+
+  {"id": "ASI02-22", "title": "Persistence via scheduled tasks", "description": "[ASI02] Writes or edits to cron, systemd timers, at-jobs, init scripts — long-term backdoor",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["shell_exec", "write_file", "edit_file"]},
+      {"target": "any_arg", "op": "contains_any", "value": ["crontab -e", "crontab -u", "/etc/cron.", "/etc/crontab", "/etc/systemd/system/", "/etc/init.d/", "systemd-run --on-", "at now ", "at -f "]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI05-04", "title": "Reverse shell / C2 patterns", "description": "[ASI05] Reverse shells, bind shells, fifo shells, pty escapes — remote code execution & C2",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["/dev/tcp/", "nc -e ", "ncat -e ", "socat exec:", "mkfifo /tmp/", "pty.spawn", "/bin/sh -i", "/bin/bash -i", "bash -i >&", "perl -e 'use Socket"]}
+    ],
+    "action": {"kind": "block"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06", "CWE-78"]},
+
+  {"id": "ASI05-05", "title": "Service & process termination", "description": "[ASI05] systemctl stop/disable/mask, killall, shutdown — service disruption",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["systemctl stop", "systemctl disable", "systemctl mask", "killall ", "pkill -9", "shutdown ", "poweroff", "reboot"]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI05-06", "title": "Outbound SSH / remote shell", "description": "[ASI05] ssh, scp, sftp, rsync-over-ssh — code execution on remote hosts",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["ssh ", "scp ", "sftp ", "rsync -e ssh", "rsync ssh:", "ssh-keyscan ", "ssh-copy-id "]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["MITRE-ATLAS-AML-T0048"]},
+
+  {"id": "ASI05-07", "title": "Network reconnaissance", "description": "[ASI05] Port / vulnerability / fuzzing scanners — pre-exploitation activity",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "equals", "value": "shell_exec"},
+      {"target": "arg.command", "op": "contains_any", "value": ["nmap ", "masscan ", "nikto ", "gobuster ", "dirb ", "ffuf ", "wfuzz ", "sqlmap ", "amass ", "subfinder "]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["MITRE-ATLAS-AML-T0048"]},
+
+  {"id": "ASI02-23", "title": "Shell & DB history reads", "description": "[ASI02] Reads of shell / REPL / DB history files — may contain accidentally-typed credentials",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [
+      {"target": "tool_id", "op": "in", "value": ["read_file", "shell_exec"]},
+      {"target": "any_arg", "op": "contains_any", "value": [".bash_history", ".zsh_history", ".python_history", ".node_repl_history", ".mysql_history", ".psql_history", ".lesshst", ".viminfo", ".rediscli_history", ".sqlite_history"]}
+    ],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM02"]},
+
+  {"id": "ASI02-10", "title": "File deletion", "description": "[ASI02] File deletion — irreversible",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "delete_file"}],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI05-03", "title": "Shell execution", "description": "[ASI05] Shell access — every shell-capable client",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "shell_exec"}],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-11", "title": "File writes", "description": "[ASI02] File creation and modification",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "in", "value": ["write_file", "edit_file", "notebook_edit"]}],
+    "action": {"kind": "classify"}, "is_builtin": true, "framework_refs": ["OWASP-LLM06"]},
+
+  {"id": "ASI02-13", "title": "Browser automation", "description": "[ASI02] Browser side effects",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "browser_action"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "ASI02-14", "title": "File move / rename", "description": "[ASI02] File moves or renames",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "move_file"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "ASI02-15", "title": "Database read access", "description": "[ASI02] Database reads — monitor for data access patterns",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "db_query"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "ASI02-15b", "title": "Database write access", "description": "[ASI02] Database writes — monitor for data mutation patterns",
+    "risk": "danger", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "db_write_query"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "ASI02-16", "title": "External communication", "description": "[ASI02] Outbound emails or chat messages — high-impact side effects",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "in", "value": ["send_email", "send_message"]}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "ASI02-17", "title": "Deployment / release tools", "description": "[ASI02] Production-impacting deploy / publish / release actions",
+    "risk": "caution", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "in", "value": ["deploy", "publish", "release"]}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "INT-01", "title": "Streamscope agent", "description": "Internal analysis tool — Streamscope LLM agent",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "agent_analysis_submit"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-01", "title": "File reads", "description": "Read file contents — every coding-agent client",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "read_file"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-02", "title": "File search & navigation", "description": "Grep, glob, find, list",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "in", "value": ["search_files", "list_files"]}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-03", "title": "Web search", "description": "Search-engine queries",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-04", "title": "Web fetch", "description": "Fetch URL content",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_fetch"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-05", "title": "Agent orchestration", "description": "Sub-agents, skills, tasks",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "in", "value": ["agent_spawn", "task_create", "skill_invoke", "ask_user"]}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-07", "title": "Language server", "description": "Code intelligence — LSP queries",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "lsp_query"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "SAFE-08", "title": "Notebook edit", "description": "Notebook cell editing",
+    "risk": "safe", "phase": "response", "scope": "tool_calls",
+    "match": [{"target": "tool_id", "op": "equals", "value": "notebook_edit"}],
+    "action": {"kind": "classify"}, "is_builtin": true},
+
+  {"id": "WS-SUB-AC-WEB-SEARCH", "title": "Web search via gateway (Anthropic server tool)",
+    "description": "Substitute the Anthropic web_search_20250305 server-tool with the gateway's filtered web_search executor — every search runs through the URL filter chain, SSRF guard, content cap, and web_audit. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_search",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-OR-WEB-SEARCH", "title": "Web search via gateway (OpenAI Responses server tool)",
+    "description": "Substitute the OpenAI Responses web_search_preview server-tool with the gateway's filtered web_search executor. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_search",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-GM-WEB-SEARCH", "title": "Web search via gateway (Gemini google_search server tool)",
+    "description": "Substitute the Gemini google_search server-tool with the gateway's filtered web_search executor. Disabled by default; enabled once Gemini server-tool parsing populates server_type.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_search",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-CC-WEB-FETCH", "title": "Web fetch via gateway (Claude Code WebFetch)",
+    "description": "Substitute Claude Code's WebFetch tool with the gateway's filtered web_fetch executor — every fetch runs through the URL filter chain, SSRF guard, content cap, and web_audit. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "claude-code|claude*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_fetch"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_fetch",
+        "description": "Fetch the contents of a URL.",
+        "parameters": {"type": "object",
+          "properties": {"url": {"type": "string", "description": "Absolute URL to fetch."}},
+          "required": ["url"]}},
+      "intercept": {"type": "web_executor", "kind": "fetch"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-CC-WEB-SEARCH", "title": "Web search via gateway (Claude Code WebSearch)",
+    "description": "Substitute Claude Code's WebSearch tool with the gateway's filtered web_search executor. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "claude-code|claude*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_search",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-OC-WEB-SEARCH", "title": "Web search via gateway (opencode websearch)",
+    "description": "Substitute opencode's websearch tool with the gateway's filtered web_search executor, so a search never leaves for OpenCode's own search providers. For OpenCode configs the gateway did not write: a provisioned config turns OpenCode's own search off and searches through the gateway's MCP web tools. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "opencode|opencode*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_search",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-OC-WEB-FETCH", "title": "Web fetch via gateway (opencode webfetch)",
+    "description": "Substitute opencode's webfetch tool with the gateway's filtered web_fetch executor. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "opencode|opencode*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_fetch"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_fetch",
+        "description": "Fetch the contents of a URL.",
+        "parameters": {"type": "object",
+          "properties": {"url": {"type": "string", "description": "Absolute URL to fetch."}},
+          "required": ["url"]}},
+      "intercept": {"type": "web_executor", "kind": "fetch"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-GC-WEB-FETCH", "title": "Web fetch via gateway (Gemini CLI web_fetch)",
+    "description": "Substitute Gemini CLI's web_fetch tool with the gateway's filtered web_fetch executor — every fetch runs through the URL filter chain, SSRF guard, content cap, and web_audit. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "gemini-cli|gemini*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_fetch"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "web_fetch",
+        "description": "Fetch the contents of a URL.",
+        "parameters": {"type": "object",
+          "properties": {"url": {"type": "string", "description": "Absolute URL to fetch."}},
+          "required": ["url"]}},
+      "intercept": {"type": "web_executor", "kind": "fetch"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-GC-WEB-SEARCH", "title": "Web search via gateway (Gemini CLI google_web_search)",
+    "description": "Substitute Gemini CLI's google_web_search tool with the gateway's filtered web_search executor. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "gemini-cli|gemini*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "google_web_search",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-CN-WEB-FETCH", "title": "Web fetch via gateway (Continue fetch_url_content)",
+    "description": "Substitute Continue's fetch_url_content tool with the gateway's filtered web_fetch executor — every fetch runs through the URL filter chain, SSRF guard, content cap, and web_audit. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "continue|continue*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_fetch"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "fetch_url_content",
+        "description": "Fetch the contents of a URL.",
+        "parameters": {"type": "object",
+          "properties": {"url": {"type": "string", "description": "Absolute URL to fetch."}},
+          "required": ["url"]}},
+      "intercept": {"type": "web_executor", "kind": "fetch"}},
+    "enabled": false, "is_builtin": true},
+
+  {"id": "WS-SUB-CN-WEB-SEARCH", "title": "Web search via gateway (Continue search_web)",
+    "description": "Substitute Continue's search_web tool with the gateway's filtered web_search executor. Disabled by default.",
+    "risk": "caution", "phase": "request", "scope": "tool_definitions", "app_filter": "continue|continue*",
+    "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+    "action": {"kind": "substitute",
+      "with": {"name": "search_web",
+        "description": "Search the web for the given query.",
+        "parameters": {"type": "object",
+          "properties": {"query": {"type": "string", "description": "The search query."}},
+          "required": ["query"]}},
+      "intercept": {"type": "web_executor", "kind": "search"}},
+    "enabled": false, "is_builtin": true}
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "key": "interactive",
+    "name": "Interactive",
+    "rank": 0,
+    "sheddable": false,
+    "queue_ttl_ms": null,
+    "is_default": false,
+    "mint_default_for": "interactive",
+    "description": "A person is waiting: coding assistants, chat clients, anything a human watches."
+  },
+  {
+    "key": "standard",
+    "name": "Standard",
+    "rank": 10,
+    "sheddable": false,
+    "queue_ttl_ms": null,
+    "is_default": true,
+    "mint_default_for": null,
+    "description": "Everything that names no class of its own."
+  },
+  {
+    "key": "background",
+    "name": "Background",
+    "rank": 20,
+    "sheddable": false,
+    "queue_ttl_ms": 120000,
+    "is_default": false,
+    "mint_default_for": "automation",
+    "description": "Unattended work: CI, batch jobs, the analysis agent. Served last under load, and waits up to two minutes for its turn."
+  }
+]

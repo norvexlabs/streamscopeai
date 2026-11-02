@@ -1,0 +1,260 @@
+/* Utilities are generated from the classes under src/ only. */
+@import 'tailwindcss' source(none);
+@source './**/*.{html,js,svelte,ts}';
+
+/* Defaults drawn from the tokens: a border or divider whose class names
+   no colour draws in --border (Tailwind's own default is the text colour), a
+   placeholder in --text-secondary, and a button shows the pointer cursor
+   (locked by `a_border_with_no_colour_draws_in_the_border_token`). */
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--border);
+  }
+  ::placeholder {
+    color: var(--text-secondary);
+  }
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
+
+/* A token never takes the name of a Tailwind theme variable (`--radius-md`,
+   `--shadow-sm`, `--text-xs`, …): a `:root` variable of the same name would
+   silently resize every utility that reads it (locked by
+   `no_token_shadows_a_tailwind_theme_variable`). */
+
+:root {
+  --bg-primary: #0e1b24;
+  --bg-secondary: #112530;
+  --bg-card: #142c38;
+  --bg-elevated: #1c3a49;
+  --bg-hover: rgba(244, 246, 245, 0.04);
+  --bg-scrim: rgba(0, 0, 0, 0.5);
+  --bg-scrim-strong: rgba(0, 0, 0, 0.6);
+  --text-primary: #f4f6f5;
+  --text-secondary: #a9b8bf;
+  --text-tertiary: #8697a0;
+  --accent: #5ab4e6;
+  --accent-hover: #7cc4ec;
+  /* Text and icons drawn on an --accent fill: the accent is light, so dark ink — a literal,
+     not the page surface, so it stays dark if a surface is retuned. */
+  --accent-fg: #0e1b24;
+  --border: #24404e;
+  --success: #34c778;
+  --warning: #e8c547;
+  --error: #f06a5b;
+  /* Text and icons drawn on a solid status fill: the fills are light, so dark ink. */
+  --success-fg: #0e1b24;
+  --warning-fg: #0e1b24;
+  --error-fg: #0e1b24;
+
+  --error-bg: rgba(240, 106, 91, 0.10);
+  --error-border: rgba(240, 106, 91, 0.26);
+  --error-text: #f7a79d;
+  --warning-bg: rgba(232, 197, 71, 0.10);
+  --warning-border: rgba(232, 197, 71, 0.26);
+  --warning-text: #f0d77e;
+  --success-bg: rgba(52, 199, 120, 0.10);
+  --success-border: rgba(52, 199, 120, 0.26);
+  --success-text: #86ddaa;
+  --info-bg: rgba(90, 180, 230, 0.10);
+  --info-border: rgba(90, 180, 230, 0.26);
+  --info-text: #9cd2f0;
+
+  --focus-ring: #9cd2f0;
+  /* Dim off-state for toggle tracks / switches: one opaque colour, so a
+     track reads the same on every background. Roughly text-secondary @ 30% on
+     bg-card. */
+  --toggle-off: #3d5866;
+  /* Tell the browser to render native UI (form controls, date/time pickers,
+     <select> popups, default scrollbars) in dark mode, and tint checkboxes /
+     radios / range inputs with the brand accent instead of the default blue. */
+  color-scheme: dark;
+  accent-color: var(--accent);
+
+  --ui-radius-sm: 6px;
+  --ui-radius-md: 8px;
+  --ui-radius-lg: 12px;
+  /* Uniform height for single-line form controls (text inputs, selects).
+     Single source of truth: a native <select> ignores line-height and renders
+     shorter than a sibling <input>, so without a shared height they never
+     align. Keep every control on this token. */
+  --control-h: 2.125rem; /* 34px */
+  /* Headings (h1–h3) in Archivo, bundled with the console (no font is fetched
+     from a third party: air-gapped installs and the CSP). Body text keeps its
+     own stack (Inter, then the system sans). The --ui- prefix keeps it out of
+     Tailwind's --font-* theme namespace. */
+  --ui-font-heading: 'Archivo Variable', 'Inter', system-ui, -apple-system, sans-serif;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.2);
+  --shadow-pop: 0 8px 24px rgba(0, 0, 0, 0.35);
+
+  /* Chart series palette — a 10-colour categorical set on the Norvex Labs
+     palette for distinguishing multi-series time-series. Cycle --chart-1..10.
+     Validated as a set on --bg-card (OKLCH L 0.48–0.67, chroma >= 0.10,
+     adjacent pairs >= 8 ΔE under protan/deutan simulation, >= 15 ΔE normal,
+     >= 3:1 contrast): keep the order when changing a value. */
+  --chart-1: #419bd4; /* blue */
+  --chart-2: #805fca; /* violet */
+  --chart-3: #24ab7e; /* aurora */
+  --chart-4: #b6770b; /* amber */
+  --chart-5: #d4679f; /* pink */
+  --chart-6: #549a44; /* green */
+  --chart-7: #5870c9; /* indigo */
+  --chart-8: #dd6d45; /* orange */
+  --chart-9: #13a5b2; /* cyan */
+  --chart-10: #767f00; /* olive */
+
+  /* Tag palette — for non-semantic category discrimination on pills/badges.
+     Each color has a low-opacity bg (its mark colour at 18%) and a light-on-dark
+     text counterpart, its lightness set per hue so every pair stays apart
+     (OKLab ΔE ≥ 8) at ≥ 4.5:1 on its own tint over --bg-card or --bg-elevated. The -mark colour
+     fills a bar, line or rule that stands for the tag's category: the chart series
+     of the same hue (rose has none and its own; neutral is --text-tertiary).
+     Use via <TagBadge color="…"> / tagMarkColor() rather than the raw CSS
+     variables; a mark never takes the -text shade, which is too light to fill. */
+  --tag-blue-bg:    rgba(65, 155, 212, 0.18);
+  --tag-blue-text:  #7fcafe;
+  --tag-blue-mark:  var(--chart-1);
+  --tag-violet-bg:  rgba(128, 95, 202, 0.18);
+  --tag-violet-text:#c2adff;
+  --tag-violet-mark:var(--chart-2);
+  --tag-teal-bg:    rgba(36, 171, 126, 0.18);
+  --tag-teal-text:  #4cf2b7;
+  --tag-teal-mark:  var(--chart-3);
+  --tag-amber-bg:   rgba(182, 119, 11, 0.18);
+  --tag-amber-text: #f8a624;
+  --tag-amber-mark: var(--chart-4);
+  --tag-pink-bg:    rgba(212, 103, 159, 0.18);
+  --tag-pink-text:  #ff8ec6;
+  --tag-pink-mark:  var(--chart-5);
+  --tag-cyan-bg:    rgba(19, 165, 178, 0.18);
+  --tag-cyan-text:  #66f0fe;
+  --tag-cyan-mark:  var(--chart-9);
+  --tag-orange-bg:  rgba(221, 109, 69, 0.18);
+  --tag-orange-text:#ffb49a;
+  --tag-orange-mark:var(--chart-8);
+  --tag-indigo-bg:  rgba(88, 112, 201, 0.18);
+  --tag-indigo-text:#cad7fd;
+  --tag-indigo-mark:var(--chart-7);
+  --tag-rose-bg:    rgba(216, 81, 100, 0.18);
+  --tag-rose-text:  #fdd0d2;
+  --tag-rose-mark:  #d85164;
+  --tag-neutral-bg: rgba(134, 151, 160, 0.18);
+  --tag-neutral-text:#abbec8;
+  --tag-neutral-mark:var(--text-tertiary);
+}
+
+/* The global rules sit in the utilities layer after Tailwind's own: a
+   utility of higher specificity (`focus:outline-hidden`) still beats them, and
+   they beat an equal one. */
+@layer utilities {
+  *:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+    border-radius: var(--ui-radius-sm);
+  }
+
+  body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+
+  /* Text selection — theme tint instead of the browser-default blue. */
+  ::selection {
+    background-color: var(--accent);
+    color: var(--accent-fg);
+  }
+
+  /* Chrome paints a yellow slab on autofilled fields; pin it to the dark
+     surface. The 9999s inset shadow is the only way to override the UA
+     autofill background, and the long delay keeps it from flashing back. */
+  input:-webkit-autofill,
+  input:-webkit-autofill:hover,
+  input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--text-primary);
+    -webkit-box-shadow: 0 0 0 1000px var(--bg-secondary) inset;
+    caret-color: var(--text-primary);
+    transition: background-color 9999s ease-in-out 0s;
+  }
+
+  /* Scrollbars — dark, token-based. Standard props for Firefox / Chrome 121+,
+     WebKit pseudo-elements for the full custom look in Chrome / Edge / Safari.
+     Applied globally so the document scrollbar and every inner scroll container
+     (sidebar, changelog, modals) match the dark surface instead of the OS bar. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: var(--ui-radius-md);
+    border: 2px solid var(--bg-primary);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: var(--text-tertiary);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  /* Until the app has hydrated (`<HydrationGate>`'s `data-hydrating`), a
+     server-rendered control has no handler and a click on it is lost: the
+     controls that need script take no pointer events and the page shows it is
+     busy. What works without script stays live: a link (even one inside a
+     blocked control), a form's submit button, a <details> disclosure. Keyboard
+     focus is left alone. */
+  [data-hydrating] {
+    cursor: progress;
+  }
+  [data-hydrating] :is(button, [role="button"], select, input[type="checkbox"], input[type="radio"]):not(form :is([type="submit"], button:not([type]))) {
+    pointer-events: none;
+  }
+  [data-hydrating] a {
+    pointer-events: auto;
+  }
+
+  /* Hide number input spinners */
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+  input[type="number"] {
+    -moz-appearance: textfield;
+  }
+}
+
+/* Uniform single-line control height across the whole app — the one place
+   every text input and <select> gets its height, so a hand-written <select>
+   lines up with its sibling inputs without a per-site lock. In @layer base so
+   a Tailwind h-* utility still wins on the rare control that needs a different
+   size. Non-text input types keep their intrinsic size; <textarea> is
+   multi-line and only shares the border-box model. */
+@layer base {
+  select,
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]):not([type="file"]):not([type="hidden"]) {
+    height: var(--control-h);
+    box-sizing: border-box;
+  }
+  textarea {
+    box-sizing: border-box;
+  }
+  h1,
+  h2,
+  h3 {
+    font-family: var(--ui-font-heading);
+  }
+}

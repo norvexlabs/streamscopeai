@@ -1,0 +1,313 @@
+# Streamscope AI — Helm values.
+#
+# The chart is a wrapper over the same images the VM appliance and the Docker
+# deployment run. Install it with `ssai-stow k8s install`, never with a
+# bare `helm install`: the installer writes the release's Secret (the generated
+# secrets and its inputs) and sets the `stowage.*` values that name the
+# release's images by digest and that Secret. What you choose here:
+#   1. postgres  — external, embedded or cnpg (see `postgres:`)
+#   2. ingress   — the public hostnames + TLS (see `ingress:`)
+# Everything else has a working default for an in-cluster evaluation.
+
+# Pull Secrets for a mirror that asks for a sign-in, beside the installer's pull
+# account when its registry needs one (the public release needs none).
+imagePullSecrets: []
+
+# ---------------------------------------------------------------------------
+# Public hostnames. admin-ui is the console, proxy is the LLM/MCP gateway,
+# admin-api is the control API (only needed as a distinct host for
+# three-hostname installs; otherwise it sits behind the UI origin).
+# ---------------------------------------------------------------------------
+hostnames:
+  adminUi: admin.streamscope.example.com
+  proxy: gateway.streamscope.example.com
+  # Optional. Leave empty to co-host the API behind the UI origin.
+  adminApi: ""
+
+# ---------------------------------------------------------------------------
+# Ingress + TLS. cert-manager issues the certs (Caddy is NOT deployed on K8s).
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations: {}
+  # How long the controller waits on the gateway with nothing read or sent, in
+  # seconds (ingress-nginx's proxy read/send timeouts). It must outlast the
+  # longest wait for capacity (QOS_QUEUE_TTL_MAX_MS, 9 minutes by default)
+  # plus a long answer: a request held for capacity sends nothing until it is
+  # served, and the controller's own default of 60 s would end it with a 504.
+  # An annotation of the same name under `annotations` wins.
+  proxyTimeoutSeconds: 900
+  # Strict-Transport-Security, emitted only when `tls.enabled`. The appliance
+  # gets this from its built-in proxy; on Kubernetes the ingress controller is
+  # where TLS terminates, so it is set here. Disable if you front the cluster
+  # with a private CA — an HSTS pin makes a certificate warning non-bypassable.
+  hsts:
+    enabled: true
+    # Quoted: an unquoted integer this large renders in scientific notation
+    # ("3.1536e+07"), which is not a valid max-age and browsers ignore it.
+    maxAge: "31536000"
+    includeSubDomains: true
+  tls:
+    enabled: true
+    # When true, the chart emits a cert-manager Certificate per hostname.
+    # When false, you must provide the secret(s) named in `secretName` yourself.
+    certManager:
+      enabled: true
+      # ClusterIssuer (issuerKind: ClusterIssuer) or namespaced Issuer.
+      issuerName: letsencrypt-prod
+      issuerKind: ClusterIssuer
+    # TLS secret name pattern; one secret per hostname (<release>-<host>-tls).
+
+# ---------------------------------------------------------------------------
+# Postgres. Two URLs, two roles (the contract Phase 1.1 proved):
+#   MIGRATION_DATABASE_URL — startup only, runs migrations (needs role/extension
+#                            create privilege; on managed PG a NON-superuser
+#                            migration role per the chart README).
+#   DATABASE_URL           — runtime, connects as streamscope_app (NOBYPASSRLS).
+#
+# mode:
+#   external — managed PG outside the cluster (PRODUCTION DEFAULT). Both URLs
+#              are secret inputs of the release (MIGRATION_DATABASE_URL,
+#              DATABASE_URL). manageAppRole defaults false (operator owns the
+#              runtime role; admin-api never ALTERs it).
+#   embedded — single-pod StatefulSet + PVC (EVALUATION ONLY, not HA). The chart
+#              builds both URLs against the in-cluster service from the
+#              release's generated passwords; manageAppRole defaults true so
+#              admin-api syncs the app-role password.
+#   cnpg     — CloudNativePG Cluster CR (in-cluster HA alternative). Requires the
+#              CloudNativePG operator installed in the cluster.
+# ---------------------------------------------------------------------------
+postgres:
+  mode: external
+
+  # mode=embedded (eval only). The image is the release's `postgres`; the
+  # superuser (the migration role here) and streamscope_app passwords are the
+  # release's generated POSTGRES_PASSWORD / POSTGRES_APP_PASSWORD.
+  embedded:
+    database: streamscope
+    storage:
+      size: 10Gi
+      className: ""
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits:   { memory: 512Mi }
+
+  # mode=cnpg (CloudNativePG).
+  cnpg:
+    instances: 3
+    # The cluster's PostgreSQL image: the release's PostgreSQL minor, the one
+    # every other shape runs. Streamscope requires PostgreSQL 18+ and refuses to
+    # boot on an older server. Another 18+ image may be set; never one below the
+    # cluster's current major: CloudNativePG rejects a major-version downgrade.
+    imageName: "ghcr.io/cloudnative-pg/postgresql:18.6-standard-trixie@sha256:39add80f5b1e573e2f6b641c66fd1a2f8dede67ca0330e870285bc1078551390"
+    database: streamscope
+    storage:
+      size: 20Gi
+      className: ""
+    # CloudNativePG provisions the database (owned by the migration role
+    # `streamscope`, on the release's POSTGRES_PASSWORD) and the
+    # managed roles: the runtime role streamscope_app (the release's
+    # POSTGRES_APP_PASSWORD) and the special roles the schema needs. No
+    # superuser is needed.
+    #
+    # Continuous backup through CloudNativePG's Barman Cloud Plugin (installed
+    # in the cluster beside the operator; CloudNativePG 1.26 or later): a WAL
+    # archive plus scheduled base backups in an object store, which is what a
+    # restore (below) and point-in-time recovery read. Off while `objectStore`
+    # is empty.
+    backup:
+      # The plugin's ObjectStore `spec` (barmancloud.cnpg.io/v1), as the
+      # plugin documents it: `configuration` (destinationPath, endpointURL,
+      # the credentials — a reference to a Secret you create in this
+      # namespace, or inheritFromIAMRole / inheritFromAzureAD for workload
+      # identity — wal/data compression…) and `retentionPolicy` (e.g. "30d").
+      objectStore: {}
+      # Base backups, as a six-field cron expression (seconds first). The
+      # first one is taken as soon as backups are turned on.
+      schedule: "0 0 3 * * *"
+      # The folder of the store this cluster archives into. Empty: the
+      # cluster's own name. CloudNativePG refuses to archive into a folder
+      # that already holds another cluster's WAL, so a cluster created again
+      # (a restore, a reset) archives under a new name.
+      serverName: ""
+    # Create the cluster from a backup instead of empty. Read only when the
+    # Cluster is created: set it, with the cluster deleted, to restore; it is
+    # ignored on a cluster that exists.
+    recovery:
+      # The ObjectStore `spec` holding the backups to restore from (it may be
+      # the same as backup.objectStore). Empty: the cluster starts empty.
+      objectStore: {}
+      # The folder the backups were archived under (the old cluster's
+      # backup.serverName, or its name). Required with objectStore.
+      serverName: ""
+      # Point-in-time recovery: CloudNativePG's recoveryTarget (e.g.
+      # {targetTime: "2026-10-27 08:00:00.00000+00"}). Empty: the latest WAL.
+      recoveryTarget: {}
+
+  # DB_MANAGE_APP_ROLE. null → smart default: true only for embedded (admin-api
+  # syncs the placeholder app-role password); false for external + cnpg (the
+  # operator / CloudNativePG owns the runtime role, admin-api must not ALTER it).
+  manageAppRole: null
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# metrics — Prometheus scrape surface. Each service (proxy, admin-api) exposes
+# /metrics on its own dedicated port (never the main service port — that one
+# rides the public ingress unauthenticated). The port stays cluster-internal:
+# with the NetworkPolicy enabled it is unreachable until you allowlist your
+# monitoring namespace via scrapeNamespaceSelector.
+# ---------------------------------------------------------------------------
+metrics:
+  # Metrics listen port on both services; 0 disables the listeners entirely.
+  port: 9464
+  # matchLabels of the namespace(s) allowed to scrape the metrics port when the
+  # NetworkPolicy is enabled, e.g. {kubernetes.io/metadata.name: monitoring}.
+  # Empty ({}) = no scrape ingress rule (fail-closed).
+  scrapeNamespaceSelector: {}
+  # Prometheus Operator ServiceMonitor for proxy + admin-api. Requires the
+  # ServiceMonitor CRD in the cluster.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    # Extra labels for the ServiceMonitor objects (e.g. release: prometheus).
+    labels: {}
+
+# ---------------------------------------------------------------------------
+# admin-api — control plane. Scales horizontally (leader-elected workers in PG).
+# ---------------------------------------------------------------------------
+adminApi:
+  replicas: 2
+  port: 9090
+  authMode: standard
+  # authMode: header only, and REQUIRED there — the chart refuses to render
+  # without it. In header mode the API accepts an identity header as proof of
+  # who the caller is, so anything able to reach it can sign in as any existing
+  # account. Name the reverse proxy that authenticates your users (e.g.
+  # "authelia"); setting it asserts that this API — the `api` ingress host as
+  # well as the console — is reachable only through that proxy. The chart ships
+  # no ingress authentication, so making that true is your job.
+  headerAuthTrustedProxy: ""
+  # authMode: header only. Your reverse proxy authenticates the user; this names
+  # the tenant they belong to, which decides what they can reach — so it is set
+  # here rather than read from a request header. Empty = the system tenant.
+  headerAuthTenantSlug: ""
+  # Let an inbound X-Tenant-Slug choose the tenant instead, for one deployment
+  # fronting several. Only enable if your proxy SETS that header per vhost,
+  # overwriting whatever the caller sent — nothing in-cluster can tell an
+  # overwritten header from a forged one. headerAuthTenantSlug still wins.
+  headerAuthTrustTenantHeader: false
+  rustLog: "streamscope_admin=info"
+  extraEnv: []
+  # Tokio worker threads. No CPU limit is set below (CPU limits cause CFS
+  # throttling), so the runtime cannot infer its allocation from a cgroup quota —
+  # pin it here. 0 = auto (sizes to a cgroup CPU limit if you add one, else uses
+  # the shared-host policy). The control plane is IO/DB-bound, so a small count
+  # is plenty.
+  workerThreads: 2
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# ---------------------------------------------------------------------------
+# proxy — the edge/gateway. Each replica registers a distinct edge instance
+# under one shared EDGE_TOKEN; its identity lives in its outbox, on the pod's
+# temporary storage beside the audit records it has not yet delivered, so a
+# replaced pod is a new edge instance and what its outbox still held is lost.
+# ---------------------------------------------------------------------------
+proxy:
+  replicas: 2
+  port: 8080
+  rustLog: "streamscope=info"
+  extraEnv: []
+  # Tokio worker threads. No CPU limit is set below — a CPU limit would let CFS
+  # throttle this latency-sensitive data plane — so the runtime cannot infer its
+  # allocation from a cgroup quota; pin it here and scale it with the per-replica
+  # workload (the HPA below adds replicas, this sizes each one). 0 = auto (sizes
+  # to a cgroup CPU limit if you add one, else uses the shared-host policy).
+  workerThreads: 2
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { memory: 512Mi }
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+# ---------------------------------------------------------------------------
+# admin-ui — the console SvelteKit app.
+# ---------------------------------------------------------------------------
+adminUi:
+  replicas: 2
+  port: 3000
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { memory: 256Mi }
+  extraEnv: []
+
+# The chart runs no backup job and no disk-pressure purge of its own. They exist
+# for the VM appliance, where Postgres is single-node with limited disk: the
+# backup image (pg_dump|age|rclone) and the purge protect that box. On
+# Kubernetes the database platform owns backups, HA, and elastic storage: the
+# managed provider (RDS / Cloud SQL / AlloyDB) with `external`, CloudNativePG
+# with `cnpg` — configured through `postgres.cnpg.backup`, which the chart
+# hands to CloudNativePG as is. A second backup path, or a purge that fights
+# elastic storage, only invites split-brain and data loss.
+
+# ---------------------------------------------------------------------------
+# NetworkPolicy — default-deny posture for the three app tiers. When enabled,
+# each component is selected by a policy, so anything NOT explicitly allowed is
+# denied (pods the chart does not select — e.g. the CloudNativePG cluster — keep
+# their own networking untouched):
+#   • ingress: proxy + admin-ui reachable only from the ingress controller's
+#     namespace; admin-api only from proxy (edge protocol) + admin-ui + the
+#     installer's provision Job (and the ingress namespace when a distinct
+#     admin-api host is exposed);
+#     embedded Postgres only from admin-api.
+#   • egress: DNS everywhere; admin-api → Postgres(5432) + external HTTPS/HTTP
+#     (OIDC, model sync, notifiers); proxy → admin-api(WS) + external HTTPS/HTTP
+#     (LLM / MCP / web fetch); admin-ui → admin-api only.
+# Egress is scoped by PORT (to any destination) so it is mode-agnostic and never
+# breaks managed/cnpg Postgres reachability; the hardening is the ingress
+# lockdown + the closed non-web egress ports. Add custom egress (e.g. an MCP
+# upstream on a non-standard port) via extraEgress.
+# ---------------------------------------------------------------------------
+networkPolicy:
+  enabled: false
+  # Namespace the ingress controller runs in (matched by the
+  # kubernetes.io/metadata.name label every namespace carries).
+  ingressNamespace: ingress-nginx
+  # Extra egress rules appended to admin-api + proxy (NetworkPolicyEgressRule[]).
+  extraEgress: []
+
+# Pod-level hardening applied to all workloads. runAsUser/runAsGroup 65532 match
+# the uid/gid baked into all three app images, so it runs as a known non-root
+# user with no reliance on world-readable files. fsGroup gives the proxy's
+# emptyDir the right group ownership so it stays writable. The uid/gid are kept
+# identical across the images, this chart, and the appliance by the
+# lint-runtime-uid.sh lint.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+# Containers run with a read-only root filesystem; each workload mounts a small
+# emptyDir at the few paths it must write (/tmp everywhere; the proxy also keeps
+# its DATA_DIR emptyDir). No app writes anywhere else on disk.
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

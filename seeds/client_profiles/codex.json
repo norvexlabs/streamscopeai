@@ -1,0 +1,21 @@
+{
+  "id": "codex",
+  "label": "OpenAI Codex CLI",
+  "targeted_client_version": "0.137.0",
+  "homepage": "https://developers.openai.com/codex/config-reference",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "launch_command": "codex",
+  "templates": [
+    {
+      "kind": "combined",
+      "protocol": "responses",
+      "route_tag": "codex",
+      "filename": "~/.codex/config.toml",
+      "format": "toml",
+      "title": "Codex · config.toml",
+      "instructions": "Place at ~/.codex/config.toml (or merge into your existing one). {{#if forward_auth}}This is a BYOK setup — paste your own upstream key into `experimental_bearer_token` and keep using your own model (none is pinned); requests route through the gateway.{{else}}The gateway key rides in `experimental_bearer_token`, so no shell export is needed.{{/if}} Keep the file private (chmod 600). Codex only speaks the OpenAI Responses wire format (`wire_api = \"responses\"`); the gateway translates Responses ↔ the upstream's native protocol so any route works. Vision and tool calls are auto-detected from request content — no explicit capability flag is needed on the codex side. Analytics, metrics export, `/feedback` uploads and the update check are off (`[analytics]`, `[otel] metrics_exporter`, `[feedback]`, `check_for_update_on_startup`); an admin who wants them back can edit this template.",
+      "body": "{{#unless forward_auth}}model = \"{{model_alias}}\"\n{{/unless}}model_provider = \"{{provider_key}}\"\ncheck_for_update_on_startup = false\n\n[analytics]\nenabled = false\n\n[feedback]\nenabled = false\n\n[otel]\nmetrics_exporter = \"none\"\n\n[model_providers.{{provider_key}}]\nname = \"Streamscope\"\nbase_url = \"{{base_url}}\"\nexperimental_bearer_token = \"{{api_key}}\"\nwire_api = \"responses\"\n{{#each mcp_servers}}\n[mcp_servers.\"{{slug}}\"]\nurl = \"{{url}}\"\nhttp_headers = { \"Authorization\" = \"Bearer {{api_key}}\" }\n{{/each}}"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "vibe",
+  "name": "Mistral Vibe",
+  "description": "Mistral's minimal CLI coding agent",
+  "url": "https://github.com/mistralai/mistral-vibe",
+  "ua_patterns": [
+    "mistral-vibe/"
+  ],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "you are mistral vibe",
+    "discover additional tools with `search_tool_functions`"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "id": "zed",
+  "label": "Zed",
+  "targeted_client_version": "schema reviewed 2026-06",
+  "homepage": "https://zed.dev/docs/ai/use-api-access",
+  "supports_llm": true,
+  "supports_mcp": false,
+  "templates": [
+    {
+      "kind": "llm",
+      "protocol": "chat_completions",
+      "route_tag": "zed",
+      "filename": "~/.config/zed/settings.json",
+      "format": "json",
+      "title": "Zed · settings.json",
+      "instructions": "Zed reads settings from ~/.config/zed/settings.json on both Linux and macOS, and from %APPDATA%\\Zed\\settings.json on Windows. This snippet is merged into your existing settings (your theme, keymap, and other keys are preserved). Zed never reads the API key from settings.json — export it in your shell as `STREAMSCOPE_API_KEY=<your key>` before launching Zed (on Windows, `setx STREAMSCOPE_API_KEY <your key>`, then start Zed again), or paste it via the Agent Panel (run `agent: open settings` and enter the key under the Streamscope provider). Commit messages and thread summaries use the gateway's fast model (the default model until an admin fills that slot on the route); pick the agent's model from the Agent Panel model picker, which keeps your choice. Telemetry to Zed and auto-update are off (`telemetry.diagnostics`, `telemetry.metrics`, `auto_update`); an admin who wants them back can edit this template.",
+      "body": "{\n  \"telemetry\": { \"diagnostics\": false, \"metrics\": false },\n  \"auto_update\": false,\n  \"agent\": {\n    \"commit_message_model\": { \"provider\": \"streamscope\", \"model\": \"{{model_slot_fast}}\" },\n    \"thread_summary_model\": { \"provider\": \"streamscope\", \"model\": \"{{model_slot_fast}}\" }\n  },\n  \"language_models\": {\n    \"openai_compatible\": {\n      \"streamscope\": {\n        \"api_url\": \"{{base_url}}\",\n        \"available_models\": [\n{{#each routes}}          { \"name\": \"{{model_alias}}\", \"display_name\": \"{{model_alias}}\", \"max_tokens\": {{#if context_window}}{{context_window}}{{else}}128000{{/if}}{{#if supports_function_calling}}, \"capabilities\": { \"tools\": true{{#if supports_vision}}, \"images\": true{{/if}} }{{else}}{{#if supports_vision}}, \"capabilities\": { \"images\": true }{{/if}}{{/if}} }{{#unless @last}},{{/unless}}\n{{/each}}        ]\n      }\n    }\n  }\n}\n",
+      "key_delivery": "environment"
+    }
+  ]
+}

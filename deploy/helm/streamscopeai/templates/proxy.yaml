@@ -1,0 +1,156 @@
+{{- $component := "proxy" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "streamscope.fullname" . }}-proxy
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  {{- if not .Values.proxy.autoscaling.enabled }}
+  replicas: {{ .Values.proxy.replicas }}
+  {{- end }}
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "streamscope.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      {{- include "streamscope.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "streamscope.podSecurityContext" (dict "root" . "ctx" .Values.podSecurityContext) | nindent 8 }}
+      # Graceful drain: HTTP + MCP-SSE + audit flush + outbox shipping before SIGKILL.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: proxy
+          image: {{ include "streamscope.image" (dict "root" . "key" "proxy") }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.proxy.port }}
+            {{- if .Values.metrics.port }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
+          env:
+            - name: PORT
+              value: {{ .Values.proxy.port | quote }}
+            {{- if .Values.metrics.port }}
+            - name: METRICS_PORT
+              value: {{ .Values.metrics.port | quote }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.proxy.rustLog | quote }}
+            - name: ADMIN_API_URL
+              value: {{ printf "http://%s-admin-api:%d" (include "streamscope.fullname" .) (int .Values.adminApi.port) | quote }}
+            - name: DATA_DIR
+              value: /var/lib/streamscope
+            {{- if .Values.proxy.workerThreads }}
+            - name: WORKER_THREADS
+              value: {{ .Values.proxy.workerThreads | quote }}
+            {{- end }}
+            - name: EDGE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: EDGE_TOKEN
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "streamscope.secretName" . }}
+                  key: ENCRYPTION_KEY
+            # No AUTH_SECRET here, and none to add back. The gateway verifies MCP
+            # OAuth tokens against the per-tenant public keys admin-api puts on
+            # the config snapshot, so it needs no signing secret — and because
+            # AUTH_SECRET derives the signing key for every console, portal and
+            # CLI session too, granting it here would let a compromise of the
+            # process that parses untrusted model output mint a session as any
+            # tenant's administrator.
+          {{- with .Values.proxy.extraEnv }}
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # /health is always-200 liveness; /ready is 503 until the proxy holds
+          # a usable config snapshot. Readiness tracks "config loaded", not
+          # "connected" — a brief disconnect from admin-api serves from cache and
+          # must not flap the pod out of the Service.
+          # The proxy can't reach /ready until admin-api is up AND it has pulled
+          # a config snapshot, so this window must cover admin-api's own startup
+          # (including the migration window) — keep it >= the admin-api budget.
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/streamscope
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Per-pod scratch: the outbox, which holds the replica's edge-instance
+        # id. Ephemeral by design: a replaced pod is a new edge instance, and
+        # what its outbox still held is lost with it.
+        - name: data
+          emptyDir: {}
+        # readOnlyRootFilesystem → writable /tmp for incidental scratch.
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        {{- if .Values.affinity }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+        {{- else }}
+        podAntiAffinity:
+          {{- include "streamscope.podAntiAffinity" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 10 }}
+        {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "streamscope.fullname" . }}-proxy
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.proxy.port }}
+      targetPort: http
+    {{- if .Values.metrics.port }}
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+    {{- end }}

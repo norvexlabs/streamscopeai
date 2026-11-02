@@ -1,0 +1,15 @@
+{
+  "key": "github",
+  "name": "GitHub",
+  "description": "Git over HTTPS and SSH, the API, archives, raw files and release downloads on github.com.",
+  "entries": [
+    "github.com:443,22",
+    "ssh.github.com:443",
+    "api.github.com",
+    "codeload.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com"
+  ],
+  "sandbox_default": "allow"
+}

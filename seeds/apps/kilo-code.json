@@ -1,0 +1,8 @@
+{
+  "id": "kilo-code",
+  "name": "Kilo Code",
+  "description": "AI coding assistant for VS Code with orchestrator mode and checkpointing",
+  "url": "https://kilocode.ai",
+  "ua_patterns": ["kilo-code", "kilocode"],
+  "referer_patterns": []
+}

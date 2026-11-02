@@ -1,0 +1,8 @@
+{
+  "id": "windsurf",
+  "name": "Windsurf",
+  "description": "Codeium's AI-powered IDE with agentic capabilities",
+  "url": "https://windsurf.ai",
+  "ua_patterns": ["windsurf/", "codeium/"],
+  "referer_patterns": ["windsurf.ai", "windsurf.com", "codeium.com"]
+}

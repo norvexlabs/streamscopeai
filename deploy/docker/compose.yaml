@@ -1,0 +1,241 @@
+# Streamscope — the core application stack.
+#
+# This file is the SINGLE definition of the core services. Two consumers read
+# it:
+#
+#   * every deploy shape Stowage installs (`ssai-stow` on Docker and the
+#     Kairos VM) — it is the spec's `stack.compose`. Stowage adds its own front
+#     (TLS, the published ports, the CA the CLI trusts), the provision hook and,
+#     on the VM, the host daemon's socket. Nothing here may require a source tree.
+#   * the repository's own dev stack — `docker-compose.yml` at the root
+#     `extends` the services below and adds the build contexts, the dev Caddy
+#     frontend and the dev-only mounts.
+#
+# So: NO `build:` anywhere in this file (a service carrying `build:` is BUILT
+# rather than pulled when its image is absent, which fails on a machine that has
+# only Docker), every image is `${STOWAGE_IMAGE_<KEY>}`, and no service
+# publishes a port — the front does. `stowage -C . lint` checks all three.
+#
+# Every setting that differs between the plain-HTTP loopback shape and a
+# TLS-fronted one is a `${VAR}` whose DEFAULT is the SAFE value (the spec's
+# `safe_defaults`); only the installer relaxes it. A secret is a bare `${VAR}`:
+# the installer generates it, and nothing may fall back to a guessable value.
+#
+# Networks: `default` is the bus the front, the provision hook and the health
+# probes join; `db` is internal and holds postgres and admin-api only, so the
+# proxy — which parses hostile upstream content — cannot reach the database.
+#
+# There is deliberately no `name:` here: Stowage names each install.
+
+x-security-defaults: &security-defaults
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+
+services:
+
+  postgres:
+    <<: *security-defaults
+    image: ${STOWAGE_IMAGE_POSTGRES}
+    # Run as the alpine `postgres` uid directly: `cap_drop: [ALL]` blocks the
+    # official entrypoint's root->postgres setuid step (CAP_SETUID).
+    user: "70:70"
+    # The least it gets: the installer raises the limit to the spec's share of
+    # the host's RAM and says so in STOWAGE_MEM_LIMIT_MB, unset where it gives
+    # none (the dev stack, Docker Desktop), hence the command's default — keep
+    # it equal to this floor.
+    mem_limit: 512M
+    # The shared cache is a quarter of the limit (Postgres' stock 128MB at the
+    # 512M floor); the planner counts three quarters as cached, the kernel's
+    # page cache holding the rest.
+    command: [sh, -c, 'm=$${STOWAGE_MEM_LIMIT_MB:-512}; exec docker-entrypoint.sh postgres -c shared_buffers=$$(( m / 4 ))MB -c effective_cache_size=$$(( m * 3 / 4 ))MB']
+    # Parallel queries share hash tables through /dev/shm; the runtime's 64 MB
+    # default fails them ("could not resize shared memory segment"). Counted
+    # inside mem_limit.
+    shm_size: 256m
+    environment:
+      POSTGRES_USER: streamscope
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      POSTGRES_DB: streamscope
+      # The database's locale, the same on every shape (admin-api refuses to
+      # boot on another): the built-in provider's PG_UNICODE_FAST (code-point
+      # order, full Unicode case mapping, no libc or ICU version), UTF-8, and a
+      # Unicode character classification (LC_CTYPE C.UTF-8), which pg_trgm
+      # reads to keep non-ASCII letters in a trigram. Read by the first start
+      # only (initdb).
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale-provider=builtin --builtin-locale=PG_UNICODE_FAST --lc-collate=C --lc-ctype=C.UTF-8"
+    volumes:
+      # The image's own volume; its data directory is a versioned folder
+      # inside it (PGDATA /var/lib/postgresql/<major>/docker).
+      - postgres:/var/lib/postgresql
+    networks:
+      - db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamscope"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  admin-api:
+    <<: *security-defaults
+    image: ${STOWAGE_IMAGE_ADMIN_API}
+    # Let the graceful drain (HTTP + background workers) finish
+    # before Docker escalates SIGTERM to SIGKILL (default is 10s).
+    stop_grace_period: 30s
+    # The least it gets; the installer raises it to the spec's share of the host.
+    mem_limit: 512M
+    environment:
+      PORT: "9090"
+      # Prometheus /metrics on its own port, reached only through the front's
+      # metrics route and its source allowlist (METRICS_ALLOW).
+      METRICS_PORT: "9464"
+      MIGRATION_DATABASE_URL: "postgres://streamscope:${POSTGRES_PASSWORD}@postgres:5432/streamscope"
+      DATABASE_URL: "postgres://streamscope_app:${POSTGRES_APP_PASSWORD}@postgres:5432/streamscope"
+      AUTH_SECRET: "${AUTH_SECRET}"
+      # The verify-only slot while AUTH_SECRET rotates: the staged next secret,
+      # then the outgoing one after the swap — accepted, never signing. Empty
+      # outside a rotation.
+      AUTH_SECRET_SECONDARY: "${AUTH_SECRET_ACCEPTED:-}"
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      INTERNAL_SERVICE_SECRET: "${INTERNAL_SERVICE_SECRET}"
+      # Shared with the proxy below. admin-api auto-provisions the matching
+      # edge_nodes row on first boot, so no operator ever pastes a token.
+      EDGE_TOKEN: "${EDGE_TOKEN}"
+      # Number of reverse proxies in front of this process: the front, on every
+      # shape — loopback mode included. A wrong value makes the pre-auth limiter
+      # key on a spoofable X-Forwarded-For, which nothing else would reveal.
+      TRUSTED_PROXY_HOPS: "${TRUSTED_PROXY_HOPS:-1}"
+      # One-shot first-boot seed of the SYSTEM public-URL rows. Operator edits in
+      # the console win on every later boot. Both the console and the API origin
+      # join the CORS allow-list; the API origin is also what the CLI's OAuth
+      # discovery document advertises as `api_origin`.
+      BOOTSTRAP_ADMIN_PUBLIC_URL: "${STOWAGE_URL_CONSOLE}"
+      BOOTSTRAP_PROXY_PUBLIC_URL: "${STOWAGE_URL_GATEWAY}"
+      BOOTSTRAP_API_PUBLIC_URL: "${STOWAGE_URL_API}"
+      # The front's internal root (or the operator's own CA), which the front
+      # publishes into the cli-ca volume. GET /api/v1/cli/ca serves it so the CLI
+      # trusts it; absent on a public-CA install, where nothing is served.
+      GATEWAY_CA_FILE: /cli-ca/ca.crt
+      AUTH_MODE: "${AUTH_MODE:-standard}"
+      HEADER_AUTH_TRUSTED_PROXY: "${HEADER_AUTH_TRUSTED_PROXY:-}"
+      HEADER_AUTH_TENANT_SLUG: "${HEADER_AUTH_TENANT_SLUG:-}"
+      HEADER_AUTH_TRUST_TENANT_HEADER: "${HEADER_AUTH_TRUST_TENANT_HEADER:-false}"
+      ALLOW_OIDC_CLAIM_EXCHANGE: "${ALLOW_OIDC_CLAIM_EXCHANGE:-false}"
+      API_DOCS_PUBLIC: "${API_DOCS_PUBLIC:-true}"
+      RUST_LOG: "${RUST_LOG:-streamscope_admin=info,streamscope=info}"
+    volumes:
+      - cli-ca:/cli-ca:ro
+    networks:
+      - db
+      - default
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9090/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  proxy:
+    <<: *security-defaults
+    image: ${STOWAGE_IMAGE_PROXY}
+    # Let the graceful drain (HTTP + MCP-SSE + audit flush + outbox shipping)
+    # finish before Docker escalates SIGTERM to SIGKILL.
+    stop_grace_period: 30s
+    # The least it gets; the installer raises it to the spec's share of the host.
+    mem_limit: 512M
+    # No `env_file:` — the data plane is granted secrets one at a time. Naming
+    # each token here makes the grant fail-closed: a secret added to `.env` is
+    # not shared with the process that parses hostile upstream content unless
+    # someone writes it below. Keep it that way.
+    environment:
+      PORT: "8080"
+      METRICS_PORT: "9464"
+      ADMIN_API_URL: "http://admin-api:9090"
+      DATA_DIR: /var/lib/streamscope
+      # Decrypts the upstream credentials carried on the config snapshot.
+      ENCRYPTION_KEY: "${ENCRYPTION_KEY}"
+      # Authenticates this edge to admin-api.
+      EDGE_TOKEN: "${EDGE_TOKEN}"
+      # Must agree with admin-api's: it describes the deployment's topology, not
+      # one process's policy.
+      TRUSTED_PROXY_HOPS: "${TRUSTED_PROXY_HOPS:-1}"
+      # Which browser origins may call the gateway; empty allows any. Read once
+      # at startup, so unlike most gateway tuning it cannot be changed centrally.
+      PROXY_CORS_ORIGIN: "${PROXY_CORS_ORIGIN:-}"
+      RUST_LOG: "${RUST_LOG:-streamscope_admin=info,streamscope=info}"
+    volumes:
+      - proxy:/var/lib/streamscope
+    # `default` only. The proxy holds no database credential and opens no
+    # database connection — it polls admin-api over HTTP. Postgres lives on `db`
+    # alone, which is what makes the absent credential mean something.
+    networks:
+      - default
+    depends_on:
+      admin-api:
+        condition: service_healthy
+    healthcheck:
+      # Readiness, not liveness: /health is always-200 with no dependency check,
+      # so gating on it would report the replica up while its tenant registry is
+      # still empty. /ready is 200 only once a config snapshot has been applied.
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  admin-ui:
+    <<: *security-defaults
+    image: ${STOWAGE_IMAGE_ADMIN_UI}
+    mem_limit: 256M
+    # No `env_file:` — same rule as the proxy, and for a sharper reason: this is
+    # the browser-facing surface and it executes JavaScript, so a dependency
+    # compromise reads whatever its environment holds. It is a presentation layer
+    # that talks to admin-api; it has no business holding the database passwords
+    # or the encryption key.
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # The origin this console is served from. SvelteKit's adapter compares a
+      # form POST's Origin header against it, so a wrong value is a 403 on every
+      # sign-in — a CSRF rejection, not a cookie problem. It also builds the OIDC
+      # redirect_uri.
+      ORIGIN: "${STOWAGE_URL_CONSOLE}"
+      ADMIN_API_URL: "http://admin-api:9090"
+      # Authenticates this BFF's own server-side calls to admin-api during the
+      # OIDC sign-in exchange. The one deployment secret this service reads.
+      INTERNAL_SERVICE_SECRET: "${INTERNAL_SERVICE_SECRET}"
+      # Whether session cookies carry `Secure`. DEFAULT TRUE, and the relaxed
+      # value is written deliberately by the installer for a plain-HTTP
+      # (loopback) install. Defaulting it to false would mean an operator who clears the
+      # variable while moving to TLS silently keeps cleartext-capable cookies.
+      COOKIE_SECURE: "${COOKIE_SECURE:-true}"
+      AUTH_MODE: "${AUTH_MODE:-standard}"
+      AUTHELIA_LOGOUT_URL: "${AUTHELIA_LOGOUT_URL:-}"
+    networks:
+      - default
+    depends_on:
+      admin-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/api/live',r=>{r.resume();process.exit(r.statusCode===200?0:1)}).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+networks:
+  db:
+    driver: bridge
+    # No egress to the host network: postgres is unreachable from outside the
+    # stack, and the proxy is not attached to this network at all.
+    internal: true
+
+volumes:
+  postgres: {}
+  proxy: {}
+  # The front publishes its CA here; admin-api reads it, read-only.
+  cli-ca: {}

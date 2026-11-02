@@ -1,0 +1,19 @@
+{
+  "id": "claude-desktop",
+  "label": "Claude Desktop",
+  "targeted_client_version": "schema reviewed 2026-06",
+  "homepage": "https://modelcontextprotocol.io/docs/develop/connect-local-servers",
+  "supports_llm": false,
+  "supports_mcp": true,
+  "templates": [
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "claude_desktop_config.json",
+      "format": "json",
+      "title": "Claude Desktop · claude_desktop_config.json",
+      "instructions": "macOS: ~/Library/Application Support/Claude/claude_desktop_config.json — Windows: %APPDATA%\\Claude\\claude_desktop_config.json. Claude Desktop only speaks stdio MCP, so the snippet uses the `mcp-remote` bridge (https://github.com/geelen/mcp-remote). Restart Claude Desktop after editing.",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"command\": \"npx\",\n      \"args\": [\n        \"-y\",\n        \"mcp-remote\",\n        \"{{url}}\",\n        \"--header\",\n        \"Authorization:Bearer {{api_key}}\"\n      ]\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+    }
+  ]
+}

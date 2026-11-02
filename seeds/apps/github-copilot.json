@@ -1,0 +1,8 @@
+{
+  "id": "github-copilot",
+  "name": "GitHub Copilot",
+  "description": "GitHub's AI coding assistant for IDEs and CLI",
+  "url": "https://github.com/features/copilot",
+  "ua_patterns": ["copilot"],
+  "referer_patterns": ["copilot.github.com"]
+}

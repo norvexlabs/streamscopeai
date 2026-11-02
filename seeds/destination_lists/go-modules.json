@@ -1,0 +1,10 @@
+{
+  "key": "go-modules",
+  "name": "Go modules",
+  "description": "The Go module proxy and checksum database.",
+  "entries": [
+    "proxy.golang.org",
+    "sum.golang.org"
+  ],
+  "sandbox_default": "allow"
+}

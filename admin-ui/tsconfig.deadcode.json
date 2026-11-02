@@ -1,0 +1,8 @@
+{
+  "//": "Strict-only overlay for the dead-code report pass. The normal build uses tsconfig.json; this turns on the unused-symbol checks (ts6133/ts6196) that the regular --threshold warning run drops as hints. Driven by the lint-deadcode.sh lint.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  }
+}

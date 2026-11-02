@@ -1,0 +1,8 @@
+{
+  "id": "streamscope-agent",
+  "name": "Streamscope Agent",
+  "description": "Built-in LLM analysis agent for automated session review",
+  "url": "",
+  "ua_patterns": [],
+  "referer_patterns": []
+}

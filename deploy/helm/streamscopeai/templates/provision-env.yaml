@@ -1,0 +1,15 @@
+{{- /*
+  The provision hook's environment beyond what the installer gives it. Once a
+  release is settled the installer runs the hook (provision.sh, the same as on
+  Docker and the VM) as a Job of its own and takes this ConfigMap, by its name,
+  as the hook container's envFrom. Only what the chart alone knows belongs here;
+  never a secret — the hook's inputs and secrets come from the release spec.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-stowage-provision
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+data:
+  ADMIN_API_URL: {{ include "streamscope.adminApiUrl" . | quote }}

@@ -1,0 +1,15 @@
+{
+  "id": "continue",
+  "name": "Continue",
+  "description": "Open-source AI code assistant for VS Code, JetBrains and the terminal (the CLI sends a generic User-Agent, so it is recognised by its system prompt)",
+  "url": "https://continue.dev",
+  "ua_patterns": [
+    "continue/"
+  ],
+  "referer_patterns": [
+    "continue.dev"
+  ],
+  "prompt_patterns": [
+    "an agent in the continue cli"
+  ]
+}

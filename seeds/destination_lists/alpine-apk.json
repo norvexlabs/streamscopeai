@@ -1,0 +1,8 @@
+{
+  "key": "alpine-apk",
+  "name": "Alpine packages",
+  "description": "Alpine Linux's package mirror.",
+  "entries": [
+    "dl-cdn.alpinelinux.org"
+  ]
+}

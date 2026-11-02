@@ -1,0 +1,8 @@
+{
+  "id": "cline",
+  "name": "Cline",
+  "description": "Autonomous AI coding agent for VS Code",
+  "url": "https://cline.bot",
+  "ua_patterns": ["cline/"],
+  "referer_patterns": ["cline.bot"]
+}

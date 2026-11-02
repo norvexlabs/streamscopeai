@@ -1,0 +1,49 @@
+{
+  "id": "continue",
+  "label": "Continue",
+  "targeted_client_version": "schema reviewed 2026-06",
+  "homepage": "https://docs.continue.dev/reference",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "launch_command": "cn",
+  "templates": [
+    {
+      "kind": "combined",
+      "protocol": "anthropic_messages",
+      "filename": "~/.continue/config.yaml",
+      "format": "yaml",
+      "title": "Continue · config.yaml (Native Anthropic, all models)",
+      "instructions": "Place at ~/.continue/config.yaml. Pick this variant for Claude models — it carries `reasoning` blocks, prompt-cache control, and citations end-to-end. Use the OpenAI-compatible variant for every other model; Continue auto-routes those to the OpenAI Responses endpoint internally, which is the feature-rich path on the OpenAI side.",
+      "keyed_arrays": {
+        "/models": "name",
+        "/mcpServers": "name"
+      },
+      "body": "name: streamscope\nversion: 0.0.1\nschema: v1\nmodels:\n{{#each routes}}  - name: {{model_alias}}\n    provider: anthropic\n    model: {{model_alias}}\n    apiBase: {{{base_url}}}/v1/\n    apiKey: {{{../api_key}}}\n    roles:\n      - chat\n      - edit\n      - apply\n{{#if supports_vision}}    capabilities:\n      - image_input\n{{#if supports_function_calling}}      - tool_use\n{{/if}}{{else}}{{#if supports_function_calling}}    capabilities:\n      - tool_use\n{{/if}}{{/if}}{{#if context_window}}    contextLength: {{context_window}}\n{{/if}}{{#if max_output_tokens}}    defaultCompletionOptions:\n      maxTokens: {{max_output_tokens}}\n{{/if}}{{/each}}{{#if mcp_servers}}mcpServers:\n{{#each mcp_servers}}  - name: {{slug}}\n    type: streamable-http\n    url: {{url}}\n    requestOptions:\n      headers:\n        Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}{{/if}}"
+    },
+    {
+      "kind": "combined",
+      "protocol": "chat_completions",
+      "filename": "~/.continue/config.yaml",
+      "format": "yaml",
+      "title": "Continue · config.yaml (OpenAI-compatible, all models)",
+      "instructions": "Place at ~/.continue/config.yaml. Works with every model the gateway serves. For GPT-5 / o-series routes Continue's `provider: openai` block auto-selects the Responses endpoint for reasoning-capable models, so this template is the feature-rich path on the OpenAI side. For Claude models, the Native Anthropic variant keeps reasoning blocks, prompt-cache control and citations intact. One key reaches every model under the chosen provider; Continue picks up changes on save. Per-model `capabilities: [image_input, tool_use]` are declared when the underlying route supports them — without these flags, Continue silently rejects images and tool calls.",
+      "keyed_arrays": {
+        "/models": "name",
+        "/mcpServers": "name"
+      },
+      "body": "name: streamscope\nversion: 0.0.1\nschema: v1\nmodels:\n{{#each routes}}  - name: {{model_alias}}\n    provider: openai\n    model: {{model_alias}}\n    apiBase: {{{base_url}}}/\n    apiKey: {{{../api_key}}}\n    roles:\n      - chat\n      - edit\n      - apply\n{{#if supports_vision}}    capabilities:\n      - image_input\n{{#if supports_function_calling}}      - tool_use\n{{/if}}{{else}}{{#if supports_function_calling}}    capabilities:\n      - tool_use\n{{/if}}{{/if}}{{#if context_window}}    contextLength: {{context_window}}\n{{/if}}{{#if max_output_tokens}}    defaultCompletionOptions:\n      maxTokens: {{max_output_tokens}}\n{{/if}}{{/each}}{{#if mcp_servers}}mcpServers:\n{{#each mcp_servers}}  - name: {{slug}}\n    type: streamable-http\n    url: {{url}}\n    requestOptions:\n      headers:\n        Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}{{/if}}"
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.continue/config.yaml",
+      "format": "yaml",
+      "title": "Continue · MCP only (static key)",
+      "instructions": "Merge into ~/.continue/config.yaml alongside any existing models block. No LLM key is minted in this flow.",
+      "keyed_arrays": {
+        "/mcpServers": "name"
+      },
+      "body": "mcpServers:\n{{#each mcp_servers}}  - name: {{slug}}\n    type: streamable-http\n    url: {{url}}\n    requestOptions:\n      headers:\n        Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}"
+    }
+  ]
+}

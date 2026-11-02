@@ -1,0 +1,104 @@
+{{- if .Values.ingress.enabled -}}
+{{- $fullname := include "streamscope.fullname" . -}}
+{{- $tls := .Values.ingress.tls -}}
+{{- $uiHost := .Values.hostnames.adminUi -}}
+{{- $proxyHost := .Values.hostnames.proxy -}}
+{{- $apiHost := .Values.hostnames.adminApi -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+  annotations:
+    {{- if and .Values.ingress.tls.enabled .Values.ingress.hsts.enabled }}
+    # HSTS belongs where TLS terminates, because only that layer knows whether
+    # the certificate is publicly trusted. Emitted only when this Ingress is
+    # actually serving TLS; turn it off (`ingress.hsts.enabled: false`) if you
+    # front the cluster with a private CA, where an HSTS pin would make the
+    # certificate warning non-bypassable. Annotation name is the ingress-nginx
+    # one — override `ingress.annotations` for a different controller.
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "Strict-Transport-Security: max-age={{ .Values.ingress.hsts.maxAge }}{{ if .Values.ingress.hsts.includeSubDomains }}; includeSubDomains{{ end }}";
+    {{- end }}
+    {{- with .Values.ingress.proxyTimeoutSeconds }}
+    {{- range $name := list "nginx.ingress.kubernetes.io/proxy-read-timeout" "nginx.ingress.kubernetes.io/proxy-send-timeout" }}
+    {{- if not (hasKey ($.Values.ingress.annotations | default dict) $name) }}
+    {{ $name }}: {{ $.Values.ingress.proxyTimeoutSeconds | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $tls.enabled }}
+  tls:
+    - hosts: [{{ $uiHost | quote }}]
+      secretName: {{ include "streamscope.tlsSecretName" (dict "root" $ "host" $uiHost) }}
+    - hosts: [{{ $proxyHost | quote }}]
+      secretName: {{ include "streamscope.tlsSecretName" (dict "root" $ "host" $proxyHost) }}
+    {{- if $apiHost }}
+    - hosts: [{{ $apiHost | quote }}]
+      secretName: {{ include "streamscope.tlsSecretName" (dict "root" $ "host" $apiHost) }}
+    {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ $uiHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-admin-ui
+                port:
+                  number: {{ .Values.adminUi.port }}
+    - host: {{ $proxyHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-proxy
+                port:
+                  number: {{ .Values.proxy.port }}
+    {{- if $apiHost }}
+    - host: {{ $apiHost | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-admin-api
+                port:
+                  number: {{ .Values.adminApi.port }}
+    {{- end }}
+{{- if and $tls.enabled $tls.certManager.enabled }}
+{{- $cm := $tls.certManager }}
+{{- range $host := (list $uiHost $proxyHost $apiHost) }}
+{{- if $host }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "streamscope.tlsSecretName" (dict "root" $ "host" $host) }}
+  labels:
+    {{- include "streamscope.labels" $ | nindent 4 }}
+spec:
+  secretName: {{ include "streamscope.tlsSecretName" (dict "root" $ "host" $host) }}
+  dnsNames:
+    - {{ $host | quote }}
+  issuerRef:
+    name: {{ $cm.issuerName }}
+    kind: {{ $cm.issuerKind }}
+    group: cert-manager.io
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

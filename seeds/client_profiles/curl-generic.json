@@ -1,0 +1,64 @@
+{
+  "id": "curl-generic",
+  "label": "curl / SDK",
+  "targeted_client_version": "n/a (generic snippet)",
+  "homepage": "https://github.com/openai/openai-python",
+  "supports_llm": true,
+  "supports_mcp": false,
+  "templates": [
+    {
+      "kind": "llm",
+      "protocol": "chat_completions",
+      "filename": null,
+      "format": "shell",
+      "title": "curl · OpenAI Chat Completions",
+      "instructions": "Run from any shell to verify connectivity.",
+      "body": "curl {{endpoint_chat_completions}} \\\n  -H \"Authorization: Bearer {{api_key}}\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"{{model_alias}}\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'\n"
+    },
+    {
+      "kind": "llm",
+      "protocol": "responses",
+      "filename": null,
+      "format": "shell",
+      "title": "curl · OpenAI Responses",
+      "instructions": "Run from any shell to verify connectivity.",
+      "body": "curl {{endpoint_responses}} \\\n  -H \"Authorization: Bearer {{api_key}}\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"{{model_alias}}\",\"input\":\"hello\"}'\n"
+    },
+    {
+      "kind": "llm",
+      "protocol": "anthropic_messages",
+      "filename": null,
+      "format": "shell",
+      "title": "curl · Anthropic Messages",
+      "instructions": "Run from any shell to verify connectivity.",
+      "body": "curl {{endpoint_anthropic_messages}} \\\n  -H \"x-api-key: {{api_key}}\" \\\n  -H \"anthropic-version: 2023-06-01\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"{{model_alias}}\",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}'\n"
+    },
+    {
+      "kind": "llm",
+      "protocol": "google_gemini",
+      "filename": null,
+      "format": "shell",
+      "title": "curl · Google Gemini",
+      "instructions": "Run from any shell to verify connectivity.",
+      "body": "curl '{{endpoint_gemini_generate}}?key={{api_key}}' \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"contents\":[{\"parts\":[{\"text\":\"hello\"}]}]}'\n"
+    },
+    {
+      "kind": "llm",
+      "protocol": "chat_completions",
+      "filename": null,
+      "format": "shell",
+      "title": "OpenAI Python SDK · env vars",
+      "instructions": "Set in your shell before running any OpenAI SDK call. The SDK auto-reads OPENAI_BASE_URL.",
+      "body": "export OPENAI_API_KEY={{api_key}}\nexport OPENAI_BASE_URL={{base_url}}\n# model: {{model_alias}}\n"
+    },
+    {
+      "kind": "llm",
+      "protocol": "anthropic_messages",
+      "filename": null,
+      "format": "shell",
+      "title": "Anthropic Python SDK · env vars",
+      "instructions": "Set in your shell before running any Anthropic SDK call.",
+      "body": "export ANTHROPIC_API_KEY={{api_key}}\nexport ANTHROPIC_BASE_URL={{base_url}}\n# model: {{model_alias}}\n"
+    }
+  ]
+}

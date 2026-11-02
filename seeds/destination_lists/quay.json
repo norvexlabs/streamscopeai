@@ -1,0 +1,12 @@
+{
+  "key": "quay",
+  "name": "Quay.io",
+  "description": "The Quay.io registry and its CDNs.",
+  "entries": [
+    "quay.io",
+    "cdn.quay.io",
+    "cdn01.quay.io",
+    "cdn02.quay.io",
+    "cdn03.quay.io"
+  ]
+}

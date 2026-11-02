@@ -1,0 +1,227 @@
+# How Streamscope AI is packaged, published and installed. Stowage reads this
+# file: `stowage ship` builds and publishes a release, and the installer it
+# publishes (`ssai-stow`) installs and operates it on Docker, Kubernetes
+# and the Kairos VM. `stowage -C . lint` checks it against the compose file
+# and the chart.
+apiVersion: stowage/v1
+name: streamscopeai                       # repositories streamscopeai-<key>
+short_name: ssai                          # the installer ssai-stow
+
+stowage:
+  requires: ">=0.14 <1"                   # exact runtime pinned in stowage.lock
+
+version:
+  source: { provider: changelog, file: CHANGELOG.md }
+  scheme: { provider: calver, format: YYYY.M.MICRO, month_guard: utc }
+changelog: { provider: keepachangelog, file: CHANGELOG.md }
+channels:
+  stable: { tag: "v{v}", mutable: false, latest: true }
+
+registry:
+  prefix: ghcr.io/norvexlabs
+  # Public packages: every install pulls anonymously.
+  pull: { provider: none }
+  # The publisher's alone: a GitHub token with write:packages.
+  push: { provider: token, user: norvexlabs, token_env: STOWAGE_PUSH_TOKEN }
+  # GitHub's registry deletes nothing through the registry API: an older
+  # release's disks are removed through its packages API, with the push token.
+  delete: { provider: github }
+
+signing:
+  provider: cosign-key
+  key: env://STREAMSCOPE_SIGNING_KEY
+  public_keys: [keys/release-2026.pub]
+
+images:
+  proxy:      { context: ., dockerfile: docker/Dockerfile.proxy }
+  admin-api:  { context: ., dockerfile: docker/Dockerfile.admin-api }
+  admin-ui:   { context: ., dockerfile: admin-ui/Dockerfile }
+  provision:  { context: ., dockerfile: deploy/docker/Dockerfile.provision, inputs: [deploy/docker/Dockerfile.provision, deploy/docker/provision.sh, LICENSE, NOTICE] }
+  postgres:   { ref: "postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5" }
+
+stack:
+  compose: deploy/docker/compose.yaml
+
+# Each service's memory limit is its percent of the host's RAM, set at every
+# start and VM boot (60 % in all, so that on the least VM the limits, the
+# console's, the front's and the OS's together stay within its RAM), never below the compose file's own limit (the floor a small
+# host still gets) and never past the maximum, where its use stops growing.
+# Postgres sizes its cache from its limit and the proxy its response cache from
+# its cgroup's; admin-api's share is its ceiling under load. The console keeps
+# its fixed limit.
+services:
+  postgres:  { memory: { percent: 30, max: 16G } }
+  proxy:     { memory: { percent: 20, max: 8G } }
+  admin-api: { memory: { percent: 10, max: 4G } }
+
+# A gateway's host serves many concurrent client and upstream connections
+# (long-lived SSE included): the network profile adds a wide local port range,
+# connection reuse, larger socket budgets and neighbour tables. An operator
+# sharing the host lowers one install with --tune-profile default.
+tune: { profile: network }
+
+front:
+  tls_modes: [acme, dns-cloudflare, byo, internal, none]
+  routes:
+    # In proxy-authenticated mode admin-api takes X-Auth-Request-* as proof of
+    # identity (and, with HEADER_AUTH_TRUST_TENANT_HEADER, X-Tenant-Slug as the
+    # tenant): the console and API routes strip them from every request, and
+    # forward auth (off while FORWARD_AUTH_ADDRESS is empty) re-adds only what
+    # the authentication service answered.
+    - name: console
+      domain_input: ADMIN_DOMAIN
+      upstream: admin-ui:3000
+      strip_headers: [X-Auth-Request-*, X-Tenant-Slug]
+      forward_auth:
+        address_input: FORWARD_AUTH_ADDRESS
+        uri_input: FORWARD_AUTH_URI
+        copy_headers: [X-Auth-Request-User, X-Auth-Request-Email, X-Auth-Request-Groups, X-Tenant-Slug]
+    - name: api
+      domain_input: API_DOMAIN
+      upstream: admin-api:9090
+      strip_headers: [X-Auth-Request-*, X-Tenant-Slug]
+      forward_auth:
+        address_input: FORWARD_AUTH_ADDRESS
+        uri_input: FORWARD_AUTH_URI
+        copy_headers: [X-Auth-Request-User, X-Auth-Request-Email, X-Auth-Request-Groups, X-Tenant-Slug]
+    - name: gateway
+      domain_input: PROXY_DOMAIN
+      upstream: proxy:8080
+    # Prometheus, served only to the sources METRICS_ALLOW holds.
+    - name: metrics-api
+      domain_input: METRICS_API_DOMAIN
+      upstream: admin-api:9464
+      allow_input: METRICS_ALLOW
+    - name: metrics-gateway
+      domain_input: METRICS_GATEWAY_DOMAIN
+      upstream: proxy:9464
+      allow_input: METRICS_ALLOW
+  portal: console
+  loopback_ports: { console: 3000, api: 9090, gateway: 8080, metrics-api: 9465, metrics-gateway: 9464 }
+  # The front is still one hop in loopback mode, so only the cookie relaxes.
+  loopback_env: { COOKIE_SECURE: "false" }
+  publish_ca: { volume: cli-ca }
+
+health:
+  provider: http-json
+  service: admin-api
+  port: 9090
+  path: /ready
+  expect: { status: ready }
+  liveness_path: /health
+
+database:
+  engine: postgres
+  service: postgres
+  name: streamscope
+  roles: { migrate: streamscope, app: streamscope_app }
+  schema_compat:
+    provider: sql
+    current: "SELECT COALESCE(max(version), 0) FROM _sqlx_migrations WHERE success"
+    barrier_after: >-
+      SELECT string_agg(version || ' (' || description || ')', '; ' ORDER BY version)
+      FROM _sqlx_migrations
+      WHERE success AND version > $1 AND description LIKE 'rollback barrier%'
+    reads_newer_label: ai.streamscope.reads-newer-schema
+    reads_newer_image: admin-api
+    baseline: 4
+
+data:
+  volumes:
+    postgres: { uid: 70 }
+    proxy:    { uid: 65532 }
+    cli-ca:   { uid: 0, keep_on_reset: true }
+  reset: [postgres, proxy]
+
+secrets:
+  - { key: ENCRYPTION_KEY,          gen: hex32 }
+  - { key: AUTH_SECRET,             gen: hex32, rotation: true }
+  - { key: INTERNAL_SERVICE_SECRET, gen: hex32 }
+  - { key: EDGE_TOKEN,              gen: hex32 }
+  - { key: POSTGRES_PASSWORD,       gen: pass18 }
+  - { key: POSTGRES_APP_PASSWORD,   gen: pass18 }
+
+safe_defaults:
+  COOKIE_SECURE: "true"
+  TRUSTED_PROXY_HOPS: "1"
+
+inputs:
+  # Asked. The provision hook reads them on every shape; an empty tenant or tenant
+  # administrator skips that step and what depends on it.
+  - { key: SETUP_ADMIN_EMAIL,     prompt: "Platform administrator email", required: true }
+  - { key: TENANT_NAME,           prompt: "Organisation name", default: Default }
+  - { key: TENANT_SLUG,           prompt: "Organisation short name (lowercase)", default: default }
+  - { key: TENANT_ADMIN_EMAIL,    prompt: "Organisation administrator email", default: "${SETUP_ADMIN_EMAIL}" }
+  - { key: METRICS_ALLOW,         prompt: "Addresses allowed to scrape metrics (CIDRs; empty refuses everyone)", optional: true, shapes: [docker, kairos] }
+  # Advanced: never asked; the compose file's default unless --set, --answers or
+  # the VM's settings give one.
+  - { key: AUTH_MODE,             prompt: "Console sign-in (standard or header)", advanced: true, shapes: [docker, kairos] }
+  - { key: FORWARD_AUTH_ADDRESS,  prompt: "Forward-auth service host:port", advanced: true, shapes: [docker, kairos] }
+  - { key: FORWARD_AUTH_URI,      prompt: "Forward-auth path (e.g. /api/authz/forward-auth)", advanced: true, shapes: [docker, kairos] }
+  - { key: AUTHELIA_LOGOUT_URL,   prompt: "Auth proxy logout URL", advanced: true, shapes: [docker, kairos] }
+  - { key: HEADER_AUTH_TRUSTED_PROXY,       prompt: "Header auth: trusted proxy", advanced: true, shapes: [docker, kairos] }
+  - { key: HEADER_AUTH_TENANT_SLUG,         prompt: "Header auth: tenant slug", advanced: true, shapes: [docker, kairos] }
+  - { key: HEADER_AUTH_TRUST_TENANT_HEADER, prompt: "Header auth: trust X-Tenant-Slug", advanced: true, shapes: [docker, kairos] }
+  - { key: ALLOW_OIDC_CLAIM_EXCHANGE,       prompt: "Allow OIDC claim exchange", advanced: true, shapes: [docker, kairos] }
+  - { key: API_DOCS_PUBLIC,                 prompt: "Serve the API docs publicly", advanced: true, shapes: [docker, kairos] }
+  - { key: PROXY_CORS_ORIGIN,     prompt: "Gateway CORS origins (empty: any)", advanced: true, shapes: [docker, kairos] }
+  - { key: RUST_LOG,              prompt: "Log filter", advanced: true, shapes: [docker, kairos] }
+  # Kubernetes: the chart's postgres.mode decides — external takes the two URLs,
+  # embedded the generated passwords, cnpg the operator's own Secret. The chart's
+  # own values carry the tunables there.
+  - { key: MIGRATION_DATABASE_URL, prompt: "Migration database URL (external Postgres)", secret: true, optional: true, shapes: [kubernetes] }
+  - { key: DATABASE_URL,           prompt: "Application database URL (external Postgres)", secret: true, optional: true, shapes: [kubernetes] }
+
+hooks:
+  provision:
+    provider: container
+    image: provision
+    cmd: [/bin/bash, /opt/streamscope/provision.sh]
+    # What provision.sh reads; it receives nothing else but what it returned
+    # before. On Kubernetes the chart's ConfigMap adds ADMIN_API_URL.
+    env: [SETUP_ADMIN_EMAIL, TENANT_NAME, TENANT_SLUG, TENANT_ADMIN_EMAIL]
+    # What it returns, so `provision --set` can give one it never returned (the
+    # password of an account that existed before the install recorded it).
+    returns: [SETUP_ADMIN_PASSWORD, TENANT_ADMIN_PASSWORD, OPERATOR_AK, TENANT_AK, TENANT_AK_SLUG]
+    outputs: credentials.txt
+  maintenance:
+    disk_pressure:
+      soft_pct: 75
+      hard_pct: 90
+      post: http://admin-api:9090/api/v1/internal/maintenance/platform-purge
+      auth_secret: INTERNAL_SERVICE_SECRET
+
+backup:
+  provider: pg-age-rclone
+  default_profile: full
+  profiles:
+    full: all
+    # Settings without the traffic: every table's structure, no audit, session
+    # or conversation rows.
+    config:
+      exclude: ['gateway_audit*', 'llm_audit*', 'mcp_audit*', 'web_audit*', 'a2a_audit*', 'mcp_sse_events*',
+                'conversation_turns*', conversation_messages, sessions, tool_definitions, audit_media_blobs,
+                agent_trigger_requests, turn_history_chunks, system_prompts, conversation_session_messages]
+
+shapes:
+  docker: {}
+  kubernetes:
+    chart: deploy/helm/streamscopeai
+    postgres_modes: [external, embedded, cnpg]
+    # `k8s rollback` reads the schema as Docker's and the VM's do: with psql
+    # from the postgres image, through the admin-api pod's migration URL.
+    schema: { url_env: MIGRATION_DATABASE_URL, image: postgres }
+  kairos:
+    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944
+    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556
+    disk_formats: [raw, qcow2, ova, vhd, gce]
+    cloud_publish: [aws, azure, gcp]
+    # Every release ships its disks, so `vm create` of it boots its own OS.
+    disks: always
+    # `vm create` sizes a VM at the recommendation and refuses one under the
+    # minimum. `disk` is the app's space: `vm create` adds what the OS systems take.
+    size:
+      min:         { cpus: 2, memory: 4G, disk: 20G }
+      recommended: { cpus: 4, memory: 8G, disk: 40G }
+    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
+    host_api: [admin-api]

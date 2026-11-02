@@ -1,0 +1,11 @@
+{
+  "id": "goose",
+  "name": "Goose",
+  "description": "Open-source on-machine AI agent with MCP support, from the Agentic AI Foundation (originally Block). Sends no User-Agent, so it is recognised by its system prompt.",
+  "url": "https://github.com/aaif-goose/goose",
+  "ua_patterns": [],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "ai agent called goose"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "nanocode",
+  "name": "nanocode",
+  "description": "Minimal Claude Code alternative with agentic coding loop",
+  "url": "https://github.com/nanoscopeai/nanocode",
+  "ua_patterns": ["nanocode"],
+  "referer_patterns": []
+}

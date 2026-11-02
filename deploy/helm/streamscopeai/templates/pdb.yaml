@@ -1,0 +1,51 @@
+{{- /*
+  PodDisruptionBudgets — keep at least one replica of each multi-replica tier up
+  during voluntary disruptions (node drain, cluster upgrade). Without these the
+  "horizontally-scaling / HA" claim is nominal: a drain could evict every replica
+  of a tier at once. Emitted only when a tier runs >1 (HPA min or static).
+*/ -}}
+{{- $fullname := include "streamscope.fullname" . -}}
+{{- $adminApiHA := or .Values.adminApi.autoscaling.enabled (gt (int .Values.adminApi.replicas) 1) -}}
+{{- $proxyHA := or .Values.proxy.autoscaling.enabled (gt (int .Values.proxy.replicas) 1) -}}
+{{- $adminUiHA := gt (int .Values.adminUi.replicas) 1 -}}
+{{- if $adminApiHA }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-admin-api
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "admin-api") | nindent 6 }}
+{{- end }}
+{{- if $proxyHA }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-proxy
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "proxy") | nindent 6 }}
+{{- end }}
+{{- if $adminUiHA }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-admin-ui
+  labels:
+    {{- include "streamscope.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "streamscope.selectorLabels" (dict "Release" .Release "Chart" .Chart "Values" .Values "component" "admin-ui") | nindent 6 }}
+{{- end }}

@@ -1,0 +1,19 @@
+{
+  "id": "codex",
+  "name": "Codex",
+  "description": "OpenAI's CLI coding agent for terminal-based development",
+  "url": "https://github.com/openai/codex",
+  "ua_patterns": [
+    "codex_cli_rs",
+    "codex-tui",
+    "codex_vscode",
+    "codex_exec",
+    "codex_atlas",
+    "codex_chatgpt_desktop",
+    "codex-desktop"
+  ],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "in the codex cli"
+  ]
+}

@@ -1,0 +1,49 @@
+[package]
+name = "streamscope-proxy"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+pprof = ["dep:pprof"]
+
+[dependencies]
+mimalloc.workspace = true
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+streamscope-core = { path = "../streamscope-core" }
+streamscope-mcp-auth = { path = "../streamscope-mcp-auth" }
+streamscope-edge-api = { path = "../streamscope-edge-api" }
+axum = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+# Upstream OAuth refresh-token grant against a third-party IdP.
+oauth2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arc-swap = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio"] }
+futures = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+dashmap = { workspace = true }
+sysinfo = "0.39"
+base64 = { workspace = true }
+bytes = { workspace = true }
+# tower is already a transitive dep (axum/tower-http are built on it); declared
+# directly here for the `tower::Layer` that wraps the router in `run` so `/fwd`
+# path normalization runs before routing (see normalize_fwd_path).
+tower = { workspace = true }
+tower-http = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

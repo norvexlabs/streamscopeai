@@ -1,0 +1,13 @@
+{
+  "id": "qwen-code",
+  "name": "Qwen Code",
+  "description": "Alibaba's Qwen Code CLI (a Gemini CLI fork) for terminal-based agentic coding over OpenAI-compatible APIs.",
+  "url": "https://github.com/QwenLM/qwen-code",
+  "ua_patterns": [
+    "qwencode"
+  ],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "you are qwen code"
+  ]
+}

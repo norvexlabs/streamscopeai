@@ -1,0 +1,23 @@
+apiVersion: v2
+name: streamscopeai
+description: >-
+  Streamscope AI — security, audit, and cost-control gateway for LLM and
+  agentic workloads. Kubernetes deployment as a horizontally-scaling wrapper
+  over the same container images the VM appliance ships.
+type: application
+# Both set by `stowage ship` when it packages the chart: `version` from the
+# release sequence, `appVersion` from CHANGELOG.md. The values here are
+# placeholders, for `helm lint` and `helm template` on the source tree.
+version: 0.0.0
+appVersion: "0.0.0"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - llm
+  - gateway
+  - audit
+  - proxy
+  - openai
+  - anthropic
+home: https://github.com/norvexlabs/streamscopeai
+sources:
+  - https://github.com/norvexlabs/streamscopeai

@@ -1,0 +1,192 @@
+[
+  {
+    "id": "github",
+    "label": "GitHub",
+    "host_patterns": ["github.com", "githubcopilot.com"],
+    "console_url": "https://github.com/settings/developers",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "Application name", "value": { "kind": "literal", "text": "Streamscope Gateway" }, "hint": "Any name." },
+      { "label": "Homepage URL", "value": { "kind": "homepage" } },
+      { "label": "Authorization callback URL", "value": { "kind": "redirect" }, "hint": "Must match exactly." },
+      { "label": "Enable Device Flow", "value": { "kind": "note", "text": "Leave unchecked — the gateway uses the authorization-code flow." } }
+    ],
+    "steps": [
+      "Open GitHub → Settings → Developer settings → OAuth Apps → New OAuth App (link below).",
+      "Fill the fields with the values above.",
+      "Click Register application, then copy the Client ID.",
+      "Click Generate a new client secret and copy it — GitHub shows it only once.",
+      "Paste both into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": ["read:user"]
+  },
+  {
+    "id": "gitlab",
+    "label": "GitLab",
+    "host_patterns": ["gitlab.com"],
+    "console_url": "https://gitlab.com/-/user_settings/applications",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "Name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Redirect URI", "value": { "kind": "redirect" }, "hint": "Must match exactly." },
+      { "label": "Confidential", "value": { "kind": "note", "text": "Keep checked — the gateway holds the secret server-side." } },
+      { "label": "Scopes", "value": { "kind": "note", "text": "Select the scopes the MCP server documents (see Suggested scopes below)." } }
+    ],
+    "steps": [
+      "Open GitLab → User Settings → Applications (link below) and add a new application.",
+      "Fill the fields with the values above and pick the scopes.",
+      "Save application, then copy the Application ID and Secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": ["read_api", "read_user"]
+  },
+  {
+    "id": "google",
+    "label": "Google",
+    "host_patterns": ["google.com", "googleapis.com"],
+    "console_url": "https://console.cloud.google.com/apis/credentials",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "Application type", "value": { "kind": "note", "text": "Web application." } },
+      { "label": "Name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Authorized redirect URIs", "value": { "kind": "redirect" }, "hint": "Add this exact URI." },
+      { "label": "Authorized JavaScript origins", "value": { "kind": "note", "text": "Not required for the gateway — leave empty." } }
+    ],
+    "steps": [
+      "Open Google Cloud Console → APIs & Services → Credentials (link below).",
+      "Create Credentials → OAuth client ID → Web application.",
+      "Add the redirect URI above under Authorized redirect URIs, then Create.",
+      "Copy the Client ID and Client Secret into the fields below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "atlassian",
+    "label": "Atlassian (Jira / Confluence)",
+    "host_patterns": ["atlassian.com"],
+    "console_url": "https://developer.atlassian.com/console/myapps/",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "App name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Callback URL", "value": { "kind": "redirect" }, "hint": "Set under Authorization → OAuth 2.0 (3LO)." }
+    ],
+    "steps": [
+      "Open the Atlassian developer console (link below) and create an OAuth 2.0 (3LO) app.",
+      "Under Authorization, set the Callback URL to the value above.",
+      "Under Settings, copy the Client ID and Secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "slack",
+    "label": "Slack",
+    "host_patterns": ["slack.com"],
+    "console_url": "https://api.slack.com/apps",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "App Name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Redirect URL (OAuth & Permissions)", "value": { "kind": "redirect" }, "hint": "Add this exact URL." }
+    ],
+    "steps": [
+      "Open Slack → Your Apps (link below) and create a new app.",
+      "Under OAuth & Permissions, add the Redirect URL above and the scopes the MCP server needs.",
+      "From Basic Information, copy the Client ID and Client Secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "notion",
+    "label": "Notion",
+    "host_patterns": ["notion.com", "notion.so"],
+    "console_url": "https://www.notion.so/my-integrations",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "Integration name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Type", "value": { "kind": "note", "text": "Public integration (enables OAuth)." } },
+      { "label": "Redirect URIs", "value": { "kind": "redirect" }, "hint": "Add this exact URI." }
+    ],
+    "steps": [
+      "Open Notion → My integrations (link below) and create a new integration.",
+      "Set it to a Public integration and add the Redirect URI above.",
+      "Copy the OAuth client ID and client secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "linear",
+    "label": "Linear",
+    "host_patterns": ["linear.app"],
+    "console_url": "https://linear.app/settings/api/applications/new",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "Application name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Callback URLs", "value": { "kind": "redirect" }, "hint": "Add this exact URL." }
+    ],
+    "steps": [
+      "Open Linear → Settings → API → Applications (link below) and create an application.",
+      "Add the Callback URL above.",
+      "Copy the Client ID and Client Secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "asana",
+    "label": "Asana",
+    "host_patterns": ["asana.com"],
+    "console_url": "https://app.asana.com/0/my-apps",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "App name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "Redirect URLs", "value": { "kind": "redirect" }, "hint": "Add this exact URL." }
+    ],
+    "steps": [
+      "Open Asana → My apps (link below) and create a new app.",
+      "Under OAuth, add the Redirect URL above.",
+      "Copy the Client ID and Client Secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "airtable",
+    "label": "Airtable",
+    "host_patterns": ["airtable.com"],
+    "console_url": "https://airtable.com/create/oauth",
+    "supports_dcr": false,
+    "fields": [
+      { "label": "Name", "value": { "kind": "literal", "text": "Streamscope Gateway" } },
+      { "label": "OAuth redirect URL", "value": { "kind": "redirect" }, "hint": "Add this exact URL." }
+    ],
+    "steps": [
+      "Open Airtable → Developer hub → OAuth integrations (link below) and register an integration.",
+      "Set the OAuth redirect URL to the value above and select the scopes.",
+      "Copy the Client ID and generate a Client Secret.",
+      "Paste them into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  },
+  {
+    "id": "generic",
+    "label": "Other / generic provider",
+    "host_patterns": [],
+    "console_url": null,
+    "supports_dcr": true,
+    "fields": [
+      { "label": "Application / client name", "value": { "kind": "literal", "text": "Streamscope Gateway" }, "hint": "Any name — identifies the gateway, not a user." },
+      { "label": "Homepage / application URL", "value": { "kind": "homepage" } },
+      { "label": "Redirect / callback URL", "value": { "kind": "redirect" }, "hint": "The one field that must match exactly." },
+      { "label": "Grant type / flow", "value": { "kind": "note", "text": "Authorization Code — enable PKCE / S256 if the provider offers it." } }
+    ],
+    "steps": [
+      "Open your provider’s developer console and create a new OAuth application (a confidential/server-side app, not a public/native one).",
+      "Fill the app’s fields with the values above — the callback URL must match character-for-character.",
+      "Save the app, then copy the issued Client ID and generate a Client Secret.",
+      "Paste both into Client ID and Client Secret below, then Save."
+    ],
+    "suggested_scopes": []
+  }
+]

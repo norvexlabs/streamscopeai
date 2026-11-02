@@ -1,0 +1,8 @@
+{
+  "id": "anthropic-sdk",
+  "name": "Anthropic SDK",
+  "description": "Direct Anthropic Python/TypeScript SDK usage (not a specific app)",
+  "url": "https://docs.anthropic.com",
+  "ua_patterns": ["anthropic-typescript", "anthropic-python"],
+  "referer_patterns": []
+}

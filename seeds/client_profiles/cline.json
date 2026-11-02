@@ -1,0 +1,37 @@
+{
+  "id": "cline",
+  "label": "Cline",
+  "targeted_client_version": "schema reviewed 2026-06",
+  "homepage": "https://github.com/cline/cline",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "templates": [
+    {
+      "kind": "llm",
+      "protocol": "anthropic_messages",
+      "filename": "VS Code settings.json",
+      "format": "json",
+      "title": "Cline · VS Code settings (Native Anthropic)",
+      "instructions": "Open VS Code → Cmd+Shift+P → Preferences: Open User Settings (JSON), then merge.",
+      "body": "{\n  \"cline.apiProvider\": \"anthropic\",\n  \"cline.anthropicApiKey\": \"{{api_key}}\",\n  \"cline.anthropicBaseUrl\": \"{{base_url}}\",\n  \"cline.anthropicModelId\": \"{{model_alias}}\"\n}\n"
+    },
+    {
+      "kind": "llm",
+      "protocol": "chat_completions",
+      "filename": "VS Code settings.json",
+      "format": "json",
+      "title": "Cline · VS Code settings (OpenAI-compatible)",
+      "instructions": "Open VS Code → Cmd+Shift+P → Preferences: Open User Settings (JSON), then merge.",
+      "body": "{\n  \"cline.apiProvider\": \"openai\",\n  \"cline.openAiApiKey\": \"{{api_key}}\",\n  \"cline.openAiBaseUrl\": \"{{base_url}}\",\n  \"cline.openAiModelId\": \"{{model_alias}}\"\n}\n"
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "cline_mcp_settings.json",
+      "format": "json",
+      "title": "Cline · MCP server",
+      "instructions": "Cline UI → MCP Servers → Edit Configuration. Or place at the cline_mcp_settings.json path shown by Cline.",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"streamableHttp\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"Bearer {{api_key}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+    }
+  ]
+}

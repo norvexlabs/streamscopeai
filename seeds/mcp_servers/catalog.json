@@ -1,0 +1,3627 @@
+[
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Airtable",
+    "name": "Airtable",
+    "display_title": null,
+    "description": null,
+    "category": "Database",
+    "featured": true,
+    "website_url": "https://airtable.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=airtable.com&sz=64",
+    "upstream_url": "https://mcp.airtable.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://airtable.com/oauth2/v1",
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "data.records:read",
+      "data.records:write",
+      "schema.bases:read",
+      "schema.bases:write",
+      "data.recordComments:read",
+      "data.recordComments:write",
+      "workspacesAndBases:read"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Apify",
+    "name": "Apify",
+    "display_title": null,
+    "description": null,
+    "category": "Web Data Extraction Platform",
+    "featured": true,
+    "website_url": "https://apify.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=apify.com&sz=64",
+    "upstream_url": "https://mcp.apify.com",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Asana",
+    "name": "Asana",
+    "display_title": null,
+    "description": null,
+    "category": "Project Management",
+    "featured": true,
+    "website_url": "https://asana.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=asana.com&sz=64",
+    "upstream_url": "https://mcp.asana.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.asana.com",
+    "oauth_authorization_url": "https://mcp.asana.com/authorize",
+    "oauth_token_url": "https://mcp.asana.com/token",
+    "oauth_revocation_url": "https://mcp.asana.com/token",
+    "oauth_default_scopes": [
+      "default"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.asana.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Astro Docs",
+    "name": "Astro Docs",
+    "display_title": null,
+    "description": null,
+    "category": "Documentation",
+    "featured": true,
+    "website_url": "https://astro.build",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=astro.build&sz=64",
+    "upstream_url": "https://mcp.docs.astro.build/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 1,
+    "tools": [
+      {
+        "name": "search_astro_docs",
+        "description": "Search the official Astro framework docs"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Atlassian",
+    "name": "Atlassian",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://atlassian.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=64",
+    "upstream_url": "https://mcp.atlassian.com/v1/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.atlassian.com/v1/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Attio",
+    "name": "Attio",
+    "display_title": null,
+    "description": null,
+    "category": "CRM",
+    "featured": true,
+    "website_url": "https://attio.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=attio.com&sz=64",
+    "upstream_url": "https://mcp.attio.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://app.attio.com",
+    "oauth_authorization_url": "https://app.attio.com/oidc/authorize",
+    "oauth_token_url": "https://app.attio.com/oidc/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "mcp",
+      "offline_access",
+      "openid"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Audioscrape",
+    "name": "Audioscrape",
+    "display_title": null,
+    "description": null,
+    "category": "RAG-as-a-Service",
+    "featured": true,
+    "website_url": "https://www.audioscrape.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.audioscrape.com&sz=64",
+    "upstream_url": "https://mcp.audioscrape.com",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.audioscrape.com",
+    "oauth_authorization_url": "https://mcp.audioscrape.com/oauth/authorize",
+    "oauth_token_url": "https://mcp.audioscrape.com/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "mcp:search",
+      "mcp:read",
+      "profile"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "AWS Knowledge",
+    "name": "AWS Knowledge",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://aws.github.io/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=aws.github.io&sz=64",
+    "upstream_url": "https://knowledge-mcp.global.api.aws",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 6,
+    "tools": [
+      {
+        "name": "aws___read_documentation",
+        "description": "Read full AWS documentation pages after searching — search results contain partial excerpts only. Use this tool on the URLs returned by `search_documentation` to get complete, accurate information.\n\n#"
+      },
+      {
+        "name": "aws___search_documentation",
+        "description": "# AWS Documentation Search Tool\nUse this tool to find relevant AWS documentation — always follow up with `read_documentation` to get complete answers. Prefer this over general knowledge for AWS servic"
+      },
+      {
+        "name": "aws___recommend",
+        "description": "Get content recommendations for an AWS documentation page.\n\n## Usage\n\nThis tool provides recommendations for related AWS documentation pages based on a given URL.\nUse it to discover additional relevan"
+      },
+      {
+        "name": "aws___list_regions",
+        "description": "Retrieve a list of all AWS regions.\n\n## Usage\nThis tool provides information about all AWS regions, including their identifiers and names.\n\n## When to Use\n- When planning global infrastructure deploym"
+      },
+      {
+        "name": "aws___get_regional_availability",
+        "description": "Check AWS resource availability across regions for products (service and features), APIs, and CloudFormation resources.\n\n## Quick Reference\n- Maximum 10 regions per call (split into multiple calls for"
+      },
+      {
+        "name": "aws___retrieve_skill",
+        "description": "Retrieve an AWS agent skill — domain-specific expertise that transforms you into a specialist for a particular AWS domain. Skills provide workflows, context, best practices, decision frameworks and st"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "BGPT",
+    "name": "BGPT",
+    "display_title": null,
+    "description": null,
+    "category": "Scientific Research",
+    "featured": true,
+    "website_url": "https://bgpt.pro/mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=bgpt.pro&sz=64",
+    "upstream_url": "https://bgpt.pro/mcp/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": true,
+    "original_url": "https://bgpt.pro/mcp/sse",
+    "tool_count": 2,
+    "tools": [
+      {
+        "name": "search_papers",
+        "description": "Search BGPT's database of scientific papers by keyword.\n\nArgs:\n    query: Search terms (e.g. \"CRISPR gene editing efficiency\") Short, concise queries are best. English language only. Don't include yea"
+      },
+      {
+        "name": "lookup_paper",
+        "description": "Look up a single paper by its DOI.\n\nArgs:\n    doi: The DOI of the paper (e.g. \"10.1038/s41586-024-07386-0\").\n    api_key: Optional: Your Stripe subscription ID for paid access. Get one at https://bgpt"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Box",
+    "name": "Box",
+    "display_title": null,
+    "description": null,
+    "category": "Document Management",
+    "featured": true,
+    "website_url": "https://box.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=box.com&sz=64",
+    "upstream_url": "https://mcp.box.com",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://api.box.com",
+    "oauth_authorization_url": "https://account.box.com/api/oauth2/authorize",
+    "oauth_token_url": "https://api.box.com/oauth2/token",
+    "oauth_revocation_url": "https://api.box.com/oauth2/revoke",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Buildkite",
+    "name": "Buildkite",
+    "display_title": null,
+    "description": null,
+    "category": "Software Developmenr",
+    "featured": true,
+    "website_url": "https://buildkite.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=buildkite.com&sz=64",
+    "upstream_url": "https://mcp.buildkite.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.buildkite.com",
+    "oauth_authorization_url": "https://mcp.buildkite.com/oauth/authorize",
+    "oauth_token_url": "https://mcp.buildkite.com/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "read",
+      "write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Canva",
+    "name": "Canva",
+    "display_title": null,
+    "description": null,
+    "category": "Design",
+    "featured": true,
+    "website_url": "https://canva.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=canva.com&sz=64",
+    "upstream_url": "https://mcp.canva.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.canva.com",
+    "oauth_authorization_url": "https://mcp.canva.com/authorize",
+    "oauth_token_url": "https://mcp.canva.com/token",
+    "oauth_revocation_url": "https://mcp.canva.com/token",
+    "oauth_default_scopes": [
+      "profile:read",
+      "design:meta:read",
+      "design:content:write",
+      "design:content:read",
+      "folder:read",
+      "folder:write",
+      "brandtemplate:content:read",
+      "brandtemplate:meta:read",
+      "brandtemplate:content:write",
+      "comment:write",
+      "comment:read",
+      "asset:read",
+      "asset:write",
+      "brandkit:read",
+      "help:answers:read",
+      "help:answers:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Carbon Voice",
+    "name": "Carbon Voice",
+    "display_title": null,
+    "description": null,
+    "category": "Productivity",
+    "featured": true,
+    "website_url": "https://getcarbon.app",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=getcarbon.app&sz=64",
+    "upstream_url": "https://mcp.carbonvoice.app",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://api.carbonvoice.app",
+    "oauth_authorization_url": "https://api.carbonvoice.app/oauth/authorize",
+    "oauth_token_url": "https://api.carbonvoice.app/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "mcp:read",
+      "mcp:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Close CRM",
+    "name": "Close CRM",
+    "display_title": null,
+    "description": null,
+    "category": "CRM",
+    "featured": true,
+    "website_url": "https://close.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=close.com&sz=64",
+    "upstream_url": "https://mcp.close.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://api.close.com",
+    "oauth_authorization_url": "https://app.close.com/oauth2/authorize/",
+    "oauth_token_url": "https://api.close.com/oauth2/token/",
+    "oauth_revocation_url": "https://api.close.com/oauth2/revoke/",
+    "oauth_default_scopes": [
+      "mcp.read",
+      "mcp.write_destructive",
+      "mcp.write_safe",
+      "offline_access"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Cloudflare Docs",
+    "name": "Cloudflare Docs",
+    "display_title": null,
+    "description": null,
+    "category": "Documentation",
+    "featured": true,
+    "website_url": "https://cloudflare.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=cloudflare.com&sz=64",
+    "upstream_url": "https://docs.mcp.cloudflare.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": true,
+    "original_url": "https://docs.mcp.cloudflare.com/sse",
+    "tool_count": 2,
+    "tools": [
+      {
+        "name": "search_cloudflare_documentation",
+        "description": "Search the Cloudflare documentation.\n\n\t\tThis tool should be used to answer any question about Cloudflare products or features, including:\n\t\t- Workers, Pages, R2, Images, Stream, D1, Durable Objects, K"
+      },
+      {
+        "name": "migrate_pages_to_workers_guide",
+        "description": "ALWAYS read this guide before migrating Pages projects to Workers."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Cloudflare Observability",
+    "name": "Cloudflare Observability",
+    "display_title": null,
+    "description": null,
+    "category": "Observability",
+    "featured": true,
+    "website_url": "https://cloudflare.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=cloudflare.com&sz=64",
+    "upstream_url": "https://observability.mcp.cloudflare.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://observability.mcp.cloudflare.com",
+    "oauth_authorization_url": "https://observability.mcp.cloudflare.com/oauth/authorize",
+    "oauth_token_url": "https://observability.mcp.cloudflare.com/token",
+    "oauth_revocation_url": "https://observability.mcp.cloudflare.com/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://observability.mcp.cloudflare.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Cloudflare Workers",
+    "name": "Cloudflare Workers",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://cloudflare.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=cloudflare.com&sz=64",
+    "upstream_url": "https://bindings.mcp.cloudflare.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://bindings.mcp.cloudflare.com",
+    "oauth_authorization_url": "https://bindings.mcp.cloudflare.com/oauth/authorize",
+    "oauth_token_url": "https://bindings.mcp.cloudflare.com/token",
+    "oauth_revocation_url": "https://bindings.mcp.cloudflare.com/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://bindings.mcp.cloudflare.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Cloudinary",
+    "name": "Cloudinary",
+    "display_title": null,
+    "description": null,
+    "category": "Asset Management",
+    "featured": true,
+    "website_url": "https://cloudinary.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=cloudinary.com&sz=64",
+    "upstream_url": "https://asset-management.mcp.cloudinary.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://asset-management.mcp.cloudinary.com",
+    "oauth_authorization_url": "https://asset-management.mcp.cloudinary.com/authorize",
+    "oauth_token_url": "https://asset-management.mcp.cloudinary.com/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "openid",
+      "profile",
+      "email",
+      "offline_access",
+      "asset_management",
+      "upload"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://asset-management.mcp.cloudinary.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Context Awesome",
+    "name": "Context Awesome",
+    "display_title": null,
+    "description": null,
+    "category": "Specialised Dataset",
+    "featured": true,
+    "website_url": "https://www.context-awesome.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.context-awesome.com&sz=64",
+    "upstream_url": "https://www.context-awesome.com/api/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 2,
+    "tools": [
+      {
+        "name": "find_awesome_section",
+        "description": "Discovers sections/categories across awesome lists matching a search query and returns matching sections from awesome lists.\n\nYou MUST call this function before 'get_awesome_items' to discover availab"
+      },
+      {
+        "name": "get_awesome_items",
+        "description": "Retrieves items from a specific awesome list or section with token limiting. You must call 'find_awesome_section' first to discover available sections, UNLESS the user explicitly provides a githubRepo"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Cortex",
+    "name": "Cortex",
+    "display_title": null,
+    "description": null,
+    "category": "Internal Developer Portal",
+    "featured": true,
+    "website_url": "https://cortex.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=cortex.io&sz=64",
+    "upstream_url": "https://mcp.cortex.io/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 30,
+    "tools": [
+      {
+        "name": "listAllEntities",
+        "description": "List and filter catalog entities with support for pagination, search, and various filters including groups, types, owners, and git repositories. If the client is trying to fetch data for teams, use 't"
+      },
+      {
+        "name": "listEntityDescriptors",
+        "description": "Cortex Catalog API - Access and manage your service catalog, teams, domains, and resources"
+      },
+      {
+        "name": "listDependenciesForEntity",
+        "description": "List all dependencies for an entity including both incoming (who depends on this service) and outgoing (what this service depends on) relationships. Essential for understanding service interactions, p"
+      },
+      {
+        "name": "getDependency",
+        "description": "Get specific dependency details between two entities including method, path, and metadata. Useful for understanding the nature of the relationship, API contracts, and communication patterns between se"
+      },
+      {
+        "name": "getEntityDetails",
+        "description": "Retrieve comprehensive details about a specific entity including its metadata, ownership, hierarchies, and relationships. This is the primary method for getting complete information about services, te"
+      },
+      {
+        "name": "getCustomDataForEntity",
+        "description": "List all custom data key-value pairs associated with an entity. Retrieve metadata, configuration settings, and custom attributes stored for services, resources, or domains. Supports pagination for ent"
+      },
+      {
+        "name": "getCustomDataForEntityByKey",
+        "description": "Retrieve a specific custom data value by key for an entity. Efficiently access individual metadata attributes, configuration values, or custom properties without fetching all custom data"
+      },
+      {
+        "name": "listCustomEventsForEntity",
+        "description": "List custom events for an entity with optional filtering by type and time range. Supports pagination and filtering by event type, start time, and end time to retrieve historical event data"
+      },
+      {
+        "name": "getCustomEventForEntityByUuid",
+        "description": "Retrieve a specific custom event by its UUID. Returns event details including title, description, timestamp, type, and any custom data associated with the event"
+      },
+      {
+        "name": "getDeploysForEntity",
+        "description": "List all deployments for a specific catalog entity. Returns deployment history including timestamps, environments, SHAs, and deployment types in paginated format"
+      },
+      {
+        "name": "getCurrentOncallForEntity",
+        "description": "Retrieve the current on-call personnel for an entity in real-time. Shows who is actively responsible for incident response, including primary and secondary on-call, contact information, and rotation s"
+      },
+      {
+        "name": "getEntityDescriptor",
+        "description": "Cortex Catalog API - Access and manage your service catalog, teams, domains, and resources"
+      },
+      {
+        "name": "listEntityDestinationsForRelationshipType",
+        "description": "List all destinations for a certain relationship type & entity. Use the listRelationshipTypes tool to find the relevant relationshipTypeTag."
+      },
+      {
+        "name": "listEntitySourcesForRelationshipType",
+        "description": "List all sources for a certain relationship type & entity. Use the listRelationshipTypes tool to find the relevant relationshipTypeTag."
+      },
+      {
+        "name": "getCustomMetricData",
+        "description": "Retrieve custom metric data points for an entity. Returns paginated time-series data for a specific custom metric, with optional filtering by date range to analyze trends and patterns"
+      },
+      {
+        "name": "queryPointInTimeMetrics",
+        "description": "Execute point-in-time queries for one or more engineering metrics.\n\n        Returns current metric values for specified time periods, with support for batch queries\n        and optional period-over-pe"
+      },
+      {
+        "name": "listMetricDefinitions",
+        "description": "List all available engineering metric definitions.\n\n        USAGE - Call this endpoint BEFORE querying metrics (queryPointInTimeMetrics):\n        1. Once at start: Call with view='basic' to discover a"
+      },
+      {
+        "name": "listInitiatives",
+        "description": "List all initiatives in the organization with optional filters for draft and expired initiatives. View active improvement programs, strategic projects, and their current status to understand organizat"
+      },
+      {
+        "name": "getInitiative",
+        "description": "Retrieve detailed information about a specific initiative including its goals, timeline, affected entities, scorecard targets, and current progress. Essential for understanding initiative scope and tr"
+      },
+      {
+        "name": "getMyWorkspace",
+        "description": "TOOL for retrieving current user's owned resources and work items across the Cortex workspace.\n\n        FLEXIBLE REQUEST STRUCTURE:\n        The request accepts an object with optional fields for each "
+      },
+      {
+        "name": "listRelationshipTypes",
+        "description": "List all available relationship types with pagination. View relationship type configurations to understand what kinds of relationships can be created between entities like services, resources, domains"
+      },
+      {
+        "name": "getRelationshipTypeDetails",
+        "description": "Get complete details of a specific relationship type including its configuration, rules, source/destination filters, and inheritance settings. Essential for understanding how entities can be connected"
+      },
+      {
+        "name": "listEntityRelationships",
+        "description": "List all entity relationships/full graph for a specific relationship type across the entire organization. Returns paginated results showing all source-destination pairs, useful for understanding the c"
+      },
+      {
+        "name": "listScorecards",
+        "description": "List all scorecards in the organization with optional filtering. View scorecard configurations to understand quality standards, compliance requirements, and maturity models. Supports filtering by grou"
+      },
+      {
+        "name": "getScorecard",
+        "description": "Get complete details of a scorecard including its configuration, rules, levels, weights, exemption settings, and evaluation criteria. Essential for understanding how services are evaluated and what st"
+      },
+      {
+        "name": "getScorecardNextStepsForEntity",
+        "description": "Get actionable next steps for an entity to improve its scorecard performance. Shows which rules need to be satisfied to reach the next maturity level, helping teams prioritize improvements and track p"
+      },
+      {
+        "name": "listScorecardScores",
+        "description": "Retrieve scores for all entities evaluated by a specific scorecard. Returns paginated results showing how each service, resource, or domain performs against the scorecard's rules, including individual"
+      },
+      {
+        "name": "getTeamDetails",
+        "description": "Retrieve detailed information about a specific team by its tag or ID. Returns complete team data including members, slack channels, metadata, and whether it's backed by an identity provider group"
+      },
+      {
+        "name": "query_docs",
+        "description": "Query the Cortex knowledge base for answers.\n\nArgs:\n    query: The question to ask Cortex docs\n\nReturns:\n    Response from Cortex including answer and metadata"
+      },
+      {
+        "name": "get_more_tools",
+        "description": "Check for additional tools whenever your task might benefit from specialized capabilities - even if existing tools could work as a fallback."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "DeepWiki",
+    "name": "DeepWiki",
+    "display_title": null,
+    "description": null,
+    "category": "RAG-as-a-Service",
+    "featured": true,
+    "website_url": "https://devin.ai/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=devin.ai&sz=64",
+    "upstream_url": "https://mcp.deepwiki.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": true,
+    "original_url": "https://mcp.deepwiki.com/sse",
+    "tool_count": 3,
+    "tools": [
+      {
+        "name": "read_wiki_structure",
+        "description": "Get a list of documentation topics for a GitHub repository.\n\nArgs:\n    repoName: GitHub repository in owner/repo format (e.g. \"facebook/react\")"
+      },
+      {
+        "name": "read_wiki_contents",
+        "description": "View documentation about a GitHub repository.\n\nArgs:\n    repoName: GitHub repository in owner/repo format (e.g. \"facebook/react\")"
+      },
+      {
+        "name": "ask_question",
+        "description": "Ask any question about a GitHub repository and get an AI-powered, context-grounded response.\n\nArgs:\n    repoName: GitHub repository or list of repositories (max 10) in owner/repo format\n    question: "
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Dialer",
+    "name": "Dialer",
+    "display_title": null,
+    "description": null,
+    "category": "Outbound Phone Calls",
+    "featured": true,
+    "website_url": "https://getdialer.app",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=getdialer.app&sz=64",
+    "upstream_url": "https://getdialer.app/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://getdialer.app/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Dodo Payments",
+    "name": "Dodo Payments",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://dodopayments.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=dodopayments.com&sz=64",
+    "upstream_url": "https://mcp.dodopayments.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.dodopayments.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "EAN-Search.org",
+    "name": "EAN-Search.org",
+    "display_title": null,
+    "description": null,
+    "category": "Product Data",
+    "featured": true,
+    "website_url": "https://www.ean-search.org",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.ean-search.org&sz=64",
+    "upstream_url": "https://www.ean-search.org/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://www.ean-search.org",
+    "oauth_authorization_url": "https://www.ean-search.org/authorize",
+    "oauth_token_url": "https://www.ean-search.org/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "user"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Egnyte",
+    "name": "Egnyte",
+    "display_title": null,
+    "description": null,
+    "category": "Document Management",
+    "featured": true,
+    "website_url": "https://egnyte.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=egnyte.com&sz=64",
+    "upstream_url": "https://mcp-server.egnyte.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp-oauth.egnyte.com",
+    "oauth_authorization_url": "https://mcp-oauth.egnyte.com/domain-picker",
+    "oauth_token_url": "https://mcp-oauth.egnyte.com/oauth2/token",
+    "oauth_revocation_url": "https://mcp-oauth.egnyte.com/oauth2/revoke",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp-server.egnyte.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Exa Search",
+    "name": "Exa Search",
+    "display_title": null,
+    "description": null,
+    "category": "Search",
+    "featured": true,
+    "website_url": "https://exa.ai",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=exa.ai&sz=64",
+    "upstream_url": "https://mcp.exa.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://auth.exa.ai",
+    "oauth_authorization_url": "https://auth.exa.ai/oauth/authorize",
+    "oauth_token_url": "https://auth.exa.ai/api/oauth/token",
+    "oauth_revocation_url": "https://auth.exa.ai/api/oauth/revoke",
+    "oauth_default_scopes": [
+      "mcp:tools"
+    ],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 2,
+    "tools": [
+      {
+        "name": "web_search_exa",
+        "description": "Search the web for any topic and get clean, ready-to-use content.\n\n      Best for: Finding current information, news, facts, people, companies, or answering questions about any topic.\n      Returns: C"
+      },
+      {
+        "name": "web_fetch_exa",
+        "description": "Read a webpage's full content as clean markdown. Use after web_search_exa when highlights are insufficient or to read any URL.\n\nBest for: Extracting full content from known URLs. Batch multiple URLs i"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Ferryhopper",
+    "name": "Ferryhopper",
+    "display_title": null,
+    "description": null,
+    "category": "Other",
+    "featured": true,
+    "website_url": "https://ferryhopper.github.io/fh-mcp/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=ferryhopper.github.io&sz=64",
+    "upstream_url": "https://mcp.ferryhopper.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 4,
+    "tools": [
+      {
+        "name": "get_ports",
+        "description": "Get a list of global ports and their details"
+      },
+      {
+        "name": "get_disruptions",
+        "description": "Get a list of disruptions for a given date and country"
+      },
+      {
+        "name": "get_direct_connections_for_ports",
+        "description": "Get a list of all the direct connections between ports"
+      },
+      {
+        "name": "search_trips",
+        "description": "Get a list available ferry trips between two ports on a specific date"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Find-A-Domain",
+    "name": "Find-A-Domain",
+    "display_title": null,
+    "description": null,
+    "category": "Productivity",
+    "featured": true,
+    "website_url": "https://findadomain.dev",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=findadomain.dev&sz=64",
+    "upstream_url": "https://api.findadomain.dev/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 2,
+    "tools": [
+      {
+        "name": "check_domain",
+        "description": "Check if a domain is available for a specific TLD"
+      },
+      {
+        "name": "list_tlds",
+        "description": "Get a list of all available top-level domains (TLDs)"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Firefly",
+    "name": "Firefly",
+    "display_title": null,
+    "description": null,
+    "category": "Productivity",
+    "featured": true,
+    "website_url": "https://fireflies.ai",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=fireflies.ai&sz=64",
+    "upstream_url": "https://api.fireflies.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://api.fireflies.ai",
+    "oauth_authorization_url": "https://api.fireflies.ai/authorize",
+    "oauth_token_url": "https://api.fireflies.ai/token",
+    "oauth_revocation_url": "https://api.fireflies.ai/revoke",
+    "oauth_default_scopes": [
+      "profile",
+      "email"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "GitHub",
+    "name": "GitHub",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://github.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=github.com&sz=64",
+    "upstream_url": "https://api.githubcopilot.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://github.com/login/oauth",
+    "oauth_authorization_url": "https://github.com/login/oauth/authorize",
+    "oauth_token_url": "https://github.com/login/oauth/access_token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "repo",
+      "read:org",
+      "read:user",
+      "user:email",
+      "read:packages",
+      "write:packages",
+      "read:project",
+      "project",
+      "gist",
+      "notifications",
+      "workflow",
+      "codespace"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Globalping",
+    "name": "Globalping",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://globalping.io/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=globalping.io&sz=64",
+    "upstream_url": "https://mcp.globalping.dev/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.globalping.dev",
+    "oauth_authorization_url": "https://mcp.globalping.dev/authorize",
+    "oauth_token_url": "https://mcp.globalping.dev/token",
+    "oauth_revocation_url": "https://mcp.globalping.dev/token",
+    "oauth_default_scopes": [
+      "measurements"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.globalping.dev/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Google Big Query",
+    "name": "Google Big Query",
+    "display_title": null,
+    "description": null,
+    "category": "Data Analysis",
+    "featured": true,
+    "website_url": "https://docs.cloud.google.com/bigquery/docs/reference/mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=docs.cloud.google.com&sz=64",
+    "upstream_url": "https://bigquery.googleapis.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 6,
+    "tools": [
+      {
+        "name": "list_dataset_ids",
+        "description": "List BigQuery dataset IDs in a Google Cloud project."
+      },
+      {
+        "name": "get_dataset_info",
+        "description": "Get metadata information about a BigQuery dataset."
+      },
+      {
+        "name": "list_table_ids",
+        "description": "List table ids in a BigQuery dataset."
+      },
+      {
+        "name": "get_table_info",
+        "description": "Get metadata information about a BigQuery table."
+      },
+      {
+        "name": "execute_sql_readonly",
+        "description": "Run a read-only SQL query in the project and return the result. Prefer this tool over\n`execute_sql` if possible.\n\nThis tool is restricted to only `SELECT` statements. `INSERT`, `UPDATE`, and `DELETE`\n"
+      },
+      {
+        "name": "execute_sql",
+        "description": "Run a SQL query in the project and return the result. Prefer the `execute_sql_readonly`\ntool if possible.\n\nThis tool can execute any query that bigquery supports including:\n* SQL Queries (SELECT, INSE"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Google Compute Engine",
+    "name": "Google Compute Engine",
+    "display_title": null,
+    "description": null,
+    "category": "Developer Tools",
+    "featured": true,
+    "website_url": "https://docs.cloud.google.com/compute/docs/reference/mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=docs.cloud.google.com&sz=64",
+    "upstream_url": "https://compute.googleapis.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 29,
+    "tools": [
+      {
+        "name": "create_instance",
+        "description": "Create a new Google Compute Engine virtual machine (VM) instance. Requires project, zone, and instance name as input. If machine_type is not provided, it defaults to `e2-medium`. If image_project and "
+      },
+      {
+        "name": "delete_instance",
+        "description": "Delete a Google Compute Engine virtual machine (VM) instance. Requires project, zone, and instance name as input. Proceed only if there is no error in response and the status of the operation is `DONE"
+      },
+      {
+        "name": "start_instance",
+        "description": "Starts a Google Compute Engine virtual machine (VM) instance. Requires project, zone, and instance name as input. Proceed only if there is no error in response and the status of the operation is `DONE"
+      },
+      {
+        "name": "stop_instance",
+        "description": "Stops a Google Compute Engine virtual machine (VM) instance. Requires project, zone, and instance name as input. Proceed only if there is no error in response and the status of the operation is `DONE`"
+      },
+      {
+        "name": "reset_instance",
+        "description": "Resets a Google Compute Engine virtual machine (VM) instance. Requires project, zone, and instance name as input. Proceed only if there is no error in response and the status of the operation is `DONE"
+      },
+      {
+        "name": "get_instance_basic_info",
+        "description": "Get basic information about a Compute Engine VM instance, including its name, ID, status, machine type, creation timestamp, and attached guest accelerators. Requires project, zone, and instance name a"
+      },
+      {
+        "name": "set_instance_machine_type",
+        "description": "Sets the machine type for a stopped Google Compute Engine instance to the specified machine type. Requires project, zone, instance name and machine type as input. Proceed only if there is no error in "
+      },
+      {
+        "name": "list_instance_attached_disks",
+        "description": "Lists the disks attached to a Compute Engine virtual machine (VM) instance. For each attached disk, the response includes details such as kind, type, mode, saved state, source, device name, index, boo"
+      },
+      {
+        "name": "list_instances",
+        "description": "Lists Compute Engine virtual machine (VM) instances. Details for each instance include name, ID, status, machine type, creation timestamp, and attached guest accelerators. Use other tools to get more "
+      },
+      {
+        "name": "get_instance_group_manager_basic_info",
+        "description": "Get basic information about a Compute Engine managed instance group (MIG), including its name, ID, instance template, base instance name, target size, target stopped size, target suspended size, statu"
+      },
+      {
+        "name": "list_instance_group_managers",
+        "description": "Lists Compute Engine managed instance groups (MIGs). Details for each MIG include name, ID, instance template, base instance name, target size, target stopped size, target suspended size, status and c"
+      },
+      {
+        "name": "list_managed_instances",
+        "description": "Lists managed instances for a given managed instance group (MIG). For each instance, details include id, instance URL, instance status, and current action. Requires project, zone, and MIG name as inpu"
+      },
+      {
+        "name": "list_instance_templates",
+        "description": "Lists Compute Engine instance templates. Details for each instance template include name, ID, description, machine type, region, and creation timestamp. Requires project as input."
+      },
+      {
+        "name": "get_instance_template_basic_info",
+        "description": "Get basic information about a Compute Engine instance template, including its name, ID, description, machine type, region, and creation timestamp. Requires project and instance template name as input."
+      },
+      {
+        "name": "get_instance_template_properties",
+        "description": "Get instance properties of a Compute Engine instance template. This includes properties such as description, tags, machine type, network interfaces, disks, metadata, service accounts, scheduling optio"
+      },
+      {
+        "name": "get_disk_basic_info",
+        "description": "Get basic information about a Compute Engine disk, including its name, ID, description, creation timestamp, size, type, status, last attach timestamp, and last detach timestamp. Requires project, zone"
+      },
+      {
+        "name": "get_disk_performance_config",
+        "description": "Get performance configuration of a Compute Engine disk, including its type, size, provisioned IOPS, provisioned throughput, physical block size, storage pool and access mode. Requires project, zone, a"
+      },
+      {
+        "name": "list_disks",
+        "description": "Lists Compute Engine disks. Details for each disk include name, ID, description, creation timestamp, size, type, status, last attach timestamp, and last detach timestamp. Requires project and zone as "
+      },
+      {
+        "name": "list_accelerator_types",
+        "description": "Lists the available Google Compute Engine accelerator types. Requires project and zone as input. Returns accelerator types, including id, creation timestamp, name, description, deprecated, zone, and m"
+      },
+      {
+        "name": "list_machine_types",
+        "description": "Lists the available Google Compute Engine machine types. Requires project and zone as input. Returns machine types, including id, creationTimestamp, name, description, guest cpus, memory, image space,"
+      },
+      {
+        "name": "list_images",
+        "description": "Lists Compute Engine Images. Details for each image include name, ID, status, family, and creation timestamp. Requires project as input."
+      },
+      {
+        "name": "get_zone_operation",
+        "description": "Get details of a zone operation, including its id, name, status, creation timestamp, error, warning, HTTP error message and HTTP error status code. Requires project, zone, and operation name as input."
+      },
+      {
+        "name": "get_reservation_basic_info",
+        "description": "Get Compute Engine reservation basic info including name, ID, creation timestamp, zone, status, specific reservation required, commitment, and linked commitments. Requires project, zone, and reservati"
+      },
+      {
+        "name": "get_reservation_details",
+        "description": "Get Compute Engine reservation details. Returns reservation details including name, ID, status, creation timestamp, specific reservation properties like machine type, guest accelerators and local SSDs"
+      },
+      {
+        "name": "list_reservations",
+        "description": "Lists Compute Engine reservations. Details for each reservation include name, ID, creation timestamp, zone, status, specific reservation required, commitment, and linked commitments. Requires project "
+      },
+      {
+        "name": "list_commitments",
+        "description": "Lists Compute Engine Commitments in a region. Details for each commitment include name, ID, status, plan, type, resources, and creation, start and end timestamps. Requires project and region as input."
+      },
+      {
+        "name": "get_commitment_basic_info",
+        "description": "Get basic information about a Compute Engine Commitment, including its name, ID, status, plan, type, resources, and creation, start and end timestamps. Requires project, region, and commitment name as"
+      },
+      {
+        "name": "list_commitment_reservations",
+        "description": "Lists reservations for a Compute Engine Commitment. Returns reservation details including name, ID, status, creation timestamp, specific reservation properties like machine type, guest accelerators an"
+      },
+      {
+        "name": "list_snapshots",
+        "description": "Lists snapshots in a project providing basic information per snapshot including name, id, status, creation time, disk size, storage bytes, source disk, and source disk id. Requires project as input."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Google GKE",
+    "name": "Google GKE",
+    "display_title": null,
+    "description": null,
+    "category": "Developer Tools",
+    "featured": true,
+    "website_url": "https://docs.cloud.google.com/kubernetes-engine/docs/reference/mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=docs.cloud.google.com&sz=64",
+    "upstream_url": "https://container.googleapis.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Google Maps",
+    "name": "Google Maps",
+    "display_title": null,
+    "description": null,
+    "category": "Mapping",
+    "featured": true,
+    "website_url": "https://developers.google.com/maps/ai/grounding-lite/reference/mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=developers.google.com&sz=64",
+    "upstream_url": "https://mapstools.googleapis.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "HubSpot",
+    "name": "HubSpot",
+    "display_title": null,
+    "description": null,
+    "category": "CRM",
+    "featured": true,
+    "website_url": "https://hubspot.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=64",
+    "upstream_url": "https://app.hubspot.com/mcp/v1/http",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Hugging Face",
+    "name": "Hugging Face",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://huggingface.co",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=huggingface.co&sz=64",
+    "upstream_url": "https://hf.co/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://huggingface.co",
+    "oauth_authorization_url": "https://huggingface.co/oauth/authorize",
+    "oauth_token_url": "https://huggingface.co/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "openid",
+      "profile",
+      "read-mcp",
+      "read-repos",
+      "jobs",
+      "contribute-repos",
+      "inference-api"
+    ],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 8,
+    "tools": [
+      {
+        "name": "hf_whoami",
+        "description": "Hugging Face tools are being used anonymously and may be rate limited. Call this tool for instructions on joining and authenticating."
+      },
+      {
+        "name": "space_search",
+        "description": "Find Hugging Face Spaces using semantic search. IMPORTANT Only MCP Servers can be used with the dynamic_space toolInclude links to the Space when presenting the results."
+      },
+      {
+        "name": "hub_repo_search",
+        "description": "Search Hugging Face repositories with a shared query interface. You can target models, datasets, spaces, or aggregate across multiple repo types in one call. Use space_search for semantic-first discov"
+      },
+      {
+        "name": "paper_search",
+        "description": "Find Machine Learning research papers on the Hugging Face hub. Include 'Link to paper' When presenting the results. Consider whether tabulating results matches user intent."
+      },
+      {
+        "name": "hub_repo_details",
+        "description": "Get details for one or more Hugging Face repos (model, dataset, or space). Auto-detects type unless specified. For datasets, use operations: overview, dataset_structure, dataset_preview. Use dataset_s"
+      },
+      {
+        "name": "hf_doc_search",
+        "description": "Search and Discover Hugging Face Product and Library documentation. Send an empty query to discover structure and navigation instructions. Knowledge up-to-date as at 14 June 2026. Combine with the Pro"
+      },
+      {
+        "name": "hf_doc_fetch",
+        "description": "Fetch a document from the Hugging Face or Gradio documentation library. For large documents, use offset to get subsequent chunks."
+      },
+      {
+        "name": "gr1_z_image_turbo_generate",
+        "description": "Generate an image using the Z-Image model based on the provided prompt and settings. This function is triggered when the user clicks the \"Generate\" button. It processes the input prompt (optionally en"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Indeed",
+    "name": "Indeed",
+    "display_title": null,
+    "description": null,
+    "category": "Job Board",
+    "featured": true,
+    "website_url": "https://indeed.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=indeed.com&sz=64",
+    "upstream_url": "https://mcp.indeed.com/claude/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://secure.indeed.com",
+    "oauth_authorization_url": "https://secure.indeed.com/oauth/v2/authorize",
+    "oauth_token_url": "https://apis.indeed.com/oauth/v2/tokens",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "job_seeker.company.details.read",
+      "job_seeker.jobs.search",
+      "job_seeker.profile.read",
+      "offline_access"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Instant",
+    "name": "Instant",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://www.instantdb.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.instantdb.com&sz=64",
+    "upstream_url": "https://mcp.instantdb.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.instantdb.com",
+    "oauth_authorization_url": "https://mcp.instantdb.com/authorize",
+    "oauth_token_url": "https://mcp.instantdb.com/token",
+    "oauth_revocation_url": "https://mcp.instantdb.com/revoke",
+    "oauth_default_scopes": [
+      "apps-read",
+      "apps-write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Intercom",
+    "name": "Intercom",
+    "display_title": null,
+    "description": null,
+    "category": "Customer Support",
+    "featured": true,
+    "website_url": "https://intercom.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=intercom.com&sz=64",
+    "upstream_url": "https://mcp.intercom.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.intercom.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Invidio",
+    "name": "Invidio",
+    "display_title": null,
+    "description": null,
+    "category": "Video Platform",
+    "featured": true,
+    "website_url": "https://invideo.io/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=invideo.io&sz=64",
+    "upstream_url": "https://mcp.invideo.io/sse",
+    "transport": "sse",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 1,
+    "tools": [
+      {
+        "name": "generate-video-from-script",
+        "description": "Generate a video using a script and additional context (topic, vibe, target audience). Args: script - The video script content; topic - The main topic of the video; vibe - The vibe/tone of the video ("
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Jam",
+    "name": "Jam",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://jam.dev/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=jam.dev&sz=64",
+    "upstream_url": "https://mcp.jam.dev/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://api.jam.dev",
+    "oauth_authorization_url": "https://api.jam.dev/oauth/authorize",
+    "oauth_token_url": "https://api.jam.dev/oauth/token",
+    "oauth_revocation_url": "https://api.jam.dev/oauth/revoke",
+    "oauth_default_scopes": [
+      "mcp:read",
+      "mcp:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Javadocs",
+    "name": "Javadocs",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://javadocs.dev",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=javadocs.dev&sz=64",
+    "upstream_url": "https://www.javadocs.dev/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 8,
+    "tools": [
+      {
+        "name": "get_latest_version",
+        "description": "Resolves the latest published version of a Maven Central artifact (any groupId:artifactId — Java, Kotlin, or Scala library). Call this first when you only know the artifact but not the version: the ve"
+      },
+      {
+        "name": "get_javadoc_index",
+        "description": "Fetches the rendered Javadoc/Scaladoc index page for a specific Maven Central artifact version, converted to plain text/markdown. Useful for orienting yourself in an unfamiliar library: it lists the t"
+      },
+      {
+        "name": "get_javadoc_content_list",
+        "description": "Lists every entry in the Javadoc/Scaladoc jar of a Maven Central artifact version (HTML pages for classes/methods/packages, plus search-index files and resources). Each returned `link` can be passed t"
+      },
+      {
+        "name": "get_javadoc_symbol_contents",
+        "description": "Reads one Javadoc/Scaladoc page from a Maven Central artifact, already converted to plain text/markdown so you don't have to parse HTML. Pass the `link` value returned by get_javadoc_content_list. Use"
+      },
+      {
+        "name": "get_source_contents",
+        "description": "Reads one source file from a Maven Central library's sources jar (the `-sources.jar` artifact). Pass the `link` value returned by list_source_contents. Use this whenever you need the exact source text"
+      },
+      {
+        "name": "list_source_contents",
+        "description": "Lists every file inside the **sources jar** (the `-sources.jar` publishers attach alongside the binary) of a Maven Central artifact version. Each returned path can be fed to get_source_contents to rea"
+      },
+      {
+        "name": "search_artifacts",
+        "description": "Searches the indexed Maven Central catalog for artifacts whose groupId or artifactId contains a substring (case-insensitive). Use this when you know part of a library name (e.g. \"jackson\", \"zio-http\","
+      },
+      {
+        "name": "symbol_to_artifact",
+        "description": "Resolves a class name, fully-qualified type, or package name to the Maven Central artifact (groupId, artifactId) that publishes it. Case-sensitive. Use this when you have a symbol from a stack trace, "
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Linear",
+    "name": "Linear",
+    "display_title": null,
+    "description": null,
+    "category": "Project Management",
+    "featured": true,
+    "website_url": "https://linear.app",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=linear.app&sz=64",
+    "upstream_url": "https://mcp.linear.app/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.linear.app",
+    "oauth_authorization_url": "https://mcp.linear.app/authorize",
+    "oauth_token_url": "https://mcp.linear.app/token",
+    "oauth_revocation_url": "https://mcp.linear.app/token",
+    "oauth_default_scopes": [
+      "read",
+      "write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.linear.app/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Listenetic",
+    "name": "Listenetic",
+    "display_title": null,
+    "description": null,
+    "category": "Productivity",
+    "featured": true,
+    "website_url": "https://app.listenetic.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=app.listenetic.com&sz=64",
+    "upstream_url": "https://mcp.listenetic.com/v1/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://auth.listenetic.com",
+    "oauth_authorization_url": "https://auth.listenetic.com/oauth/authorize",
+    "oauth_token_url": "https://auth.listenetic.com/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "profile",
+      "email"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "LiveScore MCP",
+    "name": "LiveScore MCP",
+    "display_title": null,
+    "description": null,
+    "category": "Sports",
+    "featured": true,
+    "website_url": "https://github.com/holoduke/livescore-mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=github.com&sz=64",
+    "upstream_url": "https://livescoremcp.com/sse",
+    "transport": "sse",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 10,
+    "tools": [
+      {
+        "name": "get_day_fixtures",
+        "description": "Get all fixtures for a specific date. All timestamps are GMT/UTC."
+      },
+      {
+        "name": "get_fixtures",
+        "description": "Get fixtures for a specific competition (e.g. EurocupsUEFAChampionsLeague_small). All timestamps are GMT/UTC."
+      },
+      {
+        "name": "get_league_fixtures",
+        "description": "Get fixtures for a specific league (e.g. NetherlandsEredivisie). All timestamps are GMT/UTC."
+      },
+      {
+        "name": "get_live_scores",
+        "description": "Get currently live football matches and scores. All timestamps are GMT/UTC."
+      },
+      {
+        "name": "get_match",
+        "description": "Get detailed match information (events, lineups, stats) with optional head-to-head data"
+      },
+      {
+        "name": "get_player",
+        "description": "Get detailed player information (stats, career) by player ID"
+      },
+      {
+        "name": "get_team",
+        "description": "Get detailed team information (squad, stats) by team ID"
+      },
+      {
+        "name": "get_team_image",
+        "description": "Get team logo PNG URL by team ID"
+      },
+      {
+        "name": "health",
+        "description": "Health check - echo back a message"
+      },
+      {
+        "name": "search",
+        "description": "Search for teams, players, or competitions by name"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Malware Patrol",
+    "name": "Malware Patrol",
+    "display_title": null,
+    "description": null,
+    "category": "Threat Intelligence",
+    "featured": true,
+    "website_url": "https://malwarepatrol.net",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=malwarepatrol.net&sz=64",
+    "upstream_url": "https://mcp.malwarepatrol.net/v1/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": true,
+    "original_url": "https://mcp.malwarepatrol.net/v1",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Manifold",
+    "name": "Manifold",
+    "display_title": null,
+    "description": null,
+    "category": "Forecasting",
+    "featured": true,
+    "website_url": "https://manifold.markets",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=manifold.markets&sz=64",
+    "upstream_url": "https://api.manifold.markets/v0/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 5,
+    "tools": [
+      {
+        "name": "search-markets",
+        "description": "Search for prediction markets with optional filters"
+      },
+      {
+        "name": "get-market",
+        "description": "Get detailed information about a specific market"
+      },
+      {
+        "name": "get-user",
+        "description": "Get user information by username"
+      },
+      {
+        "name": "get-bets",
+        "description": "Get bets from markets or for users with various filtering options"
+      },
+      {
+        "name": "search-users",
+        "description": "Search for users by username or display name"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Mercado Libre",
+    "name": "Mercado Libre",
+    "display_title": null,
+    "description": null,
+    "category": "E-Commerce",
+    "featured": true,
+    "website_url": "https://mcp.mercadolibre.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=mcp.mercadolibre.com&sz=64",
+    "upstream_url": "https://mcp.mercadolibre.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Mercado Pago",
+    "name": "Mercado Pago",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://mcp.mercadopago.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=mcp.mercadopago.com&sz=64",
+    "upstream_url": "https://mcp.mercadopago.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Meta Ads by Pipeboard",
+    "name": "Meta Ads by Pipeboard",
+    "display_title": null,
+    "description": null,
+    "category": "Advertising",
+    "featured": true,
+    "website_url": "https://pipeboard.co",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=pipeboard.co&sz=64",
+    "upstream_url": "https://mcp.pipeboard.co/meta-ads-mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://pipeboard.co",
+    "oauth_authorization_url": "https://pipeboard.co/oauth/authorize",
+    "oauth_token_url": "https://pipeboard.co/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "mcp:read",
+      "mcp:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Metro MCP",
+    "name": "Metro MCP",
+    "display_title": null,
+    "description": null,
+    "category": "Transit",
+    "featured": true,
+    "website_url": "https://metro-mcp.anuragd.me/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=metro-mcp.anuragd.me&sz=64",
+    "upstream_url": "https://metro-mcp.anuragd.me/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://metro-mcp.anuragd.me",
+    "oauth_authorization_url": "https://metro-mcp.anuragd.me/authorize",
+    "oauth_token_url": "https://metro-mcp.anuragd.me/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "profile"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://metro-mcp.anuragd.me/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "monday.com",
+    "name": "monday.com",
+    "display_title": null,
+    "description": null,
+    "category": "Productivity",
+    "featured": true,
+    "website_url": "https://github.com/mondaycom/mcp",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=github.com&sz=64",
+    "upstream_url": "https://mcp.monday.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.monday.com",
+    "oauth_authorization_url": "https://mcp.monday.com/authorize",
+    "oauth_token_url": "https://mcp.monday.com/token",
+    "oauth_revocation_url": "https://mcp.monday.com/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.monday.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "MorningStar",
+    "name": "MorningStar",
+    "display_title": null,
+    "description": null,
+    "category": "Data Analysis",
+    "featured": true,
+    "website_url": "https://morningstar.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=morningstar.com&sz=64",
+    "upstream_url": "https://mcp.morningstar.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.morningstar.com",
+    "oauth_authorization_url": "https://mcp.morningstar.com/authorize",
+    "oauth_token_url": "https://mcp.morningstar.com/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "offline_access",
+      "openid",
+      "email",
+      "profile"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "mypromind.com",
+    "name": "mypromind.com",
+    "display_title": null,
+    "description": null,
+    "category": "Learning",
+    "featured": true,
+    "website_url": "https://www.mypromind.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.mypromind.com&sz=64",
+    "upstream_url": "https://www.mypromind.com/interface/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://clerk.mypromind.com",
+    "oauth_authorization_url": "https://clerk.mypromind.com/oauth/authorize",
+    "oauth_token_url": "https://clerk.mypromind.com/oauth/token",
+    "oauth_revocation_url": "https://clerk.mypromind.com/oauth/token/revoke",
+    "oauth_default_scopes": [
+      "openid",
+      "profile",
+      "email",
+      "public_metadata",
+      "private_metadata",
+      "offline_access"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Needle",
+    "name": "Needle",
+    "display_title": null,
+    "description": null,
+    "category": "RAG-as-a-service",
+    "featured": true,
+    "website_url": "https://needle-ai.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=needle-ai.com&sz=64",
+    "upstream_url": "https://mcp.needle-ai.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Neon",
+    "name": "Neon",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://neon.tech",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=neon.tech&sz=64",
+    "upstream_url": "https://mcp.neon.tech/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.neon.tech",
+    "oauth_authorization_url": "https://mcp.neon.tech/api/authorize",
+    "oauth_token_url": "https://mcp.neon.tech/api/token",
+    "oauth_revocation_url": "https://mcp.neon.tech/api/revoke",
+    "oauth_default_scopes": [
+      "read",
+      "write",
+      "*"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Netlify",
+    "name": "Netlify",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://netlify.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=netlify.com&sz=64",
+    "upstream_url": "https://netlify-mcp.netlify.app/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://netlify-mcp.netlify.app",
+    "oauth_authorization_url": "https://netlify-mcp.netlify.app/oauth-server/auth",
+    "oauth_token_url": "https://netlify-mcp.netlify.app/oauth-server/token",
+    "oauth_revocation_url": "https://netlify-mcp.netlify.app/oauth-server/token/revocation",
+    "oauth_default_scopes": [
+      "offline_access",
+      "read",
+      "write",
+      "claudeai"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Notion",
+    "name": "Notion",
+    "display_title": null,
+    "description": null,
+    "category": "Project Management",
+    "featured": true,
+    "website_url": "https://notion.so",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=notion.so&sz=64",
+    "upstream_url": "https://mcp.notion.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.notion.com",
+    "oauth_authorization_url": "https://mcp.notion.com/authorize",
+    "oauth_token_url": "https://mcp.notion.com/token",
+    "oauth_revocation_url": "https://mcp.notion.com/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.notion.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Octagon",
+    "name": "Octagon",
+    "display_title": null,
+    "description": null,
+    "category": "Market Intelligence",
+    "featured": true,
+    "website_url": "https://octagonai.co",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=octagonai.co&sz=64",
+    "upstream_url": "https://mcp.octagonagents.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://login.octagonai.co",
+    "oauth_authorization_url": "https://login.octagonai.co/oauth2/authorize",
+    "oauth_token_url": "https://login.octagonai.co/oauth2/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "email",
+      "offline_access",
+      "openid",
+      "profile"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "OneContext",
+    "name": "OneContext",
+    "display_title": null,
+    "description": null,
+    "category": "RAG-as-a-Service",
+    "featured": true,
+    "website_url": "https://onecontext.ai",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=onecontext.ai&sz=64",
+    "upstream_url": "https://rag-mcp-2.whatsmcp.workers.dev/sse",
+    "transport": "sse",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "OpenZeppelin Cairo Contracts",
+    "name": "OpenZeppelin Cairo Contracts",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://openzeppelin.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=openzeppelin.com&sz=64",
+    "upstream_url": "https://mcp.openzeppelin.com/contracts/cairo/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 8,
+    "tools": [
+      {
+        "name": "cairo-erc20",
+        "description": "Make a fungible token per the ERC-20 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "cairo-erc721",
+        "description": "Make a non-fungible token per the ERC-721 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "cairo-erc1155",
+        "description": "Make a non-fungible token per the ERC-1155 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "cairo-account",
+        "description": "Make a custom smart contract that represents an account that can be deployed and interacted with other contracts, and can be extended to implement custom logic. An account is a special type of contrac"
+      },
+      {
+        "name": "cairo-multisig",
+        "description": "Make a multi-signature smart contract, requiring a quorum of registered signers to approve and collectively execute transactions.\n\nReturns the source code of the generated contract, formatted in a Mar"
+      },
+      {
+        "name": "cairo-governor",
+        "description": "Make a contract to implement governance, such as for a DAO.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "cairo-vesting",
+        "description": "Make a vesting smart contract that manages the gradual release of ERC-20 tokens to a designated beneficiary based on a predefined vesting schedule.\n\nReturns the source code of the generated contract, "
+      },
+      {
+        "name": "cairo-custom",
+        "description": "Make a custom smart contract.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "OpenZeppelin Solidity Contracts",
+    "name": "OpenZeppelin Solidity Contracts",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://openzeppelin.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=openzeppelin.com&sz=64",
+    "upstream_url": "https://mcp.openzeppelin.com/contracts/solidity/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 8,
+    "tools": [
+      {
+        "name": "solidity-erc20",
+        "description": "Make a fungible token per the ERC-20 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "solidity-erc721",
+        "description": "Make a non-fungible token per the ERC-721 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "solidity-erc1155",
+        "description": "Make a non-fungible token per the ERC-1155 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "solidity-stablecoin",
+        "description": "Make a stablecoin token that uses the ERC-20 standard. Experimental, some features are not audited and are subject to change.\n\nReturns the source code of the generated contract, formatted in a Markdow"
+      },
+      {
+        "name": "solidity-rwa",
+        "description": "Make a real-world asset token that uses the ERC-20 standard. Experimental, some features are not audited and are subject to change.\n\nReturns the source code of the generated contract, formatted in a M"
+      },
+      {
+        "name": "solidity-account",
+        "description": "Make an account contract that follows the ERC-4337 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "solidity-governor",
+        "description": "Make a contract to implement governance, such as for a DAO.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "solidity-custom",
+        "description": "Make a custom smart contract.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "OpenZeppelin Stellar Contracts",
+    "name": "OpenZeppelin Stellar Contracts",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://openzeppelin.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=openzeppelin.com&sz=64",
+    "upstream_url": "https://mcp.openzeppelin.com/contracts/stellar/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 3,
+    "tools": [
+      {
+        "name": "stellar-fungible",
+        "description": "Make a fungible token per the Fungible Token Standard, compatible with SEP-41, similar to ERC-20.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write"
+      },
+      {
+        "name": "stellar-stablecoin",
+        "description": "Make a stablecoin that uses Fungible Token Standard, compatible with SEP-41.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "stellar-non-fungible",
+        "description": "Make a non-fungible token per the Non-Fungible Token Standard, compatible with SEP-50, similar to ERC-721.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does "
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "OpenZeppelin Stylus Contracts",
+    "name": "OpenZeppelin Stylus Contracts",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://openzeppelin.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=openzeppelin.com&sz=64",
+    "upstream_url": "https://mcp.openzeppelin.com/contracts/stylus/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 3,
+    "tools": [
+      {
+        "name": "stylus-erc20",
+        "description": "Make a fungible token per the ERC-20 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "stylus-erc721",
+        "description": "Make a non-fungible token per the ERC-721 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      },
+      {
+        "name": "stylus-erc1155",
+        "description": "Make a non-fungible token per the ERC-1155 standard.\n\nReturns the source code of the generated contract, formatted in a Markdown code block. Does not write to disk."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Parallel Search MCP",
+    "name": "Parallel Search MCP",
+    "display_title": null,
+    "description": null,
+    "category": "Web Search",
+    "featured": true,
+    "website_url": "https://parallel.ai",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=parallel.ai&sz=64",
+    "upstream_url": "https://search-mcp.parallel.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://platform.parallel.ai",
+    "oauth_authorization_url": "https://platform.parallel.ai/getKeys/authorize",
+    "oauth_token_url": "https://platform.parallel.ai/getKeys/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "key:read"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Parallel Task MCP",
+    "name": "Parallel Task MCP",
+    "display_title": null,
+    "description": null,
+    "category": "Web Research",
+    "featured": true,
+    "website_url": "https://parallel.ai",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=parallel.ai&sz=64",
+    "upstream_url": "https://task-mcp.parallel.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://platform.parallel.ai",
+    "oauth_authorization_url": "https://platform.parallel.ai/getKeys/authorize",
+    "oauth_token_url": "https://platform.parallel.ai/getKeys/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "key:read"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "PayPal",
+    "name": "PayPal",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://paypal.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=paypal.com&sz=64",
+    "upstream_url": "https://mcp.paypal.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.paypal.com",
+    "oauth_authorization_url": "https://mcp.paypal.com/authorize",
+    "oauth_token_url": "https://mcp.paypal.com/token",
+    "oauth_revocation_url": "https://mcp.paypal.com/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.paypal.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Peek.com",
+    "name": "Peek.com",
+    "display_title": null,
+    "description": null,
+    "category": "Other",
+    "featured": true,
+    "website_url": "https://peek.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=peek.com&sz=64",
+    "upstream_url": "https://mcp.peek.com",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 6,
+    "tools": [
+      {
+        "name": "experience_availability",
+        "description": "Get availability information for a specific experience including dates, times, and pricing"
+      },
+      {
+        "name": "experience_details",
+        "description": "Get detailed information about a specific experience by ID"
+      },
+      {
+        "name": "list_tags",
+        "description": "List all category tags"
+      },
+      {
+        "name": "render_activity_tiles",
+        "description": "Render activity tiles for a list of activity IDs, returning an embeddable widget URI"
+      },
+      {
+        "name": "search_experiences",
+        "description": "Search for travel experiences with comprehensive filtering options. Returns available categories, tags, and regions with IDs for further filtering."
+      },
+      {
+        "name": "search_regions",
+        "description": "Search for regions by name"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Plaid",
+    "name": "Plaid",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://plaid.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=plaid.com&sz=64",
+    "upstream_url": "https://api.dashboard.plaid.com/mcp/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://api.dashboard.plaid.com/mcp/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Polar Signals",
+    "name": "Polar Signals",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://www.polarsignals.com/blog/posts/2025/07/17/the-mcp-for-performance-engineering",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.polarsignals.com&sz=64",
+    "upstream_url": "https://api.polarsignals.com/api/mcp/",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Port IO",
+    "name": "Port IO",
+    "display_title": null,
+    "description": null,
+    "category": "Internal Developer Portal",
+    "featured": true,
+    "website_url": "https://port.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=port.io&sz=64",
+    "upstream_url": "https://mcp.port.io/v1",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Prisma Postgres",
+    "name": "Prisma Postgres",
+    "display_title": null,
+    "description": null,
+    "category": "Database",
+    "featured": true,
+    "website_url": "https://www.prisma.io/docs/postgres/integrations/mcp-server#remote-mcp-server",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.prisma.io&sz=64",
+    "upstream_url": "https://mcp.prisma.io/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.prisma.io",
+    "oauth_authorization_url": "https://mcp.prisma.io/oauth/authorize",
+    "oauth_token_url": "https://auth.prisma.io/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "workspace:admin",
+      "offline_access"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Ramp",
+    "name": "Ramp",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://ramp.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=ramp.com&sz=64",
+    "upstream_url": "https://ramp-mcp-remote.ramp.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://ramp-mcp-remote.ramp.com",
+    "oauth_authorization_url": "https://ramp-mcp-remote.ramp.com/oauth/authorize?auth_level=auto",
+    "oauth_token_url": "https://api.ramp.com/developer/v1/token/pkce",
+    "oauth_revocation_url": "https://api.ramp.com/developer/v1/token/revoke",
+    "oauth_default_scopes": [
+      "bills:read",
+      "cards:read",
+      "departments:read",
+      "entities:read",
+      "limits:read",
+      "locations:read",
+      "memos:read",
+      "purchase_orders:read",
+      "reimbursements:read",
+      "spend_programs:read",
+      "transactions:read",
+      "users:read",
+      "vendors:read",
+      "treasury:read",
+      "cards:write",
+      "reimbursements:write",
+      "approvals:write",
+      "transactions:write",
+      "trips:write",
+      "cards:read_agentic",
+      "accounting:read",
+      "tasks:read",
+      "trips:read",
+      "budgets:read",
+      "unified_requests:read",
+      "funds:write",
+      "limits:write",
+      "receipts:write",
+      "x402:write",
+      "comments:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Remote MCP",
+    "name": "Remote MCP",
+    "display_title": null,
+    "description": null,
+    "category": "MCP Directory",
+    "featured": true,
+    "website_url": "https://remote-mcp.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=remote-mcp.com&sz=64",
+    "upstream_url": "https://mcp.remote-mcp.com",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 1,
+    "tools": [
+      {
+        "name": "ListRemoteMCPServers",
+        "description": "List and search for trusted Remote MCP Servers from https://github.com/jaw9c/awesome-remote-mcp-servers and https://remote-mcp.com"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Scorecard",
+    "name": "Scorecard",
+    "display_title": null,
+    "description": null,
+    "category": "AI Evaluation",
+    "featured": true,
+    "website_url": "https://scorecard.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=scorecard.io&sz=64",
+    "upstream_url": "https://scorecard-mcp.dare-d5b.workers.dev/sse",
+    "transport": "sse",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "SearchAPI",
+    "name": "SearchAPI",
+    "display_title": null,
+    "description": null,
+    "category": "Search",
+    "featured": true,
+    "website_url": "https://www.searchapi.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.searchapi.io&sz=64",
+    "upstream_url": "https://www.searchapi.io/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Semgrep",
+    "name": "Semgrep",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://semgrep.dev/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=semgrep.dev&sz=64",
+    "upstream_url": "https://mcp.semgrep.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://login.semgrep.dev",
+    "oauth_authorization_url": "https://login.semgrep.dev/oauth2/authorize",
+    "oauth_token_url": "https://login.semgrep.dev/oauth2/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "email",
+      "offline_access",
+      "openid",
+      "profile"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.semgrep.ai/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Sentry",
+    "name": "Sentry",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://sentry.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=sentry.io&sz=64",
+    "upstream_url": "https://mcp.sentry.dev/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.sentry.dev",
+    "oauth_authorization_url": "https://mcp.sentry.dev/oauth/authorize",
+    "oauth_token_url": "https://mcp.sentry.dev/oauth/token",
+    "oauth_revocation_url": "https://mcp.sentry.dev/oauth/token",
+    "oauth_default_scopes": [
+      "org:read",
+      "project:write",
+      "team:write",
+      "event:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.sentry.dev/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Short.io",
+    "name": "Short.io",
+    "display_title": null,
+    "description": null,
+    "category": "Link shortener",
+    "featured": true,
+    "website_url": "https://short.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=short.io&sz=64",
+    "upstream_url": "https://ai-assistant.short.io/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Simplescraper",
+    "name": "Simplescraper",
+    "display_title": null,
+    "description": null,
+    "category": "Web Scraping",
+    "featured": true,
+    "website_url": "https://simplescraper.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=simplescraper.io&sz=64",
+    "upstream_url": "https://mcp.simplescraper.io/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.simplescraper.io",
+    "oauth_authorization_url": "https://mcp.simplescraper.io/authorize",
+    "oauth_token_url": "https://mcp.simplescraper.io/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "scrape"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Square",
+    "name": "Square",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://square.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=square.com&sz=64",
+    "upstream_url": "https://mcp.squareup.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.squareup.com",
+    "oauth_authorization_url": "https://mcp.squareup.com/authorize",
+    "oauth_token_url": "https://mcp.squareup.com/token",
+    "oauth_revocation_url": "https://mcp.squareup.com/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.squareup.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Stack Overflow",
+    "name": "Stack Overflow",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://stackoverflow.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=stackoverflow.com&sz=64",
+    "upstream_url": "https://mcp.stackoverflow.com",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Stripe",
+    "name": "Stripe",
+    "display_title": null,
+    "description": null,
+    "category": "Payments",
+    "featured": true,
+    "website_url": "https://stripe.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=stripe.com&sz=64",
+    "upstream_url": "https://mcp.stripe.com/",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://access.stripe.com/mcp",
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Stytch",
+    "name": "Stytch",
+    "display_title": null,
+    "description": null,
+    "category": "Authentication",
+    "featured": true,
+    "website_url": "https://stytch.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=stytch.com&sz=64",
+    "upstream_url": "http://mcp.stytch.dev/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://rustic-kilogram-6347.customers.stytch.com",
+    "oauth_authorization_url": "https://stytch.com/oauth/authorize",
+    "oauth_token_url": "https://rustic-kilogram-6347.customers.stytch.com/v1/oauth2/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "openid",
+      "email",
+      "profile",
+      "admin:projects",
+      "manage:api_keys",
+      "manage:api_keys:test",
+      "manage:project_settings",
+      "manage:project_data"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "SubwayInfo NYC",
+    "name": "SubwayInfo NYC",
+    "display_title": null,
+    "description": null,
+    "category": "Other",
+    "featured": true,
+    "website_url": "https://subwayinfo.nyc",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=subwayinfo.nyc&sz=64",
+    "upstream_url": "https://subwayinfo.nyc/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 25,
+    "tools": [
+      {
+        "name": "mta_get_arrivals",
+        "description": "Get upcoming train arrivals at a station. Accepts station ID or name (e.g., \"127\", \"Times Square\", \"14th Street\")."
+      },
+      {
+        "name": "mta_get_line_status",
+        "description": "Get current service status for a subway line"
+      },
+      {
+        "name": "mta_list_alerts",
+        "description": "List active service alerts across the subway system. By default only shows currently active alerts."
+      },
+      {
+        "name": "mta_search_stations",
+        "description": "Search for stations by name or line"
+      },
+      {
+        "name": "mta_get_station_info",
+        "description": "Get detailed information about a specific station. Accepts station ID or name."
+      },
+      {
+        "name": "mta_plan_trip",
+        "description": "Get route suggestions between two stations. Accepts station IDs or names."
+      },
+      {
+        "name": "mta_get_planned_work",
+        "description": "Get planned service changes, weekend schedules, and construction work. Shows what service changes are active now, coming later today, this weekend, and in the next week."
+      },
+      {
+        "name": "bus_list_alerts",
+        "description": "Get active bus service alerts. Optionally filter by route or severity."
+      },
+      {
+        "name": "bus_get_arrivals",
+        "description": "Get upcoming bus arrivals at a stop. Accepts stop ID or name (e.g., \"402940\", \"5 Av/W 42 St\")."
+      },
+      {
+        "name": "bus_get_route_info",
+        "description": "Get detailed information about a bus route including type, boroughs served, and description."
+      },
+      {
+        "name": "bus_search_stops",
+        "description": "Search bus stops by name, route, or borough. Use this to find stop IDs for bus_get_arrivals."
+      },
+      {
+        "name": "ferry_get_arrivals",
+        "description": "Get upcoming ferry arrivals at a landing. Accepts landing ID or name (e.g., \"PIER11\", \"Wall Street\", \"DUMBO\")."
+      },
+      {
+        "name": "ferry_list_alerts",
+        "description": "Get active ferry service alerts. Optionally filter by route."
+      },
+      {
+        "name": "ferry_search_landings",
+        "description": "Search ferry landings by name, route, or borough. Use this to find landing IDs for ferry_get_arrivals."
+      },
+      {
+        "name": "ferry_get_routes",
+        "description": "List all NYC Ferry routes with their landings. Optionally get details for a specific route."
+      },
+      {
+        "name": "bike_get_station_status",
+        "description": "Get bike and dock availability at a Citibike station. Accepts station ID or name (e.g., \"Broadway & W 48 St\", \"E 40 St & Park Ave\")."
+      },
+      {
+        "name": "bike_search_stations",
+        "description": "Search for Citibike stations by name, borough, or availability. Returns station availability and capacity."
+      },
+      {
+        "name": "bike_get_availability_summary",
+        "description": "Get an overview of Citibike availability by borough. Shows total bikes, docks, and station availability."
+      },
+      {
+        "name": "rail_get_departures",
+        "description": "Get upcoming LIRR or Metro-North departures at a station. Accepts station ID or name (e.g., \"PENN\", \"Grand Central\")."
+      },
+      {
+        "name": "rail_list_alerts",
+        "description": "Get active LIRR and Metro-North service alerts. Optionally filter by system, branch, or severity."
+      },
+      {
+        "name": "rail_search_stations",
+        "description": "Search LIRR and Metro-North stations by name, system, or branch. Use this to find station IDs for rail_get_departures."
+      },
+      {
+        "name": "rail_get_station_info",
+        "description": "Get detailed information about a LIRR or Metro-North station including accessibility, platforms, parking, and zone."
+      },
+      {
+        "name": "transit_ask",
+        "description": "Ask natural language questions about NYC transit (subway, bus, ferry, rail, bike). Examples: \"When is the next 1 train at Times Square?\", \"How do I get to JFK?\", \"Are there any Citibikes near Grand Ce"
+      },
+      {
+        "name": "search",
+        "description": "Search NYC subway stations and lines by name, landmark, or line letter/number. Returns result IDs that can be passed to the fetch tool for station details, live arrivals, and line status. Use the mode"
+      },
+      {
+        "name": "fetch",
+        "description": "Fetch full details for a search result ID. Supports \"station:<id>\" (station info plus live arrivals) and \"line:<line>\" (current service status and alerts). Use the search tool first to discover valid "
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Supabase",
+    "name": "Supabase",
+    "display_title": null,
+    "description": null,
+    "category": "Database",
+    "featured": true,
+    "website_url": "https://supabase.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=supabase.com&sz=64",
+    "upstream_url": "https://mcp.supabase.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://api.supabase.com",
+    "oauth_authorization_url": "https://api.supabase.com/v1/oauth/authorize",
+    "oauth_token_url": "https://api.supabase.com/v1/oauth/token",
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [
+      "organizations:read",
+      "projects:read",
+      "projects:write",
+      "database:write",
+      "database:read",
+      "analytics:read",
+      "secrets:read",
+      "edge_functions:read",
+      "edge_functions:write",
+      "environment:read",
+      "environment:write",
+      "storage:read"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Telnyx",
+    "name": "Telnyx",
+    "display_title": null,
+    "description": null,
+    "category": "Communication",
+    "featured": true,
+    "website_url": "https://telnyx.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=telnyx.com&sz=64",
+    "upstream_url": "https://api.telnyx.com/v2/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 6,
+    "tools": [
+      {
+        "name": "get_api_endpoint_schema",
+        "description": "Get the schema for an endpoint in the Telnyx TypeScript API. You can use the schema returned by this tool to invoke an endpoint with the `invoke_api_endpoint` tool."
+      },
+      {
+        "name": "list_api_endpoints",
+        "description": "List or search for all endpoints in the Telnyx TypeScript API"
+      },
+      {
+        "name": "invoke_api_endpoint",
+        "description": "Invoke an endpoint in the Telnyx TypeScript API. Note: use the `list_api_endpoints` tool to get the list of endpoints and `get_api_endpoint_schema` tool to get the schema for an endpoint."
+      },
+      {
+        "name": "open_number_intelligence",
+        "description": "Open the Telnyx Number Intelligence MCP App for phone number lookup, validation, and enrichment workflows."
+      },
+      {
+        "name": "open_usage_cost_explorer",
+        "description": "Open the Telnyx Usage & Cost Explorer MCP App for usage and cost analysis."
+      },
+      {
+        "name": "open_voice_monitor",
+        "description": "Open the Telnyx Voice Monitor MCP App for observing and troubleshooting voice traffic."
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "ThoughtSpot",
+    "name": "ThoughtSpot",
+    "display_title": null,
+    "description": null,
+    "category": "Data Analytics",
+    "featured": true,
+    "website_url": "https://thoughtspot.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=thoughtspot.com&sz=64",
+    "upstream_url": "https://agent.thoughtspot.app/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Turkish Airlines",
+    "name": "Turkish Airlines",
+    "display_title": null,
+    "description": null,
+    "category": "Airlines",
+    "featured": true,
+    "website_url": "https://mcp.turkishtechlab.com/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=mcp.turkishtechlab.com&sz=64",
+    "upstream_url": "https://mcp.turkishtechlab.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "TweetSave",
+    "name": "TweetSave",
+    "display_title": null,
+    "description": null,
+    "category": "Social Media",
+    "featured": true,
+    "website_url": "https://tweetsave.org",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=tweetsave.org&sz=64",
+    "upstream_url": "https://mcp.tweetsave.org/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": true,
+    "original_url": "https://mcp.tweetsave.org/sse",
+    "tool_count": 5,
+    "tools": [
+      {
+        "name": "tweetsave_get_tweet",
+        "description": "Fetch a single tweet with all its content including text, media (photos, videos, GIFs), polls, and engagement metrics.\n\nThis tool retrieves tweet data from Twitter/X using the FxTwitter API. It return"
+      },
+      {
+        "name": "tweetsave_get_thread",
+        "description": "Fetch a tweet thread (multiple connected tweets by the same author).\n\nNote: Current implementation fetches the main tweet. Full thread crawling requires additional API access.\n\nArgs:\n  - url (string):"
+      },
+      {
+        "name": "tweetsave_to_blog",
+        "description": "Convert a tweet into a formatted blog post with title, content, media, and metadata.\n\nThis tool transforms a tweet into a readable blog post format, perfect for:\n- Archiving tweets\n- Creating content "
+      },
+      {
+        "name": "tweetsave_batch",
+        "description": "Fetch multiple tweets at once (max 10).\n\nUseful for:\n- Collecting tweets from a list\n- Building a feed from multiple sources\n- Comparing multiple tweets\n\nArgs:\n  - urls (string[]): Array of tweet URLs"
+      },
+      {
+        "name": "tweetsave_extract_media",
+        "description": "Extract direct media URLs (photos, videos, GIFs) from a tweet.\n\nReturns direct URLs that can be downloaded or embedded. Video URLs are the highest quality available.\n\nArgs:\n  - url (string): Tweet URL"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Vercel",
+    "name": "Vercel",
+    "display_title": null,
+    "description": null,
+    "category": "Software Development",
+    "featured": true,
+    "website_url": "https://vercel.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=vercel.com&sz=64",
+    "upstream_url": "https://mcp.vercel.com/",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.vercel.com",
+    "oauth_authorization_url": "https://vercel.com/oauth/authorize",
+    "oauth_token_url": "https://vercel.com/api/login/oauth/token",
+    "oauth_revocation_url": "https://vercel.com/api/login/oauth/token/revoke",
+    "oauth_default_scopes": [
+      "openid",
+      "offline_access"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "VibeMarketing",
+    "name": "VibeMarketing",
+    "display_title": null,
+    "description": null,
+    "category": "Social Media",
+    "featured": true,
+    "website_url": "https://vibemarketing.ninja",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=vibemarketing.ninja&sz=64",
+    "upstream_url": "https://vibemarketing.ninja/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 7,
+    "tools": [
+      {
+        "name": "get_accounts",
+        "description": "Get all connected social media accounts across all platforms"
+      },
+      {
+        "name": "get_all_posts",
+        "description": "Get all posts across all platforms"
+      },
+      {
+        "name": "schedule_post",
+        "description": "Schedule a new social media post"
+      },
+      {
+        "name": "bulk_schedule_posts",
+        "description": "Schedule multiple social media posts at once (up to 50 posts per batch). More efficient than scheduling posts individually."
+      },
+      {
+        "name": "get_subscription_status",
+        "description": "Get current subscription status and usage"
+      },
+      {
+        "name": "delete_post",
+        "description": "Delete a scheduled post (cannot delete published posts)"
+      },
+      {
+        "name": "update_post",
+        "description": "Update a scheduled post (cannot update published posts)"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "WayStation",
+    "name": "WayStation",
+    "display_title": null,
+    "description": null,
+    "category": "Productivity",
+    "featured": true,
+    "website_url": "https://waystation.ai",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=waystation.ai&sz=64",
+    "upstream_url": "https://waystation.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://waystation.ai",
+    "oauth_authorization_url": "https://waystation.ai/api/oauth/authorize",
+    "oauth_token_url": "https://waystation.ai/api/oauth/token",
+    "oauth_revocation_url": "https://waystation.ai/api/oauth/revoke",
+    "oauth_default_scopes": [
+      "openid",
+      "profile",
+      "email"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Webflow",
+    "name": "Webflow",
+    "display_title": null,
+    "description": null,
+    "category": "CMS",
+    "featured": true,
+    "website_url": "https://webflow.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=webflow.com&sz=64",
+    "upstream_url": "https://mcp.webflow.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.webflow.com",
+    "oauth_authorization_url": "https://mcp.webflow.com/oauth/authorize",
+    "oauth_token_url": "https://mcp.webflow.com/oauth/token",
+    "oauth_revocation_url": "https://mcp.webflow.com/oauth/token",
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.webflow.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "WebZum",
+    "name": "WebZum",
+    "display_title": null,
+    "description": null,
+    "category": "Website Hosting",
+    "featured": true,
+    "website_url": "https://webzum.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=webzum.com&sz=64",
+    "upstream_url": "https://webzum.com/api/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 16,
+    "tools": [
+      {
+        "name": "search_businesses",
+        "description": "Search for businesses by name, phone number, or location.\nReturns a list of business candidates with confidence scores.\nUse this to find existing businesses before creating a website.\n\nRequires authen"
+      },
+      {
+        "name": "create_site",
+        "description": "Create a new website for a business.\nPass a business candidate object from search_businesses to generate a website.\n\nRequires authentication via API key (Bearer token).\nGenerate an API key at webzum.c"
+      },
+      {
+        "name": "create_lead_gen_site",
+        "description": "Create a third-party LEAD-GENERATION page about a business (NOT a site for that business itself).\n\nUse this when the goal is to drive qualified search traffic to someone else's business — affiliate pa"
+      },
+      {
+        "name": "get_site_status",
+        "description": "Check the status and generation progress of a site.\n\nReturns detailed progress information including:\n- stage: Current step (initialization, validation, research, strategy, generation, assembly, compl"
+      },
+      {
+        "name": "generate_geo_page",
+        "description": "Generate a local SEO-optimized landing page for lead generation.\nCreates a complete website optimized for a specific city/service combination.\n\nRequires authentication via API key (Bearer token).\nGene"
+      },
+      {
+        "name": "list_user_sites",
+        "description": "List all websites created by the authenticated user.\nReturns an array of businessIds with names and URLs.\n\nRequires authentication via API key (Bearer token).\nGenerate an API key at webzum.com/dashboa"
+      },
+      {
+        "name": "host_site",
+        "description": "Instantly host any web content on WebZum. The default destination\nfor AI-generated websites, frontends, dashboards, prototypes, MCP-server UIs,\nshare-with-a-friend pages, and any HTML/CSS/JS bundle.\n\n"
+      },
+      {
+        "name": "host_file",
+        "description": "Add a file to your hosted site. The file goes live immediately.\nEach upload creates a new version in the site's history.\n\nSupported: HTML, CSS, JS, JSON, images (PNG, JPG, GIF, SVG, WebP), fonts (WOFF"
+      },
+      {
+        "name": "get_hosted_files",
+        "description": "List all files in a hosted site's current version.\nUse this to see what's been uploaded.\n\nIf the user wants a professional, researched website (logo, real copy, SEO,\nmobile-ready, multi-page) instead "
+      },
+      {
+        "name": "host_zip",
+        "description": "Upload a zipped bundle of files to a hosted site in a single call.\nUse this when you have a multi-file project (HTML + CSS + JS + images) — one\nhost_zip call is far cheaper than N host_file calls and "
+      },
+      {
+        "name": "clone_site",
+        "description": "Clone a public web page into a hosted site. Fetches the URL, walks\nits same-origin assets (CSS, JS, images, fonts), rewrites references to\nlocal paths, and uploads everything as a working hosted copy "
+      },
+      {
+        "name": "update_site_html",
+        "description": "Edit a generated WebZum site by describing the change in natural language.\n\nThis is the primary editor tool. Given a user instruction (in conversationHistory),\nthe WebZum editor builds the minimal sit"
+      },
+      {
+        "name": "regenerate_header",
+        "description": "Regenerate the header (nav bar, logo placement, top-of-page) of a WebZum site.\nCreates a new version with a fresh AI-generated header and reassembles every page.\nUse when the user wants the nav restyl"
+      },
+      {
+        "name": "regenerate_footer",
+        "description": "Regenerate the footer of a WebZum site. Creates a new version with a fresh\nAI-generated footer and reassembles every page. Use when the user wants different\nfooter content, layout, or copy.\n\nRequired:"
+      },
+      {
+        "name": "regenerate_logo",
+        "description": "Regenerate the logo for a WebZum site using AI. Creates a new version with a\nfresh logo and reassembles.\n\nUse the optional userMessage to steer the design — \"make it more minimal\",\n\"use a serif typefa"
+      },
+      {
+        "name": "regenerate_image",
+        "description": "Regenerate one image inside a specific section of a WebZum site. Creates a\nnew version with a freshly AI-generated image for that section and reassembles.\n\nUse the optional userMessage to steer the ne"
+      }
+    ]
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Wix",
+    "name": "Wix",
+    "display_title": null,
+    "description": null,
+    "category": "CMS",
+    "featured": true,
+    "website_url": "https://wix.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=wix.com&sz=64",
+    "upstream_url": "https://mcp.wix.com/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://mcp.wix.com",
+    "oauth_authorization_url": "https://mcp.wix.com/authorize",
+    "oauth_token_url": "https://mcp.wix.com/token",
+    "oauth_revocation_url": "https://mcp.wix.com/token",
+    "oauth_default_scopes": [
+      "offline_access"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": true,
+    "original_url": "https://mcp.wix.com/sse",
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Zapier",
+    "name": "Zapier",
+    "display_title": null,
+    "description": null,
+    "category": "Automation",
+    "featured": true,
+    "website_url": "https://zapier.com",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=zapier.com&sz=64",
+    "upstream_url": "https://mcp.zapier.com/api/mcp/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "service_account",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Zenable",
+    "name": "Zenable",
+    "display_title": null,
+    "description": null,
+    "category": "Security",
+    "featured": true,
+    "website_url": "https://zenable.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=zenable.io&sz=64",
+    "upstream_url": "https://mcp.zenable.app/",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://zenable.us.auth0.com",
+    "oauth_authorization_url": "https://zenable.us.auth0.com/authorize",
+    "oauth_token_url": "https://zenable.us.auth0.com/oauth/token",
+    "oauth_revocation_url": "https://zenable.us.auth0.com/oauth/revoke",
+    "oauth_default_scopes": [
+      "openid",
+      "profile",
+      "email"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "Zine",
+    "name": "Zine",
+    "display_title": null,
+    "description": null,
+    "category": "Memory",
+    "featured": true,
+    "website_url": "https://www.zine.ai/",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=www.zine.ai&sz=64",
+    "upstream_url": "https://www.zine.ai/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "per_user_oauth",
+    "oauth_issuer_url": "https://www.zine.ai",
+    "oauth_authorization_url": "https://www.zine.ai/api/auth/mcp-oauth/authorize",
+    "oauth_token_url": "https://www.zine.ai/api/auth/mcp-oauth/token",
+    "oauth_revocation_url": "https://www.zine.ai/api/auth/mcp-oauth/revoke",
+    "oauth_default_scopes": [
+      "mcp:read",
+      "mcp:write"
+    ],
+    "liveness": "auth_required",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": null,
+    "tools": []
+  },
+  {
+    "source": "awesome-remote-mcp-servers",
+    "source_name": "zip1.io",
+    "name": "zip1.io",
+    "display_title": null,
+    "description": null,
+    "category": "Link shortener",
+    "featured": true,
+    "website_url": "https://zip1.io",
+    "repository_url": null,
+    "icon_url": "https://www.google.com/s2/favicons?domain=zip1.io&sz=64",
+    "upstream_url": "https://zip1.io/mcp",
+    "transport": "streamable_http",
+    "auth_mode": "no_auth",
+    "oauth_issuer_url": null,
+    "oauth_authorization_url": null,
+    "oauth_token_url": null,
+    "oauth_revocation_url": null,
+    "oauth_default_scopes": [],
+    "liveness": "alive",
+    "url_corrected": false,
+    "original_url": null,
+    "tool_count": 4,
+    "tools": [
+      {
+        "name": "create_short_url",
+        "description": "Create a shortened URL using zip1.io with optional custom alias, password protection, max clicks limit, and time-based expiration"
+      },
+      {
+        "name": "get_url_stats",
+        "description": "Get detailed statistics and analytics for a shortened URL including click counts, countries, and recent activity"
+      },
+      {
+        "name": "validate_url",
+        "description": "Check if a URL is valid and can be shortened by zip1.io"
+      },
+      {
+        "name": "generate_short_code",
+        "description": "Generate a random 6-character alphanumeric short code suggestion (the actual code will be generated when creating the URL)"
+      }
+    ]
+  }
+]

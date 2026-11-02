@@ -1,0 +1,8 @@
+{
+  "id": "openhands",
+  "name": "OpenHands",
+  "description": "Autonomous AI coding agent that can run commands and browse the web",
+  "url": "https://github.com/All-Hands-AI/OpenHands",
+  "ua_patterns": ["openhands"],
+  "referer_patterns": []
+}

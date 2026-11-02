@@ -1,0 +1,8 @@
+{
+  "id": "cline-mcp",
+  "name": "Cline MCP",
+  "description": "Cline's MCP transport (forks of Roo Code etc. share the prefix)",
+  "url": "https://github.com/cline/cline",
+  "ua_patterns": ["cline-mcp/", "Cline-MCP/"],
+  "referer_patterns": []
+}
