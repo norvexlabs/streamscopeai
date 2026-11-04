@@ -39,6 +39,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use super::protect::{Guard, ProjectGrants};
 use super::{profiles, LaunchSpec};
 use crate::state::expand_tilde;
 
@@ -89,8 +90,8 @@ pub fn confinement_supported() -> bool {
 /// the project. Exec needs no clause of its own: `(allow process*)` covers
 /// exec, and a library written to a write-allowed dir maps executable under
 /// `(allow file-read*)`.
-fn profile(spec: &LaunchSpec, connect_ports: &[u16], scratch: &Path) -> Result<String> {
-    profile_with_ttys(spec, connect_ports, scratch, &controlling_ttys())
+fn profile(spec: &LaunchSpec, connect_ports: &[u16], scratch: &Path, project: &ProjectGrants) -> Result<String> {
+    profile_with_ttys(spec, connect_ports, scratch, project, &controlling_ttys())
 }
 
 /// The terminal devices this process's stdin/stdout/stderr are (`ttyname`),
@@ -115,7 +116,13 @@ fn controlling_ttys() -> Vec<String> {
 }
 
 /// [`profile`] granting terminal setup on `ttys` (plus `/dev/tty`).
-fn profile_with_ttys(spec: &LaunchSpec, connect_ports: &[u16], scratch: &Path, ttys: &[String]) -> Result<String> {
+fn profile_with_ttys(
+    spec: &LaunchSpec,
+    connect_ports: &[u16],
+    scratch: &Path,
+    project: &ProjectGrants,
+    ttys: &[String],
+) -> Result<String> {
     let mut p = String::from("(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n");
     p.push_str("(allow file-read*)\n");
     // cfprefsd hands preferences to a process through POSIX shared memory:
@@ -156,8 +163,23 @@ fn profile_with_ttys(spec: &LaunchSpec, connect_ports: &[u16], scratch: &Path, t
             expand_tilde(d).ok().map(|p| p.to_string_lossy().into_owned())
         }));
     }
+    writes.extend(project.extra_rw.iter().map(|d| d.to_string_lossy().into_owned()));
     for w in writes {
         push_allow_write(&mut p, &w);
+    }
+    // What the agent must not change inside the writable project (`protect`):
+    // after every write allow, since the last match wins.
+    // Every protected path, an absent file included: Seatbelt denies a
+    // write to a path that does not exist yet, so a link file the agent
+    // would create (a `commondir`) is held here too.
+    for held in &project.protected {
+        let esc = sbpl_escape(&held.path.to_string_lossy());
+        match held.guard {
+            Guard::Tree => p.push_str(&format!("(deny file-write* (subpath \"{esc}\"))\n")),
+            // The node alone: a write to a path inside a folder is checked
+            // against that path, so a Node's contents stay writable.
+            Guard::File | Guard::Node => p.push_str(&format!("(deny file-write* (literal \"{esc}\"))\n")),
+        }
     }
     for port in connect_ports {
         p.push_str(&format!("(allow network-outbound (remote ip \"localhost:{port}\"))\n"));
@@ -266,10 +288,11 @@ pub fn command(
     spec: &LaunchSpec,
     connect_ports: &[u16],
     scratch: &Path,
+    project: &ProjectGrants,
     args: &[String],
     env: &[(String, String)],
 ) -> Result<tokio::process::Command> {
-    let prof = profile(spec, connect_ports, scratch)?;
+    let prof = profile(spec, connect_ports, scratch, project)?;
     let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p").arg(prof).arg(&spec.command).args(args).current_dir(&spec.cwd);
     for (k, v) in env {
@@ -292,12 +315,37 @@ mod tests {
 
     const SCRATCH: &str = "/private/tmp/fake-home/.cache/streamscopeai/tmp/42-ab";
 
+    /// The project's holds follow every write allow (last match wins), a
+    /// linked worktree's git dir is writable, and a Node holds only itself.
+    #[test]
+    fn the_projects_holds_follow_its_write_allows() {
+        use super::super::protect::Protected;
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
+        let project = ProjectGrants {
+            extra_rw: vec![PathBuf::from("/Users/me/main/.git")],
+            stat_only: vec![],
+            protected: vec![
+                Protected { path: PathBuf::from("/Users/me/main/.git/hooks"), guard: Guard::Tree },
+                Protected { path: PathBuf::from("/Users/me/main/.git"), guard: Guard::Node },
+            ],
+        };
+        let prof = profile(&sample_spec(), &[1], Path::new(SCRATCH), &project).unwrap();
+        let allow = prof.find("(allow file-write* (subpath \"/Users/me/main/.git\"))").expect("worktree git dir writable");
+        let tree = prof.find("(deny file-write* (subpath \"/Users/me/main/.git/hooks\"))").expect("hooks held");
+        let node = prof.find("(deny file-write* (literal \"/Users/me/main/.git\"))").expect("git dir held");
+        let last_allow = prof.rfind("(allow file-write*").unwrap();
+        assert!(allow < tree && last_allow < tree && last_allow < node, "{prof}");
+        assert!(!prof.contains("(deny file-write* (subpath \"/Users/me/main/.git\"))"), "{prof}");
+    }
+
     #[test]
     fn profile_lets_the_client_write_its_runs_scratch_dir_only() {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: serialized via ENV_LOCK.
         unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
-        let prof = profile(&sample_spec(), &[12345], Path::new(SCRATCH)).unwrap();
+        let prof = profile(&sample_spec(), &[12345], Path::new(SCRATCH), &ProjectGrants::default()).unwrap();
         assert!(prof.contains(&format!("(allow file-write* (subpath \"{SCRATCH}\"))")), "{prof}");
         // Never the cache the run's dir lives in.
         assert!(!prof.contains("(subpath \"/private/tmp/fake-home/.cache/streamscopeai/tmp\")"), "{prof}");
@@ -310,7 +358,7 @@ mod tests {
         // SAFETY: serialized via ENV_LOCK.
         unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
         let prof =
-            profile_with_ttys(&sample_spec(), &[12345], Path::new(SCRATCH), &["/dev/ttys003".into()]).unwrap();
+            profile_with_ttys(&sample_spec(), &[12345], Path::new(SCRATCH), &ProjectGrants::default(), &["/dev/ttys003".into()]).unwrap();
         let ioctl: Vec<&str> = prof.lines().filter(|l| l.contains("file-ioctl")).collect();
         assert_eq!(
             ioctl,
@@ -335,6 +383,8 @@ mod tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
+            client_files: vec![],
+            allow_outside_profile: false,
         }
     }
 
@@ -397,7 +447,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: serialized via ENV_LOCK.
         unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
-        let prof = profile(&sample_spec(), &[4100, 4200], Path::new(SCRATCH)).unwrap();
+        let prof = profile(&sample_spec(), &[4100, 4200], Path::new(SCRATCH), &ProjectGrants::default()).unwrap();
         let outbound: Vec<&str> = prof.lines().filter(|l| l.contains("network-outbound")).collect();
         assert_eq!(
             outbound,
@@ -419,7 +469,7 @@ mod tests {
         let saved = std::env::var_os("HOME");
         // SAFETY: serialized via ENV_LOCK.
         unsafe { std::env::remove_var("HOME"); }
-        let result = profile(&sample_spec(), &[12345], Path::new(SCRATCH));
+        let result = profile(&sample_spec(), &[12345], Path::new(SCRATCH), &ProjectGrants::default());
         if let Some(v) = saved {
             unsafe { std::env::set_var("HOME", v); }
         }
@@ -434,7 +484,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         // SAFETY: serialized via ENV_LOCK.
         unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
-        let prof = profile(&sample_spec(), &[12345], Path::new(SCRATCH)).expect("profile builds with HOME set");
+        let prof = profile(&sample_spec(), &[12345], Path::new(SCRATCH), &ProjectGrants::default()).expect("profile builds with HOME set");
         for tail in [".ssh/id_", ".gnupg", ".aws", ".config/gcloud", ".netrc", ".npmrc"] {
             let expected = format!("/private/tmp/fake-home/{tail}");
             assert!(

@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/img/how-it-works.svg" alt="A coding agent in a sandbox on macOS or Linux reaches only the Streamscope AI gateway, which applies tool policy, budgets, QoS and audit, checks the request to the model for PII and the web content coming back for prompt injection, and forwards to the Anthropic API, to internal vLLM endpoints (translating between their protocols) and to the web" width="100%">
+  <img src="docs/img/how-it-works.svg" alt="A coding agent in a sandbox on Linux, macOS or Windows reaches only the Streamscope AI gateway, which applies tool policy, budgets, QoS and audit, checks the request to the model for PII and the web content coming back for prompt injection, and forwards to the Anthropic API, to internal vLLM endpoints (translating between their protocols) and to the web" width="100%">
 </p>
 
 Coding agents, chatbots and autonomous pipelines make hundreds of model calls per task, across
@@ -54,7 +54,10 @@ record instead of dropping it silently. Embeddings, audio, images and video are 
 
 **35+ providers, built in.** OpenAI, Anthropic, Google, Mistral, AWS Bedrock, Azure OpenAI, Vertex,
 Groq, DeepSeek, xAI, OpenRouter, Ollama, vLLM and more, with failover, load balancing and
-per-workspace routing. Model capabilities and prices come from a maintained catalog; a price the
+per-workspace routing. A model served by several replicas keeps each conversation on one of them, so
+its prompt cache keeps working across turns, and moves it only when that replica fails. An alias
+names a model and an invocation preset — a reasoning level, a temperature, any setting in the
+model's own protocol — applied after translation, to every target the alias fails over to. Model capabilities and prices come from a maintained catalog; a price the
 catalog does not know is reported as unknown, never guessed.
 
 **Provider keys stay on the server.** Provider keys are stored encrypted on the gateway, never
@@ -62,17 +65,33 @@ handed to a laptop. People and automations get scoped gateway keys that can be r
 Clients that must use their own provider key can pass it through and are governed and audited just
 the same.
 
-**Every call on the record.** Each request is recorded with its user, workspace, model, tokens,
-cost, latency and outcome, including refusals, rate limits and upstream errors, with optional full
-content capture. Agentic work is grouped into **sessions** and replayed turn by turn: tool calls,
-reasoning, sub-agents, and the MCP and A2A calls they made, interleaved in the order they happened.
+**Every call on the record.** Each request is recorded with its user, workspace, client
+application, model, tokens, cost, latency and outcome, including refusals, rate limits and upstream
+errors, with optional full content capture and a retention you set. Agentic work is grouped into
+**sessions** and replayed turn by turn: tool calls, reasoning, sub-agents, and the MCP and A2A calls
+they made, interleaved in the order they happened. A conversation resends its whole history on
+every turn; each message is stored once however often it is resent, so full capture stays
+affordable on long agent sessions. The gateway recognises which application made each call — from a
+header, its user agent or its system prompt — so you see what every tool drives.
 
 **Govern what agents do, not only what they say.** One tool-policy engine classifies, blocks or
 rewrites the tool calls agents make, on the model's output and on MCP traffic alike: a `rm -rf`, a
-force-push or a call to a cloud metadata address. Its matchers normalise the many ways a shell
-command or a path can be written, and are property-tested against the spellings that would bypass
-them. Request and response transforms, PII redaction and a prompt-injection guardrail sit on the
-same path; the injection classifier is an optional extension the installer connects.
+force-push or a call to a cloud metadata address. It reads what a tool is asked to do, not only its
+name: ten built-in detectors recognise a reverse shell, a cloud-metadata request, destructive SQL, a
+credential in the arguments, a container escape, a package install, downloaded or decoded code being
+run, lookalike characters and more, and over fifty ready-made rules put them to work. Its matchers
+normalise the many ways a shell command or a path can be written, and are property-tested against
+the spellings that would bypass them.
+
+**Guardrails on what goes in and comes out.** Web pages and tool content an agent reads are screened
+for prompt injection and handed to the model as untrusted data; in enforce mode a flagged page is
+withheld (the classifier is an optional extension the installer connects). PII — email addresses,
+cards, IBANs, phone numbers, and the national ID and tax numbers of France, Germany, Italy, Spain and
+the United Kingdom, checksums verified — is found in prompts and answers, and masked in an answer
+that is not streamed; a streamed answer's findings are recorded. Scripted request and response
+transforms sit on the same path, each change with its before/after on the record. Already inspect AI
+traffic at your network edge? An external analyzer can send what it intercepts to the gateway's
+analyze API and enforce the verdict, under the same policy and the same audit.
 
 **AI experts on your own traffic.** Seven experts (security, compliance, cost efficiency, quality,
 anomaly, tool policy, session linkage) read live traffic with a model you choose, raise alerts on
@@ -82,27 +101,74 @@ sessions and propose rules and transforms for an admin to accept.
 enforced at the edge and converged across every gateway replica, so ten replicas never grant ten
 times a budget. Spend is kept in your accounting currency: a price quoted in another is converted
 at a rate you set, never fetched, and a cost with no rate is flagged rather than guessed. A
-response cache, exact or semantic, serves repeated questions at no model cost.
+response cache, exact or semantic, serves repeated questions at no model cost, and an observe mode
+shows what it would serve on your own traffic before you turn it on.
+
+**Fair shares of your own GPUs.** A self-hosted model saturates long before a cloud API does. For
+vLLM and other self-hosted servers the gateway can hold the overflow itself instead of letting the
+engine queue it: requests go by priority class (a person waiting before a CI job), fairly between
+callers of the same class weighted by each workspace's share, and a request whose wait runs out is
+refused with a `Retry-After`. Each engine is capped at what it sustains, and the gateway reads its
+queue from the engine's own metrics; vLLM's priority scheduling can be driven from the same classes.
+A model served by several replicas keeps each conversation on the replica that has it cached. The
+Servers dashboard shows each engine's load, waits and refusals by class.
 
 **MCP and A2A, governed.** Publish Model Context Protocol servers to your users through virtual
 servers, with per-user OAuth, per-method scopes and both protocol eras served side by side. A
 catalog of 100+ remote MCP servers is a click away. A built-in web MCP server fetches pages
 behind an SSRF guard, and searches the web through an optional search extension. Agent2Agent traffic gets the same authentication, policy and audit.
 
-**Your coding agents, provisioned in one command.** The `ssai` CLI (Linux, macOS, Windows) configures Claude Code,
-Codex CLI, Gemini CLI, OpenCode, Goose, Cline, Aider, Cursor, Zed, Crush, Qwen Code, Mistral Vibe
-and more against the gateway: models, keys and MCP servers. `ssai run --sandbox native`
-confines an agent to its project: Landlock on Linux, Seatbelt on macOS. On Linux,
-`ssai run --sandbox docker` (unless an admin turns it off) runs it in a rootless Podman container
-built from the project's own image or dev container, a Docker engine inside if the project needs
-one. Either way the agent reaches the gateway, plus only the destinations an admin allows: package
-registries and Git hosts come as ready-made lists to attach.
+**One list of destinations, allowed or blocked.** Destination lists name hosts, wildcard domains,
+addresses and ports, and each is attached as **allow** or **block** — to the developers' sandbox
+(what an agent on a laptop may reach besides the gateway) and to the web tool (what a search may
+return and a fetch may open). A block always wins, and the cloud metadata address is never
+reachable whatever a list says. Package registries, Git hosts, container registries and paste
+sites come as ready-made lists to attach.
+
+**The web tools agents bring, run by the gateway.** A provider's own server-side web search
+(Anthropic's, OpenAI's) and the web fetch and search tools of Claude Code, OpenCode,
+Gemini CLI and Continue can each be replaced, by a rule you turn on, with the gateway's: the model
+calls the same tool, and the gateway runs it — through the destination lists, the SSRF guard, your
+tool rules and the prompt-injection screening, on the record like any other call — instead of the
+provider or the laptop reaching the web unseen.
+
+**Your coding agents, provisioned in one command, run in a sandbox.** The `ssai` CLI (Linux, macOS,
+Windows) configures Claude Code, Codex CLI, Gemini CLI, OpenCode, Goose, Cline, Aider, Cursor, Zed,
+Crush, Qwen Code, Mistral Vibe and more against the gateway: models, keys and MCP servers, merged
+into each tool's own config with your other settings kept. What each tool is given comes from a
+client template the admin can edit, preview and add to in the console, and the portal's quickstart
+renders the same templates. `ssai run --sandbox` then confines the agent to its project. Inside, it reaches the gateway plus
+only what the admin's destination lists allow, and it can commit, from a linked worktree too. The
+admin chooses which clients the portal and the CLI offer — one a new release adds arrives switched
+off until enabled — and can require the sandbox, so `ssai run` will not launch an agent unconfined.
+
+| Sandbox | How it confines the agent | Git hooks, git config and `.streamscopeai/` |
+|---|---|---|
+| Linux, native | Landlock | writable — `ssai run` says so when it starts |
+| Linux, container (`--sandbox docker`, unless an admin turns it off) | a rootless Podman container built from the project's own image or dev container, a Docker engine inside if the project needs one | read-only |
+| macOS | Seatbelt | read-only |
+| Windows | a dedicated local account that reads nothing in your profile but what a run grants it (the tool's folder and configuration, trusted roots, files an `--env` names); `ssai sandbox setup` creates it once, and a project stays granted to it until `ssai sandbox revoke`. Claude Code, Codex, Gemini CLI, OpenCode and Goose run there | read-only |
 
 **Multi-tenant from the database up.** Serve many isolated organisations from one deployment, each
-with its own users, sign-in (local accounts or any OIDC provider), configuration and audit.
+with its own users, sign-in (local accounts or any OIDC provider, Entra ID and AD FS included),
+configuration and audit. Console accounts carry a role, read-only included, checked on every
+request, and service accounts with automation keys provision CI pipelines. With an identity
+provider, the console role follows its groups — admin or read-only, re-checked at every sign-in, so
+someone who leaves the group loses it — and members join their workspaces from a group claim.
 Isolation is enforced by PostgreSQL row-level security on a role that cannot bypass it, so a query
-without a tenant scope reads nothing. Workspaces inside a tenant carry access, budgets and keys, and
-a self-service portal serves their members.
+without a tenant scope reads nothing. A self-service portal serves each organisation's members.
+
+**Workspaces, each with its own posture.** Inside an organisation, a workspace is where access,
+budget, priority and keys come together: it grants the providers, MCP servers and A2A agents its
+keys may reach, holds its members and their roles, and picks a profile for each policy — tool
+policy, guardrail, transforms and AI experts. The Default profile is the shared base; a workspace's
+own profile either layers on it, adding only what differs, or stands alone, and any policy can be
+turned off for one workspace. The tool rules, guardrail recognisers, transforms, experts, client
+templates, MCP catalog, model catalog, priority classes and destination lists ship built in and are
+updated with each release; a built-in you edit becomes yours and is never overwritten, one you delete
+stays deleted, and a reset brings the shipped versions back. A workspace manager — a team lead,
+not an admin — runs the team from the portal: mints and revokes members' keys, puts a budget on
+each, and raises or lowers one member's limit inside the pool the admin set.
 
 ## For admins: one console for every model, tool and agent
 
@@ -160,8 +226,14 @@ key:
   secrets redacted from the diff.
 - **A typed REST API** with an OpenAPI spec and an interactive reference at `/api/docs`; the
   console is built on the same API.
-- **Signed releases**: every image, chart, installer and VM disk is signed, and every install and
-  upgrade verifies the signature before it runs anything.
+- **Signed and scanned releases**: every image, chart, installer and VM disk is signed and carries
+  its SBOM, and is scanned for known vulnerabilities before it is published — a fixable high or
+  critical finding stops the release. Every install and upgrade verifies the signature before it
+  runs anything, and `ssai-stow audit` checks a release against today's advisories.
+- **Backups**: off-host and encrypted to public keys whose private halves stay with you, on the VM
+  appliance and the Docker deployment; on Kubernetes, the database platform's continuous archive.
+- **Prometheus metrics** for the gateway and the admin API, on hostnames of their own, open only to
+  the sources you allow.
 
 ## Performance
 
@@ -193,7 +265,9 @@ by the same installer, `ssai-stow`. Nothing needs to be built to install it:
   users and keys are then added in the console. The fastest way to try it, and enough to run it.
 - **VM appliance** — a ready-to-boot disk image (OS + apps + database in one box), with atomic
   upgrades that fall back on their own when a new release fails its health check, off-host
-  backups, and a mirror path for sites without internet.
+  backups, and a mirror path for sites without internet. It is operated from the console: upgrade
+  or roll back with the release notes in front of you, change its network on a timer that restores
+  the old settings unless you confirm, and set up and run its backups.
 - **Kubernetes** — a Helm chart wrapping the same images, installed with `ssai-stow k8s
   install`: an external (PostgreSQL 18 or later), embedded or operator-managed
   Postgres, horizontal autoscaling, and Ingress + cert-manager for TLS. Hardened by default.

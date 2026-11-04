@@ -73,8 +73,9 @@ Each image, the installer, the OS bundle and each disk of a release carries an S
 with the release's signing key. An image's SBOM also lists what is compiled into it — the Rust
 crates of each binary, the packages the console bundles — which no scan of the image itself finds. On your workstation, `ssai-stow audit [--version V] [--fail-on high]
 [--json] [--db FILE]` checks those attestations and scans them for known vulnerabilities, printed by
-severity (`--db` gives the scanner's database to a machine that cannot fetch it); `ssai-stow sbom
-export DIR [--version V]` writes the verified SBOMs as files for your own tools. Both read a mirror
+severity, each with the file its package was found in where the SBOM records it; a package found in
+two programs is two findings. `--db` gives the scanner's database to a machine that cannot fetch it.
+`ssai-stow sbom export DIR [--version V]` writes the verified SBOMs as files for your own tools. Both read a mirror
 with `--registry` (and `--registry-ca`), and a mirror export carries the SBOMs and the scanner.
 
 ### Sites without internet

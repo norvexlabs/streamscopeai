@@ -7,6 +7,7 @@
 
 pub mod guard;
 pub mod profiles;
+pub mod protect;
 
 #[cfg(target_os = "linux")]
 mod interposer;
@@ -16,7 +17,11 @@ mod linux;
 mod macos;
 #[cfg(target_os = "linux")]
 mod podman;
+// Windows confines by the account, whose temp folder is its own.
+#[cfg(not(windows))]
 mod scratch;
+#[cfg(any(windows, test))]
+pub mod windows;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod state_dirs;
 
@@ -90,8 +95,9 @@ pub struct LaunchSpec {
     /// proxy vars are added by the native launcher once the guard port is known.
     pub env: Vec<(String, String)>,
     /// CA files to expose read-only inside the sandbox. Read by the Linux
-    /// backend, which adds them to the Landlock ruleset; macOS confines through
-    /// Seatbelt and reaches its CA through the env vars in `env` instead.
+    /// backend, which adds them to the Landlock ruleset, and on Windows, which
+    /// grants them to the sandbox account; macOS confines through Seatbelt and
+    /// reaches its CA through the env vars in `env` instead.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub ca_files: Vec<PathBuf>,
     /// A combined trust bundle (`--ca-file`) for the launch to write and point
@@ -104,6 +110,16 @@ pub struct LaunchSpec {
     /// container's home. The native tiers reach them where they are.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub home_files: Vec<PathBuf>,
+    /// Every file the client was provisioned with, in the project or the
+    /// home. Windows grants the sandbox account each one to read: they are
+    /// written readable by the developer alone (they hold the gateway key),
+    /// so the account's grant on their folder does not reach them.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub client_files: Vec<PathBuf>,
+    /// Windows: the developer accepted a project outside their profile
+    /// (`--allow-outside-profile`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub allow_outside_profile: bool,
 }
 
 /// The trust-store variables a combined bundle answers: the three that
@@ -206,62 +222,55 @@ pub fn select_tier(choice: SandboxChoice) -> Result<Tier> {
             }
         }
         SandboxChoice::Auto => {
-            if native_supported() {
-                Ok(Tier::Native)
-            } else {
-                bail!(
-                    "no usable sandbox on this host — the native sandbox isn't available ({}). \
+            match native_probe() {
+                Ok(()) => Ok(Tier::Native),
+                Err(reason) => bail!(
+                    "no usable sandbox on this host — the native sandbox isn't available ({reason}). \
                      Run on a host with native-sandbox support, or re-run with --sandbox off to \
-                     launch unconfined.",
-                    native_unavailable_reason(),
-                )
+                     launch unconfined."
+                ),
             }
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-fn native_supported() -> bool {
-    linux::confinement_supported()
-}
-#[cfg(target_os = "macos")]
-fn native_supported() -> bool {
-    macos::confinement_supported()
-}
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn native_supported() -> bool {
-    false
-}
-
-/// Backend-specific hint for why the native sandbox didn't probe available. Kept
-/// as a short parenthetical so operators on the wrong platform get actionable
-/// advice, not the Linux-kernel suggestion.
-fn native_unavailable_reason() -> &'static str {
+/// Whether the native sandbox can be enforced on this host, and if not, why:
+/// a short parenthetical naming what is missing, so a developer on the wrong
+/// platform (or without the Windows setup) gets actionable advice.
+fn native_probe() -> std::result::Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        "Linux native confinement needs Landlock filesystem+network confinement — typically \
-         kernel ≥6.7 with the LSM enabled and not blocked by container/seccomp policy"
+        if linux::confinement_supported() {
+            Ok(())
+        } else {
+            Err("Linux native confinement needs Landlock filesystem+network confinement — typically \
+                 kernel ≥6.7 with the LSM enabled and not blocked by container/seccomp policy"
+                .into())
+        }
     }
     #[cfg(target_os = "macos")]
     {
-        "macOS native confinement needs `/usr/bin/sandbox-exec` (Seatbelt), which is normally \
-         shipped by Apple"
+        if macos::confinement_supported() {
+            Ok(())
+        } else {
+            Err("macOS native confinement needs `/usr/bin/sandbox-exec` (Seatbelt), which is normally \
+                 shipped by Apple"
+                .into())
+        }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
     {
-        "the native sandbox is implemented on Linux and macOS only"
+        windows::setup::probe().map(drop)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        Err("the native sandbox is implemented on Linux, macOS and Windows only".into())
     }
 }
 
 fn ensure_native_supported() -> Result<()> {
-    if native_supported() {
-        Ok(())
-    } else {
-        bail!(
-            "--sandbox native requested but this host can't enforce it ({})",
-            native_unavailable_reason(),
-        )
-    }
+    native_probe()
+        .map_err(|reason| anyhow::anyhow!("--sandbox native requested but this host can't enforce it ({reason})"))
 }
 
 /// Parse the proxy origins into `(host, port)` CONNECT targets for the guard.
@@ -291,12 +300,24 @@ fn print_sandbox_banner(spec: &LaunchSpec, tier: Tier) {
             "ssai: sandbox=off — WARNING: {} runs with no filesystem or egress confinement",
             spec.command,
         ),
-        Tier::Native => eprintln!(
-            "ssai: sandbox=native — filesystem confined to {}, egress only to {}{}",
-            spec.project_root.display(),
-            spec.proxy_origins.join(", "),
-            destinations_note(&spec.destinations),
-        ),
+        Tier::Native => {
+            eprintln!(
+                "ssai: sandbox=native — filesystem confined to {}, egress only to {}{}",
+                spec.project_root.display(),
+                spec.proxy_origins.join(", "),
+                destinations_note(&spec.destinations),
+            );
+            // Landlock grants a tree whole: nothing inside the project can be
+            // held read-only (`protect`), which the other backends do.
+            if cfg!(target_os = "linux") {
+                eprintln!(
+                    "ssai: note — on Linux the agent can also change the project's git hooks and config \
+                     (.git/hooks, .git/config — in a linked worktree, its main repository's too) and \
+                     .streamscopeai/; look at them before running git or ssai there outside the sandbox \
+                     (`--sandbox docker` holds them read-only)"
+                );
+            }
+        }
         Tier::Learn => eprintln!(
             "ssai: sandbox=learn — OBSERVE ONLY: filesystem NOT confined (egress still only \
              to {}); recording the paths {} opens to teach your global sandbox profile",
@@ -529,8 +550,14 @@ fn sandbox_env_with(
 /// value is read by two shells — git's, then ssh's for the ProxyCommand — and
 /// ssh expands `%` tokens in it, so the path is single-quoted inside a
 /// double-quoted argument; a path holding a quote, `$`, `\\`, a backtick or
-/// `%` gets none (`None`).
+/// `%` gets none (`None`). On Windows the path is written with forward
+/// slashes, which Git for Windows' shell and ssh read as the same path.
 fn git_ssh_command(exe: &str) -> Option<String> {
+    git_ssh_command_on(exe, cfg!(windows))
+}
+
+fn git_ssh_command_on(exe: &str, windows: bool) -> Option<String> {
+    let exe = if windows { exe.replace('\\', "/") } else { exe.to_string() };
     if exe.chars().any(|c| matches!(c, '\'' | '"' | '$' | '\\' | '`' | '%') || c.is_control()) {
         return None;
     }
@@ -587,14 +614,42 @@ fn exempt_engine_from_proxy(env: &mut Vec<(String, String)>, port: u16) {
     }
 }
 
+/// A command confined by this platform's backend, and the process it
+/// starts: tokio's on Linux and macOS, the sandbox account's launcher on
+/// Windows (the same calls).
+#[cfg(not(windows))]
+type ConfinedCommand = tokio::process::Command;
+#[cfg(not(windows))]
+type ConfinedChild = tokio::process::Child;
+#[cfg(windows)]
+type ConfinedCommand = windows::launch::Command;
+#[cfg(windows)]
+type ConfinedChild = windows::launch::Child;
+
+/// "No stream" for a [`ConfinedCommand`].
+#[cfg(not(windows))]
+fn null_io() -> std::process::Stdio {
+    std::process::Stdio::null()
+}
+#[cfg(windows)]
+fn null_io() -> windows::launch::Io {
+    windows::launch::Io::Null
+}
+
 /// What a confined process of this run is granted beyond the policy built
 /// from its spec: connect to these loopback ports (the guard's, plus an
-/// engine's), and the run's scratch dir (see [`scratch`]).
-#[derive(Debug, Clone)]
+/// engine's), the run's scratch dir (see [`scratch`]), and the project's own
+/// grants and holds ([`protect`]). No `Debug`: on Windows it carries the
+/// account's password.
+#[derive(Clone)]
 struct RunGrants {
     connect: Vec<u16>,
-    #[cfg_attr(not(unix), expect(dead_code, reason = "only the Unix sandbox backends read it"))]
+    #[cfg(not(windows))]
     scratch: PathBuf,
+    project: protect::ProjectGrants,
+    /// Windows: the account the run signs in as.
+    #[cfg(windows)]
+    account: std::sync::Arc<windows::launch::Account>,
 }
 
 /// A private engine for one run of an engine-backed client (see
@@ -665,7 +720,7 @@ impl EnginePlan {
     /// attached to — the agent's tools would run in it, outside the sandbox —
     /// and is asked before the password is sent. A process deliberately racing
     /// for the port is out of this guard's scope.
-    async fn wait_ready(&self, child: &mut tokio::process::Child, log: &std::path::Path) -> Result<()> {
+    async fn wait_ready(&self, child: &mut ConfinedChild, log: &std::path::Path) -> Result<()> {
         use base64::Engine as _;
         let auth = base64::engine::general_purpose::STANDARD
             .encode(format!("{}:{}", self.spec.basic_user, self.secret));
@@ -761,7 +816,7 @@ fn log_tail(log: &std::path::Path) -> String {
 /// period. On Linux the child may be the trampoline's connect() supervisor,
 /// which passes the SIGTERM on to the engine and exits after it (a learn pass
 /// writes its record then).
-async fn stop_engine(child: &mut tokio::process::Child) {
+async fn stop_engine(child: &mut ConfinedChild) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // SAFETY: plain kill(2) on a child we spawned and have not reaped.
@@ -783,9 +838,45 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     // engine) builds a policy that grants them.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     state_dirs::prepare_state_dirs(&spec)?;
+    // Windows: the sandbox account, checked; the run adjusted for it; the
+    // account granted this project and what the client needs.
+    #[cfg(windows)]
+    let (account_sid, owner_sid, account, project) = {
+        let ready = windows::setup::probe().map_err(anyhow::Error::msg)?;
+        // Written before `prepare`, which grants the account every CA file.
+        if let Some(pem) = spec.ca_bundle.take() {
+            let path = windows::run::shared_ca_bundle(&pem)?;
+            point_at_ca_bundle(&mut spec, &path);
+        }
+        let dirs = windows::run::prepare(&mut spec)?;
+        let project = windows::run::grant(&spec, &ready.record.account_sid, &dirs)?;
+        let account = windows::launch::Account {
+            name: ready.record.account,
+            sid: ready.record.account_sid.clone(),
+            password: ready.password,
+        };
+        (ready.record.account_sid, ready.record.owner_sid, std::sync::Arc::new(account), project)
+    };
+    // Windows: what the account left running or scheduled (a run killed
+    // before its own cleanup) is ended before this one starts — only when no
+    // other run of the developer's is live, since it ends every process of
+    // the account.
+    #[cfg(windows)]
+    let hold = {
+        let (hold, alone) = windows::leftovers::RunHold::open(&crate::state::config_dir()?.join("sandbox-run.lock"))
+            .context("open the sandbox's run lock")?;
+        if alone {
+            windows::leftovers::end(account.clone(), account_sid.clone(), "before the run").await;
+        }
+        tokio::task::block_in_place(|| hold.share(alone)).context("hold the sandbox's run lock")?;
+        hold
+    };
     // The run's private temp dir, shared by all its confined commands and
-    // removed when this function returns, however it returns.
+    // removed when this function returns, however it returns. Windows needs
+    // none: the account's own temp folder is no one else's.
+    #[cfg(not(windows))]
     let scratch = scratch::ScratchDir::create()?;
+    #[cfg(not(windows))]
     if let Some(pem) = spec.ca_bundle.take() {
         let path = scratch.write_ca_bundle(&pem)?;
         point_at_ca_bundle(&mut spec, &path);
@@ -794,7 +885,11 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
         gateway: allow_targets(&spec.proxy_origins)?,
         destinations: spec.destinations.clone(),
     };
+    #[cfg(not(windows))]
     let guard = guard::start(egress, verbose).await?;
+    // Windows: only the sandbox account's processes may use the guard.
+    #[cfg(windows)]
+    let guard = guard::start_for_account(egress, verbose, account_sid.clone()).await?;
     // This process must outlive the client to stop the engine and whatever
     // else the run left behind, so until the client exits it takes SIGINT /
     // SIGTERM / SIGHUP instead of dying of them (`wait_client`). SIGTERM and
@@ -804,7 +899,24 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     #[cfg(unix)]
     let mut signals = RunSignals::take()?;
     let mut env = sandbox_env(&spec, guard.port, &|k| inherited_value(&spec.cwd, k));
-    let mut grants = RunGrants { connect: vec![guard.port], scratch: scratch.path().to_path_buf() };
+    // (On Windows, resolved and prepared by the grant above.)
+    #[cfg(not(windows))]
+    let project = {
+        let project = protect::resolve(&spec.project_root);
+        // Landlock holds nothing inside the project: the empty folders that
+        // `prepare` makes to be held would serve no purpose on Linux.
+        #[cfg(target_os = "macos")]
+        project.prepare().context("prepare the project's protected git folders")?;
+        project
+    };
+    let mut grants = RunGrants {
+        connect: vec![guard.port],
+        #[cfg(not(windows))]
+        scratch: scratch.path().to_path_buf(),
+        project,
+        #[cfg(windows)]
+        account,
+    };
 
     #[cfg(target_os = "linux")]
     linux::become_child_subreaper();
@@ -831,6 +943,7 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     // write, execute), so a runtime that extracts a native library and loads
     // it — Bun, for OpenCode's TUI — never writes outside the grant. Last, so
     // nothing appended to `env` above can override it.
+    #[cfg(not(windows))]
     scratch.pin_env(&mut env);
 
     // Everything that can fail is built before the engine starts, so once it
@@ -842,7 +955,7 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
             confined_command(&spec, &grants, records.next(learn, "version"), &["--version".to_string()], &env)?;
         let (log, file) = private_log_file()?;
         let mut cmd = confined_command(&spec, &grants, records.next(learn, "engine"), &plan.serve_args(), &env)?;
-        cmd.stdin(std::process::Stdio::null())
+        cmd.stdin(null_io())
             .stdout(file.try_clone()?)
             .stderr(file)
             .kill_on_drop(true);
@@ -882,6 +995,8 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
             signals.restore_defaults();
             stop_engine(&mut child).await;
             reap_leftovers().await;
+            #[cfg(windows)]
+            windows_after_run(&spec, &grants, &account_sid, &owner_sid, &hold).await;
             // The log stays only where the error points the user at it — and,
             // like a failed run's, only among the newest few kept.
             if !format!("{e:#}").contains(&log.display().to_string()) {
@@ -929,6 +1044,8 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
         }
     }
     reap_leftovers().await;
+    #[cfg(windows)]
+    windows_after_run(&spec, &grants, &account_sid, &owner_sid, &hold).await;
     #[cfg(target_os = "linux")]
     records.apply(&spec, &scratch);
 
@@ -943,6 +1060,34 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     }
 
     Ok(status?.code().unwrap_or(1))
+}
+
+/// Windows, once the run's processes are gone, and only when no other run of
+/// the developer's is live: what the account left running or scheduled is
+/// ended, then what the agent created or replaced is the developer's again
+/// (a run killed before this, or one that ended beside another, leaves its
+/// files to the sweep of the next run that ends alone).
+#[cfg(windows)]
+async fn windows_after_run(
+    spec: &LaunchSpec,
+    grants: &RunGrants,
+    account_sid: &str,
+    owner_sid: &str,
+    hold: &windows::leftovers::RunHold,
+) {
+    // While another run is live its agent is still writing: both wait for
+    // the last run to end.
+    if !hold.last() {
+        return;
+    }
+    windows::leftovers::end(grants.account.clone(), account_sid.to_string(), "after the run").await;
+    tokio::task::block_in_place(|| {
+        for dir in std::iter::once(&spec.project_root).chain(&grants.project.extra_rw) {
+            if let Err(e) = windows::sweep::reown_reporting(dir, account_sid, owner_sid) {
+                crate::ui::warn("", format_args!("could not give the project's files back to you: {e:#}"));
+            }
+        }
+    });
 }
 
 /// Whether a client's exit was the user stopping it — Ctrl-C (exit 130, or
@@ -1221,10 +1366,14 @@ fn confined_command(
     record: Option<PathBuf>,
     args: &[String],
     env: &[(String, String)],
-) -> Result<tokio::process::Command> {
+) -> Result<ConfinedCommand> {
     #[cfg(target_os = "linux")]
     {
         let mut policy = linux::build_policy(spec, &grants.scratch)?;
+        // A linked worktree's git dirs, outside the project. Landlock cannot
+        // hold anything inside a granted tree, so `grants.project.protected`
+        // stays writable here: the banner names it.
+        policy.fs_rw.extend(grants.project.extra_rw.iter().cloned());
         policy.net_connect = grants.connect.clone();
         policy.learn_record = record;
         let json = serde_json::to_string(&policy)?;
@@ -1244,12 +1393,24 @@ fn confined_command(
     #[cfg(target_os = "macos")]
     {
         let _ = record;
-        macos::command(spec, &grants.connect, &grants.scratch, args, env)
+        macos::command(spec, &grants.connect, &grants.scratch, &grants.project, args, env)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        // Windows confines by the account, its access entries and its
+        // firewall rule, all set before the launch: nothing per command.
+        let _ = record;
+        let mut cmd = windows::launch::Command::new(grants.account.clone(), &spec.command);
+        cmd.args(args.iter().cloned()).current_dir(&spec.cwd);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        Ok(cmd)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (spec, grants, record, args, env);
-        bail!("the native sandbox is only implemented on Linux and macOS")
+        bail!("the native sandbox is only implemented on Linux, macOS and Windows")
     }
 }
 
@@ -1262,11 +1423,11 @@ fn confined_command(
 async fn check_client_version(
     command: &str,
     engine: &profiles::EngineSpec,
-    mut probe: tokio::process::Command,
+    mut probe: ConfinedCommand,
 ) -> Result<()> {
     let probe = probe
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(null_io())
+        .stderr(null_io())
         .kill_on_drop(true)
         .output();
     let Ok(Ok(out)) = tokio::time::timeout(std::time::Duration::from_secs(10), probe).await else {
@@ -1339,6 +1500,8 @@ mod tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
+            client_files: vec![],
+            allow_outside_profile: false,
         }
     }
 
@@ -1359,6 +1522,8 @@ mod tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
+            client_files: vec![],
+            allow_outside_profile: false,
         };
         point_at_ca_bundle(&mut spec, Path::new("/root/run.pem"));
         // `Command::env` keeps the last value of a key.
@@ -1441,9 +1606,9 @@ mod tests {
         });
         assert!(last(&inherited, "JAVA_TOOL_OPTIONS").unwrap().starts_with("-Djavax.net.ssl.trustStore=/corp.jks -D"));
 
-        // The running test binary's path names the command: on Windows (no
-        // sandbox launch) it holds a `\\`, which gets none.
-        if cfg!(unix) {
+        // The running test binary's path names the command (on Windows with
+        // forward slashes).
+        {
             let ssh = last(&env, "GIT_SSH_COMMAND").unwrap().to_string();
             assert!(ssh.starts_with("ssh -o ProxyCommand=\"'") && ssh.ends_with("' __connect %h %p\""), "{ssh}");
         }
@@ -1455,6 +1620,13 @@ mod tests {
         for bad in ["/o'q/ssai", "/a\"b/ssai", "/$HOME/ssai", "/a`b`/ssai", "/100%/ssai"] {
             assert_eq!(git_ssh_command(bad), None, "{bad}");
         }
+        // A Windows path is routed, written with forward slashes; elsewhere a
+        // backslash still gets none.
+        assert_eq!(
+            git_ssh_command_on(r"C:\Users\me\ssai\ssai.exe", true).as_deref(),
+            Some("ssh -o ProxyCommand=\"'C:/Users/me/ssai/ssai.exe' __connect %h %p\"")
+        );
+        assert_eq!(git_ssh_command_on(r"C:\Users\me\ssai.exe", false), None);
         // The user's own ssh setting, passed or inherited, is left as it is.
         let passed = sandbox_env(&spec_env(&[("GIT_SSH_COMMAND", "ssh -i key")]), 4242, &none);
         assert_eq!(last(&passed, "GIT_SSH_COMMAND"), Some("ssh -i key"));

@@ -1875,7 +1875,11 @@ backend: it is served on every tenant, through the same destination lists and SS
 is served once a search backend is configured — choosing no backend removes it again — and the
 server's description to clients names only the tools it serves. To keep a workspace's agents off the web entirely, don't grant it the
 `web` virtual server — and don't enable a web-fetch substitution rule for it, which serves
-`web_fetch` through the gateway without that grant. A call the gateway runs for such a rule is first
+`web_fetch` through the gateway without that grant. **Substitution rules** (built-in tool rules,
+off until you turn one on) replace a web tool the model is offered with the gateway's own: a
+provider's server-side web search (Anthropic's, OpenAI Responses'), or the web fetch or
+search tool of Claude Code, OpenCode, Gemini CLI or Continue. The model calls the tool it knows, and
+the gateway runs it through this tab's destination lists, the SSRF guard and the guardrail. A call the gateway runs for such a rule is first
 decided by your tool-call rules, as a call your users' client receives is: a rewrite changes what
 is fetched, and a blocked call is never fetched — the model is told it was blocked, and the
 request's audit shows the blocked call. The Claude Code rule also covers a WebFetch that Claude Code
@@ -2463,7 +2467,8 @@ profile, the **Default**; per-workspace profiles are not offered yet):
   (GitLab.com, Debian and Alpine packages, Microsoft and Quay registries, Kubernetes, Dev Container
   features) are yours to attach. Add your own internal services (registry, git server, artifact mirror) as a list of
   your own and attach it beside them. **Require the sandbox** refuses `ssai run --sandbox off` and `--sandbox learn`
-  (which leaves the filesystem unconfined). **Allow the container sandbox** (on by default) lets developers
+  (which leaves the filesystem unconfined); on Windows the developer first runs `ssai sandbox setup` once
+  (see *The Windows sandbox* under [Set up tools with the `ssai` CLI](#set-up-tools-with-the-ssai-cli)). **Allow the container sandbox** (on by default) lets developers
   run `ssai run --sandbox docker`, which starts the agent in a container on their Linux machine; turned
   off, that run is refused and names `--sandbox native`. `ssai` enforces these on the developer's machine: a guard against an agent's mistakes and
   injected instructions, not against a developer who edits their own machine. Traffic to an allowed
@@ -2569,10 +2574,10 @@ On Windows the CLI keeps its own state in `%LOCALAPPDATA%\streamscopeai\config\`
 roaming profile a domain copies to its server), readable by your account
 alone, and writes each tool's configuration where that tool reads it on Windows: in your profile
 folder for most (`%USERPROFILE%\.claude`, `.codex`, `.gemini`, `.config\opencode`, …), and under
-`%APPDATA%` for Goose, Zed, VS Code (Cline) and Claude Desktop. The sandbox described below is not
-available on Windows: launch a provisioned tool with `ssai run --sandbox off <client>`, or start
-it as usual. (`--ca-file` there gives the client, for that run, the roots Windows trusts plus the
-file's — it changes nothing in Windows' own trust.)
+`%APPDATA%` for Goose, Zed, VS Code (Cline) and Claude Desktop. The sandbox described below runs on
+Windows through a dedicated sandbox account, set up once by an administrator (**The Windows
+sandbox**, below). (`--ca-file` there gives the client, for that run, the roots Windows trusts plus
+the file's — it changes nothing in Windows' own trust.)
 
 If your gateway uses a private or self-signed certificate, the installer detects that the
 certificate isn't trusted, captures the gateway's CA, and prints its SHA-256 fingerprint before
@@ -2603,7 +2608,10 @@ with a private certificate authority needs its root in Windows' trusted roots be
 `https://<portal-host>/api/v1/cli/ca` with **certmgr.msc → Trusted Root Certification Authorities**,
 after checking its fingerprint with the gateway's operator). The installer stops with that advice when
 the certificate is not trusted. The `ssai` command trusts what Windows trusts. The Node-based AI CLIs
-do not read the Windows store: point them at the root with `setx NODE_EXTRA_CA_CERTS <root file>`.
+do not read the Windows store: point them at the root with `setx NODE_EXTRA_CA_CERTS <root file>`
+(a sandboxed run carries it when it sets no trust of its own — with `--ca-file`, or a gateway
+certificate the CLI captured, the run's own bundle is used instead — and gives the sandbox account
+the file to read when it is in your profile).
 The installer uses Windows' proxy settings, signing in to a proxy with your Windows account.
 
 `login` sends you through the same sign-in the portal uses (password or SSO) plus a one-click
@@ -2843,9 +2851,30 @@ connection (`psql`, `redis-cli`) is not carried. A client your administrator has
 refused, and so are `--sandbox off` and `--sandbox learn` when the administrator requires the
 sandbox. The sandbox is **fail-closed**: if the machine can't enforce it, `run` refuses rather than
 launch the tool unconfined — use `--sandbox off` to opt out deliberately. This works on Linux and
-WSL2 (the network confinement needs a Linux kernel 6.7 or newer) and on macOS (Apple Silicon, via
-the system's built-in Seatbelt); on Windows there is none, and `run` refuses unless you
-pass `--sandbox off`. (`run` only launches already-provisioned tools; provision the project first.)
+WSL2 (the network confinement needs a Linux kernel 6.7 or newer), on macOS (Apple Silicon, via
+the system's built-in Seatbelt) and on Windows (a dedicated sandbox account, below). (`run` only
+launches already-provisioned tools; provision the project first.)
+
+The project's git hooks and configuration (`.git/hooks`, `.git/config`, a worktree's or a
+submodule's links and configuration, a hooks folder `core.hooksPath` names) and its
+`.streamscopeai/` folder are read-only to the agent, and `.git` (with its worktrees' and submodules'
+git folders) cannot be renamed — so an agent cannot change the hooks and settings that will run
+later, outside the sandbox, when you use git there. A
+linked worktree's own git folder, which lives in its main repository outside the project, is
+granted, so the agent can commit from the worktree. Git commands that write the repository's
+configuration then fail inside the sandbox — `git push -u` (after the push itself succeeds), a new
+branch that tracks a remote, `git remote add`, `git submodule add`, `git config`: run those yourself.
+This holds on macOS, on Windows and in the
+container sandbox. **On Linux the native sandbox cannot hold them** (it grants a folder whole), and
+`run` says so when it starts: look at them before you run git or `ssai` there outside the sandbox,
+or use `--sandbox docker`. What is held is what exists when the run starts and what git reads
+there. Not held: git files the agent creates where there were none (a repository in a project that
+had none; a link file git follows, except on macOS, which holds those too), a hooks folder that is a
+link or is reached through one, a hooks folder only your
+global git configuration names, a file the project's git configuration includes from the work tree,
+and the tools' own settings that can run commands (a project's `.claude/settings.json` hooks, for
+one). The sandbox guards against an agent's mistakes and the instructions injected into it, not
+against an agent built to get out.
 
 OpenCode 2 runs the agent's tools in a separate background server. Under `ssai run`,
 each run gets its own private OpenCode server inside the same sandbox, used only by that run and
@@ -2868,6 +2897,72 @@ command, for instance — is stopped when the tool exits (not with `--sandbox of
 from a script or another terminal, send `ssai run` SIGTERM: it passes the signal on to the
 tool and cleans up after it. Ctrl-C at the terminal reaches the tool directly, as without
 `ssai run`.
+
+**The Windows sandbox.** On Windows the agent runs as a dedicated local account of yours,
+`ssai-sbx-<six hex digits>`: a standard user (never an administrator), hidden from the sign-in
+screen, which owns nothing of yours and so reads nothing in your profile but what a run grants it
+(below), and whose every
+connection except to this computer is blocked by a Windows Firewall rule — the run's guard, on this
+computer, lets it reach only the gateway and the destinations your administrator allows, and serves
+only programs running as the sandbox account. Set it up
+once with `ssai sandbox setup`, which asks for administrator rights (one UAC prompt; a standard
+user enters an administrator's credentials). `ssai sandbox setup --check` checks the account, its
+firewall rule and that the firewall is on for every network profile, and changes nothing; running
+`ssai sandbox setup` again repairs what is missing or changed;
+`ssai run --sandbox native` refuses to start while any of it is missing or changed, and names the
+command. The account's password is generated by setup and kept for your account with Windows data
+protection, which needs a sign-in with your password: from an SSH session signed in with a key,
+`run` cannot read it and says so — sign in at the desktop, over Remote Desktop, or over SSH with
+your password. `ssai sandbox uninstall` removes the account, its profile and its firewall rule,
+after taking back every grant.
+
+The first run in a project grants the sandbox account that folder (read, write, run, delete —
+never its access settings), the tool's configuration folder among your folders
+(`%USERPROFILE%\.claude` for Claude Code, `.codex` for Codex, `.gemini` for Gemini CLI,
+`%APPDATA%\Block\goose` for Goose; or the one you name with `--env CLAUDE_CONFIG_DIR=…`,
+`CODEX_HOME=…`, `GEMINI_CLI_HOME=…` — the folder holding `.gemini` — or `GOOSE_PATH_ROOT=…`; the
+agent reads and writes all of that folder, the tool's own sign-ins and history in it included —
+Claude Code keeps its user-scope settings there too, so an MCP server added with
+`claude mcp add --scope user` outside the sandbox is not seen in it), read-and-run on the folders of `ssai` and of the tool, and read on the gateway's
+certificate files — each of those inside your profile (elsewhere every account may read them
+already) — and read, never write, on each file `provision` wrote for the tool (its configuration,
+which holds its gateway key and is otherwise readable by you alone), inside your profile or the
+project, and read on a file an `--env` value names — and keeps the git and `.streamscopeai\` holds described above. Git, which refuses a
+repository another account owns, trusts the project for the run without a change to your git
+configuration; Claude Code starts past its first-run screen. The grants stay between runs (granting a large project again each time would cost seconds), so
+while one project runs, the sandbox account can also write every project it was granted before:
+`ssai sandbox revoke [<folder>]` takes one project's back, and
+`--all` every one (revoking a project that holds another granted project inside it takes that
+folder's entries back too; the inner project's next run grants them again). A folder in the project
+with an access list of its own (one that inherits nothing) is named on the first run: the sandbox
+cannot write there. `run` refuses a drive's root,
+your profile folder and any folder above it, and a project outside your profile: a folder made
+directly on a drive inherits a setting that lets every account on the computer write it, the
+sandbox's included, whatever it is granted — move the project into your profile, or pass
+`--allow-outside-profile` to run there anyway (it warns on every run; there, the agent can also
+change who may open the files it creates, and giving them back to you may need an administrator). Files the agent creates in the
+project are given back to you when a run ends with no other run of yours still going (otherwise
+by the next one that does), so you remain their owner. The tool runs with the
+account's own profile and temporary folder: its history and caches stay there, apart from yours,
+except for the configuration folder above. Codex's own sandbox is turned off inside it (it cannot
+run under another account; the sandbox account confines Codex instead). Every process of the run
+ends with it, and whatever the agent scheduled to run later as the account, or left running outside
+the run, is removed when the run ends and before the next one starts — while you have another
+sandboxed run open, this waits until the last one ends, so one run never stops another. The
+Windows sandbox runs the command-line agents — Claude Code, Codex, Gemini CLI, OpenCode and Goose,
+with their terminal interfaces — not OpenCode's desktop app.
+
+What it does not hold, as on the other systems: name lookups (DNS) still resolve, a channel an
+agent could use to leak data in small amounts; the agent can write where every account on the
+computer may (`C:\Users\Public`, `C:\ProgramData`, `C:\Windows\Temp`, a new folder at a drive's root);
+a connection to one of this computer's own network addresses counts as local and is not blocked; a
+window the agent opens shares your desktop (its keyboard, clipboard and screen); Windows Credential
+Manager is per account, so a tool that keeps its login there does not find it (a provisioned tool
+uses the gateway key in its configuration, which the sandbox account may read but not change); and `--sandbox learn` is not available. Windows checks
+whether a server's certificate was revoked, and tools using Windows' own TLS (git, `curl.exe`,
+.NET) fail when that check cannot reach its servers: if your administrator allows an internal HTTPS
+host (a git server, a registry), the destination list must also allow the hosts its certificate
+authority publishes revocation lists on.
 
 **The container sandbox (Linux).** `ssai run --sandbox docker <tool>` runs the agent in a container
 built from your project's own image instead of on your machine — for a project whose toolchain lives in

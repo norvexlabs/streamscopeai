@@ -8,7 +8,7 @@ name: streamscopeai                       # repositories streamscopeai-<key>
 short_name: ssai                          # the installer ssai-stow
 
 stowage:
-  requires: ">=0.14 <1"                   # exact runtime pinned in stowage.lock
+  requires: ">=0.26 <1"                   # exact runtime pinned in stowage.lock
 
 version:
   source: { provider: changelog, file: CHANGELOG.md }
@@ -38,6 +38,8 @@ images:
   admin-ui:   { context: ., dockerfile: admin-ui/Dockerfile }
   provision:  { context: ., dockerfile: deploy/docker/Dockerfile.provision, inputs: [deploy/docker/Dockerfile.provision, deploy/docker/provision.sh, LICENSE, NOTICE] }
   postgres:   { ref: "postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5" }
+
+audit: { fail_on: high, fixable_only: true, allow: audit-allow.yaml }
 
 stack:
   compose: deploy/docker/compose.yaml
@@ -212,7 +214,7 @@ shapes:
     # from the postgres image, through the admin-api pod's migration URL.
     schema: { url_env: MIGRATION_DATABASE_URL, image: postgres }
   kairos:
-    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944
+    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
     kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556
     disk_formats: [raw, qcow2, ova, vhd, gce]
     cloud_publish: [aws, azure, gcp]

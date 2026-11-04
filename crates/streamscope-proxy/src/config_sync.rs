@@ -1530,14 +1530,32 @@ pub(crate) mod tests {
             }
         });
 
+        // The changes start once the reader is reading, and stop is set only once
+        // a whole sweep began after they did (the sweep in progress when they
+        // start may finish on the old version): on a loaded host the other
+        // worker can otherwise pick the reader up after the last change. Each
+        // wait is bounded and fails if the reader has ended.
+        let read_past = |n: usize| {
+            let (reads, reader) = (&reads, &reader);
+            async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while reads.load(Ordering::Relaxed) <= n {
+                    assert!(!reader.is_finished(), "the reader ended before it read");
+                    assert!(std::time::Instant::now() < deadline, "the reader never read");
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        read_past(0).await;
+        let before = reads.load(Ordering::Relaxed);
         for version in 1..=40 {
             apply_incremental_update(&registry, &update(version));
             tokio::task::yield_now().await;
         }
+        read_past(before + 1).await;
         stop.store(true, Ordering::Relaxed);
         reader.await.expect("reader task");
 
-        assert!(reads.load(Ordering::Relaxed) > 0, "the reader must have observed the changes");
         assert_eq!(*mixed.lock().unwrap(), Vec::<String>::new(), "a request met a key and a config of different versions");
         let current = registry.load();
         assert!(streamscope_core::auth::authenticate_proxy("sk-fresh", &current).is_ok(), "the added key is live");

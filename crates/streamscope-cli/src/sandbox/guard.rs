@@ -63,8 +63,43 @@ impl Guard {
     }
 }
 
+/// Decides whether the guard serves a loopback connection, from the guard's
+/// own address and the peer's: blocking (it may read system tables), run off
+/// the accept loop. `false` is answered 403.
+type PeerCheck = Arc<dyn Fn(SocketAddr, SocketAddr) -> bool + Send + Sync>;
+
 /// Bind the guard on `127.0.0.1:<ephemeral>` and start accepting.
+#[cfg_attr(windows, allow(dead_code, reason = "Windows starts the account's guard, `start_for_account`"))]
 pub async fn start(policy: EgressPolicy, verbose: bool) -> Result<Guard> {
+    listen(policy, verbose, None).await
+}
+
+/// [`start`], serving only connections opened by a process of the account
+/// `account_sid` — the Windows sandbox account: the client, its engine and
+/// every tool they start run as it, and nothing else needs the guard. A
+/// connection whose process or account cannot be found is refused.
+#[cfg(windows)]
+pub async fn start_for_account(policy: EgressPolicy, verbose: bool, account_sid: String) -> Result<Guard> {
+    let check: PeerCheck = Arc::new(move |guard, peer| {
+        let found = match (guard, peer) {
+            (SocketAddr::V4(guard), SocketAddr::V4(peer)) => super::windows::peer::opener_sid(guard, peer),
+            _ => Err(anyhow::anyhow!("not an IPv4 connection")),
+        };
+        match found {
+            Ok(sid) if sid == account_sid => true,
+            other => {
+                if verbose {
+                    let who = other.unwrap_or_else(|e| format!("unknown: {e:#}"));
+                    eprintln!("ssai: guard refused a connection from {peer} (account {who})");
+                }
+                false
+            }
+        }
+    });
+    listen(policy, verbose, Some(check)).await
+}
+
+async fn listen(policy: EgressPolicy, verbose: bool, check: Option<PeerCheck>) -> Result<Guard> {
     let listener = TcpListener::bind("127.0.0.1:0").await.context("bind egress guard on loopback")?;
     let port = listener.local_addr()?.port();
     let policy = Arc::new(policy);
@@ -72,22 +107,51 @@ pub async fn start(policy: EgressPolicy, verbose: bool) -> Result<Guard> {
     let task = {
         let refused = refused.clone();
         tokio::spawn(async move {
-            while let Ok((mut sock, peer)) = listener.accept().await {
+            while let Ok((sock, peer)) = listener.accept().await {
                 // The guard binds 127.0.0.1, so only local processes can reach
-                // it. (Per-uid peer authentication isn't possible here —
-                // SO_PEERCRED is Unix-socket-only — so on a shared host another
-                // local user's process could also use the guard; a residual
-                // noted in the design. Reject anything not from loopback as a
-                // belt-and-suspenders check.)
+                // it. Without a peer check, any local process may use it —
+                // another local user's included (SO_PEERCRED is
+                // Unix-socket-only), a residual noted in the design. Anything
+                // not from loopback is refused as a belt-and-suspenders check.
                 if !peer.ip().is_loopback() {
-                    let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+                    tokio::spawn(refuse(sock));
                     continue;
                 }
-                serve_detached(sock, policy.clone(), refused.clone(), verbose);
+                let Some(check) = check.clone() else {
+                    serve_detached(sock, policy.clone(), refused.clone(), verbose);
+                    continue;
+                };
+                let (policy, refused) = (policy.clone(), refused.clone());
+                tokio::spawn(async move {
+                    let admitted = match sock.local_addr() {
+                        Ok(own) => tokio::task::spawn_blocking(move || check(own, peer)).await.unwrap_or(false),
+                        Err(_) => false,
+                    };
+                    if admitted {
+                        serve_detached(sock, policy, refused, verbose);
+                    } else {
+                        refuse(sock).await;
+                    }
+                });
             }
         })
     };
     Ok(Guard { port, refused, _task: task })
+}
+
+/// Answer 403 to a connection whose request was not read, and close it
+/// without a reset: closed with its request unread, Windows resets the
+/// connection, and the peer may lose the answer before reading it. So the
+/// write side is shut, then what the peer sent is drained (for a while) until
+/// it closes.
+async fn refuse(mut sock: TcpStream) {
+    let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+    let _ = sock.shutdown().await;
+    let mut sink = [0u8; 1024];
+    let drain = async {
+        while matches!(sock.read(&mut sink).await, Ok(n) if n > 0) {}
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
 }
 
 /// The peers a socket guard admits, by the uid the kernel reports for the
@@ -701,6 +765,71 @@ mod tests {
         let refused = ask(format!("127.0.0.1:{}", up_port.wrapping_add(1))).await;
         assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
         assert_eq!(guard.refused(), vec![format!("127.0.0.1:{}", up_port.wrapping_add(1))]);
+    }
+
+    /// A guard with a peer check: CONNECT to a target that answers "hello",
+    /// through a guard started by `start_guard`.
+    async fn ask_through<F, Fut>(start_guard: F) -> String
+    where
+        F: FnOnce(EgressPolicy) -> Fut,
+        Fut: std::future::Future<Output = Guard>,
+    {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = upstream.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = upstream.accept().await {
+                let _ = s.write_all(b"hello").await;
+            }
+        });
+        let policy = EgressPolicy {
+            gateway: vec![],
+            destinations: Policy {
+                allow: DestinationSet::parse(&[format!("127.0.0.1:{up_port}")]).unwrap(),
+                block: DestinationSet::default(),
+            },
+        };
+        let guard = start_guard(policy).await;
+        let mut s = TcpStream::connect(("127.0.0.1", guard.port)).await.unwrap();
+        s.write_all(format!("CONNECT 127.0.0.1:{up_port} HTTP/1.1\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), s.read_to_end(&mut out)).await;
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[tokio::test]
+    async fn a_peer_check_decides_with_both_ends_of_the_connection() {
+        let seen: Arc<Mutex<Vec<(SocketAddr, SocketAddr)>>> = Arc::default();
+        let log = seen.clone();
+        let served = ask_through(|p| async move {
+            let check: PeerCheck = Arc::new(move |own, peer| {
+                log.lock().unwrap().push((own, peer));
+                true
+            });
+            listen(p, false, Some(check)).await.unwrap()
+        })
+        .await;
+        assert!(served.starts_with("HTTP/1.1 200") && served.ends_with("hello"), "{served}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let (own, peer) = seen[0];
+        assert!(own.ip().is_loopback() && peer.ip().is_loopback() && own != peer, "{own} {peer}");
+
+        let refused = ask_through(|p| async move { listen(p, false, Some(Arc::new(|_, _| false))).await.unwrap() }).await;
+        assert!(refused.starts_with("HTTP/1.1 403") && !refused.contains("hello"), "{refused}");
+    }
+
+    /// Positive control: a guard for this process's own account serves it;
+    /// one for another account refuses it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn an_account_guard_serves_its_account_and_refuses_another() {
+        let me = crate::win_acl::current_user_sid().unwrap();
+        let served = ask_through(|p| async move { start_for_account(p, false, me).await.unwrap() }).await;
+        assert!(served.starts_with("HTTP/1.1 200") && served.ends_with("hello"), "{served}");
+        // LocalSystem: never this test's account.
+        let other = "S-1-5-18".to_string();
+        let refused = ask_through(|p| async move { start_for_account(p, false, other).await.unwrap() }).await;
+        assert!(refused.starts_with("HTTP/1.1 403") && !refused.contains("hello"), "{refused}");
     }
 
     #[cfg(target_os = "linux")]

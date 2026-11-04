@@ -37,3 +37,6 @@ docs/
 # holds a local CA's private root (root-owned 0600).
 .backup-recipient*.key
 **/caddy-local-pki/
+
+# The audit gate's allowances: read by stowage ship only, never an image input.
+audit-allow.yaml

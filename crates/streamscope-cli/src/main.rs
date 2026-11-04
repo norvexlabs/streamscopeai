@@ -153,7 +153,8 @@ enum Command {
     /// egress allowed only to the gateway proxy. Requires the current dir to be
     /// provisioned (run `ssai provision` first).
     Run(commands::run::RunArgs),
-    /// Manage the docker sandbox's images and volumes (`ssai run --sandbox docker`).
+    /// Set up the Windows sandbox account; manage the docker sandbox's images
+    /// and volumes (`ssai run --sandbox docker`).
     #[command(subcommand)]
     Sandbox(commands::sandbox::SandboxCommand),
     /// PID 1 of a docker-sandbox container. Not for direct use.
@@ -170,6 +171,20 @@ enum Command {
         container_root_uid: Option<u32>,
         #[arg(long)]
         container_root_gid: Option<u32>,
+    },
+    /// The elevated half of `ssai sandbox setup` on Windows: do the request
+    /// in `request` and answer beside it. Not for direct use.
+    #[command(name = "__sandbox-setup", hide = true)]
+    SandboxSetup { request: std::path::PathBuf },
+    /// Windows: the process a sandboxed run starts as the sandbox account,
+    /// which starts the client (`<mode>`: `console:<cols>x<rows>` or `pipes`),
+    /// or, in mode `cleanup`, ends what the account left. Not for direct use.
+    #[command(name = "__sandbox-host", hide = true)]
+    SandboxHost {
+        mode: String,
+        /// The client program (an absolute path) + args, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        command: Vec<String>,
     },
     /// Tunnel stdin/stdout to `host:port` through the sandbox guard — the
     /// `ssh` ProxyCommand inside `ssai run`.
@@ -212,6 +227,30 @@ fn main() {
         Command::SandboxSweep { root, container_root_uid, container_root_gid } => {
             finish(sandbox::podman_sweep(root, *container_root_uid, *container_root_gid))
         }
+        #[cfg(windows)]
+        Command::SandboxSetup { request } => finish(sandbox::windows::setup::helper(request)),
+        #[cfg(not(windows))]
+        Command::SandboxSetup { .. } => finish(Err(anyhow::Error::msg("__sandbox-setup runs on Windows only"))),
+        // The cleanup mode: as the account, end what it left (its one
+        // argument is the account's SID, checked against its own).
+        #[cfg(windows)]
+        Command::SandboxHost { mode, command } if mode == "cleanup" => match command.as_slice() {
+            [sid] => match sandbox::windows::leftovers::host_main(sid) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => finish(Err(e)),
+            },
+            _ => finish(Err(anyhow::Error::msg("__sandbox-host cleanup: give the account's SID"))),
+        },
+        #[cfg(windows)]
+        Command::SandboxHost { mode, command } => match command.split_first() {
+            Some((program, args)) => match sandbox::windows::host::main(mode, program, args) {
+                Ok(code) => std::process::exit(code),
+                Err(e) => finish(Err(e)),
+            },
+            None => finish(Err(anyhow::Error::msg("__sandbox-host: no command given"))),
+        },
+        #[cfg(not(windows))]
+        Command::SandboxHost { .. } => finish(Err(anyhow::Error::msg("__sandbox-host runs on Windows only"))),
         _ => {}
     }
 
@@ -223,8 +262,8 @@ fn main() {
     finish(result);
 }
 
-/// Run an async subcommand. `RunConfined`, `SandboxInit` and `SandboxSweep`
-/// are handled in `main` before the runtime starts, so they never reach here.
+/// Run an async subcommand. `RunConfined`, `SandboxInit`, `SandboxSweep`,
+/// `SandboxSetup` and `SandboxHost` are handled in `main` before the runtime starts, so they never reach here.
 async fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Login {
@@ -257,7 +296,11 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Run(args) => commands::run::run(args).await,
         Command::Sandbox(command) => commands::sandbox::run(command).await,
         Command::Connect { host, port } => sandbox::guard::connect_through(&host, port).await,
-        Command::RunConfined { .. } | Command::SandboxInit { .. } | Command::SandboxSweep { .. } => {
+        Command::RunConfined { .. }
+        | Command::SandboxInit { .. }
+        | Command::SandboxSweep { .. }
+        | Command::SandboxSetup { .. }
+        | Command::SandboxHost { .. } => {
             unreachable!("handled in main before the runtime starts")
         }
     }

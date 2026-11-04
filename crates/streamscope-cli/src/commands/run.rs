@@ -46,6 +46,11 @@ pub struct RunArgs {
     /// entry is also exposed read-only inside the sandbox.
     #[arg(long = "env", short = 'e')]
     pub env: Vec<String>,
+    /// Windows: run the native sandbox in a project outside your profile,
+    /// where every account on the computer may write (a folder under a
+    /// drive's root inherits that). Warned about on every run.
+    #[arg(long)]
+    pub allow_outside_profile: bool,
     /// Arguments forwarded verbatim to the client (everything after `--`).
     #[arg(last = true)]
     pub client_args: Vec<String>,
@@ -180,6 +185,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         ca_files,
         ca_bundle,
         home_files: resolved.home_files,
+        client_files: resolved.client_files,
+        allow_outside_profile: args.allow_outside_profile,
     };
 
     let tier = sandbox::select_tier(choice)?;
@@ -219,6 +226,8 @@ struct ResolvedClient {
     project_config_dir: Option<PathBuf>,
     /// A globally provisioned client's files (under the home).
     home_files: Vec<PathBuf>,
+    /// Every file the client was provisioned with, either scope.
+    client_files: Vec<PathBuf>,
 }
 
 /// Resolve `client` against the project manifest first, then the GLOBAL manifest.
@@ -282,6 +291,7 @@ fn resolve_client(client: &str, host: Option<&str>) -> Result<ResolvedClient> {
         } else {
             None
         };
+        let files = provisioned_files(managed, is_project.then_some(confine_root.as_path()));
         return Ok(ResolvedClient {
             client_id: managed.client_id.clone(),
             command,
@@ -294,7 +304,8 @@ fn resolve_client(client: &str, host: Option<&str>) -> Result<ResolvedClient> {
             project_config_dir,
             // A global client's config lives under the home, which the
             // docker tier does not mount: it mounts these files instead.
-            home_files: if *is_project { Vec::new() } else { managed.files.iter().map(|f| PathBuf::from(&f.path)).collect() },
+            home_files: if *is_project { Vec::new() } else { files.clone() },
+            client_files: files,
         });
     }
     // A `--host` naming no provisioned gateway at all is the thing to fix.
@@ -380,6 +391,24 @@ fn destinations_of(access: &ClientAccess) -> Result<Policy> {
         )
     })?;
     Ok(Policy { allow, block })
+}
+
+/// The files `managed` was provisioned with, as canonical paths on disk (a
+/// file not there yet as written): a record's `~/…` expanded as every reader
+/// of it expands it. A project's record (`project_root`, canonical) keeps only
+/// files inside the project: a project's manifest can come with the
+/// repository, and a sandbox grants these files to the client.
+fn provisioned_files(managed: &ManagedClient, project_root: Option<&Path>) -> Vec<PathBuf> {
+    managed
+        .files
+        .iter()
+        .filter_map(|f| {
+            let path = crate::state::expand_tilde(&f.path).ok()?;
+            let Some(root) = project_root else { return Some(dunce::canonicalize(&path).unwrap_or(path)) };
+            let real = dunce::canonicalize(&path).ok()?;
+            (real != root && real.starts_with(root)).then_some(real)
+        })
+        .collect()
 }
 
 /// The directory holding `managed`'s main config, when it is a directory of
@@ -546,6 +575,44 @@ mod tests {
 
     fn ws(clients: Vec<serde_json::Value>) -> serde_json::Value {
         serde_json::json!({ "keys": {}, "group_etags": {}, "proxy_origins": [], "clients": clients })
+    }
+
+    fn with_files(paths: &[&str]) -> ManagedClient {
+        let mut c = client("codex");
+        c["files"] = paths
+            .iter()
+            .map(|p| serde_json::json!({ "path": p, "format": "toml", "owned": [], "file_hash": "" }))
+            .collect();
+        serde_json::from_value(c).unwrap()
+    }
+
+    /// A global record names its files `~/…`: each is the file under the
+    /// home, as provision wrote it — what the docker tier mounts and the
+    /// Windows sandbox grants.
+    #[test]
+    fn a_global_records_files_are_found_under_the_home() {
+        let home = crate::state::home_dir().unwrap();
+        let files = provisioned_files(&with_files(&["~/.codex/config.toml"]), None);
+        let want = home.join(".codex").join("config.toml");
+        assert_eq!(files, vec![dunce::canonicalize(&want).unwrap_or(want)]);
+    }
+
+    /// A project's manifest can come with the repository: it names files of
+    /// that project alone, never one elsewhere — the project's own (positive
+    /// control) is kept.
+    #[test]
+    fn a_projects_record_names_only_files_inside_the_project() {
+        let base = std::env::temp_dir().join(format!("ssai-run-files-{}", std::process::id()));
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let root = dunce::canonicalize(&root).unwrap();
+        let own = root.join(".claude").join("settings.json");
+        let outside = dunce::canonicalize(&base).unwrap().join("secret");
+        std::fs::write(&own, "{}").unwrap();
+        std::fs::write(&outside, "x").unwrap();
+        let named = [own.to_str().unwrap(), outside.to_str().unwrap(), "~/.ssh/id_ed25519", root.to_str().unwrap()];
+        assert_eq!(provisioned_files(&with_files(&named), Some(&root)), vec![own]);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn two_gateways() -> crate::state::Manifest {

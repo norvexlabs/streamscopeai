@@ -37,6 +37,33 @@ pub struct AgentProfile {
     /// installed by npm, so the project's image must already carry it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub npm_package: Option<&'static str>,
+    /// Windows, where the client runs as the sandbox account and the
+    /// account's own profile holds its state: each entry points the client
+    /// at its configuration among the developer's folders.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "the Windows column, for the run as the sandbox account"))]
+    pub windows_config: &'static [WindowsConfig],
+    /// Windows: arguments put before the client's own.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "the Windows column, for the run as the sandbox account"))]
+    pub windows_args: &'static [&'static str],
+    /// Windows: `(file, key)` — a JSON file in the first `windows_config`
+    /// folder whose top-level `key` is set to `true` when absent: the
+    /// first-run state the client otherwise asks for interactively.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "the Windows column, for the run as the sandbox account"))]
+    pub windows_seed: &'static [(&'static str, &'static str)],
+}
+
+/// One configuration variable of the Windows column: `var` is set to
+/// `value`, and `granted` (relative to it, `""` for the value itself) is the
+/// folder created when absent, seeded and granted to the sandbox account —
+/// the one the client keeps its state in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsConfig {
+    pub var: &'static str,
+    /// `~` or `~/…`: the developer's profile; `%APPDATA%/…`: their roaming
+    /// folder, wherever Windows keeps it (where provision writes a client
+    /// that keeps its config there).
+    pub value: &'static str,
+    pub granted: &'static str,
 }
 
 /// How to run an engine-backed client confined: a private engine per run,
@@ -181,6 +208,11 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@anthropic-ai/claude-code"),
+        // Under its own folder, Claude Code keeps `.claude.json` there too,
+        // apart from the developer's: the onboarding is seeded done.
+        windows_config: &[WindowsConfig { var: "CLAUDE_CONFIG_DIR", value: "~/.claude", granted: "" }],
+        windows_args: &[],
+        windows_seed: &[(".claude.json", "hasCompletedOnboarding")],
     },
     AgentProfile {
         names: &["codex"],
@@ -190,6 +222,13 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@openai/codex"),
+        windows_config: &[WindowsConfig { var: "CODEX_HOME", value: "~/.codex", granted: "" }],
+        // Codex's own Windows sandbox cannot run inside the sandbox
+        // account (it needs an administrator, and its secrets are tied to
+        // one identity): off, the account confines it. Unquoted, so a
+        // `.cmd` launcher can carry it.
+        windows_args: &["-c", "sandbox_mode=danger-full-access"],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["gemini", "gemini-cli"],
@@ -199,6 +238,10 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@google/gemini-cli"),
+        // Gemini CLI takes the variable for the home it keeps `.gemini` in.
+        windows_config: &[WindowsConfig { var: "GEMINI_CLI_HOME", value: "~", granted: ".gemini" }],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["qwen", "qwen-code"],
@@ -208,6 +251,9 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@qwen-code/qwen-code"),
+        windows_config: &[],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["opencode"],
@@ -225,6 +271,9 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: Some(&OPENCODE_ENGINE),
         config_dir_env: Some("OPENCODE_CONFIG_DIR"),
         npm_package: Some("@opencode/cli"),
+        windows_config: &[],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["goose"],
@@ -242,6 +291,11 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: None,
+        // Goose keeps its config, data and state under `<root>/config`,
+        // `/data` and `/state`; on Windows the root is `%APPDATA%\Block\goose`.
+        windows_config: &[WindowsConfig { var: "GOOSE_PATH_ROOT", value: "%APPDATA%/Block/goose", granted: "" }],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["aider"],
@@ -251,6 +305,9 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: None,
+        windows_config: &[],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         // The Continue CLI (`cn`) bootstraps against its hub (api.continue.dev)
@@ -262,6 +319,9 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@continuedev/cli"),
+        windows_config: &[],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["crush"],
@@ -271,6 +331,9 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@charmland/crush"),
+        windows_config: &[],
+        windows_args: &[],
+        windows_seed: &[],
     },
     AgentProfile {
         names: &["vibe"],
@@ -280,6 +343,9 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: None,
+        windows_config: &[],
+        windows_args: &[],
+        windows_seed: &[],
     },
 ];
 
@@ -510,6 +576,26 @@ mod tests {
 
     fn argv(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_windows_column_is_well_formed() {
+        for agent in AGENTS {
+            for c in agent.windows_config {
+                assert!(!c.var.is_empty() && c.var.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'), "{}", c.var);
+                let anchored = c.value == "~" || c.value.starts_with("~/") || c.value.starts_with("%APPDATA%/");
+                assert!(anchored && !c.value.contains(".."), "{}", c.value);
+                assert!(!c.granted.contains("..") && !c.granted.starts_with('/'), "{}", c.granted);
+                // The profile itself is never the granted folder.
+                assert!(!(c.value == "~" && c.granted.is_empty()), "{:?}", agent.names);
+            }
+            // A seed lives in the first configuration folder: none, no seed.
+            assert!(agent.windows_seed.is_empty() || !agent.windows_config.is_empty(), "{:?}", agent.names);
+            // Every npm client is a `.cmd` launcher, which refuses these.
+            for arg in agent.windows_args {
+                assert!(!arg.contains(['"', '%', '\r', '\n']), "{arg}");
+            }
+        }
     }
 
     /// Every AgentProfile has the `engine` field set explicitly; this lists the

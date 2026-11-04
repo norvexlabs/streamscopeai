@@ -60,6 +60,40 @@ pub struct RunFacts {
     pub limits: super::config::Limits,
     /// Stdin is a terminal: allocate one in the container.
     pub tty: bool,
+    /// The project's own mounts ([`project_mounts`]), after the project's.
+    pub project_mounts: Vec<ProjectMount>,
+}
+
+/// One mount the project's grants add: `(host path, container path, read-only)`.
+pub type ProjectMount = (PathBuf, String, bool);
+
+/// The mounts that carry the project's grants and holds
+/// ([`crate::sandbox::protect`]) into the container, in mount order (a parent
+/// before what is mounted inside it): a linked worktree's git dirs at their
+/// host paths (its `.git` file names them absolutely), each held folder bound
+/// onto itself (a mount point cannot be renamed or removed), and each held
+/// tree or file read-only. `None` when a path podman would split must be
+/// mounted ([`mountable`]).
+pub fn project_mounts(grants: &crate::sandbox::protect::ProjectGrants, root: &Path, workspace: &str) -> Option<Vec<ProjectMount>> {
+    use crate::sandbox::protect::Guard;
+    let inside = |p: &Path| -> String {
+        match p.strip_prefix(root) {
+            Ok(rest) if rest.as_os_str().is_empty() => workspace.to_string(),
+            Ok(rest) => format!("{}/{}", workspace.trim_end_matches('/'), rest.to_string_lossy()),
+            Err(_) => p.to_string_lossy().into_owned(),
+        }
+    };
+    let mut out: Vec<ProjectMount> = grants.extra_rw.iter().map(|p| (p.clone(), inside(p), false)).collect();
+    for held in grants.held() {
+        let read_only = held.guard != Guard::Node;
+        let at = inside(&held.path);
+        // A git dir outside the project is already a mount of its own.
+        if !out.iter().any(|(_, c, _)| *c == at) {
+            out.push((held.path.clone(), at, read_only));
+        }
+    }
+    out.sort_by_key(|(_, c, _)| Path::new(c).components().count());
+    out.iter().all(|(h, c, _)| mountable(&h.to_string_lossy()) && mountable(c)).then_some(out)
 }
 
 /// The argv after `podman`.
@@ -95,6 +129,9 @@ pub fn run_argv(f: &RunFacts) -> Vec<String> {
         a.push(format!("--cpus={c}"));
     }
     a.push(volume(&f.project, &f.workspace, ""));
+    for (host, container, read_only) in &f.project_mounts {
+        a.push(volume(host, container, if *read_only { ":ro" } else { "" }));
+    }
     a.push(volume(&f.binary, INIT_BINARY, ":ro"));
     a.push(volume(&f.run_dir, RUN_MOUNT, ":ro"));
     a.push(volume(&f.sock_dir, SOCK_MOUNT, ""));
@@ -158,7 +195,46 @@ mod tests {
             engine_volume: None,
             limits: Limits { memory: Some("6g".into()), cpus: Some(3.0), pids: 4096 },
             tty: false,
+            project_mounts: vec![],
         }
+    }
+
+    /// A linked worktree under `/home/dev/app` whose main checkout is
+    /// `/home/dev/main`: its common git dir mounted at its host path, the
+    /// held git dirs bound onto themselves, the rest read-only, parents first.
+    #[test]
+    fn the_projects_holds_become_mounts_parents_first() {
+        use crate::sandbox::protect::{Guard, ProjectGrants, Protected};
+        let held = |p: &str, guard| Protected { path: PathBuf::from(p), guard };
+        let grants = ProjectGrants {
+            extra_rw: vec!["/home/dev/main/.git".into()],
+            stat_only: vec!["/home/dev/main".into()],
+            protected: vec![
+                held("/home/dev/main/.git/hooks", Guard::Tree),
+                held("/home/dev/app/.streamscopeai", Guard::Tree),
+                held("/home/dev/main/.git/worktrees/app", Guard::Node),
+                held("/home/dev/main/.git", Guard::Node),
+            ],
+        };
+        let mounts = project_mounts(&grants, Path::new("/home/dev/app"), "/workspaces/app").unwrap();
+        assert_eq!(
+            mounts,
+            vec![
+                (PathBuf::from("/home/dev/app/.streamscopeai"), "/workspaces/app/.streamscopeai".to_string(), true),
+                (PathBuf::from("/home/dev/main/.git"), "/home/dev/main/.git".to_string(), false),
+                (PathBuf::from("/home/dev/main/.git/hooks"), "/home/dev/main/.git/hooks".to_string(), true),
+                (PathBuf::from("/home/dev/main/.git/worktrees/app"), "/home/dev/main/.git/worktrees/app".to_string(), false),
+            ]
+        );
+        let mut f = facts();
+        f.project_mounts = mounts;
+        let a = run_argv(&f);
+        let project = a.iter().position(|x| x == "--volume=/home/dev/app:/workspaces/app").unwrap();
+        let hooks = a.iter().position(|x| x == "--volume=/home/dev/main/.git/hooks:/home/dev/main/.git/hooks:ro").unwrap();
+        assert!(project < hooks, "{a:?}");
+        // A path podman would split refuses the mounts.
+        let split = ProjectGrants { protected: vec![held("/home/dev/app/a,b", Guard::Tree)], ..Default::default() };
+        assert_eq!(project_mounts(&split, Path::new("/home/dev/app"), "/workspaces/app"), None);
     }
 
     fn has(a: &[String], flag: &str) -> bool {

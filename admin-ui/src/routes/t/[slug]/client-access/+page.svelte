@@ -169,7 +169,7 @@
         <div class="rounded-lg border border-(--border) bg-(--bg-card) px-5 divide-y divide-(--border)">
           <ToggleSetting
             label="Require the sandbox"
-            description="Refuse `ssai run --sandbox off` in this tenant's workspaces. A guard against mistakes on a developer's machine, not against its owner."
+            description="Refuse `ssai run --sandbox off` in this tenant's workspaces. On Windows a developer first runs `ssai sandbox setup` once. A guard against mistakes on a developer's machine, not against its owner."
             value={content.settings.require_sandbox}
             disabled={saving}
             onValueChange={(v: boolean) => update({ settings: { require_sandbox: v } }, 'Sandbox setting saved')}

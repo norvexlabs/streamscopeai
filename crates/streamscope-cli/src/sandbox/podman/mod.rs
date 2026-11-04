@@ -406,6 +406,14 @@ async fn run_container(
     // whatever of the developer's the container is given, so the run dir holds
     // only what this run hands the agent anyway.
 
+    // The project's grants and holds: git's hooks and config read-only, its
+    // git dirs unrenamable, a linked worktree's git dirs reachable.
+    let grants = crate::sandbox::protect::resolve(root);
+    grants.prepare().context("prepare the project's protected git folders")?;
+    let project_mounts = plan::project_mounts(&grants, root, &workspace).context(
+        "a git folder of this project has a `:` or `,` in its path, which podman cannot mount — use --sandbox native",
+    )?;
+
     let key = project_key(root, &spec.command);
     let mut suffix = [0u8; 4];
     rand::rng().fill_bytes(&mut suffix);
@@ -427,6 +435,7 @@ async fn run_container(
         engine_volume: config.docker.then(|| format!("ssai-engine-{}", project_key(root, ""))),
         limits: config.limits.clone(),
         tty,
+        project_mounts,
     };
     let mut cmd = tokio::process::Command::new("podman");
     cmd.args(plan::run_argv(&facts));
@@ -811,6 +820,8 @@ mod tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files,
+            client_files: vec![],
+            allow_outside_profile: false,
         }
     }
 

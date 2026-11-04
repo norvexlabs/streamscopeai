@@ -41,7 +41,7 @@ pub fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
     }
     let (sid, spelled) = current_user()?;
     if !is_owner_only(dir, spelled) {
-        apply(Target::Path(dir), dir, sid, "OICI").with_context(|| format!("restrict {} to its owner", dir.display()))?;
+        apply(Target::Path(dir), dir, sid, &[], "OICI").with_context(|| format!("restrict {} to its owner", dir.display()))?;
     }
     if let Ok(mut tried) = TRIED.lock() {
         tried.insert(dir.to_path_buf());
@@ -53,18 +53,30 @@ pub fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
 /// a protected list granting full control to the current user and SYSTEM.
 pub fn restrict_file_to_owner(file: &std::fs::File, path: &Path) -> Result<()> {
     let sid = current_user_sid()?;
-    apply(Target::Handle(file.as_raw_handle() as HANDLE), path, &sid, "")
+    apply(Target::Handle(file.as_raw_handle() as HANDLE), path, &sid, &[], "")
         .with_context(|| format!("restrict {} to its owner", path.display()))
 }
 
+/// Give the folder `dir` a protected list granting full control to the
+/// current user, SYSTEM and the Administrators group, inherited by everything
+/// created in it: a hand-off folder between the developer and an elevated
+/// helper, which may run as another (administrator) account.
+pub fn restrict_dir_to_owner_and_admins(dir: &Path) -> Result<()> {
+    let sid = current_user_sid()?;
+    apply(Target::Path(dir), dir, &sid, &["BA"], "OICI")
+        .with_context(|| format!("restrict {} to you and the administrators", dir.display()))
+}
+
 /// Set the owner-only list (`inherit` = `OICI` on a folder) on `target` (at
-/// `path`, named in a warning). Where the file system keeps no access lists
+/// `path`, named in a warning), granting the `also` trustees (SDDL SIDs or
+/// aliases) full control as well. Where the file system keeps no access lists
 /// (FAT, exFAT) it is left as it is, as a Unix mode is on such a file system;
 /// where it refuses this one (a network share that maps no access lists, or
 /// grants no right to change them) it is left as it is with a warning. An
 /// error is this code's own failure, never the file system's.
-fn apply(target: Target<'_>, path: &Path, sid: &str, inherit: &str) -> Result<()> {
-    let sddl = wide(format!("D:P(A;{inherit};FA;;;{sid})(A;{inherit};FA;;;SY)").as_ref());
+fn apply(target: Target<'_>, path: &Path, sid: &str, also: &[&str], inherit: &str) -> Result<()> {
+    let also: String = also.iter().map(|who| format!("(A;{inherit};FA;;;{who})")).collect();
+    let sddl = wide(format!("D:P(A;{inherit};FA;;;{sid})(A;{inherit};FA;;;SY){also}").as_ref());
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `sddl` is NUL-terminated; `sd` receives a LocalAlloc'd
     // descriptor, freed below.
@@ -223,7 +235,7 @@ fn dacl_sddl(path: &Path) -> Option<String> {
 }
 
 /// The current user's SID as a string (`S-1-5-21-…`), read once per process.
-fn current_user_sid() -> Result<String> {
+pub(crate) fn current_user_sid() -> Result<String> {
     Ok(current_user()?.0.clone())
 }
 
@@ -251,7 +263,7 @@ fn read_current_user_sid() -> Result<String> {
     sid
 }
 
-fn token_user_sid(token: HANDLE) -> Result<String> {
+pub(crate) fn token_user_sid(token: HANDLE) -> Result<String> {
     let mut len = 0u32;
     // SAFETY: a size query (null buffer, zero length) on an open token.
     unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len) };
@@ -280,7 +292,7 @@ fn token_user_sid(token: HANDLE) -> Result<String> {
 
 /// # Safety
 /// `text` points at a NUL-terminated UTF-16 string.
-unsafe fn wide_to_string(text: *const u16) -> String {
+pub(crate) unsafe fn wide_to_string(text: *const u16) -> String {
     // SAFETY: per the contract, every unit up to the NUL is readable.
     unsafe {
         let n = (0..).take_while(|&i| *text.add(i) != 0).count();
@@ -288,7 +300,7 @@ unsafe fn wide_to_string(text: *const u16) -> String {
     }
 }
 
-fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+pub(crate) fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 

@@ -835,6 +835,8 @@ mod learn_tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
+            client_files: vec![],
+            allow_outside_profile: false,
         };
         let policy = build_policy_in(&home, &spec, &scratch).unwrap();
         // `fs_rw` is applied with `AccessFs::from_all`: write AND execute.
@@ -908,6 +910,8 @@ mod learn_tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
+            client_files: vec![],
+            allow_outside_profile: false,
         };
         let agent = profiles::agent_for(&spec.command).unwrap();
         create_state_dirs(&home, agent.state_dirs, &secret_deny(&home), Create::Dir);
@@ -963,6 +967,8 @@ mod learn_tests {
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
+            client_files: vec![],
+            allow_outside_profile: false,
         };
         let policy = build_policy_in(&home, &spec, &home.join(".cache/streamscopeai/tmp/run")).unwrap();
         for dir in [

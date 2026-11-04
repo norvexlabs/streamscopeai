@@ -539,7 +539,7 @@
   "portal_qs_cli_ci_post": ").",
   "portal_qs_cli_ci_pre": "Non-interactive runners authenticate with a workspace automation key instead of a login — two environment variables and one command. Each run mints a short-lived gateway key (2 hours by default — tune with",
   "portal_qs_cli_install_instructions": "Linux and macOS: downloads the CLI from this gateway (sha256-verified) into ~/.local/bin.",
-  "portal_qs_cli_install_windows_instructions": "Windows (PowerShell): downloads ssai.exe from this gateway (sha256-verified) into %LOCALAPPDATA%\\Programs\\ssai and adds it to your PATH. There is no sandbox on Windows: run clients with `ssai run --sandbox off <client>`. A gateway with a private certificate authority needs its root trusted by Windows first (your IT department, or certmgr.msc).",
+  "portal_qs_cli_install_windows_instructions": "Windows (PowerShell): downloads ssai.exe from this gateway (sha256-verified) into %LOCALAPPDATA%\\Programs\\ssai and adds it to your PATH. The sandbox on Windows runs agents as a dedicated local account: run `ssai sandbox setup` once (it asks for an administrator's approval) before `ssai run`. A gateway with a private certificate authority needs its root trusted by Windows first (your IT department, or certmgr.msc).",
   "portal_qs_cli_intro_post": "CLI provisions your installed AI tools in one go: it logs in through your browser, mints one workspace key, and merges the gateway config into each tool's own config file — your other settings are kept.",
   "portal_qs_cli_intro_pre": "The",
   "portal_qs_cli_login_instructions": "Opens your browser to approve this device — works with password and SSO logins alike.",

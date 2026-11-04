@@ -1,0 +1,472 @@
+# Findings the release gate accepts for a while: the finding's id, the artifact it is in (an image
+# key, installer, os - a disk's findings are its bundle's), the package and, where it sits in one
+# binary, the file it is narrowed to, why, and the last day it holds. Each waits on an upstream
+# rebuild: when the rebuilt image or package is pinned, its entries go.
+
+- id: CVE-2026-107928
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-107929
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-111497
+  artifact: postgres
+  package: brotli-libs
+  reason: "brotli 1.2.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 1.2.1 since 2026-10-22, the image's next rebuild carries it"
+  expires: 2027-01-01
+- id: CVE-2026-86409
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-86410
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-86411
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-86412
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-86413
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-86414
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-86415
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-87861
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-87862
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-87863
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-87864
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-87865
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-87866
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92386
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92387
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92388
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92389
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92390
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92391
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-92392
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-94265
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: CVE-2026-94266
+  artifact: postgres
+  package: libcurl
+  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
+  expires: 2027-01-01
+- id: GO-2025-4006
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2025-4007
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2025-4009
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2025-4013
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2025-4155
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4337
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4341
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4601
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4870
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4918
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4946
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4947
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4970
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4971
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4977
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4981
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-4986
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-5026
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-5037
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-5038
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-5972
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6088
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6089
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6090
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6603
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6604
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6605
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6607
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6608
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6609
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6610
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6611
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6612
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6613
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GO-2026-6617
+  artifact: postgres
+  package: stdlib
+  path: /usr/local/bin/gosu
+  reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
+  expires: 2027-01-01
+- id: GHSA-mgcc-cww5-fp2q
+  artifact: os
+  package: github.com/go-jose/go-jose/v4
+  path: /usr/bin/containerd
+  reason: "go-jose in containerd 2.4.2, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-5942
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6603
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd
+  reason: "golang.org/x/net in containerd, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6603
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd-shim-runc-v2
+  reason: "golang.org/x/net in containerd-shim-runc-v2, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6603
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/ctr
+  reason: "golang.org/x/net in ctr, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6603
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6610
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd
+  reason: "golang.org/x/net in containerd, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6610
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd-shim-runc-v2
+  reason: "golang.org/x/net in containerd-shim-runc-v2, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6610
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/ctr
+  reason: "golang.org/x/net in ctr, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6610
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6611
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd
+  reason: "golang.org/x/net in containerd, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6611
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd-shim-runc-v2
+  reason: "golang.org/x/net in containerd-shim-runc-v2, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6611
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/ctr
+  reason: "golang.org/x/net in ctr, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6611
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6612
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd
+  reason: "golang.org/x/net in containerd, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6612
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd-shim-runc-v2
+  reason: "golang.org/x/net in containerd-shim-runc-v2, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6612
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/ctr
+  reason: "golang.org/x/net in ctr, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6612
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6617
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd
+  reason: "golang.org/x/net in containerd, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6617
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd-shim-runc-v2
+  reason: "golang.org/x/net in containerd-shim-runc-v2, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6617
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/ctr
+  reason: "golang.org/x/net in ctr, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6617
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
