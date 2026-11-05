@@ -2149,12 +2149,12 @@ pub async fn patch_server(
     security(("bearer_auth" = []))
 )]
 pub async fn delete_server(
+    // First: a preview is marked before any other extractor can refuse it.
+    crate::middleware::DryRun(dry_run): crate::middleware::DryRun,
     mut db: TenantConn,
     Path(id): Path<Uuid>,
-    Query(q): Query<DryRunQuery>,
 ) -> Result<Json<ActionResponse>, ApiError> {
     let tenant_id = db.tenant_uuid();
-    let dry_run = q.dry_run.unwrap_or(false);
     // The preview IS the deletion, rolled back — so what it reports cannot
     // drift from what the deletion does.
     let mut tx = db.conn().begin().await.map_err(|e| {
@@ -3385,6 +3385,12 @@ pub struct ModelSyncResponse {
     pub removed: Vec<RemovedModelInfo>,
     /// What each enabled endpoint answered, primary first.
     pub endpoints: Vec<super::model_sync::EndpointSyncReport>,
+    /// "Sync now" would not make some of `removed`, or would refuse the sync
+    /// whole: it judges an answer implausibly short (under half of what the
+    /// server, or the endpoint, listed before). The review still offers them — a server
+    /// can really shrink — and this says to check the server is fully up
+    /// before accepting them.
+    pub unattended_refuses: bool,
 }
 
 #[utoipa::path(
@@ -3416,9 +3422,11 @@ pub async fn sync_server_models(
     // discovery on any replica.
     crate::custom_ca::refresh_from_conn(db.conn()).await;
 
-    // Manual sync = read-only diff; the UI drives the apply via the model-create
-    // endpoint. The pipeline computes the same diff the autosync worker applies,
-    // including real removed-route counts.
+    // Manual sync = read-only diff the operator reviews; the UI applies it
+    // through the model create and delete endpoints. The pipeline computes the
+    // worker's diff (real removed-route counts included) but judges no
+    // answer's length, so it also offers removals the worker refuses as
+    // implausible — `unattended_refuses` says when.
     let answers = discover_all(&server).await;
     if let Some(e) = nobody_answered(&answers) {
         // Deliberately records NOTHING. This path previews a diff and applies
@@ -3460,6 +3468,7 @@ pub async fn sync_server_models(
         new_models: outcome.new_models,
         removed: outcome.removed,
         endpoints: outcome.endpoints,
+        unattended_refuses: outcome.unattended_refuses,
     }))
 }
 

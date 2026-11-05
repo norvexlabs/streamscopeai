@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::db::tenant::{AdminTenantCtx, TenantConn};
 use crate::middleware::audit_common::{
-    CONSOLE_BODY_LIMIT, build_generic_diff, capped_change_diff, buffer_request_body, capture_created_id, capture_error_body, derive_action,
+    CONSOLE_BODY_LIMIT, build_generic_diff, capped_change_diff, buffer_request_body, capture_created_id, capture_error_body, derive_action, recorded_action,
     is_mutating, needs_before_snapshot, resolve_diff_target, snapshot_row,
     AuditDiffSink, DiffKind, AUDIT_WRITE_TIMEOUT, ADMIN_ACTION_OVERRIDES,
 };
@@ -127,6 +127,8 @@ pub async fn admin_audit_mw(
         // Handler-stamped diff wins; otherwise build the generic one on success.
         let change_diff = match handler_diff {
             Some(d) => Some(d),
+            // A preview changed nothing: there is no effect to diff.
+            None if sink.is_dry_run() => None,
             None if status < 300 => match resolved.as_ref() {
                 Some(r) => {
                     build_generic_diff(
@@ -146,6 +148,7 @@ pub async fn admin_audit_mw(
         let (action, resource_kind, resource_id) = derive_action(
             &method, route_template.as_deref(), &path, ADMIN_PREFIXES, ADMIN_ACTION_OVERRIDES,
         );
+        let action = recorded_action(action, &sink);
         let pool = state.db.clone();
         let write = write_audit(
             &pool,

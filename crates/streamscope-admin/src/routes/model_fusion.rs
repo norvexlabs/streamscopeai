@@ -12,11 +12,15 @@
 //!   exactly what it served.
 //! - **An answer adds; it removes only when trusted.** An answer names the
 //!   models the endpoint serves. It may REMOVE the ones it omits only when the
-//!   endpoint had answered before, the answer is not implausibly short against
-//!   what the endpoint last LISTED (empty, or under half), and the server is
-//!   past its first sync. Otherwise the omitted models are kept as they were
-//!   (listed ones stay listed, so a repeated short answer stays short) — save
-//!   an assumed one another enabled endpoint lists, which goes.
+//!   endpoint had answered before, the server is past its first sync, and —
+//!   in a sync applied unattended ([`Judge::Unattended`]) — the answer is not
+//!   implausibly short against what the endpoint last LISTED (empty, or under
+//!   half). A sync a person reviews ([`Judge::Reviewed`]) of a server whose
+//!   every endpoint answered judges no length but emptiness: a server that
+//!   really went from four models to one must be able to say so, and the
+//!   reviewer decides. Otherwise the omitted models are kept as
+//!   they were (listed ones stay listed, so a repeated short answer stays
+//!   short) — save an assumed one another enabled endpoint lists, which goes.
 //! - **A model retires only on the word of every endpoint that listed it.**
 //!   The quorum is the endpoints that had answered before and served the
 //!   model; every one of them must have answered, with the right to remove,
@@ -106,6 +110,28 @@ pub struct FusionPlan {
     pub endpoints: Vec<EndpointPlan>,
 }
 
+/// Who stands behind the plan, which decides whether an answer's LENGTH is
+/// judged. The evidence rules (only an answer is evidence, the quorum, no
+/// model stranded) hold for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Judge {
+    /// Applied with nobody looking at it (the worker, "Sync now"): an answer
+    /// implausibly short for its endpoint removes nothing, one implausibly
+    /// short for the whole server refuses the sync, and a partial answer never
+    /// takes the server below half its models.
+    Unattended,
+    /// A diff a person reviews before anything is written; it is never
+    /// refused, and its whole-server floors (the server gate, the
+    /// partial-answer floor) are the reviewer's to judge. When EVERY endpoint
+    /// answered, no per-endpoint floor either: every model the endpoints no
+    /// longer list is offered for removal — save what an endpoint answering an
+    /// EMPTY list served (a server lists nothing while it starts, never as the
+    /// models it serves). With an endpoint silent, each answer's own floor
+    /// holds, so a short answer beside a replica serving its models by
+    /// assumption offers none of them.
+    Reviewed,
+}
+
 /// The server-level plausibility gate refused the sync: every endpoint
 /// answered, and together they named fewer than half the current models.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,12 +154,20 @@ pub fn plausibility_floor(count: usize) -> usize {
 /// An endpoint with NO listed row has no evidence of its own, so it is judged
 /// against everything it serves: an operator's sync reads a never-answered
 /// endpoint as serving every model, and one answering 3 of 20 must not be
-/// trusted to remove the other 17.
+/// trusted to remove the other 17 unattended ([`Judge::Unattended`]); a
+/// review offers them, and says the unattended sync would not.
 pub fn listed_count(ep: &EndpointState) -> usize {
     match ep.members.values().filter(|k| **k == MemberKind::Listed).count() {
         0 => ep.members.len(),
         n => n,
     }
+}
+
+/// Whether an endpoint's answer is too short to remove what it omits: under
+/// the floor of what it listed — or, on a review that heard every endpoint
+/// (`lenient`), only when it names nothing.
+fn is_short(listed: &BTreeSet<String>, ep: &EndpointState, lenient: bool) -> bool {
+    if lenient { listed.is_empty() } else { listed.len() < plausibility_floor(listed_count(ep)) }
 }
 
 /// What discovery got from one endpoint.
@@ -162,16 +196,19 @@ impl Answer {
 ///
 /// `existing` is every current model name of the server; `answers[i]` is what
 /// `endpoints[i]` gave. `server_first_sync` makes every answer add-only.
-/// `gate` asks for the server-level plausibility gate, which fires only when
-/// EVERY endpoint answered — a disabled one included: with one endpoint that
-/// is the gate a single-URL server has always had, and a partial answer is
-/// already held by the per-endpoint rule.
+/// An [`Judge::Unattended`] sync applies every length floor: the server-level
+/// gate fires only when EVERY endpoint answered — a disabled one included:
+/// with one endpoint that is the gate a single-URL server has always had, and
+/// a partial answer is held by the per-endpoint floor and the partial-answer
+/// floor. A [`Judge::Reviewed`] sync never refuses: it applies the
+/// per-endpoint floor only while an endpoint is silent (and, when every one
+/// answered, removes nothing on an empty answer).
 pub fn fuse(
     existing: &BTreeSet<String>,
     endpoints: &[EndpointState],
     answers: &[Answer],
     server_first_sync: bool,
-    gate: bool,
+    judge: Judge,
 ) -> Result<FusionPlan, Implausible> {
     assert_eq!(endpoints.len(), answers.len(), "one answer slot per endpoint");
 
@@ -180,7 +217,10 @@ pub fn fuse(
     // siblings may not list, so with one out the others' union is no measure
     // of the whole server — the per-endpoint rule guards each answer instead.
     let every_endpoint_answered = !answers.is_empty() && answers.iter().all(|a| matches!(a, Answer::Listed(_)));
-    if gate && every_endpoint_answered {
+    // A review judges no length only on a whole reading of the server: with an
+    // endpoint silent, what it serves by assumption is held by the floors.
+    let lenient = judge == Judge::Reviewed && every_endpoint_answered;
+    if judge == Judge::Unattended && every_endpoint_answered {
         let floor = plausibility_floor(existing.len());
         if answered_union.len() < floor {
             return Err(Implausible { discovered: answered_union.len(), existing: existing.len() });
@@ -203,7 +243,7 @@ pub fn fuse(
                 Some(KeptReason::FirstAnswer)
             } else if server_first_sync {
                 Some(KeptReason::ServerFirstSync)
-            } else if listed.len() < plausibility_floor(listed_count(ep)) {
+            } else if is_short(listed, ep, lenient) {
                 Some(KeptReason::ShortAnswer)
             } else {
                 None
@@ -299,7 +339,7 @@ pub fn fuse(
     // cannot judge the union, so this does: no sync takes the server below half
     // its models on a partial answer — the promise the single-URL gate made. A
     // silent replica may be the one serving what the others do not list.
-    if gate && !every_endpoint_answered && !retire.is_empty()
+    if judge == Judge::Unattended && !every_endpoint_answered && !retire.is_empty()
         && existing.len() - retire.len() < plausibility_floor(existing.len())
     {
         return Err(Implausible { discovered: answered_union.len(), existing: existing.len() });
@@ -366,6 +406,7 @@ mod tests {
 
     use MemberKind::{Assumed, Listed};
     use Answer::{Failed, NotAsked};
+    use Judge::{Reviewed, Unattended};
 
     /// The kinds are the membership table's CHECK vocabulary and the reasons
     /// are what the API reports; a changed spelling fails a write or a client.
@@ -382,7 +423,7 @@ mod tests {
     fn a_single_endpoint_reconciles_exactly_as_a_single_url_server_did() {
         let existing = set(&["a", "b", "c"]);
         let ep = listed(1, &[("a", Listed), ("b", Listed), ("c", Listed)]);
-        let plan = fuse(&existing, &[ep], &[Answer::Listed(set(&["a", "b", "d"]))], false, true).unwrap();
+        let plan = fuse(&existing, &[ep], &[Answer::Listed(set(&["a", "b", "d"]))], false, Unattended).unwrap();
         assert_eq!(plan.new_models, vec!["d".to_string()]);
         assert_eq!(plan.retire, vec!["c".to_string()]);
         assert_eq!(members_of(&plan.endpoints[0]).keys().cloned().collect::<Vec<_>>(), vec!["a", "b", "d"]);
@@ -396,14 +437,14 @@ mod tests {
             listed(2, &[("a", Listed), ("b", Listed), ("c", Listed), ("d", Listed)]),
         ];
         // Both answered one name: 1 < floor(4) = 2 → refused.
-        let both = fuse(&existing, &eps, &[Answer::Listed(set(&["a"])), Answer::Listed(set(&["a"]))], false, true);
+        let both = fuse(&existing, &eps, &[Answer::Listed(set(&["a"])), Answer::Listed(set(&["a"]))], false, Unattended);
         assert_eq!(both, Err(Implausible { discovered: 1, existing: 4 }));
         // Two names reach the floor: accepted (positive control at the boundary).
-        let at_floor = fuse(&existing, &eps, &[Answer::Listed(set(&["a", "b"])), Answer::Listed(set(&["a", "b"]))], false, true);
+        let at_floor = fuse(&existing, &eps, &[Answer::Listed(set(&["a", "b"])), Answer::Listed(set(&["a", "b"]))], false, Unattended);
         assert!(at_floor.is_ok());
         // One did not answer: no server gate; the answering endpoint's own gate
         // keeps what it served, and nothing retires.
-        let partial = fuse(&existing, &eps, &[Answer::Listed(set(&["a"])), Failed], false, true).unwrap();
+        let partial = fuse(&existing, &eps, &[Answer::Listed(set(&["a"])), Failed], false, Unattended).unwrap();
         assert!(partial.retire.is_empty());
         assert_eq!(partial.endpoints[1], EndpointPlan::Unchanged);
     }
@@ -412,12 +453,14 @@ mod tests {
     fn the_per_endpoint_floor_holds_on_both_sides() {
         let existing = set(&["a", "b", "c", "d"]);
         let ep = listed(1, &[("a", Listed), ("b", Listed), ("c", Listed), ("d", Listed)]);
+        // A silent sibling keeps the server-level gate out of it.
+        let eps = [ep.clone(), fresh(2)];
         // 1 < floor(4) = 2: omitted models are kept.
-        let short = fuse(&existing, std::slice::from_ref(&ep), &[Answer::Listed(set(&["a"]))], false, false).unwrap();
+        let short = fuse(&existing, &eps, &[Answer::Listed(set(&["a"])), Failed], false, Unattended).unwrap();
         assert!(matches!(&short.endpoints[0], EndpointPlan::Answered { kept: Some(KeptReason::ShortAnswer), .. }));
         assert!(short.retire.is_empty());
         // 2 = floor: trusted, omitted models removed.
-        let enough = fuse(&existing, &[ep], &[Answer::Listed(set(&["a", "b"]))], false, false).unwrap();
+        let enough = fuse(&existing, &[ep], &[Answer::Listed(set(&["a", "b"]))], false, Unattended).unwrap();
         assert!(matches!(&enough.endpoints[0], EndpointPlan::Answered { kept: None, .. }));
         assert_eq!(enough.retire, vec!["c".to_string(), "d".to_string()]);
     }
@@ -425,7 +468,7 @@ mod tests {
     #[test]
     fn a_first_answer_adds_and_keeps_everything_else_assumed() {
         let existing = set(&["a", "b"]);
-        let plan = fuse(&existing, &[fresh(1)], &[Answer::Listed(set(&["a", "lora"]))], false, true).unwrap();
+        let plan = fuse(&existing, &[fresh(1)], &[Answer::Listed(set(&["a", "lora"]))], false, Unattended).unwrap();
         assert_eq!(plan.new_models, vec!["lora".to_string()]);
         assert!(plan.retire.is_empty());
         let m = members_of(&plan.endpoints[0]);
@@ -446,24 +489,24 @@ mod tests {
         let three: BTreeSet<String> = names[..3].iter().cloned().collect();
         let answers = [Answer::Listed(names.iter().cloned().collect()), Answer::Listed(three.clone())];
         // (A's trusted answer omits "hand", which retires.)
-        let plan = fuse(&existing, &[a.clone(), fresh(2)], &answers, false, true).unwrap();
+        let plan = fuse(&existing, &[a.clone(), fresh(2)], &answers, false, Unattended).unwrap();
         assert_eq!(plan.retire, vec!["hand".to_string()]);
         assert_eq!(members_of(&plan.endpoints[1]).keys().cloned().collect::<BTreeSet<_>>(), three);
         // The same with "Sync now" reading B as serving everything by assumption.
         let stand_in = EndpointState { listed: true, members: existing.iter().map(|n| (n.clone(), Assumed)).collect() };
         // B's short answer keeps "hand" (no one lists it), and holds it alive.
-        let plan = fuse(&existing, &[a.clone(), stand_in], &answers, false, true).unwrap();
+        let plan = fuse(&existing, &[a.clone(), stand_in], &answers, false, Unattended).unwrap();
         let b = members_of(&plan.endpoints[1]);
         assert!(plan.retire.is_empty());
         assert_eq!(b.len(), 4);
         assert_eq!(b.get("hand"), Some(&Assumed));
         // A replica that lists them but is disabled takes no traffic: B keeps
         // them, or they would be served by no enabled endpoint.
-        let plan = fuse(&existing, &[a.clone(), fresh(2)], &[NotAsked, Answer::Listed(three.clone())], false, true).unwrap();
+        let plan = fuse(&existing, &[a.clone(), fresh(2)], &[NotAsked, Answer::Listed(three.clone())], false, Unattended).unwrap();
         assert_eq!(members_of(&plan.endpoints[1]).len(), 21);
         // A replica that lists them and failed to answer still lists them. A
         // model it is only ASSUMED to serve stays assumed on B: nobody lists it.
-        let plan = fuse(&existing, &[a, fresh(2)], &[Failed, Answer::Listed(three)], false, true).unwrap();
+        let plan = fuse(&existing, &[a, fresh(2)], &[Failed, Answer::Listed(three)], false, Unattended).unwrap();
         let b = members_of(&plan.endpoints[1]);
         assert_eq!(b.len(), 4);
         assert_eq!(b.get("hand"), Some(&Assumed));
@@ -474,7 +517,7 @@ mod tests {
         let existing = set(&["x", "y"]);
         let eps = [listed(1, &[("x", Listed)]), listed(2, &[("x", Listed), ("y", Listed)])];
         // Endpoint 1 no longer lists x; endpoint 2 still does.
-        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), Answer::Listed(set(&["x", "y"]))], false, true).unwrap();
+        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), Answer::Listed(set(&["x", "y"]))], false, Unattended).unwrap();
         assert!(plan.retire.is_empty());
         assert!(!members_of(&plan.endpoints[0]).contains_key("x"));
         assert!(members_of(&plan.endpoints[1]).contains_key("x"));
@@ -484,7 +527,7 @@ mod tests {
     fn a_never_answering_endpoint_neither_keeps_nor_retires_a_model() {
         let existing = set(&["x", "y"]);
         let eps = [listed(1, &[("x", Listed), ("y", Listed)]), fresh(2)];
-        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), Failed], false, true).unwrap();
+        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), Failed], false, Unattended).unwrap();
         assert_eq!(plan.retire, vec!["x".to_string()]);
     }
 
@@ -499,12 +542,15 @@ mod tests {
             1,
             &[("a", Listed), ("b", Listed), ("c", Assumed), ("d", Assumed), ("e", Assumed), ("f", Assumed), ("g", Assumed), ("h", Assumed)],
         );
-        let plan = fuse(&existing, &[small], &[Answer::Listed(set(&["a", "b"]))], false, false).unwrap();
+        // (A sibling serves the six, so the server as a whole is not short.)
+        let sibling = listed(2, &[("c", Listed), ("d", Listed), ("e", Listed), ("f", Listed), ("g", Listed), ("h", Listed)]);
+        let others = Answer::Listed(set(&["c", "d", "e", "f", "g", "h"]));
+        let plan = fuse(&existing, &[small, sibling], &[Answer::Listed(set(&["a", "b"])), others], false, Unattended).unwrap();
         assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: None, .. }));
         assert_eq!(members_of(&plan.endpoints[0]).keys().cloned().collect::<Vec<_>>(), vec!["a", "b"]);
         // Its own evidence still guards it: a listed set that halves is short.
         let big = listed(1, &[("a", Listed), ("b", Listed), ("c", Listed), ("d", Listed)]);
-        let plan = fuse(&existing, &[big], &[Answer::Listed(set(&["a"]))], false, false).unwrap();
+        let plan = fuse(&existing, &[big, fresh(2)], &[Answer::Listed(set(&["a"])), Failed], false, Unattended).unwrap();
         assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: Some(KeptReason::ShortAnswer), .. }));
     }
 
@@ -520,7 +566,7 @@ mod tests {
             members: names.iter().map(|n| (n.clone(), Assumed)).collect(),
         };
         let answer: BTreeSet<String> = names[..3].iter().cloned().collect();
-        let plan = fuse(&existing, &[stand_in, fresh(2)], &[Answer::Listed(answer), Failed], false, true).unwrap();
+        let plan = fuse(&existing, &[stand_in, fresh(2)], &[Answer::Listed(answer), Failed], false, Unattended).unwrap();
         assert!(plan.retire.is_empty(), "retired {:?} on a short first answer", plan.retire);
     }
 
@@ -536,7 +582,7 @@ mod tests {
         let answers = [Failed, Answer::Listed(three)];
         for sync in 0..3 {
             // A refusal (`Err`) writes nothing either.
-            if let Ok(plan) = fuse(&existing, &eps, &answers, false, true) {
+            if let Ok(plan) = fuse(&existing, &eps, &answers, false, Unattended) {
                 assert!(plan.retire.is_empty(), "sync {sync} retired {:?}", plan.retire);
                 eps = apply(&eps, &plan);
             }
@@ -551,7 +597,7 @@ mod tests {
         let existing: BTreeSet<String> = names.iter().cloned().collect();
         let a = EndpointState { listed: true, members: names.iter().map(|n| (n.clone(), Listed)).collect() };
         let half: BTreeSet<String> = names[..10].iter().cloned().collect();
-        let plan = fuse(&existing, &[a, fresh(2)], &[Answer::Listed(half), Failed], false, true).unwrap();
+        let plan = fuse(&existing, &[a, fresh(2)], &[Answer::Listed(half), Failed], false, Unattended).unwrap();
         assert_eq!(plan.retire.len(), 10);
     }
 
@@ -560,7 +606,7 @@ mod tests {
         let existing = set(&["m1", "m2"]);
         let eps = [listed(1, &[("m1", Listed), ("m2", Listed)]), fresh(2)];
         // A drops m2 (trusted); B answers for the first time with m1 only.
-        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["m1"])), Answer::Listed(set(&["m1"]))], false, false).unwrap();
+        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["m1"])), Answer::Listed(set(&["m1"]))], false, Unattended).unwrap();
         assert_eq!(plan.retire, vec!["m2".to_string()]);
         assert!(!members_of(&plan.endpoints[1]).contains_key("m2"));
     }
@@ -570,7 +616,7 @@ mod tests {
         let existing = set(&["x", "y"]);
         let eps = [listed(1, &[("x", Listed), ("y", Listed)]), listed(2, &[("x", Listed), ("y", Listed)])];
         // Endpoint 2 is disabled for maintenance; endpoint 1 no longer lists x.
-        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), NotAsked], false, true).unwrap();
+        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), NotAsked], false, Unattended).unwrap();
         assert!(plan.retire.is_empty(), "a model the disabled replica serves was retired");
         assert_eq!(plan.endpoints[1], EndpointPlan::Unchanged);
     }
@@ -588,7 +634,7 @@ mod tests {
         ];
         let answers = [Answer::Listed(set(&["m1", "m2"])), Answer::Listed(b_names.iter().cloned().collect())];
         for sync in 0..2 {
-            let plan = fuse(&existing, &eps, &answers, false, true).unwrap();
+            let plan = fuse(&existing, &eps, &answers, false, Unattended).unwrap();
             assert!(plan.retire.is_empty(), "sync {sync} retired {:?}", plan.retire);
             assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: Some(KeptReason::ShortAnswer), .. }));
             eps = apply(&eps, &plan);
@@ -604,19 +650,19 @@ mod tests {
         let a = EndpointState { listed: true, members: names[..3].iter().map(|n| (n.clone(), Listed)).collect() };
         let b = EndpointState { listed: true, members: names[3..].iter().map(|n| (n.clone(), Listed)).collect() };
         let answer: BTreeSet<String> = names[..3].iter().cloned().collect();
-        let plan = fuse(&existing, &[a, b], &[Answer::Listed(answer), NotAsked], false, true).unwrap();
+        let plan = fuse(&existing, &[a, b], &[Answer::Listed(answer), NotAsked], false, Unattended).unwrap();
         assert!(plan.retire.is_empty());
         // Positive control: with B answering too, a short union IS gated.
         let a = EndpointState { listed: true, members: names[..3].iter().map(|n| (n.clone(), Listed)).collect() };
         let b = EndpointState { listed: true, members: names[3..].iter().map(|n| (n.clone(), Listed)).collect() };
-        let gated = fuse(&existing, &[a, b], &[Answer::Listed(set(&["m0"])), Answer::Listed(set(&["m3"]))], false, true);
+        let gated = fuse(&existing, &[a, b], &[Answer::Listed(set(&["m0"])), Answer::Listed(set(&["m3"]))], false, Unattended);
         assert_eq!(gated, Err(Implausible { discovered: 2, existing: 20 }));
     }
 
     #[test]
     fn a_model_served_only_by_assumption_is_never_retired() {
         let existing = set(&["hand-made"]);
-        let plan = fuse(&existing, &[fresh(1), fresh(2)], &[Failed, Failed], false, true).unwrap();
+        let plan = fuse(&existing, &[fresh(1), fresh(2)], &[Failed, Failed], false, Unattended).unwrap();
         assert!(plan.retire.is_empty());
     }
 
@@ -624,10 +670,85 @@ mod tests {
     fn server_first_sync_is_add_only() {
         let existing = set(&["a", "b"]);
         let ep = listed(1, &[("a", Listed), ("b", Listed)]);
-        let plan = fuse(&existing, &[ep], &[Answer::Listed(set(&["a", "c"]))], true, true).unwrap();
+        let plan = fuse(&existing, &[ep], &[Answer::Listed(set(&["a", "c"]))], true, Unattended).unwrap();
         assert!(plan.retire.is_empty());
         assert_eq!(plan.new_models, vec!["c".to_string()]);
         assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: Some(KeptReason::ServerFirstSync), .. }));
+    }
+
+    /// A server that really went from four models to one: unattended, the
+    /// answer is implausible and the sync refuses; reviewed, the three it no
+    /// longer lists are offered for removal.
+    #[test]
+    fn a_reviewed_sync_offers_what_a_short_answer_omits() {
+        let existing = set(&["a", "b", "c", "d"]);
+        let ep = listed(1, &[("a", Listed), ("b", Listed), ("c", Listed), ("d", Listed)]);
+        let one = [Answer::Listed(set(&["a"]))];
+        assert_eq!(
+            fuse(&existing, std::slice::from_ref(&ep), &one, false, Unattended),
+            Err(Implausible { discovered: 1, existing: 4 })
+        );
+        let plan = fuse(&existing, &[ep], &one, false, Reviewed).unwrap();
+        assert_eq!(plan.retire, vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+        assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: None, .. }));
+    }
+
+    /// The server pointed at another host: its endpoint starts over as never
+    /// answered, and an operator's sync reads it as serving every model, all
+    /// assumed. Reviewed, its first answer of one offers the other three.
+    #[test]
+    fn a_reviewed_sync_after_a_new_url_offers_what_the_new_host_does_not_list() {
+        let existing = set(&["a", "b", "c", "d"]);
+        let stand_in = EndpointState { listed: true, members: existing.iter().map(|n| (n.clone(), Assumed)).collect() };
+        let plan = fuse(&existing, &[stand_in], &[Answer::Listed(set(&["z"]))], false, Reviewed).unwrap();
+        assert_eq!(plan.new_models, vec!["z".to_string()]);
+        assert_eq!(plan.retire, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]);
+    }
+
+    /// An endpoint that lists nothing is starting, not empty: even a review
+    /// offers nothing on its word. One model listed is a real answer.
+    #[test]
+    fn a_reviewed_sync_offers_nothing_on_an_empty_answer() {
+        let existing = set(&["a", "b"]);
+        let ep = listed(1, &[("a", Listed), ("b", Listed)]);
+        let plan = fuse(&existing, std::slice::from_ref(&ep), &[Answer::Listed(set(&[]))], false, Reviewed).unwrap();
+        assert!(plan.retire.is_empty());
+        assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: Some(KeptReason::ShortAnswer), .. }));
+        let plan = fuse(&existing, &[ep], &[Answer::Listed(set(&["a"]))], false, Reviewed).unwrap();
+        assert_eq!(plan.retire, vec!["b".to_string()]);
+    }
+
+    /// A replica never heard from serves every model by assumption: with it
+    /// silent, a short answer from its sibling offers nothing — that answer's
+    /// own floor holds — and the review is not refused.
+    #[test]
+    fn a_reviewed_sync_with_a_silent_replica_keeps_the_per_endpoint_floor() {
+        // Twelve models: retiring three would leave over half, so only the
+        // per-endpoint floor holds this.
+        let existing = set(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]);
+        let a = listed(1, &[("a", Listed), ("b", Listed), ("c", Listed), ("d", Listed)]);
+        let plan = fuse(&existing, &[a.clone(), fresh(2)], &[Answer::Listed(set(&["a"])), Failed], false, Reviewed).unwrap();
+        assert!(plan.retire.is_empty(), "{:?}", plan.retire);
+        assert!(matches!(&plan.endpoints[0], EndpointPlan::Answered { kept: Some(KeptReason::ShortAnswer), .. }));
+        // A trusted answer beside the silent replica is offered.
+        let plan = fuse(&existing, &[a.clone(), fresh(2)], &[Answer::Listed(set(&["a", "b"])), Failed], false, Reviewed).unwrap();
+        assert_eq!(plan.retire, vec!["c".to_string(), "d".to_string()]);
+        // Positive control: with the replica answering too, the review offers them.
+        let plan = fuse(&existing, &[a, fresh(2)], &[Answer::Listed(set(&["a"])), Answer::Listed(set(&["a"]))], false, Reviewed).unwrap();
+        assert_eq!(plan.retire, vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+    }
+
+    /// The review lifts the length floors, not the evidence rule: a model an
+    /// endpoint that did not answer serves is not offered.
+    #[test]
+    fn a_reviewed_sync_still_keeps_what_a_silent_endpoint_serves() {
+        let existing = set(&["x", "y"]);
+        let eps = [listed(1, &[("x", Listed), ("y", Listed)]), listed(2, &[("x", Listed)])];
+        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), Failed], false, Reviewed).unwrap();
+        assert!(plan.retire.is_empty());
+        // Positive control: with endpoint 2 answering without it too, x goes.
+        let plan = fuse(&existing, &eps, &[Answer::Listed(set(&["y"])), Answer::Listed(set(&["y"]))], false, Reviewed).unwrap();
+        assert_eq!(plan.retire, vec!["x".to_string()]);
     }
 
     // ---- properties ---------------------------------------------------------
@@ -659,6 +780,10 @@ mod tests {
     /// (current models, endpoints, their answers, server first sync).
     type Scenario = (BTreeSet<String>, Vec<EndpointState>, Vec<Answer>, bool);
 
+    fn judge() -> impl Strategy<Value = Judge> {
+        prop_oneof![Just(Unattended), Just(Reviewed)]
+    }
+
     fn scenario() -> impl Strategy<Value = Scenario> {
         (1usize..=4).prop_flat_map(|n| {
             (
@@ -680,10 +805,39 @@ mod tests {
         })
     }
 
+    /// A refusal a property skips must be one the rules make: only an
+    /// unattended sync refuses — the server gate when every endpoint answered
+    /// (and named under half the server), the partial-answer floor otherwise.
+    fn refusal_is_expected(existing: &BTreeSet<String>, answers: &[Answer], judge: Judge, refused: Implausible) -> bool {
+        let every = !answers.is_empty() && answers.iter().all(|a| matches!(a, Answer::Listed(_)));
+        judge == Unattended
+            && refused.existing == existing.len()
+            && (!every || refused.discovered < plausibility_floor(existing.len()))
+    }
+
+    /// `fuse`'s plan, or `None` for a refusal the rules make — a property
+    /// skips that case (it writes nothing) and fails on any other refusal.
+    fn planned(
+        existing: &BTreeSet<String>,
+        eps: &[EndpointState],
+        answers: &[Answer],
+        first: bool,
+        judge: Judge,
+    ) -> Result<Option<FusionPlan>, TestCaseError> {
+        match fuse(existing, eps, answers, first, judge) {
+            Ok(plan) => Ok(Some(plan)),
+            Err(refused) => {
+                prop_assert!(refusal_is_expected(existing, answers, judge, refused), "{:?}", refused);
+                Ok(None)
+            }
+        }
+    }
+
     proptest! {
         #[test]
-        fn an_endpoint_that_did_not_answer_changes_nothing((existing, eps, answers, first) in scenario()) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+        fn an_endpoint_that_did_not_answer_changes_nothing((existing, eps, answers, first) in scenario(), judge in judge()) {
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, judge)? else { return Ok(()) };
             for (i, a) in answers.iter().enumerate() {
                 if a.listed().is_none() {
                     prop_assert_eq!(&plan.endpoints[i], &EndpointPlan::Unchanged);
@@ -693,9 +847,11 @@ mod tests {
 
         #[test]
         fn every_answered_name_is_listed_on_its_endpoint_and_known_to_the_server(
-            (existing, eps, answers, first) in scenario()
+            (existing, eps, answers, first) in scenario(),
+            judge in judge(),
         ) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, judge)? else { return Ok(()) };
             for (i, a) in answers.iter().enumerate() {
                 let Some(a) = a.listed() else { continue };
                 let m = members_of(&plan.endpoints[i]);
@@ -709,9 +865,11 @@ mod tests {
 
         #[test]
         fn a_model_retires_only_on_the_word_of_every_endpoint_that_listed_it(
-            (existing, eps, answers, first) in scenario()
+            (existing, eps, answers, first) in scenario(),
+            judge in judge(),
         ) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, judge)? else { return Ok(()) };
             for name in &plan.retire {
                 prop_assert!(!first, "a first sync never retires");
                 let quorum: Vec<usize> = eps.iter().enumerate()
@@ -723,14 +881,20 @@ mod tests {
                     prop_assert!(a.is_some(), "a quorum member that did not answer retired {}", name);
                     let a = a.unwrap();
                     prop_assert!(!a.contains(name));
-                    prop_assert!(a.len() >= plausibility_floor(listed_count(&eps[i])));
+                    if judge == Unattended {
+                        prop_assert!(a.len() >= plausibility_floor(listed_count(&eps[i])));
+                    } else {
+                        // A review keeps one floor: an empty answer retires nothing.
+                        prop_assert!(!a.is_empty(), "an empty answer retired {}", name);
+                    }
                 }
             }
         }
 
         #[test]
-        fn no_model_is_stranded((existing, eps, answers, first) in scenario()) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+        fn no_model_is_stranded((existing, eps, answers, first) in scenario(), judge in judge()) {
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, judge)? else { return Ok(()) };
             for name in &existing {
                 let served_before = eps.iter().any(|e| serves(e, &existing).any(|n| n == name));
                 if !served_before || plan.retire.contains(name) {
@@ -746,12 +910,15 @@ mod tests {
 
         /// Two syncs with the same answers: an answer too short to trust
         /// against the endpoint's own listed evidence is still too short in
-        /// the second.
+        /// the second — kept again, or the sync refused whole, which writes
+        /// nothing. (Unattended: a review judges no length; with one endpoint
+        /// the server gate refuses a short answer before this floor is read.)
         #[test]
         fn a_short_answer_is_short_on_every_repeat((existing, eps, answers, first) in scenario()) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, Unattended)? else { return Ok(()) };
             let next = apply(&eps, &plan);
-            let again = fuse(&existing, &next, &answers, first, false).unwrap();
+            let Some(again) = planned(&existing, &next, &answers, first, Unattended)? else { return Ok(()) };
             for (i, p) in plan.endpoints.iter().enumerate() {
                 // Judged against listed evidence of its own (an endpoint with
                 // none is judged against everything it serves, and its first
@@ -767,9 +934,38 @@ mod tests {
             }
         }
 
+        /// A review of a server whose every endpoint answered offers every
+        /// model the endpoints serving it all answered without — however
+        /// short the answers, if not empty. With an endpoint silent it offers
+        /// no more than that.
         #[test]
-        fn no_endpoint_holds_a_retired_model((existing, eps, answers, first) in scenario()) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+        fn a_reviewed_sync_offers_every_model_its_quorum_answered_without(
+            (existing, eps, answers, first) in scenario(),
+        ) {
+            let plan = fuse(&existing, &eps, &answers, first, Reviewed).unwrap();
+            if first {
+                return Ok(());
+            }
+            let named: BTreeSet<&String> = answers.iter().filter_map(Answer::listed).flatten().collect();
+            for name in &existing {
+                let quorum: Vec<usize> = eps.iter().enumerate()
+                    .filter(|(_, e)| e.listed && e.members.contains_key(name))
+                    .map(|(i, _)| i).collect();
+                let offered = !quorum.is_empty()
+                    && quorum.iter().all(|i| answers[*i].listed().is_some_and(|l| !l.is_empty()))
+                    && !named.contains(name);
+                if answers.iter().all(|a| a.listed().is_some()) {
+                    prop_assert_eq!(plan.retire.contains(name), offered, "model {}", name);
+                } else {
+                    prop_assert!(!plan.retire.contains(name) || offered, "model {}", name);
+                }
+            }
+        }
+
+        #[test]
+        fn no_endpoint_holds_a_retired_model((existing, eps, answers, first) in scenario(), judge in judge()) {
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, judge)? else { return Ok(()) };
             for p in &plan.endpoints {
                 if let EndpointPlan::Answered { members, .. } = p {
                     for name in &plan.retire {
@@ -780,8 +976,9 @@ mod tests {
         }
 
         #[test]
-        fn an_untrusted_answer_removes_nothing((existing, eps, answers, first) in scenario()) {
-            let plan = fuse(&existing, &eps, &answers, first, false).unwrap();
+        fn an_untrusted_answer_removes_nothing((existing, eps, answers, first) in scenario(), judge in judge()) {
+            // A refusal writes nothing, so it holds every claim.
+            let Some(plan) = planned(&existing, &eps, &answers, first, judge)? else { return Ok(()) };
             let after = apply(&eps, &plan);
             for (i, p) in plan.endpoints.iter().enumerate() {
                 if let EndpointPlan::Answered { members, kept: Some(_) } = p {

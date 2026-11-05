@@ -13582,6 +13582,14 @@ export interface components {
             existing: components["schemas"]["ModelResponse"][];
             new_models: components["schemas"]["DiscoveredModel"][];
             removed: components["schemas"]["RemovedModelInfo"][];
+            /**
+             * @description "Sync now" would not make some of `removed`, or would refuse the sync
+             *     whole: it judges an answer implausibly short (under half of what the
+             *     server, or the endpoint, listed before). The review still offers them — a server
+             *     can really shrink — and this says to check the server is fully up
+             *     before accepting them.
+             */
+            unattended_refuses: boolean;
         };
         /** @description Returned after a destructive operation — how many keys were revoked. */
         MutationResult: {
@@ -35303,7 +35311,7 @@ export interface operations {
     delete_endpoint: {
         parameters: {
             query?: {
-                /** @description Report what removing the endpoint would do, without removing it. */
+                /** @description When true, return impact preview without mutating. */
                 dry_run?: boolean;
             };
             header?: never;

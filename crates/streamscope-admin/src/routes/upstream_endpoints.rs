@@ -23,7 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 use streamscope_core::config::upstream_transport::UpstreamTransport;
@@ -1055,13 +1055,6 @@ fn last_enabled_error() -> ApiError {
     )
 }
 
-#[derive(Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct EndpointDryRunQuery {
-    /// Report what removing the endpoint would do, without removing it.
-    pub dry_run: Option<bool>,
-}
-
 /// What removing an endpoint did (or, on a dry run, would do).
 #[derive(Serialize, ToSchema)]
 pub struct EndpointRemovalResponse {
@@ -1083,7 +1076,7 @@ pub struct EndpointRemovalResponse {
     params(
         ("id" = Uuid, Path, description = "Server ID"),
         ("endpoint_id" = Uuid, Path, description = "Endpoint ID"),
-        EndpointDryRunQuery,
+        super::key_lifecycle::DryRunQuery,
     ),
     responses(
         (status = 200, description = "Endpoint removed (or the removal previewed)", body = EndpointRemovalResponse),
@@ -1094,12 +1087,12 @@ pub struct EndpointRemovalResponse {
     security(("bearer_auth" = []))
 )]
 pub async fn delete_endpoint(
+    // First: a preview is marked before any other extractor can refuse it.
+    crate::middleware::DryRun(dry_run): crate::middleware::DryRun,
     mut db: TenantConn,
     Path((server_id, endpoint_id)): Path<(Uuid, Uuid)>,
-    Query(q): Query<EndpointDryRunQuery>,
 ) -> Result<Json<EndpointRemovalResponse>, ApiError> {
     server_facts(db.conn(), server_id).await?;
-    let dry_run = q.dry_run.unwrap_or(false);
     // The preview IS the removal, rolled back — so what it reports cannot
     // drift from what the removal does.
     let mut tx = db.conn().begin().await.map_err(db_error("failed to remove the endpoint"))?;

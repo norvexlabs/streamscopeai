@@ -8,8 +8,8 @@
 use serde_json::Value;
 use streamscope_core::api::domain_request::{
     domain_assistant_content_from_stored, domain_messages_from_stored,
-    domain_request_meta_from_stored, DomainContentBlock, DomainMessage, DomainRequestMeta,
-    DomainRole,
+    computer_screenshot_block, domain_request_meta_from_stored, unknown_part_kind,
+    DomainContentBlock, DomainMessage, DomainRequestMeta, DomainRole,
 };
 use streamscope_core::api::sse::ApiVersion;
 use streamscope_core::audit::BlobType;
@@ -573,6 +573,30 @@ fn append_message_events(
     let mut meta_slot = if attach_metadata && !tool_result { turn.metadata.clone() } else { None };
 
     for block in &msg.content {
+        // A computer call's screenshot is the image the client sent, in its
+        // place among the message's events, the item itself in the raw view.
+        let screenshot = match block {
+            DomainContentBlock::Unknown { value } => computer_screenshot_block(value),
+            _ => None,
+        };
+        if screenshot.is_some() {
+            flush_text(events, role_str, &mut text_buf, &mut thinking_buf, turn, &mut raw_slot, &mut meta_slot, is_new, is_from_history);
+            if let (true, DomainContentBlock::Unknown { value }) = (turn.include_raw, block) {
+                events.push(ConversationEvent::Message {
+                    role: role_str.to_string(),
+                    content: String::new(),
+                    thinking: None,
+                    turn: turn.turn_number,
+                    is_new,
+                    is_from_history,
+                    metadata: meta_slot.take(),
+                    raw: Some(value.clone()),
+                    guardrails: Vec::new(),
+                });
+            }
+        }
+        let role_str = if screenshot.is_some() { "user" } else { role_str };
+        let block = screenshot.as_ref().unwrap_or(block);
         // A tool result's text is its `ToolResult`, and a block of a type the
         // parser did not model is in that event's raw.
         if tool_result && matches!(block, DomainContentBlock::Text { .. } | DomainContentBlock::Unknown { .. }) {
@@ -871,10 +895,17 @@ fn append_message_events(
                 });
             }
             DomainContentBlock::Unknown { value } => {
-                // Only emit a stub event when the caller asked for raw — otherwise
-                // skip to avoid rendering a blank message bubble with no prose.
-                if turn.include_raw {
+                // A part the client attached to its own message is shown as an
+                // attachment, named but not played. A history item the assistant
+                // side keeps (`redacted_thinking`, `reasoning`, ...) is no
+                // attachment of anyone's.
+                let attachment = matches!(msg.role, DomainRole::User);
+                if turn.include_raw || attachment {
                     flush_text(events, role_str, &mut text_buf, &mut thinking_buf, turn, &mut raw_slot, &mut meta_slot, is_new, is_from_history);
+                }
+                // The raw view's stub: without raw, a blank message bubble with
+                // no prose.
+                if turn.include_raw {
                     events.push(ConversationEvent::Message {
                         role: role_str.to_string(),
                         content: String::new(),
@@ -885,6 +916,22 @@ fn append_message_events(
                         metadata: meta_slot.take(),
                         raw: Some(value.clone()),
                         guardrails: Vec::new(),
+                    });
+                }
+                if attachment {
+                    events.push(ConversationEvent::Media {
+                        role: role_str.to_string(),
+                        media_type: unknown_part_media_type(value).unwrap_or("application/octet-stream").to_string(),
+                        content_type: "file".to_string(),
+                        data: None,
+                        url: None,
+                        title: Some(unknown_part_kind(value).to_string()),
+                        size_bytes: None,
+                        turn: turn.turn_number,
+                        is_new,
+                        content_hash: None,
+                        blob_type: None,
+                        request_id: None,
                     });
                 }
             }
@@ -952,6 +999,23 @@ fn concat_text(blocks: &[DomainContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The media type an unmodelled part states, on itself or one level down (a
+/// Chat `file`, a Gemini `inlineData`, an Anthropic `source`), as a field or as
+/// the head of a data URL. Only a well-formed name counts: the client chose it.
+fn unknown_part_media_type(value: &Value) -> Option<&str> {
+    let nested = value.as_object().into_iter().flat_map(|part| part.values());
+    std::iter::once(value)
+        .chain(nested)
+        .filter_map(Value::as_object)
+        .find_map(|part| {
+            ["media_type", "mime_type", "mimeType"]
+                .iter()
+                .find_map(|field| part.get(*field)?.as_str())
+                .or_else(|| part.get("file_data")?.as_str()?.strip_prefix("data:")?.split([';', ',']).next())
+        })
+        .filter(|mt| mt.len() <= 127 && mt.contains('/') && mt.chars().all(|c| c.is_ascii_alphanumeric() || "+-._/".contains(c)))
 }
 
 fn media_type_to_category(mt: &str) -> String {
@@ -1708,6 +1772,146 @@ mod tests {
                 assert_eq!(content, "<system-reminder>no close");
             }
             other => panic!("expected FrameworkReminder, got {other:?}"),
+        }
+    }
+
+    /// The `media` events of a turn, as (role, media type, title).
+    fn attachments(events: &[ConversationEvent]) -> Vec<(String, String, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ConversationEvent::Media { role, media_type, title, data, url, size_bytes, content_hash, .. } => {
+                    assert!(data.is_none() && url.is_none() && size_bytes.is_none() && content_hash.is_none(), "{e:?}");
+                    Some((role.clone(), media_type.clone(), title.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The raw view's stub for a block with no event of its own.
+    fn raw_stubs(events: &[ConversationEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ConversationEvent::Message { content, raw: Some(_), .. } if content.is_empty()))
+            .count()
+    }
+
+    /// A part the client attached that no parser models is named on the view
+    /// with or without raw: its kind and stated media type, in order after the
+    /// prose before it, never its bytes outside the raw view.
+    #[test]
+    fn a_user_part_kept_as_unknown_is_an_attachment_with_or_without_raw() {
+        let check = |protocol: ApiVersion, part: Value, media_type: &str, kind: &str| {
+            for include_raw in [false, true] {
+                let mut turn = turn_for_messages(json!([]));
+                let messages: &'static Value = Box::leak(Box::new(match protocol {
+                    ApiVersion::GoogleGemini => json!([{"role": "user", "parts": [{"text": "see this"}, part.clone()]}]),
+                    _ => json!([{"role": "user", "content": [{"type": "text", "text": "see this"}, part.clone()]}]),
+                }));
+                turn.messages_json = messages;
+                turn.protocol = protocol;
+                turn.include_raw = include_raw;
+                let events = build_events(&turn).unwrap().events;
+                assert_eq!(
+                    attachments(&events),
+                    [("user".to_string(), media_type.to_string(), Some(kind.to_string()))],
+                    "{protocol:?} include_raw: {include_raw}"
+                );
+                let prose = events.iter().position(|e| matches!(e, ConversationEvent::Message { content, .. } if content == "see this"));
+                let attachment = events.iter().position(|e| matches!(e, ConversationEvent::Media { .. }));
+                assert!(prose.is_some() && prose < attachment, "{events:?}");
+                assert_eq!(raw_stubs(&events), usize::from(include_raw), "{protocol:?} include_raw: {include_raw}");
+                if !include_raw {
+                    let shown = serde_json::to_string(&events).unwrap();
+                    assert!(!shown.contains("//79") && !shown.contains("PAYLOAD"), "{shown}");
+                }
+            }
+        };
+        let file = json!({"filename": "n.txt", "file_data": "data:text/plain;base64,//79"});
+        check(ApiVersion::ChatCompletions, json!({"type": "file", "file": file}), "text/plain", "file");
+        check(
+            ApiVersion::ChatCompletions,
+            json!({"type": "future_widget", "payload": "PAYLOAD"}),
+            "application/octet-stream",
+            "future_widget",
+        );
+        check(ApiVersion::GoogleGemini, json!({"inlineData": {"mimeType": "text/plain", "data": "//79"}}), "text/plain", "inlineData");
+    }
+
+    /// A media type that could carry content is not repeated; the attachment is
+    /// still there.
+    #[test]
+    fn an_unknown_part_is_named_only_by_a_plain_kind_and_media_type() {
+        assert_eq!(unknown_part_media_type(&json!({"media_type": "text/plain"})), Some("text/plain"));
+        assert_eq!(unknown_part_media_type(&json!({"source": {"media_type": "image/svg+xml"}})), Some("image/svg+xml"));
+        assert_eq!(unknown_part_media_type(&json!({"file_data": "data:text/plain;base64,//79"})), Some("text/plain"));
+        assert_eq!(unknown_part_media_type(&json!({"file_data": "//79"})), None);
+        assert_eq!(unknown_part_media_type(&json!({"mimeType": "plain"})), None);
+        assert_eq!(unknown_part_media_type(&json!({"mimeType": format!("a/{}", "x".repeat(125))})).map(str::len), Some(127));
+        assert_eq!(unknown_part_media_type(&json!({"mimeType": format!("a/{}", "x".repeat(126))})), None);
+        assert_eq!(unknown_part_media_type(&json!({"data": {"deep": {"mimeType": "text/plain"}}})), None);
+    }
+
+    /// A computer call's screenshot shows as the client's image, stored or by URL,
+    /// and the item stays in the raw view.
+    #[test]
+    fn a_stored_computer_screenshot_is_a_stored_image_on_the_view() {
+        let hash = "a".repeat(64);
+        let mut turn = turn_for_messages(json!([
+            {"type": "computer_call_output", "call_id": "k1", "output":
+                {"type": "blob_ref", "content_hash": hash, "media_type": "image/png", "blob_type": "chat_image"}},
+            {"type": "computer_call_output", "call_id": "k2", "output":
+                {"type": "computer_screenshot", "image_url": "https://x/shot.png"}},
+            {"role": "user", "content": "go on"},
+        ]));
+        turn.protocol = ApiVersion::Responses;
+        for include_raw in [false, true] {
+            turn.include_raw = include_raw;
+            let events = build_events(&turn).unwrap().events;
+            let media: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ConversationEvent::Media { role, content_hash, url, .. } => Some((role.as_str(), content_hash.as_deref(), url.as_deref())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(media, [("user", Some(hash.as_str()), None), ("user", None, Some("https://x/shot.png"))], "{events:?}");
+            let mut raw_calls: Vec<&str> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ConversationEvent::Message { raw: Some(raw), .. } if raw["type"] == "computer_call_output" => raw["call_id"].as_str(),
+                    _ => None,
+                })
+                .collect();
+            raw_calls.sort_unstable();
+            raw_calls.dedup();
+            assert_eq!(raw_calls, if include_raw { vec!["k1", "k2"] } else { vec![] }, "{events:?}");
+        }
+    }
+
+    /// A history item the assistant side keeps as unknown stays out of the
+    /// view without raw, and is only the raw stub with it. So is a tool result's
+    /// unknown block, which is in its `ToolResult`'s raw.
+    #[test]
+    fn an_assistant_or_tool_unknown_is_not_an_attachment() {
+        for include_raw in [false, true] {
+            let mut turn = turn_for_messages(json!([
+                {"role": "user", "content": "x"},
+                {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "//79"}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": [{"type": "future_widget", "payload": "PAYLOAD"}]}]},
+            ]));
+            turn.protocol = ApiVersion::AnthropicMessages;
+            turn.include_raw = include_raw;
+            let events = build_events(&turn).unwrap().events;
+            assert_eq!(attachments(&events), [], "include_raw: {include_raw}");
+            assert!(events.iter().any(|e| matches!(e, ConversationEvent::ToolResult { .. })), "{events:?}");
+            let redacted_stub = events
+                .iter()
+                .filter(|e| matches!(e, ConversationEvent::Message { role, content, raw: Some(raw), .. }
+                    if role == "assistant" && content.is_empty() && raw["type"] == "redacted_thinking"))
+                .count();
+            assert_eq!(redacted_stub, usize::from(include_raw), "include_raw: {include_raw}");
         }
     }
 

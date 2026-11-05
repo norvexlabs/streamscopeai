@@ -29,7 +29,7 @@
     PROVIDER_DEFAULTS,
     getProvider as getProviderIcon,
   } from '#lib/generated/providers.js';
-  import { canModelSync } from '#lib/server-form.js';
+  import { canAskForModels, canModelSync } from '#lib/server-form.js';
   import ServerWizard from '#lib/components/llm/ServerWizard.svelte';
   import TabbedPage from '#lib/components/page/TabbedPage.svelte';
   import Callout from '#lib/components/Callout.svelte';
@@ -2089,6 +2089,15 @@
 
     <!-- Removed models -->
     {#if (sync.removed || []).length > 0}
+      {#if sync.unattended_refuses}
+        <div class="mb-4" data-testid="sync-unattended-refuses">
+          <Callout severity="warning" title="The server's list is much shorter than before">
+            Sync now would not make all of these removals, and may refuse the sync altogether: the
+            server's list is implausibly short against what it listed before. If it is still starting or was only briefly unreachable, close this and review
+            again once it is fully up. Remove them only if the server really serves fewer models now.
+          </Callout>
+        </div>
+      {/if}
       <div class="mb-6">
         <div class="flex items-center justify-between mb-2">
           <h4 class="text-sm font-semibold text-(--warning)">Removed Models ({sync.removed.length})</h4>
@@ -2670,13 +2679,11 @@
                     </td>
                     <td class="px-5 py-3.5 text-right font-mono text-sm text-(--text-secondary)">{models.length}</td>
                     <td class="px-5 py-3.5">
-                      <!-- The toggle needs a discoverable server with a
-                           credential to offer; the STATUS is shown whenever one
-                           was recorded. A keyless local engine whose first sync
-                           failed is exactly the case that records one, and
-                           gating the two together hid it from the one page an
-                           operator scans. -->
-                      {#if canModelSync(server) && server.has_credential}
+                      <!-- The toggle shows wherever the worker may discover
+                           (as on the server's page), so it can always be turned
+                           off; Sync now and Review only where an ask can be
+                           answered. The STATUS is shown whenever recorded. -->
+                      {#if canModelSync(server)}
                         <div class="flex flex-col gap-1">
                           <button
                             type="button"
@@ -2700,7 +2707,7 @@
                     </td>
                     <td class="px-5 py-3.5 text-right">
                       <div class="flex items-center justify-end gap-3">
-                        {#if canModelSync(server) && server.has_credential}
+                        {#if canAskForModels(server)}
                           <button onclick={() => syncNow(server)} disabled={syncingNowId === server.id} class="text-xs font-medium text-(--accent) hover:text-(--accent-hover) bg-(--accent)/5 hover:bg-(--accent)/10 px-2.5 py-1 rounded-md transition-colors disabled:opacity-50">{syncingNowId === server.id ? 'Syncing…' : 'Sync now'}</button>
                           <button onclick={() => openSync(server)} class="text-xs font-medium text-(--accent) hover:text-(--accent-hover) transition-colors">Review</button>
                         {/if}

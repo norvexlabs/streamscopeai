@@ -1272,18 +1272,30 @@ fn value_part_may_be_media(part: &serde_json::Value) -> bool {
     }
     matches!(
         part.get("type").and_then(|t| t.as_str()),
-        Some("image" | "image_url" | "input_image" | "document" | "input_audio" | "input_file")
+        Some("image" | "image_url" | "input_image" | "computer_screenshot" | "document" | "input_audio" | "input_file" | "file")
     )
 }
 
+/// A Responses `computer_call_output`'s `output`: one screenshot object, where
+/// every other tool result has a string or an array of parts.
+pub(crate) fn computer_screenshot_output(msg: &serde_json::Value) -> Option<&serde_json::Value> {
+    if msg.get("type").and_then(|t| t.as_str()) != Some("computer_call_output") {
+        return None;
+    }
+    msg.get("output").filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("computer_screenshot"))
+}
+
+use crate::api::domain_request::split_data_uri;
+
 /// Whether a raw JSON message could contain media: walks the same
-/// `content`/`parts`/`output` arrays `strip_media_inner` walks, testing each
-/// part with [`value_part_may_be_media`].
+/// `content`/`parts`/`output` arrays and screenshot `strip_media_inner` walks,
+/// testing each part with [`value_part_may_be_media`].
 fn value_message_may_have_media(msg: &serde_json::Value) -> bool {
-    ["content", "parts", "output"]
-        .iter()
-        .filter_map(|key| msg.get(key).and_then(|c| c.as_array()))
-        .any(|arr| arr.iter().any(value_part_may_be_media))
+    computer_screenshot_output(msg).is_some()
+        || ["content", "parts", "output"]
+            .iter()
+            .filter_map(|key| msg.get(key).and_then(|c| c.as_array()))
+            .any(|arr| arr.iter().any(value_part_may_be_media))
 }
 
 /// Media probe over typed ChatCompletions/Responses content parts.
@@ -2751,7 +2763,8 @@ pub struct StripMediaResult {
 /// When `mutate=true`, replaces content blocks in-place (blob_ref or stripped).
 /// When `mutate=false`, only scans for summary metadata without modifying messages.
 ///
-/// Handles `image`, `image_url`, `document`, and `input_audio` content block types.
+/// Handles `image`, `image_url`, `input_image`, `computer_screenshot`, `document`,
+/// `input_audio`, `input_file` and `file` content block types.
 pub fn strip_media_from_messages(
     messages: &mut serde_json::Value,
     max_blob_bytes: usize,
@@ -2785,11 +2798,17 @@ fn strip_media_inner(
     for msg in msgs {
         // OpenAI/Anthropic: content parts in msg["content"]; Gemini: in
         // msg["parts"] (from serialized GeminiContent); a Responses tool
-        // result: in its `output` array.
+        // result: in its `output` array, or its `output` is the one screenshot
+        // of a computer call.
         for key in ["content", "parts", "output"] {
             if let Some(parts) = msg.get_mut(key).and_then(|c| c.as_array_mut()) {
                 strip_media_parts(parts, max_blob_bytes, store_blobs, mutate, &mut blobs, &mut summary);
             }
+        }
+        if computer_screenshot_output(msg).is_some()
+            && let Some(screenshot) = msg.get_mut("output")
+        {
+            strip_media_parts(std::slice::from_mut(screenshot), max_blob_bytes, store_blobs, mutate, &mut blobs, &mut summary);
         }
     }
 
@@ -2857,10 +2876,10 @@ fn strip_media_parts(
                     }
                 }
             }
-            // The Responses image part: `image_url` is the URL itself.
-            "input_image" => {
-                if let Some(rest) = part.get("image_url").and_then(|u| u.as_str()).and_then(|u| u.strip_prefix("data:"))
-                    && let Some((mt, b64)) = rest.split_once(";base64,")
+            // The Responses image part and computer-use screenshot: `image_url`
+            // is the URL itself.
+            "input_image" | "computer_screenshot" => {
+                if let Some((mt, b64)) = part.get("image_url").and_then(|u| u.as_str()).and_then(split_data_uri)
                     && let Some(entry) = extract_and_replace(b64, mt, BlobType::ChatImage, max_blob_bytes, store_blobs)
                 {
                     summary.push(entry.summary);
@@ -2871,8 +2890,7 @@ fn strip_media_parts(
             "image_url" => {
                 if let Some(image_url) = part.get("image_url") {
                     let url_str = image_url.get("url").and_then(|u| u.as_str()).unwrap_or("");
-                    if let Some(rest) = url_str.strip_prefix("data:")
-                        && let Some((mt, b64)) = rest.split_once(";base64,")
+                    if let Some((mt, b64)) = split_data_uri(url_str)
                         && let Some(entry) = extract_and_replace(b64, mt, BlobType::ChatImage, max_blob_bytes, store_blobs)
                     {
                         summary.push(entry.summary);
@@ -2912,11 +2930,12 @@ fn strip_media_parts(
                     }
                 }
             }
-            "input_file" => {
+            // A Responses `input_file` holds its file data itself, a Chat `file`
+            // in `file`.
+            "input_file" | "file" => {
                 // Extract inline file data from data URI
-                if let Some(data_uri) = part.get("file_data").and_then(|d| d.as_str())
-                    && let Some(rest) = data_uri.strip_prefix("data:")
-                    && let Some((mime, b64)) = rest.split_once(";base64,")
+                if let Some(data_uri) = part.get("file_data").or_else(|| part.pointer("/file/file_data")).and_then(|d| d.as_str())
+                    && let Some((mime, b64)) = split_data_uri(data_uri)
                     && let Some(entry) = extract_and_replace(b64, mime, BlobType::ChatFile, max_blob_bytes, store_blobs)
                 {
                     summary.push(entry.summary);
@@ -2945,8 +2964,7 @@ fn extract_and_replace(
     max_blob_bytes: usize,
     store_blobs: bool,
 ) -> Option<ExtractResult> {
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let data = crate::api::domain_request::decode_proto_bytes(b64)?;
     let size_bytes = data.len();
     let hash = {
         let mut hasher = Sha256::new();
@@ -3129,6 +3147,12 @@ mod tests {
                 "contents": [{"role":"user","parts":[{"functionResponse":{"name":"shot","response":{},
                     "parts":[{"inlineData":{"mimeType":"image/png","data":b64}}]}}]}]
             })).unwrap()),
+            ApiRequest::Responses(serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "input": [{"type":"computer_call_output","call_id":"t1","output":
+                    {"type":"computer_screenshot","image_url":format!("data:image/png;base64,{b64}")}
+                }]
+            })).unwrap()),
         ];
         for req in &cases {
             let content = extract_request_content(req, 128);
@@ -3177,6 +3201,13 @@ mod tests {
             ApiRequest::GoogleGemini(serde_json::from_value(serde_json::json!({
                 "contents": [{"role":"user","parts":[{"text":"hi"}]}]
             })).unwrap()),
+            ApiRequest::Responses(serde_json::from_value(serde_json::json!({
+                "model": "m",
+                "input": [
+                    {"type":"function_call_output","call_id":"t1","output":"done"},
+                    {"type":"computer_call_output","call_id":"t2","output":{"type":"not_a_screenshot"}}
+                ]
+            })).unwrap()),
         ];
         for req in &text_cases {
             let content = extract_request_content(req, 128);
@@ -3185,6 +3216,92 @@ mod tests {
                 "probe false-positive on text-only {req:?}"
             );
         }
+    }
+
+    /// A Chat `file` part's `data:` file is stored like a Responses `input_file`;
+    /// one by id has no bytes to store. The capture probe reads what the pass stores.
+    #[test]
+    fn a_chat_file_part_is_stored_as_a_blob_only_when_it_carries_its_bytes() {
+        let file = serde_json::json!({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,aGVsbG8="}});
+        assert!(value_part_may_be_media(&file));
+        let mut msgs = serde_json::json!([{"role": "user", "content": [file, {"type": "file", "file": {"file_id": "file-1"}}]}]);
+        let r = strip_media_from_messages(&mut msgs, 1024, true);
+        assert_eq!(r.blobs.len(), 1);
+        assert_eq!(r.blobs[0].blob_type, BlobType::ChatFile);
+        assert_eq!(&r.blobs[0].data[..], b"hello");
+        assert_eq!(msgs[0]["content"][0]["type"], "blob_ref");
+        assert_eq!(msgs[0]["content"][1]["file"]["file_id"], "file-1");
+    }
+
+    /// A computer call's screenshot is stored like any other image: its `data:`
+    /// URL leaves the audit copy for a blob, and a reference takes its place. A
+    /// screenshot with no bytes of its own is left as the client sent it.
+    #[test]
+    fn a_computer_screenshot_is_stored_as_a_blob_only_when_it_carries_its_bytes() {
+        let screenshot = |output: serde_json::Value| {
+            serde_json::json!([{"type": "computer_call_output", "call_id": "k1", "output": output}])
+        };
+        let data_url = serde_json::json!({"type": "computer_screenshot", "image_url": "data:image/png;base64,aGVsbG8="});
+        let max = 1024;
+
+        let mut msgs = screenshot(data_url.clone());
+        let r = strip_media_from_messages(&mut msgs, max, true);
+        assert_eq!(r.blobs.len(), 1);
+        assert_eq!(r.blobs[0].media_type, "image/png");
+        assert_eq!(r.blobs[0].blob_type, BlobType::ChatImage);
+        assert_eq!(&r.blobs[0].data[..], b"hello");
+        assert_eq!(r.summary.len(), 1);
+        assert_eq!(msgs[0]["output"]["type"], "blob_ref");
+        assert_eq!(msgs[0]["output"]["content_hash"], r.blobs[0].content_hash.as_str());
+        assert_eq!(msgs[0]["call_id"], "k1", "the item around the screenshot stays");
+
+        // Past the cap, or with storage off, it is a visible marker, no blob.
+        let mut msgs = screenshot(data_url.clone());
+        let r = strip_media_from_messages(&mut msgs, 1, true);
+        assert!(r.blobs.is_empty());
+        assert_eq!(r.summary.len(), 1);
+        assert_eq!(msgs[0]["output"]["type"], "stripped");
+
+        // A scan counts it and changes nothing.
+        let mut msgs = screenshot(data_url.clone());
+        let r = scan_media_summary(&mut msgs, max);
+        assert_eq!(r.summary.len(), 1);
+        assert_eq!(msgs, screenshot(data_url));
+
+        // Nothing to store: a remote image, an uploaded file, another output.
+        for output in [
+            serde_json::json!({"type": "computer_screenshot", "image_url": "https://x/shot.png"}),
+            serde_json::json!({"type": "computer_screenshot", "file_id": "file-1"}),
+            serde_json::json!({"type": "not_a_screenshot", "image_url": "data:image/png;base64,aGVsbG8="}),
+            serde_json::json!("done"),
+        ] {
+            let mut msgs = screenshot(output.clone());
+            let r = strip_media_from_messages(&mut msgs, max, true);
+            assert!(r.blobs.is_empty() && r.summary.is_empty(), "{output}");
+            assert_eq!(msgs, screenshot(output));
+        }
+    }
+
+    /// The media pass works on the captured copy: the request sent upstream
+    /// keeps its screenshot.
+    #[test]
+    fn storing_a_computer_screenshot_leaves_the_request_untouched() {
+        let body = serde_json::json!({
+            "model": "m",
+            "input": [{"type": "computer_call_output", "call_id": "k1", "output":
+                {"type": "computer_screenshot", "image_url": "data:image/png;base64,aGVsbG8="}}],
+        });
+        let req: crate::api::responses::ResponsesRequest = serde_json::from_value(body.clone()).unwrap();
+        let req = ApiRequest::Responses(req);
+        let content = extract_request_content(&req, 128);
+        let mut msgs = serde_json::Value::Array(
+            content.messages_json.iter().map(|s| serde_json::from_str(s).unwrap()).collect(),
+        );
+        strip_media_from_messages(&mut msgs, 1024, true);
+        assert_eq!(msgs[0]["output"]["type"], "blob_ref");
+
+        let ApiRequest::Responses(sent) = &req else { unreachable!() };
+        assert_eq!(serde_json::to_value(sent).unwrap()["input"], body["input"]);
     }
 
     /// `hash_tools_blob` relies on `serde_json::Value::Object` being
@@ -4818,5 +4935,18 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(strip_volatile_inline(input), expected, "input={input:?}");
         }
+    }
+
+    /// A blob's bytes are stored under one hash whichever base64 spelling the
+    /// client used, the spellings the protocol walks read: what reaches a model
+    /// is what the row stores.
+    #[test]
+    fn a_blobs_spelling_does_not_decide_what_is_stored() {
+        let hash = |b64: &str| extract_and_replace(b64, "image/png", BlobType::ChatImage, 1024, true).map(|e| e.summary.content_hash);
+        let standard = hash("+/+/").expect("standard base64 decodes");
+        assert_eq!(hash("-_-_").as_ref(), Some(&standard), "URL-safe");
+        assert_eq!(hash("+/+/\r\n").as_ref(), Some(&standard), "line-wrapped");
+        assert_eq!(hash("QUI"), hash("QUI="), "unpadded");
+        assert_eq!(hash("!!!!"), None, "not base64");
     }
 }

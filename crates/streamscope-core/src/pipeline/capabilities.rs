@@ -188,12 +188,16 @@ fn check_unclassified_media(request: &ApiRequest, caps: &ModelCapabilities) -> R
         return Ok(());
     };
     let has_untyped_media = req.contents.iter().any(|c| {
-        c.parts.iter().any(|part| {
-            matches!(
-                part,
-                crate::api::gemini::GeminiPart::FileData { file_data }
-                    if file_data.mime_type.is_none()
-            )
+        c.parts.iter().any(|part| match part {
+            crate::api::gemini::GeminiPart::InlineData { inline_data } => inline_data.mime_type.is_empty(),
+            crate::api::gemini::GeminiPart::FileData { file_data } => {
+                file_data.mime_type.as_deref().is_none_or(str::is_empty)
+            }
+            crate::api::gemini::GeminiPart::FunctionResponse { function_response } => {
+                function_response.parts.iter().any(gemini_raw_part_is_untyped)
+            }
+            crate::api::gemini::GeminiPart::Unknown(part) => gemini_raw_part_is_untyped(part),
+            _ => false,
         })
     });
     if has_untyped_media {
@@ -275,9 +279,16 @@ fn has_content_type(request: &ApiRequest, pred: impl Fn(&ContentPart) -> bool) -
                 // multimodal. `ContentPart` has an untagged `Unknown` arm, so
                 // the parse always succeeds and unknown parts still reach the
                 // predicate. A tool result's `output` array carries the same
-                // parts as a message's `content`, and reaches the model too.
+                // parts as a message's `content`, and reaches the model too. A
+                // computer call's `output` is one screenshot object instead,
+                // read as the image part it is, by URL or by uploaded file.
                 ResponseInput::Raw(items) => items.iter().any(|item| {
-                    ["content", "output"].iter().any(|key| {
+                    // A predicate reads the URL's head alone, so a screenshot's
+                    // bytes are not copied for it.
+                    crate::proxy::content::computer_screenshot_output(item).is_some_and(|shot| {
+                        let head = shot.get("image_url").and_then(|u| u.as_str()).map(|u| &u[..u.floor_char_boundary(128)]);
+                        pred(&ContentPart::Unknown(serde_json::json!({"type": "input_image", "image_url": head})))
+                    }) || ["content", "output"].iter().any(|key| {
                         item.get(key)
                             .and_then(|c| c.as_array())
                             .is_some_and(|parts| {
@@ -340,13 +351,15 @@ fn has_content_type(request: &ApiRequest, pred: impl Fn(&ContentPart) -> bool) -
                     crate::api::gemini::GeminiPart::FileData { file_data } => {
                         file_data.mime_type.as_deref()
                     }
-                    // A function response's blobs reach the model too.
+                    // A function response's media reaches the model too, on the
+                    // same two channels.
                     crate::api::gemini::GeminiPart::FunctionResponse { function_response } => {
-                        return function_response.parts.iter().any(|p| {
-                            p.pointer("/inlineData/mimeType")
-                                .and_then(|m| m.as_str())
-                                .is_some_and(|mime| gemini_mime_matches(mime, &pred))
-                        });
+                        return function_response.parts.iter().any(|p| gemini_raw_part_matches(p, &pred));
+                    }
+                    // A part that did not parse as typed (it states a member under
+                    // both spellings, say) still reaches a Gemini model.
+                    crate::api::gemini::GeminiPart::Unknown(part) => {
+                        return gemini_raw_part_matches(part, &pred);
                     }
                     _ => None,
                 };
@@ -354,6 +367,34 @@ fn has_content_type(request: &ApiRequest, pred: impl Fn(&ContentPart) -> bool) -
             })
         }),
     }
+}
+
+/// A raw part's blob and reference, under either proto3 JSON spelling.
+fn gemini_raw_media(part: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    ["inlineData", "inline_data", "fileData", "file_data"].into_iter().filter_map(|member| part.get(member))
+}
+
+/// A raw blob's or reference's stated MIME types, under either spelling.
+fn gemini_raw_media_mimes(media: &serde_json::Value) -> impl Iterator<Item = &str> {
+    ["mimeType", "mime_type"].into_iter().filter_map(|member| media.get(member)?.as_str())
+}
+
+/// The raw parts a function response holds, for a part that parsed as no typed one.
+fn gemini_raw_nested_parts(part: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    ["functionResponse", "function_response"]
+        .into_iter()
+        .filter_map(|member| part.get(member)?.get("parts")?.as_array())
+        .flatten()
+}
+
+fn gemini_raw_part_is_untyped(part: &serde_json::Value) -> bool {
+    gemini_raw_media(part).any(|media| gemini_raw_media_mimes(media).all(str::is_empty))
+        || gemini_raw_nested_parts(part).any(gemini_raw_part_is_untyped)
+}
+
+fn gemini_raw_part_matches(part: &serde_json::Value, pred: &impl Fn(&ContentPart) -> bool) -> bool {
+    gemini_raw_media(part).flat_map(gemini_raw_media_mimes).any(|mime| gemini_mime_matches(mime, pred))
+        || gemini_raw_nested_parts(part).any(|nested| gemini_raw_part_matches(nested, pred))
 }
 
 /// Map a Gemini MIME type onto the protocol-agnostic content part the capability
@@ -627,6 +668,108 @@ mod tests {
             {"type": "tool_result", "tool_use_id": "c1", "content": [{"type": "text", "text": "ok"}]},
         ]}]}));
         assert_accepted(&text, &nothing_supported());
+    }
+
+    /// A computer call's `output` is one screenshot object, not an array of
+    /// parts, and the screenshot reaches the model like any other image.
+    #[test]
+    fn a_computer_screenshot_is_gated_as_an_image() {
+        let call = |output: serde_json::Value| {
+            responses(serde_json::json!({"model": "m", "input": [
+                {"type": "computer_call_output", "call_id": "k1", "output": output},
+            ]}))
+        };
+        let with_vision = ModelCapabilities { vision: true, ..nothing_supported() };
+        for shot in [
+            serde_json::json!({"type": "computer_screenshot", "image_url": "data:image/png;base64,AAAA"}),
+            serde_json::json!({"type": "computer_screenshot", "image_url": "https://x/shot.png"}),
+            serde_json::json!({"type": "computer_screenshot", "file_id": "file-1"}),
+        ] {
+            assert_rejected(&call(shot.clone()), &nothing_supported());
+            assert_accepted(&call(shot), &with_vision);
+        }
+
+        // The image channel's split holds here too: a PDF data URI is a document.
+        let pdf = call(serde_json::json!({"type": "computer_screenshot", "image_url": "data:application/pdf;base64,AAAA"}));
+        assert_rejected(&pdf, &with_vision);
+        assert_accepted(&pdf, &ModelCapabilities { pdf_input: true, ..nothing_supported() });
+
+        // An output that is not a screenshot asks for nothing.
+        assert_accepted(&call(serde_json::json!({"type": "not_a_screenshot", "image_url": "https://x/y.png"})), &nothing_supported());
+        assert_accepted(
+            &responses(serde_json::json!({"model": "m", "input": [
+                {"type": "function_call_output", "call_id": "c1", "output": "done"},
+            ]})),
+            &nothing_supported(),
+        );
+    }
+
+    /// A function response's `fileData` part is held to the capabilities like
+    /// its `inlineData` part, by its MIME type. `mimeType` is optional on it, so
+    /// omitting it is held like a message's untyped file reference.
+    #[test]
+    fn a_function_responses_file_reference_is_gated_like_its_inline_data() {
+        let response = |part: serde_json::Value| {
+            gemini(serde_json::json!({"contents": [{"role": "user", "parts": [{"functionResponse": {
+                "name": "shot", "response": {}, "parts": [part],
+            }}]}]}))
+        };
+        let file = |mime: &str| {
+            response(serde_json::json!({"fileData": {"mimeType": mime, "fileUri": "gs://bucket/object"}}))
+        };
+        for (mime, granted) in [
+            ("image/png", ModelCapabilities { vision: true, ..nothing_supported() }),
+            ("audio/wav", ModelCapabilities { audio_input: true, ..nothing_supported() }),
+            ("video/mp4", ModelCapabilities { video_input: true, ..nothing_supported() }),
+            ("application/pdf", ModelCapabilities { pdf_input: true, ..nothing_supported() }),
+        ] {
+            assert_rejected(&file(mime), &nothing_supported());
+            assert_accepted(&file(mime), &granted);
+        }
+        // Another modality's capability does not admit it.
+        assert_rejected(&file("image/png"), &ModelCapabilities { audio_input: true, ..nothing_supported() });
+
+        let untyped = response(serde_json::json!({"fileData": {"fileUri": "gs://bucket/object"}}));
+        assert_rejected(&untyped, &nothing_supported());
+        assert_accepted(&untyped, &ModelCapabilities { vision: true, ..nothing_supported() });
+
+        // Either proto3 spelling is held alike, and an empty type is no type.
+        let snake = response(serde_json::json!({"file_data": {"mime_type": "image/png", "file_uri": "gs://b/o"}}));
+        assert_rejected(&snake, &nothing_supported());
+        assert_accepted(&snake, &ModelCapabilities { vision: true, ..nothing_supported() });
+        assert_rejected(&response(serde_json::json!({"fileData": {"mimeType": "", "fileUri": "gs://b/o"}})), &nothing_supported());
+        for part in [
+            serde_json::json!({"inline_data": {"mime_type": "image/png", "data": "AAAA"}}),
+            serde_json::json!({"file_data": {"mime_type": "image/png", "file_uri": "gs://b/o"}}),
+            serde_json::json!({"fileData": {"mimeType": "", "fileUri": "gs://b/o"}}),
+            serde_json::json!({"inlineData": {"mimeType": "", "data": "AAAA"}}),
+        ] {
+            let message = gemini(serde_json::json!({"contents": [{"role": "user", "parts": [part]}]}));
+            assert_rejected(&message, &nothing_supported());
+            assert_accepted(&message, &ModelCapabilities { vision: true, ..nothing_supported() });
+        }
+
+        // A member stated under both spellings parses as no typed part, and is
+        // held all the same.
+        let both = gemini(serde_json::json!({"contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "image/png", "mime_type": "image/png", "data": "AAAA"}},
+        ]}]}));
+        assert_rejected(&both, &nothing_supported());
+        assert_accepted(&both, &ModelCapabilities { vision: true, ..nothing_supported() });
+
+        // Nor does a function response that parsed as no typed part hide its media.
+        let nameless = gemini(serde_json::json!({"contents": [{"role": "user", "parts": [
+            {"functionResponse": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]}},
+        ]}]}));
+        assert_rejected(&nameless, &nothing_supported());
+        assert_accepted(&nameless, &ModelCapabilities { vision: true, ..nothing_supported() });
+
+        // A type no capability names is the upstream's to decide.
+        assert_accepted(&file("text/plain"), &nothing_supported());
+        // An inline image is held to vision too.
+        let inline = response(serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "AAAA"}}));
+        assert_rejected(&inline, &nothing_supported());
+        assert_accepted(&inline, &ModelCapabilities { vision: true, ..nothing_supported() });
     }
 
     #[test]

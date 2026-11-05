@@ -588,9 +588,10 @@ pub async fn update_user(
     security(("bearer_auth" = []))
 )]
 pub async fn delete_user(
+    // First: a preview is marked before any other extractor can refuse it.
+    crate::middleware::DryRun(dry_run): crate::middleware::DryRun,
     mut db: TenantConn,
     Path(id): Path<Uuid>,
-    Query(q): Query<DryRunQuery>,
 ) -> Result<Json<DeletionResponse>, ApiError> {
     // The built-in agent is guarded against every lifecycle verb — the generic
     // DELETE must not be the one path that can destroy it (cascade would drop
@@ -646,7 +647,7 @@ pub async fn delete_user(
         ApiError::internal("failed to count sessions")
     })?;
 
-    if q.dry_run.unwrap_or(false) {
+    if dry_run {
         let impact = key_lifecycle::count_keys_for_user(db.conn(), id)
             .await
             .map_err(|e| {

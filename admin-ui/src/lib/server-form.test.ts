@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyProvider,
   applyTransport,
+  canAskForModels,
   canModelSync,
   isEmptyPatch,
   patchNeedsProbe,
@@ -239,5 +240,24 @@ describe('serverPatch', () => {
   it('carries a provider, protocol and transport change', () => {
     const patch = serverPatch(form(), form({ provider: 'anthropic', upstream_api_format: 'anthropic_messages', transport: 'aws_bedrock' }));
     expect(patch).toMatchObject({ provider: 'anthropic', upstream_api_format: 'anthropic_messages', transport: 'aws_bedrock' });
+  });
+});
+
+describe('canAskForModels', () => {
+  const keyless = { has_credential: false, transport: 'default' };
+  it('offers a keyed server, and a keyless self-hosted engine', () => {
+    expect(canAskForModels({ ...keyless, provider: 'openai', upstream_url: 'https://api.openai.com', has_credential: true })).toBe(true);
+    expect(canAskForModels({ ...keyless, provider: 'vllm', upstream_url: 'http://10.0.0.5:8000' })).toBe(true);
+    // A local engine registered under a cloud provider's protocol is self-hosted too.
+    expect(canAskForModels({ ...keyless, provider: 'openai', upstream_url: 'http://localhost:8000/v1' })).toBe(true);
+  });
+  it('does not offer a keyless server at its provider\'s own address, however spelled', () => {
+    expect(canAskForModels({ ...keyless, provider: 'openai', upstream_url: 'https://api.openai.com' })).toBe(false);
+    expect(canAskForModels({ ...keyless, provider: 'openai', upstream_url: 'HTTPS://API.OPENAI.COM/ ' })).toBe(false);
+    expect(canAskForModels({ ...keyless, provider: 'openai', upstream_url: '' })).toBe(false);
+    expect(canAskForModels({ ...keyless, provider: 'openai', upstream_url: null })).toBe(false);
+  });
+  it('never offers a server whose models cannot be discovered', () => {
+    expect(canAskForModels({ ...keyless, provider: 'perplexity', upstream_url: 'http://x', has_credential: true })).toBe(false);
   });
 });

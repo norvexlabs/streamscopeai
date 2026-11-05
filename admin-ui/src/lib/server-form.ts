@@ -79,6 +79,25 @@ export function canModelSync(server: { provider: string; transport?: string | nu
   return providerPublishesModelList(server.provider) && transportPublishesModelList(server.transport);
 }
 
+/** Whether the console offers to ask this server for its models (Sync now,
+ *  Review, the auto-sync switch): it must be discoverable, and hold a key —
+ *  unless it is self-hosted, where a keyless engine is normal. A keyless server
+ *  at its provider's own default address is a cloud account missing its key:
+ *  every ask would be refused. */
+export function canAskForModels(server: {
+  provider: string;
+  transport?: string | null;
+  upstream_url?: string | null;
+  has_credential: boolean;
+}): boolean {
+  if (!canModelSync(server)) return false;
+  if (server.has_credential) return true;
+  const cloud = PROVIDER_DEFAULTS.find((p) => p.value === server.provider)?.defaultUrl ?? '';
+  const bare = (url: string) => url.trim().replace(/\/+$/, '').toLowerCase();
+  // No URL of its own is the provider's default address.
+  return !cloud || (bare(server.upstream_url ?? '') || bare(cloud)) !== bare(cloud);
+}
+
 /** Every server forwards to a URL it states — the backend refuses one it cannot
  *  resolve. A provider with a seed default (OpenAI, Anthropic, …) fills it;
  *  vLLM, Ollama and Custom have none, and a keyless pass-through has no

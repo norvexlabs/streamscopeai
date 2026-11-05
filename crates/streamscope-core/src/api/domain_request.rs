@@ -2452,10 +2452,13 @@ fn convert_chat_content_to_domain(content: Option<&MessageContent>) -> Vec<Domai
     }
 }
 
-/// A base64 data URL's media type (with any parameters) and payload — the one
+/// A base64 data URL's media type (without its parameters) and payload — the one
 /// reader of the `data:<type>;base64,<payload>` shape for every part.
-fn split_data_uri(uri: &str) -> Option<(&str, &str)> {
-    uri.strip_prefix("data:")?.split_once(";base64,")
+pub(crate) fn split_data_uri(uri: &str) -> Option<(&str, &str)> {
+    let (head, data) = uri.strip_prefix("data:")?.split_once(";base64,")?;
+    // The domain compares bare media types: a parameterised string would miss
+    // every walk's branch for its type.
+    Some((head.split(';').next().unwrap_or(head), data))
 }
 
 /// The base64 audio and its format in an `input_audio` part's value, in each
@@ -2601,12 +2604,6 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
             if let Some(data_uri) = file_data
                 && let Some((mime, b64)) = split_data_uri(data_uri)
             {
-                // A data URI may carry parameters (`data:text/plain;charset=utf-8;
-                // base64,…`). The domain compares BARE media types, so strip them
-                // here: a parameterised string would decode below and then miss
-                // every walk's text branch, which is the same decode/inline
-                // mismatch in reverse.
-                let mime = mime.split(';').next().unwrap_or(mime);
                 if mime.starts_with("image/") {
                     return DomainContentBlock::Image {
                         data: b64.to_string(),
@@ -2614,41 +2611,25 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                         cache_control: None,
                     };
                 }
-                // `Document.data` holds PROSE for a text media type everywhere
-                // else in the domain (`from_anthropic` stores it raw) and every
-                // walk inlines it as prose, so a `data:text/plain;base64,…`
-                // payload has to be decoded HERE. Left encoded, the model
-                // receives base64 in place of the file, on every target at
-                // once. A payload that is not valid base64 is passed through
-                // unchanged rather than lost.
                 // The decode range and the walks' inline range must be the SAME
                 // set — `text/*` on both sides. Decoding wider than the walks
                 // inline would stamp decoded prose back into a base64 channel;
                 // decoding narrower leaves base64 to be inlined as prose. Both
                 // are silent corruption, in opposite directions.
-                let (data, media_type) = if mime.starts_with("text/") {
+                // A text file is its text; bytes that are not UTF-8 stay the
+                // client's part, as sent. A data URL's base64 is the standard,
+                // padded alphabet; a payload that is not — most likely
+                // already prose — is passed through unchanged rather than lost.
+                if mime.starts_with("text/") {
                     use base64::Engine;
-                    match base64::engine::general_purpose::STANDARD.decode(b64) {
-                        Ok(bytes) => match String::from_utf8(bytes) {
-                            Ok(text) => (text, mime.to_string()),
-                            // Valid base64 that is not UTF-8 is real bytes in
-                            // some other encoding. Keep them, and stop calling
-                            // them text, so the walks emit a file rather than
-                            // inlining gibberish as prose.
-                            Err(_) => (
-                                b64.to_string(),
-                                "application/octet-stream".to_string(),
-                            ),
-                        },
-                        // Not base64 at all — most likely already prose.
-                        Err(_) => (b64.to_string(), mime.to_string()),
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                        return text_file_document(mime, bytes, filename)
+                            .unwrap_or_else(|| DomainContentBlock::Unknown { value: part.clone() });
                     }
-                } else {
-                    (b64.to_string(), mime.to_string())
-                };
+                }
                 return DomainContentBlock::Document {
-                    data,
-                    media_type,
+                    data: b64.to_string(),
+                    media_type: mime.to_string(),
                     title: filename,
                     context: None,
                     citations: None,
@@ -2675,7 +2656,12 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
             Some(file) => {
                 let mut flat = file.clone();
                 flat.insert("type".into(), Value::from("input_file"));
-                parse_responses_content_part(&Value::Object(flat))
+                // A part kept as sent is the client's Chat part, never the
+                // Responses spelling it was read through.
+                match parse_responses_content_part(&Value::Object(flat)) {
+                    DomainContentBlock::Unknown { .. } => DomainContentBlock::Unknown { value: part.clone() },
+                    block => block,
+                }
             }
             None => match part.get("file_id").and_then(Value::as_str) {
                 Some(id) => DomainContentBlock::File {
@@ -2739,7 +2725,7 @@ const RESPONSES_ITEM_TYPES: &[&str] = &[
 /// carry beside it. The client chose it, and it reaches the model (a marker)
 /// and the audit row, so only a short plain name is used; anything else is
 /// `unknown`.
-fn unknown_part_kind(value: &Value) -> &str {
+pub fn unknown_part_kind(value: &Value) -> &str {
     const PART_FIELDS: [&str; 5] = ["thought", "thoughtSignature", "partMetadata", "mediaResolution", "videoMetadata"];
     value
         .get("type")
@@ -2747,6 +2733,25 @@ fn unknown_part_kind(value: &Value) -> &str {
         .or_else(|| value.as_object()?.keys().map(String::as_str).find(|k| !PART_FIELDS.contains(k)))
         .filter(|kind| kind.len() <= 64 && kind.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)))
         .unwrap_or("unknown")
+}
+
+/// A Responses `computer_call_output`'s screenshot as the block a reader shows:
+/// the audit's placeholder for it, the image it names by a URL or carries inline,
+/// or the uploaded file it names. `None` for any other item.
+pub fn computer_screenshot_block(value: &Value) -> Option<DomainContentBlock> {
+    if value.get("type").and_then(Value::as_str) != Some("computer_call_output") {
+        return None;
+    }
+    let output = value.get("output")?;
+    if let Some(stored) = detect_synthetic_block(output) {
+        return Some(stored);
+    }
+    crate::proxy::content::computer_screenshot_output(value)?;
+    if let Some(url) = output.get("image_url").and_then(Value::as_str) {
+        return Some(parse_responses_content_part(&serde_json::json!({"type": "input_image", "image_url": url})));
+    }
+    let file_id = output.get("file_id").and_then(Value::as_str)?;
+    Some(DomainContentBlock::File { file_id: Some(file_id.to_string()), url: None, media_type: None, filename: None, cache_control: None })
 }
 
 /// One label per distinct kind, in order of first appearance, with how many
@@ -2783,6 +2788,141 @@ fn history_item_carried(target: ApiVersion, value: &Value) -> bool {
         ApiVersion::GoogleGemini => value.get("type").is_none(),
         ApiVersion::AnthropicMessages => is_redacted_thinking(value),
         ApiVersion::ChatCompletions => false,
+    }
+}
+
+/// Whether the walk for `target` sends a MEDIA block held in an ASSISTANT
+/// turn as a text marker ([`assistant_media_marker`]) in place of the block —
+/// the one predicate those walks and [`DomainRequest::not_carried_to`] read (locked by
+/// `an_assistant_turns_media_is_carried_or_named_on_every_target`). A Chat
+/// assistant message's content is text or a refusal, and a Responses output
+/// message's `output_text` or `refusal`, so neither has a channel for an
+/// image, an audio clip or a file; the Anthropic walk sends an assistant turn
+/// its text, calls and thinking; a Gemini model turn takes a blob or a URI
+/// as a user turn does — but not a reference that names no URI, nor a
+/// document with no bytes (its nested content or nothing). A text file is its
+/// text on every walk. The gateway's own stored-media placeholder in an
+/// assistant turn is left to the marker on every target, and a last message
+/// holding only such media is not sent ([`DomainRequest::assistant_turns_left_out_from`]).
+/// A block that is not media is read by its own predicate
+/// ([`history_item_carried`], [`DomainRequest::thinking_not_carried`]).
+fn assistant_media_dropped(target: ApiVersion, block: &DomainContentBlock) -> bool {
+    match block {
+        DomainContentBlock::Document { media_type, .. } if media_type.starts_with("text/") => false,
+        DomainContentBlock::File { url, .. } => target != ApiVersion::GoogleGemini || url.is_none(),
+        DomainContentBlock::Document { data, media_type, .. } => {
+            target != ApiVersion::GoogleGemini || data.is_empty() || media_type.is_empty()
+        }
+        DomainContentBlock::BlobRef { .. } | DomainContentBlock::Stripped { .. } => true,
+        DomainContentBlock::Image { .. } | DomainContentBlock::Audio { .. } => target != ApiVersion::GoogleGemini,
+        DomainContentBlock::Text { .. }
+        | DomainContentBlock::ToolUse { .. }
+        | DomainContentBlock::ToolResult { .. }
+        | DomainContentBlock::Thinking { .. }
+        | DomainContentBlock::Unknown { .. } => false,
+    }
+}
+
+/// Whether another provider can fetch a file reference: a plain web URL, not a
+/// `gs://` object nor a Gemini Files API resource, which need the client's own
+/// Google credential, nor a YouTube video, which Gemini alone reads by URL.
+fn uri_read_elsewhere(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some_and(|host| {
+            !matches!(host, "generativelanguage.googleapis.com" | "youtube.com" | "youtu.be") && !host.ends_with(".youtube.com")
+        })
+}
+
+/// Whether a file reference is an image another provider can fetch, which every
+/// walk with an image channel sends as an image.
+fn file_reference_is_web_image(block: &DomainContentBlock) -> bool {
+    matches!(block, DomainContentBlock::File { file_id: None, url: Some(url), media_type: Some(mt), .. }
+        if mt.starts_with("image/") && uri_read_elsewhere(url))
+}
+
+/// Whether Anthropic reads this image or document: an image in four types or
+/// by URL; a document as a PDF, by URL, as text (every text flavour goes as its
+/// `text/plain` source) or as nested blocks. Nothing with no bytes of its own. Read for a user message
+/// ([`user_media_refused`]) and a tool result
+/// ([`DomainRequest::tool_result_carries`]).
+fn anthropic_reads_media(block: &DomainContentBlock) -> bool {
+    match block {
+        DomainContentBlock::Image { data, media_type, .. } => {
+            !data.is_empty()
+                && matches!(media_type.as_str(), "image/url" | "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp")
+        }
+        DomainContentBlock::Document { data, media_type, nested_content, .. } => {
+            nested_content.is_some()
+                || (!data.is_empty()
+                    && (media_type == "application/pdf" || media_type == "document/url" || media_type.starts_with("text/")))
+        }
+        _ => true,
+    }
+}
+
+/// Whether `target` refuses the whole request for this image or document in a
+/// USER message, so that a translation sends a text marker in its place
+/// ([`user_media_marker`]) — the one predicate [`DomainRequest::user_content`]
+/// and [`DomainRequest::not_carried_to`] read (locked by
+/// `a_user_turns_media_is_carried_or_named_on_every_target`). Anthropic reads
+/// what [`anthropic_reads_media`] says. A Chat `file` part takes a PDF's bytes
+/// alone; its walk inlines a text document and names one with no bytes, or one
+/// by URL, itself. Neither the Responses nor the Gemini reference states what
+/// happens to a type it does not list, so a document's bytes go there as written.
+/// A file reference locating nothing the target reads has no rendering on
+/// Anthropic or Gemini; a URI only its own store can read reaches no other
+/// provider ([`uri_read_elsewhere`]), and Anthropic reads a reference by URL as an
+/// image or a PDF: a stated type that is neither is refused, while no stated type
+/// (a Responses `file_url` states none) says nothing against it.
+fn user_media_refused(target: ApiVersion, block: &DomainContentBlock) -> bool {
+    match (target, block) {
+        (_, DomainContentBlock::Image { data, .. }) if data.is_empty() => true,
+        (ApiVersion::AnthropicMessages, DomainContentBlock::File { file_id: None, url: None, .. }) => true,
+        (ApiVersion::GoogleGemini, DomainContentBlock::File { url: None, .. }) => true,
+        (ApiVersion::AnthropicMessages | ApiVersion::Responses, DomainContentBlock::File { file_id: None, url: Some(url), media_type, .. }) => {
+            !uri_read_elsewhere(url)
+                || match target {
+                    ApiVersion::AnthropicMessages => media_type.as_deref().is_some_and(|m| !m.starts_with("image/") && m != "application/pdf"),
+                    // Its walk has no audio channel, and no video one.
+                    _ => media_type.as_deref().is_some_and(|m| m.starts_with("audio/") || m.starts_with("video/")),
+                }
+        }
+        (ApiVersion::AnthropicMessages, _) => !anthropic_reads_media(block),
+        (ApiVersion::ChatCompletions, DomainContentBlock::Document { data, media_type, .. }) => {
+            !data.is_empty()
+                && media_type != "application/pdf"
+                && media_type != "document/url"
+                && !media_type.starts_with("text/")
+        }
+        _ => false,
+    }
+}
+
+/// Whether the walk to `target` sends a user message's media as a label alone
+/// (`[Document: …]`, `[File: …]`, `[Audio (…) omitted …]`), so that
+/// [`DomainRequest::not_carried_to`] names it — each arm the branch of its walk
+/// (the walks and this predicate agree in
+/// `a_user_turns_labelled_or_unlocated_media_is_named`).
+fn user_media_labelled(target: ApiVersion, dialect: crate::api::mistral::ChatDialect, block: &DomainContentBlock) -> bool {
+    match block {
+        DomainContentBlock::Document { data, media_type, .. } if !media_type.starts_with("text/") => match target {
+            // Mistral's dialect reads a document by URL; OpenAI's has no URL
+            // channel for a file.
+            ApiVersion::ChatCompletions if media_type == "document/url" => dialect != crate::api::mistral::ChatDialect::Mistral,
+            ApiVersion::ChatCompletions => data.is_empty(),
+            ApiVersion::Responses => data.is_empty() && media_type != "document/url",
+            ApiVersion::GoogleGemini => data.is_empty() || media_type.is_empty(),
+            ApiVersion::AnthropicMessages => false,
+        },
+        DomainContentBlock::File { file_id: None, url, .. } => {
+            (target == ApiVersion::ChatCompletions && !file_reference_is_web_image(block))
+                || (target == ApiVersion::Responses && url.is_none())
+        }
+        DomainContentBlock::Audio { .. } => matches!(target, ApiVersion::AnthropicMessages | ApiVersion::Responses),
+        _ => false,
     }
 }
 
@@ -3203,8 +3343,10 @@ fn responses_conversation(input: &ResponseInput, from: usize) -> Vec<DomainMessa
 
 /// The domain messages of Gemini `contents`.
 fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
+    let mut unanswered: Vec<(&str, String)> = Vec::new();
+    let mut generated_ids = std::collections::HashSet::new();
     let mut messages = Vec::new();
-    for content in items {
+    for (turn, content) in items.iter().enumerate() {
         let role_str = content.role.as_deref().unwrap_or("user");
         let is_model = role_str == "model";
 
@@ -3235,7 +3377,17 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
                     });
                 }
                 GeminiPart::InlineData { inline_data } => {
-                    content_blocks.push(gemini_inline_block(&inline_data.mime_type, &inline_data.data));
+                    // A blob the domain has no block for travels as sent.
+                    content_blocks.push(gemini_inline_block(&inline_data.mime_type, &inline_data.data).unwrap_or_else(
+                        || DomainContentBlock::Unknown { value: serde_json::json!({ "inlineData": inline_data }) },
+                    ));
+                }
+                // A clip by URI is of no kind the domain has a block for, like a
+                // clip's bytes (`gemini_inline_block`).
+                GeminiPart::FileData { file_data }
+                    if file_data.mime_type.as_deref().is_some_and(|m| m.starts_with("video/")) =>
+                {
+                    content_blocks.push(DomainContentBlock::Unknown { value: serde_json::json!({ "fileData": file_data }) });
                 }
                 GeminiPart::FileData { file_data } => {
                     content_blocks.push(DomainContentBlock::File {
@@ -3247,11 +3399,15 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
                     });
                 }
                 GeminiPart::FunctionCall { function_call, thought_signature } => {
+                    // A call with no `id` takes a generated one, unique in the request:
+                    // each model turn numbers its parts from zero.
+                    let id = function_call.id.clone().unwrap_or_else(|| {
+                        let id = format!("call_{idx}");
+                        if generated_ids.insert(id.clone()) { id } else { format!("call_{turn}_{idx}") }
+                    });
+                    unanswered.push((function_call.name.as_str(), id.clone()));
                     content_blocks.push(DomainContentBlock::ToolUse {
-                        id: function_call
-                            .id
-                            .clone()
-                            .unwrap_or_else(|| format!("call_{idx}")),
+                        id,
                         name: function_call.name.clone(),
                         input: function_call.args.clone(),
                         input_raw: None,
@@ -3295,10 +3451,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
             content.extend(fr.parts.iter().map(gemini_function_response_part));
             messages.push(DomainMessage {
                 role: DomainRole::Tool {
-                    tool_call_id: fr
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| fr.name.clone()),
+                    tool_call_id: gemini_response_call_id(fr, &mut unanswered),
                     is_error: None,
                     cache_control: None,
                 },
@@ -3309,57 +3462,157 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
     messages
 }
 
+/// The call a function response answers: its own `id`, optional on Gemini, else
+/// the earliest unanswered call of its name. A walk to a protocol that pairs by id
+/// reads the two as one exchange, or the repair of an orphaned pair drops both.
+fn gemini_response_call_id(response: &GeminiFunctionResponseData, unanswered: &mut Vec<(&str, String)>) -> String {
+    let position = match &response.id {
+        Some(id) => unanswered.iter().position(|(_, call)| call == id),
+        None => unanswered.iter().position(|(name, _)| *name == response.name),
+    };
+    let answered = position.map(|at| unanswered.remove(at).1);
+    response.id.clone().or(answered).unwrap_or_else(|| response.name.clone())
+}
+
+/// A `text/*` file's bytes as a text document — the one reading of a text
+/// file a client sends as bytes (a Responses or Chat `input_file`'s `data:`
+/// URL, a Gemini `text/*` blob): `Document.data` holds prose for a text media
+/// type everywhere in the domain, and every walk inlines it as prose. `None`
+/// when the bytes are not UTF-8: they are text in some other encoding, which
+/// no target's text channel takes and whose bytes no target reads as a file
+/// of that type, so the caller keeps the client's part as sent
+/// ([`DomainContentBlock::Unknown`]) — sent back on a re-render of the client's
+/// own request, named on a translation.
+fn text_file_document(mt: &str, bytes: Vec<u8>, title: Option<String>) -> Option<DomainContentBlock> {
+    Some(DomainContentBlock::Document {
+        data: String::from_utf8(bytes).ok()?,
+        media_type: mt.to_string(),
+        title,
+        context: None,
+        citations: None,
+        cache_control: None,
+        nested_content: None,
+    })
+}
+
+/// A `bytes` field's base64 as its bytes, in every spelling a client may send:
+/// proto3 JSON's standard or URL-safe alphabet, padded or not, with line breaks
+/// a line-wrapping encoder leaves, and any trailing bits. Only a string with
+/// characters of neither alphabet, or of both, is refused.
+pub(crate) fn decode_proto_bytes(data: &str) -> Option<Vec<u8>> {
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+    use base64::engine::DecodePaddingMode;
+    use base64::{alphabet, Engine};
+    const LENIENT: GeneralPurposeConfig = GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true);
+    const STANDARD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, LENIENT);
+    const URL_SAFE: GeneralPurpose = GeneralPurpose::new(&alphabet::URL_SAFE, LENIENT);
+    let unwrapped: std::borrow::Cow<'_, str> = if data.bytes().any(|c| c.is_ascii_whitespace()) {
+        data.split_ascii_whitespace().collect::<String>().into()
+    } else {
+        data.into()
+    };
+    STANDARD.decode(unwrapped.as_bytes()).or_else(|_| URL_SAFE.decode(unwrapped.as_bytes())).ok()
+}
+
+/// A text document's body as the base64 `inlineData.data` Gemini takes — the
+/// one encoding of a text blob going back to a Gemini client's own upstream.
+fn gemini_text_blob_data(text: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(text)
+}
+
 /// A Gemini `inlineData` blob as a domain block, by its media type — the one
-/// reading of a message's blob and a function response's: an audio clip, a
-/// document (`application/*`), and anything else as an image (best effort).
-fn gemini_inline_block(mt: &str, data: &str) -> DomainContentBlock {
-    if let Some(format) = mt.strip_prefix("audio/") {
-        DomainContentBlock::Audio { data: data.to_string(), format: format.to_string(), cache_control: None }
-    } else if mt.starts_with("application/") {
-        DomainContentBlock::Document {
-            data: data.to_string(),
+/// reading of a message's blob and a function response's. Its encoding is
+/// settled here: proto3 `bytes` may be spelled in either base64 alphabet,
+/// padded or not ([`decode_proto_bytes`]), and the block holds standard padded
+/// base64, the encoding every walk's base64 field takes — data already spelled
+/// so is kept as written, any other spelling decoded and re-encoded. A text
+/// file is its text ([`text_file_document`]); an audio clip, a document
+/// (`application/*`) or an image is that block. `None` — the caller keeps the
+/// part as sent — when the data is not base64, a text file's bytes are not
+/// UTF-8, or the media type is of a kind the domain has no block for (a
+/// `video/*` clip, which only Gemini takes).
+fn gemini_inline_block(mt: &str, data: &str) -> Option<DomainContentBlock> {
+    let standard = |data: &str| -> Option<String> {
+        use base64::Engine;
+        if is_standard_base64(data) {
+            return Some(data.to_string());
+        }
+        Some(base64::engine::general_purpose::STANDARD.encode(decode_proto_bytes(data)?))
+    };
+    let (kind, subtype) = mt.split_once('/')?;
+    match kind {
+        "text" => text_file_document(mt, decode_proto_bytes(data)?, None),
+        "audio" => Some(DomainContentBlock::Audio { data: standard(data)?, format: subtype.to_string(), cache_control: None }),
+        "application" => Some(DomainContentBlock::Document {
+            data: standard(data)?,
             media_type: mt.to_string(),
             title: None,
             context: None,
             citations: None,
             cache_control: None,
             nested_content: None,
-        }
-    } else {
-        DomainContentBlock::Image { data: data.to_string(), media_type: mt.to_string(), cache_control: None }
+        }),
+        "image" => Some(DomainContentBlock::Image { data: standard(data)?, media_type: mt.to_string(), cache_control: None }),
+        _ => None,
     }
 }
 
-/// A function response's part as a domain block: an image's, a PDF's or an
-/// audio clip's blob as [`gemini_inline_block`] reads it, a text blob as a
-/// text document (its bytes decoded, as the Responses parser does a `text/*`
-/// `input_file`), and any other part — a blob of another kind (video), one
-/// whose text is not UTF-8 — as sent.
+/// Whether `data` is already in the standard alphabet, padded, with no trailing
+/// bits — the one spelling every base64 field reads: checked in one pass with
+/// no allocation, since a blob is parsed several times per request and is
+/// usually spelled so.
+fn is_standard_base64(data: &str) -> bool {
+    let body = data.strip_suffix("==").or_else(|| data.strip_suffix('=')).unwrap_or(data);
+    let trailing_bits = match data.len() - body.len() {
+        2 => 0x0f,
+        1 => 0x03,
+        _ => 0,
+    };
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => c - b'A',
+        b'a'..=b'z' => c - b'a' + 26,
+        b'0'..=b'9' => c - b'0' + 52,
+        _ => 62,
+    };
+    data.len().is_multiple_of(4)
+        && body.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/')
+        && body.bytes().last().is_none_or(|c| value(c) & trailing_bits == 0)
+}
+
+/// A function response's part as a domain block: an image's, a PDF's, an
+/// audio clip's or a text file's blob as [`gemini_inline_block`] reads it, and
+/// any other part — a blob of another kind (video), one it reads as none — as
+/// sent.
 fn gemini_function_response_part(part: &Value) -> DomainContentBlock {
     let unknown = || detect_synthetic_block(part).unwrap_or_else(|| DomainContentBlock::Unknown { value: part.clone() });
+    // A reference is a message's `fileData` over again, a clip by URI included.
+    // One stating a member the domain has no field for stays as written.
+    if let Some(uri) = part.pointer("/fileData/fileUri").and_then(Value::as_str) {
+        let mt = part.pointer("/fileData/mimeType").and_then(Value::as_str);
+        let modelled = part.as_object().is_some_and(|p| p.len() == 1)
+            && part["fileData"].as_object().is_some_and(|f| f.keys().all(|k| matches!(k.as_str(), "fileUri" | "mimeType" | "displayName")));
+        if !modelled || mt.is_some_and(|m| m.starts_with("video/")) {
+            return unknown();
+        }
+        return DomainContentBlock::File {
+            file_id: None,
+            url: Some(uri.to_string()),
+            media_type: mt.map(str::to_string),
+            filename: part.pointer("/fileData/displayName").and_then(Value::as_str).map(str::to_string),
+            cache_control: None,
+        };
+    }
     let (Some(mt), Some(data)) = (
         part.pointer("/inlineData/mimeType").and_then(Value::as_str),
         part.pointer("/inlineData/data").and_then(Value::as_str),
     ) else {
         return unknown();
     };
-    if mt.starts_with("text/") {
-        use base64::Engine;
-        return match base64::engine::general_purpose::STANDARD.decode(data).map(String::from_utf8) {
-            Ok(Ok(text)) => DomainContentBlock::Document {
-                data: text,
-                media_type: mt.to_string(),
-                title: None,
-                context: None,
-                citations: None,
-                cache_control: None,
-                nested_content: None,
-            },
-            _ => unknown(),
-        };
-    }
-    if mt.starts_with("image/") || mt.starts_with("audio/") || mt == "application/pdf" {
-        gemini_inline_block(mt, data)
+    if mt.starts_with("text/") || mt.starts_with("image/") || mt.starts_with("audio/") || mt == "application/pdf" {
+        gemini_inline_block(mt, data).unwrap_or_else(unknown)
     } else {
         unknown()
     }
@@ -3388,6 +3641,12 @@ fn gemini_history_parts(content: &GeminiContent) -> Vec<Value> {
                         .filter(|(k, v)| !matches!(k.as_str(), "mimeType" | "data") && !asks_nothing(v))
                         .map(|(k, v)| entry(k, v)),
                 );
+            }
+            // An image reference's title has no place on an image anywhere else.
+            if let Some(name) = p.pointer("/fileData/displayName")
+                && p.pointer("/fileData/mimeType").and_then(Value::as_str).is_some_and(|m| m.starts_with("image/"))
+            {
+                out.push(entry("displayName", name));
             }
         }
     }
@@ -3480,6 +3739,10 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                 // `file_data`, which a bare reference has no bytes for). It has
                 // NO url channel, unlike the Responses `file_url` — so a
                 // URL-only reference is named rather than dropped.
+                // An image by URL is an image.
+                b @ DomainContentBlock::File { url: Some(url), .. } if file_reference_is_web_image(b) => {
+                    Some(ContentPart::ImageUrl { image_url: ImageUrl { url: url.clone(), detail: None } })
+                }
                 DomainContentBlock::File { file_id, url, filename, .. } => {
                     if let Some(id) = file_id {
                         let mut f = serde_json::Map::new();
@@ -3625,9 +3888,13 @@ fn sanitize_gemini_schema(v: &Value) -> Value {
 
 /// Convert domain content blocks to Gemini parts.
 /// `tool_name_map` resolves `tool_use_id → function_name` for `ToolResult` blocks.
+/// `text_documents_as_blobs`: a text document goes as the `inlineData` blob a
+/// Gemini client sends it as (a re-render of the client's own request), not
+/// as text.
 fn domain_to_gemini_parts(
     blocks: &[DomainContentBlock],
     tool_name_map: Option<&HashMap<String, String>>,
+    text_documents_as_blobs: bool,
 ) -> Vec<GeminiPart> {
     blocks
         .iter()
@@ -3678,7 +3945,14 @@ fn domain_to_gemini_parts(
                 // raw prose nor an empty body belongs there: a `text/plain`
                 // document is text, and a bodiless one is named — the same split
                 // the Chat and Responses walks make.
-                if media_type.starts_with("text/") {
+                if media_type.starts_with("text/") && text_documents_as_blobs {
+                    Some(GeminiPart::InlineData {
+                        inline_data: GeminiInlineData {
+                            mime_type: media_type.clone(),
+                            data: gemini_text_blob_data(data),
+                        },
+                    })
+                } else if media_type.starts_with("text/") {
                     Some(GeminiPart::Text { text: data.clone() })
                 } else if data.is_empty() || media_type.is_empty() {
                     let label = title.as_deref().unwrap_or("untitled");
@@ -3771,6 +4045,10 @@ fn domain_to_responses_input_parts(blocks: &[DomainContentBlock]) -> Vec<Value> 
                 "text": format!("[Audio ({format}) omitted — the Responses API has no audio input channel]")
             }))
         }
+        // An image by URL is an image: `input_file` lists no image type.
+        DomainContentBlock::File { file_id: None, url: Some(url), media_type: Some(mt), .. } if mt.starts_with("image/") => {
+            Some(serde_json::json!({"type": "input_image", "image_url": url}))
+        }
         DomainContentBlock::File { file_id, url, filename, .. } => {
             // The spec locates a file by `file_id`, `file_url`
             // or `file_data`. A part carrying none of them is
@@ -3848,8 +4126,9 @@ pub(crate) fn gemini_response(text: String, is_error: Option<bool>) -> Value {
     serde_json::json!({ key: value })
 }
 
-/// What a tool result's block is called where a walk names it.
-fn tool_result_block_kind(block: &DomainContentBlock) -> &str {
+/// What a user message's, a tool result's or an assistant turn's block is
+/// called where a walk names it.
+fn media_block_kind(block: &DomainContentBlock) -> &str {
     match block {
         DomainContentBlock::Image { .. } => "image",
         DomainContentBlock::Document { .. } => "document",
@@ -3863,7 +4142,19 @@ fn tool_result_block_kind(block: &DomainContentBlock) -> &str {
 
 /// The text a tool result's block goes as where the walk cannot carry it.
 fn tool_result_marker(block: &DomainContentBlock) -> String {
-    format!("[A tool result's {} could not be carried to this model.]", tool_result_block_kind(block))
+    format!("[A tool result's {} could not be carried to this model.]", media_block_kind(block))
+}
+
+/// The text an assistant turn's media goes as where the walk cannot carry it
+/// ([`assistant_media_dropped`]).
+fn assistant_media_marker(block: &DomainContentBlock) -> String {
+    format!("[The assistant's {} here could not be carried to this model.]", media_block_kind(block))
+}
+
+/// The text a user message's media goes as where the target refuses it
+/// ([`user_media_refused`]).
+fn user_media_marker(block: &DomainContentBlock) -> String {
+    format!("[This message's {} could not be carried to this model.]", media_block_kind(block))
 }
 
 /// An Anthropic content block as a block of a tool result's content.
@@ -3998,7 +4289,8 @@ fn domain_to_image_source(data: &str, media_type: &str) -> ImageSource {
     } else {
         ImageSource {
             r#type: "base64".to_string(),
-            media_type: media_type.to_string(),
+            // Clients write `image/jpg`; Anthropic lists `image/jpeg` alone.
+            media_type: if media_type == "image/jpg" { "image/jpeg" } else { media_type }.to_string(),
             data: data.to_string(),
             url: None,
             file_id: None,
@@ -4094,6 +4386,10 @@ fn domain_to_anthropic_assistant_blocks(blocks: &[DomainContentBlock], rerenders
     blocks
         .iter()
         .filter_map(|b| match b {
+            // Media this walk does not send is a marker.
+            b if assistant_media_dropped(ApiVersion::AnthropicMessages, b) => {
+                Some(ContentBlock::Text { text: assistant_media_marker(b), cache_control: None })
+            }
             DomainContentBlock::Text {
                 text,
                 cache_control,
@@ -4101,6 +4397,14 @@ fn domain_to_anthropic_assistant_blocks(blocks: &[DomainContentBlock], rerenders
                 text: text.clone(),
                 cache_control: cache_control.clone(),
             }),
+            // A text file in the turn (a Gemini model turn's `text/*` blob)
+            // is its text: an assistant turn has no document channel.
+            // (An empty one says nothing, and Anthropic refuses an empty text block.)
+            DomainContentBlock::Document { data, media_type, cache_control, .. }
+                if media_type.starts_with("text/") && !data.is_empty() =>
+            {
+                Some(ContentBlock::Text { text: data.clone(), cache_control: cache_control.clone() })
+            }
             DomainContentBlock::ToolUse {
                 id,
                 name,
@@ -4139,6 +4443,7 @@ fn domain_to_anthropic_assistant_blocks(blocks: &[DomainContentBlock], rerenders
             {
                 Some(ContentBlock::Unknown(value.clone()))
             }
+            // Another protocol's item is left out.
             _ => None,
         })
         .collect()
@@ -4514,37 +4819,83 @@ impl DomainRequest {
         }
     }
 
-    /// Whether a user message's unrecognised part goes as sent — the one
-    /// predicate [`Self::user_content`] and [`Self::not_carried_to`] read.
+    /// Whether a user message's unrecognised part, or media its target refuses,
+    /// goes as sent — the one predicate [`Self::user_content`] and
+    /// [`Self::not_carried_to`] read.
     fn sends_unknown_user_parts(&self) -> bool {
         self.upstream.rerenders_client_request
     }
 
-    /// A user message's content as a walk sends it. A part the client's
-    /// parser did not recognise is the client's own protocol's, so it goes as
-    /// sent only on a re-render of the client's request
+    /// A message's content as Gemini parts. On a re-render of a Gemini
+    /// client's own request a text document goes back as the `inlineData` blob
+    /// it was sent as — its decoded text encoded back in standard padded
+    /// base64, the same bytes whatever spelling the client used — as a function
+    /// response's does ([`Self::gemini_blob`]), in a user turn and a model turn
+    /// alike; a translation sends it as text.
+    fn gemini_message_parts(&self, blocks: &[DomainContentBlock], tool_name_map: &HashMap<String, String>) -> Vec<GeminiPart> {
+        domain_to_gemini_parts(blocks, Some(tool_name_map), self.sends_unknown_user_parts())
+    }
+
+    /// A user message's content as the walk to `target` sends it. A part the
+    /// client's parser did not recognise is the client's own protocol's, and
+    /// media `target` refuses ([`user_media_refused`]) fails the whole request
+    /// there, so each goes as sent only on a re-render of the client's request
     /// ([`UpstreamFacts::rerenders_client_request`]); a translation sends a
     /// text marker naming it in its place — never an emptied turn, which would
     /// leave the model continuing the assistant's — and
-    /// [`Self::not_carried_to`] names it.
-    fn user_content<'a>(&self, blocks: &'a [DomainContentBlock]) -> std::borrow::Cow<'a, [DomainContentBlock]> {
-        if self.sends_unknown_user_parts() || !blocks.iter().any(|b| matches!(b, DomainContentBlock::Unknown { .. })) {
+    /// [`Self::not_carried_to`] names it. A part's prompt-cache breakpoint stays
+    /// where the client put it.
+    fn user_content<'a>(&self, blocks: &'a [DomainContentBlock], target: ApiVersion) -> std::borrow::Cow<'a, [DomainContentBlock]> {
+        let replaced = |b: &DomainContentBlock| matches!(b, DomainContentBlock::Unknown { .. }) || user_media_refused(target, b);
+        if self.sends_unknown_user_parts() || !blocks.iter().any(replaced) {
             return std::borrow::Cow::Borrowed(blocks);
         }
         std::borrow::Cow::Owned(
             blocks
                 .iter()
                 .map(|b| match b {
-                    // The part's prompt-cache breakpoint stays where the client
-                    // put it.
                     DomainContentBlock::Unknown { value } => DomainContentBlock::Text {
                         text: format!("[A `{}` part of this message could not be carried to this model.]", unknown_part_kind(value)),
                         cache_control: value.get("cache_control").and_then(|c| serde_json::from_value(c.clone()).ok()),
                     },
+                    DomainContentBlock::Image { cache_control, .. }
+                    | DomainContentBlock::Document { cache_control, .. }
+                    | DomainContentBlock::File { cache_control, .. }
+                        if user_media_refused(target, b) =>
+                    {
+                        DomainContentBlock::Text { text: user_media_marker(b), cache_control: cache_control.clone() }
+                    }
                     other => other.clone(),
                 })
                 .collect(),
         )
+    }
+
+    /// Where the run of assistant turns the walk to `target` leaves out starts, if it
+    /// does. Anthropic reads a final assistant message as a prefill, so turns after
+    /// the last user message or tool result that hold nothing but media the walk
+    /// would send as markers ([`assistant_media_dropped`]), empty text aside, are not
+    /// sent; their media stays named by [`Self::not_carried_to`]. A run holding
+    /// anything else goes whole, markers included, and a request with no such message
+    /// keeps its turns rather than sending no message at all. Read once per walk: the
+    /// message count is the client's.
+    fn assistant_turns_left_out_from(&self, target: ApiVersion) -> usize {
+        // A re-render of the client's own request keeps the client's turns.
+        if self.upstream.rerenders_client_request {
+            return usize::MAX;
+        }
+        let last = self.messages.iter().rposition(|m| match m.role {
+            DomainRole::User => !m.content.is_empty(),
+            DomainRole::Tool { .. } => true,
+            DomainRole::System | DomainRole::Assistant => false,
+        });
+        let Some(start) = last.map(|l| l + 1) else {
+            return usize::MAX;
+        };
+        let run = || self.messages[start..].iter().filter(|m| matches!(m.role, DomainRole::Assistant)).flat_map(|m| &m.content);
+        let only_media = run().any(|b| assistant_media_dropped(target, b))
+            && run().all(|b| assistant_media_dropped(target, b) || matches!(b, DomainContentBlock::Text { text, .. } if text.is_empty()));
+        if only_media { start } else { usize::MAX }
     }
 
     /// Whether a tool result's `block` reaches `target`, serving
@@ -4573,22 +4924,32 @@ impl DomainRequest {
             DomainContentBlock::File { file_id: None, url: None, .. } => false,
             // A Gemini client's own blob goes back as it sent it.
             _ if target == ApiVersion::GoogleGemini && self.gemini_blob(block, upstream_model).is_some() => true,
-            // A blob of no image type is no image anywhere.
-            DomainContentBlock::Image { media_type, .. } if !media_type.starts_with("image/") => false,
+            // A reference by URI, where a function response reads media at all.
+            // A client's own goes back as sent; a translation's only as what such a
+            // model reads, as with a blob.
+            DomainContentBlock::File { url: Some(_), media_type, .. }
+                if target == ApiVersion::GoogleGemini
+                    && (self.sends_unknown_user_parts()
+                        || (gemini_model_reads_function_response_parts(upstream_model)
+                            && media_type.as_deref().is_some_and(|m| m.starts_with("image/") || m == "application/pdf"))) =>
+            {
+                true
+            }
+            // The reference a user message would send as a marker.
+            DomainContentBlock::File { .. }
+                if target != ApiVersion::GoogleGemini && !self.sends_unknown_user_parts() && user_media_refused(target, block) =>
+            {
+                false
+            }
+            // A blob of no image type is no image anywhere, nor one with no bytes.
+            DomainContentBlock::Image { data, media_type, .. } if !media_type.starts_with("image/") || data.is_empty() => false,
             _ => match target {
                 ApiVersion::ChatCompletions => false,
                 // Anthropic reads a document's bytes as a PDF only, and an
                 // image's in four types.
-                ApiVersion::AnthropicMessages => match block {
-                    DomainContentBlock::Audio { .. } => false,
-                    DomainContentBlock::Image { media_type, .. } => {
-                        matches!(media_type.as_str(), "image/url" | "image/jpeg" | "image/png" | "image/gif" | "image/webp")
-                    }
-                    DomainContentBlock::Document { media_type, nested_content, .. } => {
-                        nested_content.is_some() || media_type == "application/pdf" || media_type == "document/url"
-                    }
-                    _ => true,
-                },
+                ApiVersion::AnthropicMessages => {
+                    !matches!(block, DomainContentBlock::Audio { .. }) && anthropic_reads_media(block)
+                }
                 // A document with no bytes and no URL (nested blocks) has
                 // no `input_file`.
                 ApiVersion::Responses => match block {
@@ -4640,6 +5001,7 @@ impl DomainRequest {
             match block {
                 // Anthropic refuses an empty text block.
                 DomainContentBlock::Text { text, .. } if text.is_empty() => {}
+                DomainContentBlock::Document { data, media_type, .. } if data.is_empty() && media_type.starts_with("text/") => {}
                 DomainContentBlock::Text { text, cache_control } => {
                     blocks.push(ToolResultBlock::Text { text: text.clone(), cache_control: cache_control.clone() });
                 }
@@ -4702,8 +5064,7 @@ impl DomainRequest {
                 Some((std::borrow::Cow::Owned(format!("audio/{format}")), std::borrow::Cow::Borrowed(data.as_str())))
             }
             DomainContentBlock::Document { data, media_type, .. } if own && media_type.starts_with("text/") => {
-                use base64::Engine;
-                Some((std::borrow::Cow::Borrowed(media_type.as_str()), std::borrow::Cow::Owned(base64::engine::general_purpose::STANDARD.encode(data))))
+                Some((std::borrow::Cow::Borrowed(media_type.as_str()), std::borrow::Cow::Owned(gemini_text_blob_data(data))))
             }
             _ => None,
         }
@@ -4725,6 +5086,16 @@ impl DomainRequest {
             .filter(|b| self.tool_result_carries(b, ApiVersion::GoogleGemini, upstream_model))
             .filter_map(|b| match b {
                 DomainContentBlock::Unknown { value } => Some(value.clone()),
+                DomainContentBlock::File { url: Some(uri), media_type, filename, .. } => {
+                    let mut file = serde_json::Map::from_iter([("fileUri".to_string(), Value::from(uri.clone()))]);
+                    if let Some(mime) = media_type {
+                        file.insert("mimeType".to_string(), Value::from(mime.clone()));
+                    }
+                    if let Some(name) = filename {
+                        file.insert("displayName".to_string(), Value::from(name.clone()));
+                    }
+                    Some(serde_json::json!({ "fileData": file }))
+                }
                 b => self
                     .gemini_blob(b, upstream_model)
                     .map(|(mime, data)| serde_json::json!({"inlineData": {"mimeType": mime, "data": data}})),
@@ -4770,6 +5141,17 @@ impl DomainRequest {
                 }),
             |kind| format!("history item {kind}"),
         ));
+        // An assistant turn's media the walk has no channel for — named once
+        // per kind, with how many.
+        out.extend(counted(
+            self.messages
+                .iter()
+                .filter(|m| matches!(m.role, DomainRole::Assistant))
+                .flat_map(|m| &m.content)
+                .filter(|b| assistant_media_dropped(target, b))
+                .map(|b| media_block_kind(b).to_string()),
+            |kind| format!("{kind} in an assistant turn"),
+        ));
         out.extend(self.thinking_not_carried(target));
         // Only Gemini signs a call, so every other walk leaves its signature
         // behind (`DomainContentBlock::ToolUse`).
@@ -4790,7 +5172,7 @@ impl DomainRequest {
                 .filter(|m| matches!(m.role, DomainRole::Tool { .. }))
                 .flat_map(|m| &m.content)
                 .filter(|b| !self.tool_result_carries(b, target, upstream_model))
-                .map(|b| tool_result_block_kind(b).to_string()),
+                .map(|b| media_block_kind(b).to_string()),
             |kind| format!("{kind} in a tool result"),
         ));
         // An Anthropic tool result's document has no title, context or
@@ -4837,6 +5219,21 @@ impl DomainRequest {
                 |kind| format!("user content part {kind}"),
             ));
         }
+        // A user message's media a translation sends as a marker
+        // (`user_content`), or any walk as its label — named once per kind, with
+        // how many.
+        out.extend(counted(
+            self.messages
+                .iter()
+                .filter(|m| matches!(m.role, DomainRole::User))
+                .flat_map(|m| &m.content)
+                .filter(|b| {
+                    (!self.sends_unknown_user_parts() && user_media_refused(target, b))
+                        || user_media_labelled(target, self.upstream.chat_dialect, b)
+                })
+                .map(|b| media_block_kind(b).to_string()),
+            |kind| format!("{kind} in a user turn"),
+        ));
         // A client tool whose parameters schema Anthropic cannot take goes
         // with the empty object schema (`anthropic_input_schema`).
         if target == ApiVersion::AnthropicMessages {
@@ -5064,7 +5461,7 @@ impl DomainRequest {
             AnthropicGroup::User(i) => {
                 let m = &self.messages[*i];
                 !m.content.iter().any(|b| matches!(b, DomainContentBlock::ToolResult { .. }))
-                    && !domain_to_anthropic_user_blocks(&self.user_content(&m.content)).is_empty()
+                    && !domain_to_anthropic_user_blocks(&self.user_content(&m.content, ApiVersion::AnthropicMessages)).is_empty()
             }
             _ => false,
         };
@@ -5100,6 +5497,7 @@ impl DomainRequest {
     /// request continues ([`Self::final_assistant_turn_is_sealed`]), so the two
     /// cannot see different conversations.
     fn anthropic_groups(&self) -> Vec<AnthropicGroup> {
+        let left_out_from = self.assistant_turns_left_out_from(ApiVersion::AnthropicMessages);
         let mut groups = Vec::new();
         let mut i = 0;
         while i < self.messages.len() {
@@ -5110,7 +5508,9 @@ impl DomainRequest {
                     i += 1;
                 }
                 DomainRole::Assistant => {
-                    groups.push(AnthropicGroup::Assistant(i));
+                    if i < left_out_from {
+                        groups.push(AnthropicGroup::Assistant(i));
+                    }
                     i += 1;
                 }
                 DomainRole::Tool { .. } => {
@@ -5806,7 +6206,8 @@ impl DomainRequest {
             });
         }
 
-        for msg in &self.messages {
+        let left_out_from = self.assistant_turns_left_out_from(ApiVersion::ChatCompletions);
+        for (i, msg) in self.messages.iter().enumerate() {
             match &msg.role {
                 DomainRole::User => {
                     // vLLM/Mistral chat templates reject "user" directly after "tool"
@@ -5824,7 +6225,7 @@ impl DomainRequest {
                     // A part rendered as a marker is not the user's text: a turn
                     // holding one is emitted whole, never folded into a tool's
                     // output.
-                    let content = self.user_content(&msg.content);
+                    let content = self.user_content(&msg.content, ApiVersion::ChatCompletions);
                     let mergeable = msg
                         .content
                         .iter()
@@ -5856,13 +6257,39 @@ impl DomainRequest {
                     // both duplicate the text and put a `system` message past
                     // the leading run, which a strict chat template rejects.
                 }
+                DomainRole::Assistant if i >= left_out_from => {}
                 DomainRole::Assistant => {
                     let mut text_parts = Vec::new();
                     let mut tool_calls = Vec::new();
+                    let mut after_document = false;
                     for block in &msg.content {
                         match block {
+                            // Media this wire has no channel for is a marker, set
+                            // apart like a text file.
+                            b if assistant_media_dropped(ApiVersion::ChatCompletions, b) => {
+                                if text_parts.iter().any(|p: &String| !p.is_empty()) {
+                                    text_parts.push("\n".to_string());
+                                }
+                                text_parts.push(assistant_media_marker(b));
+                                after_document = true;
+                            }
                             DomainContentBlock::Text { text, .. } => {
+                                if !text.is_empty() && std::mem::take(&mut after_document) {
+                                    text_parts.push("\n".to_string());
+                                }
                                 text_parts.push(text.clone());
+                            }
+                            // A text file in the turn is its text, set apart from
+                            // the text beside it (this walk joins parts with
+                            // nothing between them).
+                            DomainContentBlock::Document { data, media_type, .. }
+                                if media_type.starts_with("text/") && !data.is_empty() =>
+                            {
+                                if text_parts.iter().any(|p: &String| !p.is_empty()) {
+                                    text_parts.push("\n".to_string());
+                                }
+                                text_parts.push(data.clone());
+                                after_document = true;
                             }
                             DomainContentBlock::ToolUse {
                                 id, name, input, input_raw, ..
@@ -5887,8 +6314,9 @@ impl DomainRequest {
                                 });
                                 tool_calls.push(ToolCall::function(id.clone(), name.clone(), arguments));
                             }
-                            // Thinking has no Chat Completions representation and is
-                            // dropped along with anything else this wire cannot carry.
+                            // Thinking has no Chat Completions representation
+                            // ([`DomainRequest::thinking_not_carried`]), nor has
+                            // another protocol's item ([`history_item_carried`]).
                             _ => {}
                         }
                     }
@@ -6074,7 +6502,8 @@ impl DomainRequest {
         // The call ids rendered as custom calls: their answers are custom
         // outputs.
         let mut custom_calls: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for m in &self.messages {
+        let left_out_from = self.assistant_turns_left_out_from(ApiVersion::Responses);
+        for (i, m) in self.messages.iter().enumerate() {
             match &m.role {
                 DomainRole::User => {
                     // The Responses input union is `input_text` / `input_image` /
@@ -6084,7 +6513,7 @@ impl DomainRequest {
                     // every non-text turn goes through the native builder; only a
                     // wholly textual one may take the plain-string form the spec
                     // also accepts.
-                    let content = self.user_content(&m.content);
+                    let content = self.user_content(&m.content, ApiVersion::Responses);
                     let text_only = content
                         .iter()
                         .all(|b| matches!(b, DomainContentBlock::Text { .. }));
@@ -6104,14 +6533,25 @@ impl DomainRequest {
                     // Already folded into `instructions` by
                     // `render_system_channel`; see the comment there.
                 }
+                DomainRole::Assistant if i >= left_out_from => {}
                 DomainRole::Assistant => {
                     // Emit text blocks as an assistant message, tool_use blocks as
                     // separate function_call items (per Responses API spec).
                     let mut text_parts = Vec::new();
                     for block in &m.content {
                         match block {
+                            // Media an output message has no channel for is a marker.
+                            b if assistant_media_dropped(ApiVersion::Responses, b) => {
+                                text_parts.push(assistant_media_marker(b));
+                            }
                             DomainContentBlock::Text { text, .. } if !text.is_empty() => {
                                 text_parts.push(text.clone());
+                            }
+                            // A text file in the turn is its text.
+                            DomainContentBlock::Document { data, media_type, .. }
+                                if media_type.starts_with("text/") && !data.is_empty() =>
+                            {
+                                text_parts.push(data.clone());
                             }
                             DomainContentBlock::ToolUse { id, name, input, input_raw, .. } => {
                                 // Flush accumulated text as assistant message first
@@ -6165,7 +6605,9 @@ impl DomainRequest {
                                 }
                                 items.push(value.clone());
                             }
-                            // Skip thinking/image blocks — not representable in Responses format
+                            // Thinking ([`DomainRequest::thinking_not_carried`]), another
+                            // protocol's item ([`history_item_carried`]) and an empty
+                            // text file have no channel in an output message.
                             _ => {}
                         }
                     }
@@ -6368,7 +6810,7 @@ impl DomainRequest {
         let mut anthropic_messages = Vec::new();
         for group in self.anthropic_groups() {
             let (role, blocks) = match group {
-                AnthropicGroup::User(i) => ("user", domain_to_anthropic_user_blocks(&self.user_content(&self.messages[i].content))),
+                AnthropicGroup::User(i) => ("user", domain_to_anthropic_user_blocks(&self.user_content(&self.messages[i].content, ApiVersion::AnthropicMessages))),
                 AnthropicGroup::Assistant(i) => {
                     ("assistant", domain_to_anthropic_assistant_blocks(&self.messages[i].content, self.upstream.rerenders_client_request))
                 }
@@ -6387,7 +6829,7 @@ impl DomainRequest {
                         })
                         .collect();
                     if let Some(i) = user {
-                        blocks.extend(domain_to_anthropic_user_blocks(&self.user_content(&self.messages[i].content)));
+                        blocks.extend(domain_to_anthropic_user_blocks(&self.user_content(&self.messages[i].content, ApiVersion::AnthropicMessages)));
                     }
                     ("user", blocks)
                 }
@@ -6706,6 +7148,7 @@ impl DomainRequest {
         // `systemInstruction` (see below); position is collapsed to the front.
         let mut contents = Vec::new();
         let system_extra = self.in_array_system_text();
+        let left_out_from = self.assistant_turns_left_out_from(ApiVersion::GoogleGemini);
         let mut i = 0;
         while i < self.messages.len() {
             match &self.messages[i].role {
@@ -6715,7 +7158,7 @@ impl DomainRequest {
                     i += 1;
                 }
                 DomainRole::User => {
-                    let parts = domain_to_gemini_parts(&self.user_content(&self.messages[i].content), Some(&tool_name_map));
+                    let parts = self.gemini_message_parts(&self.user_content(&self.messages[i].content, ApiVersion::GoogleGemini), &tool_name_map);
                     if !parts.is_empty() {
                         contents.push(GeminiContent {
                             role: Some("user".to_string()),
@@ -6724,20 +7167,24 @@ impl DomainRequest {
                     }
                     i += 1;
                 }
+                DomainRole::Assistant if i >= left_out_from => i += 1,
                 DomainRole::Assistant => {
-                    // An item of another protocol's own is not a Gemini part.
+                    // An item of another protocol's own is not a Gemini part;
+                    // media a model turn cannot take is a marker.
                     let content: Vec<DomainContentBlock> = self.messages[i]
                         .content
                         .iter()
-                        .filter(|b| match b {
+                        .filter_map(|b| match b {
                             DomainContentBlock::Unknown { value } => {
-                                history_item_carried(ApiVersion::GoogleGemini, value)
+                                history_item_carried(ApiVersion::GoogleGemini, value).then(|| b.clone())
                             }
-                            _ => true,
+                            b if assistant_media_dropped(ApiVersion::GoogleGemini, b) => {
+                                Some(DomainContentBlock::Text { text: assistant_media_marker(b), cache_control: None })
+                            }
+                            b => Some(b.clone()),
                         })
-                        .cloned()
                         .collect();
-                    let parts = domain_to_gemini_parts(&content, Some(&tool_name_map));
+                    let parts = self.gemini_message_parts(&content, &tool_name_map);
                     if !parts.is_empty() {
                         contents.push(GeminiContent {
                             role: Some("model".to_string()),
@@ -6774,7 +7221,7 @@ impl DomainRequest {
                     if i < self.messages.len()
                         && matches!(self.messages[i].role, DomainRole::User)
                     {
-                        let user_parts = domain_to_gemini_parts(&self.user_content(&self.messages[i].content), Some(&tool_name_map));
+                        let user_parts = self.gemini_message_parts(&self.user_content(&self.messages[i].content, ApiVersion::GoogleGemini), &tool_name_map);
                         func_parts.extend(user_parts);
                         i += 1;
                     }
@@ -8700,21 +9147,40 @@ mod tests {
         }
     }
 
+    /// A text file whose bytes are not UTF-8 is text in another encoding: no
+    /// target's text channel takes it, Chat takes a file only as a PDF, and no
+    /// target lists opaque bytes as a file type (fetched 2026-11-04). Every
+    /// parser keeps it as the client's part, as sent: sent back on the client's
+    /// own re-render, named on a translation.
     #[test]
-    fn a_responses_text_file_that_is_not_utf8_keeps_its_bytes() {
-        // Valid base64 that is not UTF-8 is real bytes in another encoding.
-        // Keeping them under a text type would inline gibberish as prose, so the
-        // media type moves to octet-stream and the walks emit a file instead.
-        let req: ResponsesRequest = serde_json::from_str(
-            r#"{"model":"gpt-5","input":[{"role":"user","content":[
-                {"type":"input_file","filename":"n.txt",
-                 "file_data":"data:text/plain;base64,//79"}]}]}"#,
-        )
-        .unwrap();
-        let dr = DomainRequest::from_responses(&req);
-        assert_matches!(&dr.messages[0].content[0],
-            DomainContentBlock::Document { data, media_type, .. }
-            if data == "//79" && media_type == "application/octet-stream");
+    fn a_text_file_that_is_not_utf8_is_the_clients_part_on_every_parser() {
+        let responses_part = serde_json::json!({"type": "input_file", "filename": "n.txt", "file_data": "data:text/plain;base64,//79"});
+        let chat_part = serde_json::json!({"type": "file", "file": {"filename": "n.txt", "file_data": "data:text/plain;base64,//79"}});
+        let gemini_part = serde_json::json!({"inlineData": {"mimeType": "text/plain", "data": "//79"}});
+        let from_responses = DomainRequest::from_responses(&serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"role": "user", "content": [responses_part.clone()]}]})).unwrap());
+        let from_chat = DomainRequest::from_chat_completions(&chat(serde_json::json!({
+            "messages": [{"role": "user", "content": [chat_part.clone()]}]})));
+        let from_gemini = DomainRequest::from_gemini(&serde_json::from_value(serde_json::json!({
+            "contents": [{"role": "user", "parts": [gemini_part.clone()]}]})).unwrap());
+        for (mut dr, part, own, kind) in [
+            (from_responses, responses_part, ApiVersion::Responses, "input_file"),
+            (from_chat, chat_part, ApiVersion::ChatCompletions, "file"),
+            (from_gemini, gemini_part, ApiVersion::GoogleGemini, "inlineData"),
+        ] {
+            assert_matches!(&dr.messages[0].content[0], DomainContentBlock::Unknown { value } if *value == part, "{own:?}");
+            for target in [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini] {
+                assert_eq!(dr.not_carried_to(target, "m", true), [format!("user content part {kind}")], "{own:?} → {target:?}");
+            }
+            dr.upstream.rerenders_client_request = true;
+            let sent = match own {
+                ApiVersion::Responses => serde_json::to_value(dr.to_responses()).unwrap()["input"][0]["content"][0].clone(),
+                ApiVersion::ChatCompletions => serde_json::to_value(dr.to_chat_completions()).unwrap()["messages"][0]["content"][0].clone(),
+                _ => serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"][0]["parts"][0].clone(),
+            };
+            assert_eq!(sent, part, "{own:?} re-render");
+            assert!(dr.not_carried_to(own, "m", true).is_empty(), "{own:?}");
+        }
     }
 
     #[test]
@@ -10665,7 +11131,7 @@ mod tests {
         ];
 
         // Without tool_name_map: falls back to tool_use_id
-        let parts = domain_to_gemini_parts(&blocks, None);
+        let parts = domain_to_gemini_parts(&blocks, None, false);
         assert_eq!(parts.len(), 1);
         if let GeminiPart::FunctionResponse { function_response } = &parts[0] {
             assert_eq!(function_response.name, "call_123");
@@ -10676,7 +11142,7 @@ mod tests {
         // With tool_name_map: resolves to function name
         let mut map = HashMap::new();
         map.insert("call_123".to_string(), "get_weather".to_string());
-        let parts = domain_to_gemini_parts(&blocks, Some(&map));
+        let parts = domain_to_gemini_parts(&blocks, Some(&map), false);
         assert_eq!(parts.len(), 1);
         if let GeminiPart::FunctionResponse { function_response } = &parts[0] {
             assert_eq!(function_response.name, "get_weather");
@@ -14111,6 +14577,859 @@ mod tests {
         let sent = serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap();
         assert_eq!(sent["contents"][1]["parts"][0], response);
         assert!(dr.not_carried_to(ApiVersion::GoogleGemini, "gemini-2.5-flash", true).is_empty());
+    }
+
+    /// A text file a Gemini client attaches to its message (`text/*`
+    /// `inlineData`, base64) is a text document: its prose on every target,
+    /// never an image, and the blob as sent on the client's own re-render.
+    #[test]
+    fn a_gemini_messages_text_blob_is_a_text_document_on_every_target() {
+        let blob = serde_json::json!({"inlineData": {"mimeType": "text/plain", "data": "bm90ZXM="}});
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "summarise"}, blob.clone()]},
+        ]}))
+        .unwrap();
+        let mut dr = DomainRequest::from_gemini(&req);
+        assert_matches!(&dr.messages[0].content[1], DomainContentBlock::Document { data, media_type, .. }
+            if data == "notes" && media_type == "text/plain");
+
+        let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert_eq!(anthropic["messages"][0]["content"][1],
+            serde_json::json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "notes"}}));
+        let responses = serde_json::to_value(dr.to_responses()).unwrap();
+        assert_eq!(responses["input"][0]["content"][1], serde_json::json!({"type": "input_text", "text": "notes"}));
+        let chat = serde_json::to_value(dr.to_chat_completions()).unwrap();
+        let chat_content = chat["messages"][0]["content"].to_string();
+        assert!(chat_content.contains("notes") && !chat_content.contains("image"), "{chat_content}");
+        for target in [ApiVersion::AnthropicMessages, ApiVersion::Responses, ApiVersion::ChatCompletions] {
+            assert!(dr.not_carried_to(target, "m", true).is_empty(), "{target:?}");
+        }
+        // Gemini: text when translated; the blob as sent on the client's own re-render.
+        let gemini = |dr: &DomainRequest| serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"][0]["parts"][1].clone();
+        assert_eq!(gemini(&dr), serde_json::json!({"text": "notes"}));
+        dr.upstream.rerenders_client_request = true;
+        assert_eq!(gemini(&dr), blob);
+
+        // A model turn's text blob goes back as sent on the re-render too.
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "write notes"}]},
+            {"role": "model", "parts": [blob.clone()]},
+        ]}))
+        .unwrap();
+        let mut dr = DomainRequest::from_gemini(&req);
+        // Translated, the model turn says its text: an assistant turn has no
+        // document channel on any target.
+        let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert_eq!(anthropic["messages"][1]["content"][0], serde_json::json!({"type": "text", "text": "notes"}));
+        let chat = serde_json::to_value(dr.to_chat_completions()).unwrap();
+        assert_eq!(chat["messages"][1]["content"], "notes");
+        // Chat joins a turn's text parts with nothing between them: the file
+        // is set apart from the text on both sides.
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "write notes"}]},
+            {"role": "model", "parts": [{"text": "Here:"}, blob.clone(), {"text": "Done."}]},
+        ]}))
+        .unwrap();
+        let chat = serde_json::to_value(DomainRequest::from_gemini(&req).to_chat_completions()).unwrap();
+        assert_eq!(chat["messages"][1]["content"], "Here:\nnotes\nDone.");
+        // An empty text part beside it adds no break.
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "write notes"}]},
+            {"role": "model", "parts": [{"text": ""}, blob.clone(), {"text": ""}]},
+        ]}))
+        .unwrap();
+        let chat = serde_json::to_value(DomainRequest::from_gemini(&req).to_chat_completions()).unwrap();
+        assert_eq!(chat["messages"][1]["content"], "notes");
+        let responses = serde_json::to_value(dr.to_responses()).unwrap();
+        assert!(responses["input"].to_string().contains("notes"), "{}", responses["input"]);
+        dr.upstream.rerenders_client_request = true;
+        let sent = serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap();
+        assert_eq!(sent["contents"][1]["parts"][0], blob);
+
+        // `data` is proto3 `bytes`: URL-safe and unpadded base64 are the same
+        // file. ("a?>" is `YT8+` in the standard alphabet.)
+        for data in ["YT8-", "YT8+", "bm90ZXM"] {
+            let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+                {"role": "user", "parts": [{"inlineData": {"mimeType": "text/plain", "data": data}}]},
+            ]}))
+            .unwrap();
+            let dr = DomainRequest::from_gemini(&req);
+            assert_matches!(&dr.messages[0].content[0], DomainContentBlock::Document { data: text, .. }
+                if text == "a?>" || text == "notes", "{data}");
+        }
+
+        // Bytes that are not UTF-8 are not read as text: the part travels as
+        // sent on a re-render, and is named on a translation.
+        let raw = serde_json::json!({"inlineData": {"mimeType": "text/plain", "data": "//79"}});
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [raw.clone()]},
+        ]}))
+        .unwrap();
+        let mut dr = DomainRequest::from_gemini(&req);
+        assert_matches!(&dr.messages[0].content[0], DomainContentBlock::Unknown { .. });
+        assert!(!dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true).is_empty());
+        dr.upstream.rerenders_client_request = true;
+        assert_eq!(gemini_first(&dr), raw);
+    }
+
+    /// Gemini takes a `video/*` clip as `inlineData` (fetched 2026-11-04);
+    /// Chat, Responses and Anthropic have no video input. The domain has no
+    /// video block, so the clip is the client's part: sent back as it was on
+    /// the client's own re-render, in a user turn and a model turn, and named on
+    /// a translation — never an image.
+    #[test]
+    fn a_gemini_video_clip_is_never_an_image() {
+        let by_uri = serde_json::json!({"fileData": {"mimeType": "video/mp4", "fileUri": "gs://b/c.mp4"}});
+        let dr = DomainRequest::from_gemini(&serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [by_uri.clone()]}]})).unwrap());
+        assert_matches!(&dr.messages[0].content[0], DomainContentBlock::Unknown { value } if *value == by_uri);
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["user content part fileData"]);
+        let clip = serde_json::json!({"inlineData": {"mimeType": "video/mp4", "data": "AAEC"}});
+        let mut dr = DomainRequest::from_gemini(&serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "describe"}, clip.clone()]},
+            {"role": "model", "parts": [{"text": "here"}, clip.clone()]},
+            {"role": "user", "parts": [{"text": "again"}]},
+        ]})).unwrap());
+        for (i, m) in [0, 1].into_iter().map(|i| (i, &dr.messages[i])) {
+            assert_matches!(&m.content[1], DomainContentBlock::Unknown { value } if *value == clip, "message {i}");
+        }
+        for target in [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::AnthropicMessages] {
+            assert_eq!(
+                dr.not_carried_to(target, "m", true),
+                ["history item inlineData", "user content part inlineData"],
+                "{target:?}"
+            );
+        }
+        let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap().to_string();
+        assert!(!anthropic.contains("video/mp4") && !anthropic.contains("\"image\""), "{anthropic}");
+        dr.upstream.rerenders_client_request = true;
+        let sent = serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap();
+        assert_eq!(sent["contents"][0]["parts"][1], clip);
+        assert_eq!(sent["contents"][1]["parts"][1], clip);
+        assert!(dr.not_carried_to(ApiVersion::GoogleGemini, "m", true).is_empty());
+    }
+
+    /// A blob a Gemini client spells in URL-safe or unpadded base64 (proto3
+    /// `bytes` allows both) reaches every target's base64 field in the
+    /// standard alphabet, padded.
+    #[test]
+    fn a_gemini_blob_reaches_every_target_in_standard_base64() {
+        // 0xfb 0xff 0xbf: `+/+/` in the standard alphabet, `-_-_` URL-safe.
+        let dr = DomainRequest::from_gemini(&serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [
+                {"inlineData": {"mimeType": "image/png", "data": "-_-_"}},
+                {"inlineData": {"mimeType": "application/pdf", "data": "-_-_"}},
+                {"inlineData": {"mimeType": "audio/wav", "data": "QUI"}},
+            ]},
+        ]})).unwrap());
+        let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert_eq!(anthropic["messages"][0]["content"][0]["source"]["data"], "+/+/");
+        assert_eq!(anthropic["messages"][0]["content"][1]["source"]["data"], "+/+/");
+        let chat = serde_json::to_value(dr.to_chat_completions()).unwrap();
+        assert_eq!(chat["messages"][0]["content"][0]["image_url"]["url"], "data:image/png;base64,+/+/");
+        assert_eq!(chat["messages"][0]["content"][2]["input_audio"]["data"], "QUI=");
+        let responses = serde_json::to_value(dr.to_responses()).unwrap();
+        assert_eq!(responses["input"][0]["content"][0]["image_url"], "data:image/png;base64,+/+/");
+        assert_eq!(responses["input"][0]["content"][1]["file_data"], "data:application/pdf;base64,+/+/");
+    }
+
+    /// A Chat assistant message's content is text or a refusal, and a
+    /// Responses output message's `output_text` or `refusal`; Gemini's model
+    /// turn takes the parts a user turn does (fetched 2026-11-04). Each media
+    /// block in an assistant turn either reaches the target's wire or is named
+    /// by `not_carried_to` — exactly one of the two, on every target.
+    #[test]
+    fn an_assistant_turns_media_is_carried_or_named_on_every_target() {
+        // (block, what marks it on the wire, its kind, whether Gemini's model
+        // turn takes it; a text file is text everywhere, nothing else is
+        // carried by Chat, Responses or Anthropic)
+        let cases: [(DomainContentBlock, &str, &str, bool); 8] = [
+            (DomainContentBlock::Image { data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }, "SU1H", "image", true),
+            (DomainContentBlock::Audio { data: "QVVE".into(), format: "wav".into(), cache_control: None }, "QVVE", "audio", true),
+            (DomainContentBlock::Document { data: "UERG".into(), media_type: "application/pdf".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "UERG", "document", true),
+            (DomainContentBlock::Document { data: "plain words".into(), media_type: "text/plain".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "plain words", "document", true),
+            (DomainContentBlock::File { file_id: None, url: Some("gs://b/clip".into()), media_type: Some("image/png".into()), filename: None, cache_control: None }, "gs://b/clip", "file", true),
+            (DomainContentBlock::File { file_id: Some("file-9".into()), url: None, media_type: None, filename: None, cache_control: None }, "file-9", "file", false),
+            (DomainContentBlock::Stripped { media_type: Some("image/png".into()), size_bytes: Some(9), reason: Some("too_large".into()) }, "too_large", "media", false),
+            (DomainContentBlock::Document { data: String::new(), media_type: "application/pdf".into(), title: Some("Spec Title".into()), context: None, citations: None, cache_control: None, nested_content: None }, "Spec Title", "document", false),
+        ];
+        for (block, needle, kind, gemini_takes) in cases {
+            let text_file = needle == "plain words";
+            let dr = DomainRequest {
+                messages: vec![
+                    text_msg(DomainRole::User, "q"),
+                    DomainMessage { role: DomainRole::Assistant, content: vec![DomainContentBlock::Text { text: "a".into(), cache_control: None }, block] },
+                    text_msg(DomainRole::User, "next"),
+                ],
+                ..empty_domain_request()
+            };
+            for target in [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini] {
+                let wire = match target {
+                    ApiVersion::ChatCompletions => serde_json::to_value(dr.to_chat_completions()).unwrap()["messages"][1].clone(),
+                    ApiVersion::Responses => serde_json::to_value(dr.to_responses()).unwrap()["input"].clone(),
+                    ApiVersion::AnthropicMessages => serde_json::to_value(dr.to_anthropic()).unwrap()["messages"][1].clone(),
+                    ApiVersion::GoogleGemini => serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"][1].clone(),
+                }
+                .to_string();
+                let named = dr.not_carried_to(target, "m", true).contains(&format!("{kind} in an assistant turn"));
+                let carried = text_file || (gemini_takes && target == ApiVersion::GoogleGemini);
+                assert_eq!(wire.contains(needle), carried, "{kind} {needle} on the {target:?} wire: {wire}");
+                assert_eq!(named, !carried, "{kind} {needle} named for {target:?}");
+                // What is not carried leaves a marker in its place.
+                assert_eq!(wire.contains(&format!("The assistant's {kind} here could not be carried")), !carried, "{target:?}: {wire}");
+            }
+        }
+    }
+
+    /// A user turn's wire on `target`, serialized.
+    fn user_turn_wire(dr: &DomainRequest, target: ApiVersion) -> Value {
+        match target {
+            ApiVersion::ChatCompletions => serde_json::to_value(dr.to_chat_completions()).unwrap()["messages"][0]["content"].clone(),
+            ApiVersion::Responses => serde_json::to_value(dr.to_responses()).unwrap()["input"][0]["content"].clone(),
+            ApiVersion::AnthropicMessages => serde_json::to_value(dr.to_anthropic()).unwrap()["messages"][0]["content"].clone(),
+            ApiVersion::GoogleGemini => serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"][0]["parts"].clone(),
+        }
+    }
+
+    fn document_of(data: &str, media_type: &str) -> DomainContentBlock {
+        DomainContentBlock::Document {
+            data: data.into(),
+            media_type: media_type.into(),
+            title: None,
+            context: None,
+            citations: None,
+            cache_control: None,
+            nested_content: None,
+        }
+    }
+
+    /// A reference locating nothing is a marker the audit names on every target,
+    /// a document or reference sent as its label alone is named, and `image/jpg`
+    /// reaches Anthropic as the `image/jpeg` it lists.
+    #[test]
+    fn a_user_turns_labelled_or_unlocated_media_is_named() {
+        let with = |block: DomainContentBlock| DomainRequest {
+            messages: vec![DomainMessage { role: DomainRole::User, content: vec![block] }],
+            ..empty_domain_request()
+        };
+        let file = |file_id: Option<&str>, url: Option<&str>| DomainContentBlock::File {
+            file_id: file_id.map(str::to_string),
+            url: url.map(str::to_string),
+            media_type: None,
+            filename: None,
+            cache_control: None,
+        };
+        let named = |dr: &DomainRequest, target, kind: &str| dr.not_carried_to(target, "m", true).contains(&format!("{kind} in a user turn"));
+        let all = [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini];
+
+        let nowhere = with(file(None, None));
+        for target in all {
+            assert!(named(&nowhere, target, "file"), "{target:?}");
+            let wire = user_turn_wire(&nowhere, target).to_string();
+            assert!(wire.contains("could not be carried") || wire.contains("[File: untitled]"), "{target:?}: {wire}");
+        }
+        // An id is read everywhere but on Gemini; a URL goes as its label on Chat.
+        let by_id = with(file(Some("file-1"), None));
+        let by_url = with(file(None, Some("https://x/a.pdf")));
+        for target in all {
+            assert_eq!(named(&by_id, target, "file"), target == ApiVersion::GoogleGemini, "{target:?}");
+            assert_eq!(named(&by_url, target, "file"), target == ApiVersion::ChatCompletions, "{target:?}");
+        }
+        assert!(user_turn_wire(&by_url, ApiVersion::ChatCompletions).to_string().contains("[File: https://x/a.pdf]"));
+        // An image by URL has Chat's image channel.
+        let image_ref = with(DomainContentBlock::File { file_id: None, url: Some("https://x/a.png".into()), media_type: Some("image/png".into()), filename: None, cache_control: None });
+        assert!(!named(&image_ref, ApiVersion::ChatCompletions, "file"));
+        assert_eq!(user_turn_wire(&image_ref, ApiVersion::ChatCompletions)[0]["image_url"]["url"], "https://x/a.png");
+
+        let doc_url = with(document_of("https://x/d.pdf", "document/url"));
+        assert!(named(&doc_url, ApiVersion::ChatCompletions, "document"));
+        assert!(!named(&doc_url, ApiVersion::Responses, "document"));
+        let bodiless = with(document_of("", "application/pdf"));
+        for target in [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::GoogleGemini] {
+            assert!(named(&bodiless, target, "document"), "{target:?}");
+        }
+
+        // The predicate and each walk's label agree.
+        let audio = with(DomainContentBlock::Audio { data: "AAEC".into(), format: "wav".into(), cache_control: None });
+        for dr in [&doc_url, &bodiless, &by_url, &audio] {
+            for target in all {
+                let wire = user_turn_wire(dr, target).to_string();
+                let label = wire.contains("[Document:") || wire.contains("[File:") || wire.contains("[Audio (");
+                let block = &dr.messages[0].content[0];
+                assert_eq!(user_media_labelled(target, dr.upstream.chat_dialect, block), label, "{target:?}: {wire}");
+            }
+        }
+
+        // A data URL's parameters are no part of the domain's media type.
+        assert_matches!(
+            parse_responses_content_part(&serde_json::json!({"type": "input_file", "file_data": "data:application/pdf;name=r.pdf;base64,QllURVM"})),
+            DomainContentBlock::Document { media_type, .. } if media_type == "application/pdf"
+        );
+
+        // An image with no bytes reaches no target, a YouTube video or a typed audio
+        // reference no walk without its channel.
+        let hollow_image = with(DomainContentBlock::Image { data: String::new(), media_type: "image/png".into(), cache_control: None });
+        for target in all {
+            assert!(named(&hollow_image, target, "image"), "{target:?}");
+        }
+        for target in [ApiVersion::AnthropicMessages, ApiVersion::Responses] {
+            assert!(named(&with(file(None, Some("https://www.youtube.com/watch?v=x"))), target, "file"), "{target:?}");
+        }
+        let heard = with(DomainContentBlock::File { file_id: None, url: Some("https://x/a.mp3".into()), media_type: Some("audio/mpeg".into()), filename: None, cache_control: None });
+        assert!(named(&heard, ApiVersion::Responses, "file"));
+
+        // Nothing with no bytes of its own reaches Anthropic.
+        for empty in [document_of("", "text/plain"), DomainContentBlock::Image { data: String::new(), media_type: "image/png".into(), cache_control: None }] {
+            assert!(user_media_refused(ApiVersion::AnthropicMessages, &empty));
+        }
+        // A URI only its own store reads is a marker elsewhere, whatever its case.
+        let store = |url: &str| with(file(None, Some(url)));
+        for url in [
+            "gs://b/o",
+            "https://generativelanguage.googleapis.com/v1beta/files/abc",
+            "HTTPS://generativelanguage.googleapis.com/f",
+            "https://generativelanguage.googleapis.com:443/f",
+            "https://m.youtube.com/watch?v=x",
+            "https://user@youtu.be/x",
+        ] {
+            for target in [ApiVersion::AnthropicMessages, ApiVersion::Responses] {
+                assert!(named(&store(url), target, "file"), "{url} {target:?}");
+            }
+            assert!(!named(&store(url), ApiVersion::GoogleGemini, "file"), "{url}");
+        }
+        assert!(!named(&store("HTTPS://x/a.pdf"), ApiVersion::Responses, "file"));
+        // Anthropic reads a reference by URL as an image or a PDF: a stated type
+        // can rule it out, and no stated type does not.
+        let typed = |mt: &str| with(DomainContentBlock::File { file_id: None, url: Some("https://x/a".into()), media_type: Some(mt.into()), filename: None, cache_control: None });
+        assert!(named(&typed("application/zip"), ApiVersion::AnthropicMessages, "file"));
+        assert!(!named(&typed("application/pdf"), ApiVersion::AnthropicMessages, "file"));
+        assert!(!named(&typed("image/png"), ApiVersion::AnthropicMessages, "file"));
+        assert!(!named(&typed("application/zip"), ApiVersion::Responses, "file"));
+
+        let jpg = with(DomainContentBlock::Image { data: "AAEC".into(), media_type: "image/jpg".into(), cache_control: None });
+        assert!(!named(&jpg, ApiVersion::AnthropicMessages, "image"));
+        assert_eq!(user_turn_wire(&jpg, ApiVersion::AnthropicMessages)[0]["source"]["media_type"], "image/jpeg");
+    }
+
+    /// A function call's and response's `id` are optional on Gemini: an exchange with
+    /// none is still one exchange on a protocol that pairs by id, in call order.
+    #[test]
+    fn a_gemini_exchange_without_ids_stays_paired_on_chat() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "q"}]},
+            {"role": "model", "parts": [
+                {"functionCall": {"name": "a", "args": {}}},
+                {"functionCall": {"name": "a", "args": {"n": 2}}},
+                {"functionCall": {"name": "b", "args": {}}},
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"name": "b", "response": {"r": "b"}}},
+                {"functionResponse": {"name": "a", "response": {"r": "first"}}},
+                {"functionResponse": {"name": "a", "response": {"r": "second"}}},
+            ]},
+            {"role": "user", "parts": [{"functionResponse": {"name": "never_called", "response": {}}}]},
+        ]}))
+        .unwrap();
+        let chat = serde_json::to_value(DomainRequest::from_gemini(&req).to_chat_completions()).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        let calls: Vec<&str> = messages[1]["tool_calls"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert_eq!(calls.len(), 3, "{chat}");
+        let answers: Vec<(&str, &str)> = messages[2..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| (m["tool_call_id"].as_str().unwrap(), m["content"].as_str().unwrap()))
+            .collect();
+        assert_eq!(answers, [(calls[2], r#"{"r":"b"}"#), (calls[0], r#"{"r":"first"}"#), (calls[1], r#"{"r":"second"}"#)], "{chat}");
+    }
+
+    /// A tool loop of several rounds with no ids: every call's id is unique in the
+    /// request, as Anthropic requires, and each round's answer stays with its call.
+    #[test]
+    fn a_gemini_tool_loop_without_ids_has_unique_call_ids() {
+        let round = |answer: &str| {
+            [
+                serde_json::json!({"role": "model", "parts": [{"functionCall": {"name": "a", "args": {}}}]}),
+                serde_json::json!({"role": "user", "parts": [{"functionResponse": {"name": "a", "response": {"r": answer}}}]}),
+            ]
+        };
+        let mut contents = vec![serde_json::json!({"role": "user", "parts": [{"text": "q"}]})];
+        contents.extend(round("one"));
+        contents.extend(round("two"));
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": contents})).unwrap();
+        let chat = serde_json::to_value(DomainRequest::from_gemini(&req).to_chat_completions()).unwrap();
+        let messages = chat["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 5, "{chat}");
+        let (first, second) = (messages[1]["tool_calls"][0]["id"].as_str().unwrap(), messages[3]["tool_calls"][0]["id"].as_str().unwrap());
+        assert_ne!(first, second, "{chat}");
+        assert_eq!(messages[2]["tool_call_id"], first);
+        assert_eq!(messages[4]["tool_call_id"], second);
+    }
+
+    /// The Gemini reference lists `FunctionResponseFileData` (`fileUri`, optional
+    /// `mimeType`, `displayName`; fetched 2026-11-04). A function response's
+    /// reference is a reference on every target reading one, as written on the
+    /// client's own re-render, and a marker where a result has no channel for it.
+    #[test]
+    fn a_function_responses_file_reference_is_carried_or_named() {
+        let part = serde_json::json!({"fileData": {"fileUri": "https://x/a.png", "mimeType": "image/png", "displayName": "a"}});
+        let block = gemini_function_response_part(&part);
+        assert_matches!(&block, DomainContentBlock::File { url: Some(u), filename: Some(n), .. } if u == "https://x/a.png" && n == "a");
+        let clip = serde_json::json!({"fileData": {"fileUri": "https://x/a.mp4", "mimeType": "video/mp4"}});
+        assert_matches!(gemini_function_response_part(&clip), DomainContentBlock::Unknown { .. });
+        // A member the domain has no field for keeps the part as written.
+        for odd in [
+            serde_json::json!({"fileData": {"fileUri": "https://x/a.png", "other": 1}}),
+            serde_json::json!({"fileData": {"fileUri": "https://x/a.png"}, "mediaResolution": {"level": "low"}}),
+        ] {
+            assert_matches!(gemini_function_response_part(&odd), DomainContentBlock::Unknown { .. });
+        }
+
+        let plain = empty_domain_request();
+        let own = DomainRequest { upstream: UpstreamFacts { rerenders_client_request: true, ..Default::default() }, ..empty_domain_request() };
+        assert!(own.tool_result_carries(&block, ApiVersion::GoogleGemini, "gemini-2.5-flash"));
+        assert!(plain.tool_result_carries(&block, ApiVersion::GoogleGemini, "gemini-3-pro"));
+        assert!(!plain.tool_result_carries(&block, ApiVersion::GoogleGemini, "gemini-2.5-flash"));
+        assert!(plain.tool_result_carries(&block, ApiVersion::AnthropicMessages, "m"));
+        assert!(plain.tool_result_carries(&block, ApiVersion::Responses, "m"));
+        assert!(!plain.tool_result_carries(&block, ApiVersion::ChatCompletions, "m"));
+
+        let scoped = gemini_function_response_part(&serde_json::json!({"fileData": {"fileUri": "gs://b/o", "mimeType": "image/png"}}));
+        assert!(!plain.tool_result_carries(&scoped, ApiVersion::AnthropicMessages, "m"));
+        assert!(plain.tool_result_carries(&scoped, ApiVersion::GoogleGemini, "gemini-3-pro"));
+        let files_api = gemini_function_response_part(&serde_json::json!({"fileData": {"fileUri": "https://generativelanguage.googleapis.com/v1beta/files/a", "mimeType": "image/png"}}));
+        assert!(!plain.tool_result_carries(&files_api, ApiVersion::Responses, "m"));
+        // A translation to Gemini reads a reference's type as it reads a blob's; a
+        // re-render of the client's own goes as written.
+        let zipped = gemini_function_response_part(&serde_json::json!({"fileData": {"fileUri": "https://x/a.zip", "mimeType": "application/zip"}}));
+        assert!(!plain.tool_result_carries(&zipped, ApiVersion::GoogleGemini, "gemini-3-pro"));
+        assert!(own.tool_result_carries(&zipped, ApiVersion::GoogleGemini, "gemini-2.5-flash"));
+        assert!(own.tool_result_carries(&files_api, ApiVersion::Responses, "m"), "a re-render goes as written");
+
+        let rendered = own.gemini_function_response("c", "shot".to_string(), std::slice::from_ref(&block), None, "gemini-2.5-flash");
+        assert_eq!(rendered.parts, [part]);
+
+        // The emitted shape on each other target: an image by URL is an image.
+        let result = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                DomainMessage {
+                    role: DomainRole::Assistant,
+                    content: vec![DomainContentBlock::ToolUse {
+                        id: "c".into(),
+                        name: "shot".into(),
+                        input: serde_json::json!({}),
+                        input_raw: None,
+                        cache_control: None,
+                        thought_signature: None,
+                    }],
+                },
+                DomainMessage { role: DomainRole::Tool { tool_call_id: "c".into(), is_error: None, cache_control: None }, content: vec![block] },
+            ],
+            ..empty_domain_request()
+        };
+        let anthropic = serde_json::to_value(result.to_anthropic()).unwrap().to_string();
+        assert_eq!(
+            serde_json::from_str::<Value>(&anthropic).unwrap()["messages"][2]["content"][0]["content"][0]["source"],
+            serde_json::json!({"type": "url", "url": "https://x/a.png"}),
+            "{anthropic}"
+        );
+        let responses = serde_json::to_value(result.to_responses()).unwrap().to_string();
+        assert!(responses.contains(r#""image_url":"https://x/a.png""#) && responses.contains("input_image"), "{responses}");
+        assert!(!responses.contains("file_url"), "{responses}");
+        let chat = serde_json::to_value(result.to_chat_completions()).unwrap().to_string();
+        assert!(!chat.contains("https://x/a.png") && chat.contains("could not be carried"), "{chat}");
+    }
+
+    /// Anthropic's base64 image source lists jpeg, png, gif and webp, and its
+    /// document sources a PDF, plain text, nested content and a URL; Chat
+    /// Completions "accepts only PDF files as `file` content parts"; Responses
+    /// takes the other document types as `input_file` (fetched 2026-11-04). A
+    /// user turn's image or document either reaches the target's wire or is a
+    /// marker the audit names — exactly one of the two, on every target — and
+    /// the turn is sent either way.
+    #[test]
+    fn a_user_turns_media_is_carried_or_named_on_every_target() {
+        use ApiVersion::{AnthropicMessages as A, ChatCompletions as C};
+        const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        let image = |t: &str| DomainContentBlock::Image { data: "QllURVM".into(), media_type: t.into(), cache_control: None };
+        // (block, what marks it on the wire, its kind, the targets refusing it)
+        let cases: Vec<(DomainContentBlock, &str, &str, &[ApiVersion])> = vec![
+            (image("image/jpeg"), "QllURVM", "image", &[]),
+            (image("image/png"), "QllURVM", "image", &[]),
+            (image("image/gif"), "QllURVM", "image", &[]),
+            (image("image/webp"), "QllURVM", "image", &[]),
+            (image("image/heic"), "QllURVM", "image", &[A]),
+            (image("image/bmp"), "QllURVM", "image", &[A]),
+            (DomainContentBlock::Image { data: "https://x/y.heic".into(), media_type: "image/url".into(), cache_control: None }, "https://x/y.heic", "image", &[]),
+            (document_of("QllURVM", "application/pdf"), "QllURVM", "document", &[]),
+            (document_of("QllURVM", DOCX), "QllURVM", "document", &[A, C]),
+            (document_of("QllURVM", "application/octet-stream"), "QllURVM", "document", &[A, C]),
+            (document_of("plain words", "text/plain"), "plain words", "document", &[]),
+            (document_of("https://x/d.docx", "document/url"), "https://x/d.docx", "document", &[]),
+        ];
+        for (block, needle, kind, refusing) in cases {
+            let dr = DomainRequest {
+                messages: vec![DomainMessage {
+                    role: DomainRole::User,
+                    content: vec![DomainContentBlock::Text { text: "read this".into(), cache_control: None }, block.clone()],
+                }],
+                ..empty_domain_request()
+            };
+            for target in [C, ApiVersion::Responses, A, ApiVersion::GoogleGemini] {
+                let refused = refusing.contains(&target);
+                let wire = user_turn_wire(&dr, target).to_string();
+                assert!(wire.contains("read this"), "{block:?} {target:?}: {wire}");
+                assert_eq!(wire.contains(needle), !refused, "{block:?} on the {target:?} wire: {wire}");
+                assert_eq!(wire.contains(&format!("This message's {kind} could not be carried")), refused, "{block:?} {target:?}: {wire}");
+                let named = dr.not_carried_to(target, "m", true).contains(&format!("{kind} in a user turn"));
+                // Chat has no URL channel for a file: a document by URL goes as its label.
+                let labelled = target == C && needle == "https://x/d.docx";
+                assert_eq!(named, refused || labelled, "{block:?} named for {target:?}");
+            }
+            // A re-render of the client's own request sends it as written.
+            let mut own = dr.clone();
+            own.upstream.rerenders_client_request = true;
+            for target in [C, A] {
+                let labelled = target == C && needle == "https://x/d.docx";
+                assert!(user_turn_wire(&own, target).to_string().contains(needle), "{block:?} {target:?}");
+                assert_eq!(own.not_carried_to(target, "m", true).contains(&format!("{kind} in a user turn")), labelled, "{block:?} {target:?}");
+            }
+        }
+    }
+
+    /// The shapes a carried user block goes in, from the specs named on
+    /// `a_user_turns_media_is_carried_or_named_on_every_target`.
+    #[test]
+    fn a_user_turns_carried_media_keeps_its_wire_shape() {
+        let turn = |block: DomainContentBlock| DomainRequest {
+            messages: vec![DomainMessage { role: DomainRole::User, content: vec![block] }],
+            ..empty_domain_request()
+        };
+        let image = turn(DomainContentBlock::Image { data: "QllURVM".into(), media_type: "image/webp".into(), cache_control: None });
+        assert_eq!(
+            user_turn_wire(&image, ApiVersion::AnthropicMessages)[0],
+            serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/webp", "data": "QllURVM"}}),
+        );
+        let by_url = turn(DomainContentBlock::Image { data: "https://x/y.bmp".into(), media_type: "image/url".into(), cache_control: None });
+        assert_eq!(
+            user_turn_wire(&by_url, ApiVersion::AnthropicMessages)[0],
+            serde_json::json!({"type": "image", "source": {"type": "url", "url": "https://x/y.bmp"}}),
+        );
+        let pdf = turn(document_of("QllURVM", "application/pdf"));
+        assert_eq!(
+            user_turn_wire(&pdf, ApiVersion::AnthropicMessages)[0],
+            serde_json::json!({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "QllURVM"}}),
+        );
+        assert_eq!(
+            user_turn_wire(&pdf, ApiVersion::ChatCompletions)[0],
+            serde_json::json!({"type": "file", "file": {"filename": "document", "file_data": "data:application/pdf;base64,QllURVM"}}),
+        );
+        // Nested blocks are a document source of Anthropic's, whatever the
+        // media type beside them.
+        let nested = turn(DomainContentBlock::Document {
+            data: String::new(),
+            media_type: "application/x-nested".into(),
+            title: None,
+            context: None,
+            citations: None,
+            cache_control: None,
+            nested_content: Some(serde_json::json!([{"type": "text", "text": "inner"}])),
+        });
+        let wire = user_turn_wire(&nested, ApiVersion::AnthropicMessages);
+        assert_eq!(wire[0]["source"]["type"], "content", "{wire}");
+        assert!(nested.not_carried_to(ApiVersion::AnthropicMessages, "m", true).is_empty());
+    }
+
+    /// A marker keeps the breakpoint the client set on the block, a turn holding
+    /// only refused media is still sent, and several of a kind are counted.
+    #[test]
+    fn a_user_turns_refused_media_leaves_a_turn_with_its_breakpoint() {
+        let cache: CacheControl = serde_json::from_value(serde_json::json!({"type": "ephemeral"})).unwrap();
+        let dr = DomainRequest {
+            messages: vec![DomainMessage {
+                role: DomainRole::User,
+                content: vec![
+                    DomainContentBlock::Image { data: "QllURVM".into(), media_type: "image/heic".into(), cache_control: Some(cache) },
+                    DomainContentBlock::Image { data: "QllURVM".into(), media_type: "image/bmp".into(), cache_control: None },
+                ],
+            }],
+            ..empty_domain_request()
+        };
+        let wire = user_turn_wire(&dr, ApiVersion::AnthropicMessages);
+        assert_eq!(wire[0]["type"], "text", "{wire}");
+        assert_eq!(wire[0]["cache_control"]["type"], "ephemeral", "{wire}");
+        assert_eq!(wire[1]["type"], "text", "{wire}");
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["image in a user turn (×2)"]);
+    }
+
+    /// A refused document right after a tool result goes as a marker in the
+    /// message the walk joins them into, and Chat does not fold it into the
+    /// tool's output.
+    #[test]
+    fn a_user_turns_refused_media_after_a_tool_result_is_a_marker() {
+        let dr = DomainRequest {
+            messages: vec![
+                DomainMessage {
+                    role: DomainRole::Assistant,
+                    content: vec![DomainContentBlock::ToolUse { id: "c1".into(), name: "t".into(), input: serde_json::json!({}), input_raw: None, thought_signature: None, cache_control: None }],
+                },
+                DomainMessage {
+                    role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
+                    content: vec![DomainContentBlock::Text { text: "out".into(), cache_control: None }],
+                },
+                DomainMessage { role: DomainRole::User, content: vec![document_of("QllURVM", "application/zip")] },
+            ],
+            ..empty_domain_request()
+        };
+        let marker = "This message's document could not be carried";
+        let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert!(anthropic["messages"][1]["content"][1]["text"].as_str().unwrap().contains(marker), "{anthropic}");
+        let chat = serde_json::to_value(dr.to_chat_completions()).unwrap();
+        assert_eq!(chat["messages"][1]["content"], "out", "{chat}");
+        assert_eq!(chat["messages"][2]["role"], "user", "{chat}");
+        assert!(chat["messages"][2]["content"].to_string().contains(marker), "{chat}");
+        for target in [ApiVersion::AnthropicMessages, ApiVersion::ChatCompletions] {
+            assert_eq!(dr.not_carried_to(target, "m", true), ["document in a user turn"], "{target:?}");
+        }
+    }
+
+    /// "If the final message uses the `assistant` role, the response content
+    /// will continue immediately from the content in that message" (Anthropic,
+    /// fetched 2026-11-04). A last assistant turn of media a target has no
+    /// channel for sends no note to continue from, and the audit still names it.
+    /// The same turn with anything after it keeps its marker.
+    #[test]
+    fn a_run_of_media_only_turns_is_left_out_of_a_translation() {
+        // Stripped media is the one kind no target carries in a model turn.
+        let media = DomainContentBlock::Stripped { media_type: Some("image/png".into()), size_bytes: Some(9), reason: Some("too_large".into()) };
+        let assistant = DomainMessage { role: DomainRole::Assistant, content: vec![media] };
+        let marker = "The assistant's media here could not be carried";
+        // The role of the last message on the wire, and all of it.
+        let wire = |dr: &DomainRequest, target: ApiVersion| -> (Value, String) {
+            let all = match target {
+                ApiVersion::ChatCompletions => serde_json::to_value(dr.to_chat_completions()).unwrap()["messages"].clone(),
+                ApiVersion::Responses => serde_json::to_value(dr.to_responses()).unwrap()["input"].clone(),
+                ApiVersion::AnthropicMessages => serde_json::to_value(dr.to_anthropic()).unwrap()["messages"].clone(),
+                ApiVersion::GoogleGemini => serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"].clone(),
+            };
+            let last = all.as_array().and_then(|a| a.last()).map(|m| m["role"].clone()).unwrap_or(Value::Null);
+            (last, all.to_string())
+        };
+        let ending = DomainRequest {
+            messages: vec![text_msg(DomainRole::User, "q"), assistant.clone()],
+            ..empty_domain_request()
+        };
+        let then_system = DomainRequest {
+            messages: vec![text_msg(DomainRole::User, "q"), assistant.clone(), text_msg(DomainRole::System, "s")],
+            ..empty_domain_request()
+        };
+        let followed = DomainRequest {
+            messages: vec![text_msg(DomainRole::User, "q"), assistant.clone(), text_msg(DomainRole::User, "next")],
+            ..empty_domain_request()
+        };
+        let all_targets = [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini];
+        for target in all_targets {
+            for dr in [&ending, &then_system] {
+                let (last, all) = wire(dr, target);
+                assert_eq!(last, "user", "{target:?}: {all}");
+                assert!(!all.contains(marker), "{target:?}: {all}");
+                assert!(dr.not_carried_to(target, "m", true).contains(&"media in an assistant turn".to_string()), "{target:?}");
+            }
+            let (_, all) = wire(&followed, target);
+            assert!(all.contains(marker), "{target:?}: {all}");
+            assert!(followed.not_carried_to(target, "m", true).contains(&"media in an assistant turn".to_string()), "{target:?}");
+        }
+        // A last turn holding its own text goes whole, its marker included.
+        let spoken = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                DomainMessage {
+                    role: DomainRole::Assistant,
+                    content: vec![DomainContentBlock::Text { text: "The best answer is".into(), cache_control: None }, assistant.content[0].clone()],
+                },
+            ],
+            ..empty_domain_request()
+        };
+        for target in all_targets {
+            let (last, all) = wire(&spoken, target);
+            assert!(all.contains("The best answer is") && all.contains(marker), "{target:?}: {all}");
+            assert_ne!(last, "user", "{target:?}: {all}");
+            assert!(spoken.not_carried_to(target, "m", true).contains(&"media in an assistant turn".to_string()), "{target:?}");
+        }
+        // Empty text or thinking beside the media does not leave an empty final turn.
+        let hollow = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                DomainMessage {
+                    role: DomainRole::Assistant,
+                    content: vec![DomainContentBlock::Text { text: String::new(), cache_control: None }, assistant.content[0].clone()],
+                },
+            ],
+            ..empty_domain_request()
+        };
+        for target in all_targets {
+            let (last, all) = wire(&hollow, target);
+            assert_eq!(last, "user", "{target:?}: {all}");
+        }
+        // A run of such turns ends on no marker, and a request of nothing else keeps
+        // its marker.
+        let run = DomainRequest {
+            messages: vec![text_msg(DomainRole::User, "q"), assistant.clone(), assistant.clone()],
+            ..empty_domain_request()
+        };
+        let lone = DomainRequest { messages: vec![assistant.clone()], ..empty_domain_request() };
+        let empty_user = DomainRequest {
+            messages: vec![DomainMessage { role: DomainRole::User, content: vec![] }, assistant.clone()],
+            ..empty_domain_request()
+        };
+        let before_a_result = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                assistant.clone(),
+                DomainMessage { role: DomainRole::Tool { tool_call_id: "c".into(), is_error: None, cache_control: None }, content: vec![] },
+            ],
+            ..empty_domain_request()
+        };
+        let mut own = ending.clone();
+        own.upstream.rerenders_client_request = true;
+        for (dr, why) in [
+            (&empty_user, "an empty user turn sends nothing"),
+            (&before_a_result, "a tool result still goes after it"),
+            (&own, "a re-render keeps the client's turns"),
+        ] {
+            assert_eq!(dr.assistant_turns_left_out_from(ApiVersion::AnthropicMessages), usize::MAX, "{why}");
+        }
+        // A run holding anything else goes whole: thinking is not left to end the
+        // request alone.
+        let thought = DomainContentBlock::Thinking { thinking: "t".into(), signature: Some("s".into()), signed_by: Some(ApiVersion::AnthropicMessages) };
+        let beside = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                DomainMessage { role: DomainRole::Assistant, content: vec![thought.clone(), assistant.content[0].clone()] },
+            ],
+            ..empty_domain_request()
+        };
+        let before = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                DomainMessage { role: DomainRole::Assistant, content: vec![thought] },
+                assistant.clone(),
+            ],
+            ..empty_domain_request()
+        };
+        for dr in [&beside, &before] {
+            let all = serde_json::to_value(dr.to_anthropic()).unwrap()["messages"].to_string();
+            assert!(all.contains(marker), "{all}");
+        }
+        for target in all_targets {
+            let (last, all) = wire(&run, target);
+            assert_eq!(last, "user", "{target:?}: {all}");
+            assert!(!all.contains(marker), "{target:?}: {all}");
+            assert!(wire(&lone, target).1.contains(marker), "{target:?}");
+        }
+        // What Gemini's model turn takes goes as the last message too.
+        let blob = DomainRequest {
+            messages: vec![
+                text_msg(DomainRole::User, "q"),
+                DomainMessage {
+                    role: DomainRole::Assistant,
+                    content: vec![DomainContentBlock::Image { data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }],
+                },
+            ],
+            ..empty_domain_request()
+        };
+        let (last, all) = wire(&blob, ApiVersion::GoogleGemini);
+        assert_eq!(last, "model", "{all}");
+        assert!(all.contains("SU1H"), "{all}");
+    }
+
+    /// `decode_proto_bytes` reads every spelling proto3 JSON gives `bytes`:
+    /// the same bytes in either alphabet, padded or not, decode to the same
+    /// bytes, line-wrapped or not, and every blob reads as the same domain
+    /// block. Deliberately NOT claimed: a string mixing the two alphabets is read
+    /// (it is neither spelling, and is refused).
+    mod proto_bytes_properties {
+        use super::super::{decode_proto_bytes, gemini_inline_block, DomainContentBlock};
+        use base64::Engine;
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+        use proptest::prelude::*;
+
+        /// The base64 a non-text block holds.
+        fn held_bytes(block: &DomainContentBlock) -> Option<&str> {
+            match block {
+                DomainContentBlock::Image { data, .. }
+                | DomainContentBlock::Audio { data, .. }
+                | DomainContentBlock::Document { data, .. } => Some(data),
+                _ => None,
+            }
+        }
+
+        proptest! {
+            /// A Gemini blob's encoding is settled at the parser: every
+            /// spelling proto3 allows of the same bytes is the same domain
+            /// block, a non-text one holding them in standard padded base64;
+            /// a text blob is a document exactly when its bytes are UTF-8; a
+            /// video clip is no block in any spelling.
+            #[test]
+            fn every_spelling_of_the_same_bytes_reads_the_same(bytes in proptest::collection::vec(any::<u8>(), 0..96)) {
+                let wrapped = STANDARD.encode(&bytes).as_bytes().chunks(8).map(|l| String::from_utf8_lossy(l).into_owned()).collect::<Vec<_>>().join("\r\n");
+                for spelling in [STANDARD.encode(&bytes), URL_SAFE.encode(&bytes), STANDARD_NO_PAD.encode(&bytes), URL_SAFE_NO_PAD.encode(&bytes), wrapped] {
+                    let decoded = decode_proto_bytes(&spelling);
+                    prop_assert_eq!(decoded.as_deref(), Some(bytes.as_slice()), "{}", spelling);
+                    for mt in ["text/plain", "image/png", "audio/wav", "application/pdf", "video/mp4"] {
+                        let read = gemini_inline_block(mt, &spelling);
+                        let canonical = gemini_inline_block(mt, &STANDARD.encode(&bytes));
+                        prop_assert_eq!(
+                            serde_json::to_value(&read).unwrap(),
+                            serde_json::to_value(&canonical).unwrap(),
+                            "{} {}", mt, spelling
+                        );
+                        match mt {
+                            "text/plain" => prop_assert_eq!(read.is_some(), std::str::from_utf8(&bytes).is_ok()),
+                            "video/mp4" => prop_assert!(read.is_none()),
+                            _ => {
+                                let read = read.unwrap();
+                                let standard = STANDARD.encode(&bytes);
+                                prop_assert_eq!(held_bytes(&read), Some(standard.as_str()), "{}", mt);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Data that is no spelling of any bytes stays the client's part,
+        /// whatever its length; a media type's case is not folded, so a type in
+        /// another case is of no kind the domain has a block for.
+        #[test]
+        fn what_is_not_base64_or_of_no_known_kind_is_no_block() {
+            for data in ["!!!!", "!!!!!", "=AAA"] {
+                assert!(gemini_inline_block("image/png", data).is_none(), "{data}");
+            }
+            assert!(gemini_inline_block("Image/PNG", "AAAA").is_none());
+            assert!(gemini_inline_block("image/png", "AAAA").is_some());
+        }
+
+        /// Non-zero trailing bits are the same byte, held in its one spelling.
+        #[test]
+        fn trailing_bits_read_as_the_same_block() {
+            for data in ["QR==", "QR", "QQ==", "QQ"] {
+                let block = gemini_inline_block("image/png", data).unwrap();
+                assert_eq!(held_bytes(&block), Some("QQ=="), "{data}");
+            }
+            let block = gemini_inline_block("image/png", "QUJ=").unwrap();
+            assert_eq!(held_bytes(&block), Some("QUI="));
+        }
+
+        /// The claim not made, pinned: a mixed spelling is no spelling.
+        #[test]
+        fn a_mixed_alphabet_is_refused() {
+            assert_eq!(decode_proto_bytes("+_+_"), None);
+        }
+    }
+
+    fn gemini_first(dr: &DomainRequest) -> Value {
+        serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"][0]["parts"][0].clone()
     }
 
     #[test]

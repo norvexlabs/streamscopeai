@@ -14,8 +14,11 @@
 //! the plan (add + refresh + remove) and refuses to write when every endpoint
 //! answered and together they named implausibly few models (empty, or fewer
 //! than half the current count), so a transient provider blip can never wipe a
-//! configured fleet. MANUAL mode computes the same diff but writes nothing —
-//! the UI drives the apply via the existing model-create endpoint.
+//! configured fleet. MANUAL mode computes the diff a person reviews and writes
+//! nothing — the UI drives the apply via the model create and delete
+//! endpoints. Its diff judges no answer's length: every model the answering
+//! endpoints no longer list is offered for removal, so a server that really
+//! shrank can be reconciled.
 
 use uuid::Uuid;
 
@@ -111,7 +114,8 @@ pub async fn retire_model_soft(
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SyncMode {
-    /// Compute the diff, write nothing.
+    /// Compute the diff a person reviews, write nothing. No length floor:
+    /// every model the answering endpoints no longer list is offered.
     Manual,
     /// Apply the diff: add new models, refresh caps/pricing, remove vanished ones.
     /// The worker's mode once a server has synced: an endpoint's FIRST answer
@@ -126,7 +130,7 @@ pub enum SyncMode {
     /// yet, so a discovery that doesn't list a configured model must augment —
     /// never tear down — that fresh config. Full reconciliation (including
     /// removal) resumes once a sync succeeds; an explicit operator `Sync now`
-    /// (`Auto`) always reconciles fully.
+    /// (`Explicit`) always reconciles fully.
     AutoFirstSync,
 }
 
@@ -161,14 +165,25 @@ impl SyncError {
         match self {
             SyncError::ServerNotFound => "server not found".to_string(),
             SyncError::Discovery(e) => format!("discovery failed: {}", e.message),
-            SyncError::Implausible { discovered, existing } => format!(
-                "implausible discovery: provider returned {discovered} models vs {existing} configured — refusing to remove"
-            ),
+            SyncError::Implausible { discovered, existing } => implausible_message(*discovered, *existing),
             SyncError::NameConflict { name } => format!(
                 "downstream name '{name}' is already in use by another downstream — refusing to mirror"
             ),
             SyncError::Db(e) => format!("database error: {e}"),
         }
+    }
+}
+
+/// Why an implausible discovery was refused, and what the operator can do: a
+/// list that names nothing is a server not up yet (a review removes nothing
+/// on it either); a short one may be a real shrink, which a review of the
+/// fully-up server accepts (a review keeps a short answer's floor while one
+/// of the server's endpoints is silent, and an empty answer's always).
+fn implausible_message(discovered: usize, existing: usize) -> String {
+    if discovered == 0 {
+        format!("implausible discovery: provider listed no models vs {existing} configured — refusing to remove; check the server is up and sync again")
+    } else {
+        format!("implausible discovery: provider returned {discovered} models vs {existing} configured — refusing to remove; once every endpoint of the server is up and answering, review the sync to accept the change")
     }
 }
 
@@ -179,10 +194,8 @@ pub fn sync_error_to_api(e: SyncError) -> crate::routes::ApiError {
     match e {
         SyncError::ServerNotFound => ApiError::not_found("server not found", ApiErrorCode::ServerNotFound),
         SyncError::Discovery(api) => api,
-        SyncError::Implausible { discovered, existing } => ApiError::bad_gateway(format!(
-            "implausible discovery: provider returned {discovered} models vs {existing} configured — refusing to remove"
-        ))
-        .code(ApiErrorCode::UpstreamUnreachable),
+        SyncError::Implausible { discovered, existing } => ApiError::bad_gateway(implausible_message(discovered, existing))
+            .code(ApiErrorCode::UpstreamUnreachable),
         SyncError::NameConflict { name } => ApiError::conflict(format!(
             "downstream name '{name}' is already in use by another downstream provider"
         ), ApiErrorCode::DownstreamNameTaken),
@@ -220,6 +233,9 @@ pub struct SyncOutcome {
     pub removed: Vec<RemovedModelInfo>,
     /// One report per enabled endpoint, primary first.
     pub endpoints: Vec<EndpointSyncReport>,
+    /// Manual only: "Sync now" on the same answers would not make every one
+    /// of `removed` — it judges an answer implausibly short.
+    pub unattended_refuses: bool,
     // Apply counts (Auto only).
     pub added: u32,
     pub refreshed: u32,
@@ -502,7 +518,7 @@ pub(crate) async fn apply_sync(
     answers: &[EndpointAnswer],
     mode: SyncMode,
 ) -> Result<SyncOutcome, SyncError> {
-    use super::model_fusion::{Answer, EndpointPlan, EndpointState, MemberKind};
+    use super::model_fusion::{Answer, EndpointPlan, EndpointState, Judge, MemberKind};
     use std::collections::{BTreeMap, BTreeSet};
 
     let server_id = server.id;
@@ -576,9 +592,18 @@ pub(crate) async fn apply_sync(
         &states,
         &answer_sets,
         mode == SyncMode::AutoFirstSync,
-        mode != SyncMode::Manual,
+        if mode == SyncMode::Manual { Judge::Reviewed } else { Judge::Unattended },
     )
     .map_err(|i| SyncError::Implausible { discovered: i.discovered, existing: i.existing })?;
+    // The review offers removals an unattended sync ("Sync now", on the same
+    // reading of the endpoints) refuses as implausible; it says so, from that
+    // sync's own decision rather than a restatement of its floors.
+    let unattended_refuses = mode == SyncMode::Manual
+        && !plan.retire.is_empty()
+        && match super::model_fusion::fuse(&existing_names, &states, &answer_sets, false, Judge::Unattended) {
+            Err(_) => true,
+            Ok(unattended) => plan.retire.iter().any(|name| !unattended.retire.contains(name)),
+        };
     // A first answer keeps every current model assumed: not a retired one.
     for p in &mut plan.endpoints {
         if let EndpointPlan::Answered { members, .. } = p {
@@ -599,29 +624,38 @@ pub(crate) async fn apply_sync(
     let new_models: Vec<DiscoveredModel> =
         discovered.iter().filter(|d| plan.new_models.contains(&d.id)).cloned().collect();
 
-    let mut removed = Vec::with_capacity(plan.retire.len());
-    for name in &plan.retire {
-        let Some(m) = existing.iter().find(|m| &m.upstream_model == name) else { continue };
-        let manual_routes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM downstream_routes WHERE model_id = $1 AND auto_synced = false",
+    // Every retired model's routes, counted in one round trip: a review may
+    // offer a whole fleet.
+    let by_name: HashMap<&str, &ExistingModel> = existing.iter().map(|m| (m.upstream_model.as_str(), m)).collect();
+    let retiring: Vec<&ExistingModel> = plan.retire.iter().filter_map(|name| by_name.get(name.as_str()).copied()).collect();
+    let ids: Vec<Uuid> = retiring.iter().map(|m| m.id).collect();
+    let counts: HashMap<Uuid, (i64, i64)> = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        sqlx::query_as::<_, (Uuid, i64, i64)>(
+            "SELECT model_id, COUNT(*), COUNT(*) FILTER (WHERE auto_synced = false) \
+             FROM downstream_routes WHERE model_id = ANY($1) GROUP BY model_id",
         )
-        .bind(m.id)
-        .fetch_one(&mut *conn)
+        .bind(&ids)
+        .fetch_all(&mut *conn)
         .await
-        .map_err(SyncError::Db)?;
-        let route_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM downstream_routes WHERE model_id = $1")
-                .bind(m.id)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(SyncError::Db)?;
-        removed.push(RemovedModelInfo {
-            id: m.id,
-            upstream_model: m.upstream_model.clone(),
-            route_count,
-            in_use: manual_routes > 0,
-        });
-    }
+        .map_err(SyncError::Db)?
+        .into_iter()
+        .map(|(id, all, manual)| (id, (all, manual)))
+        .collect()
+    };
+    let removed: Vec<RemovedModelInfo> = retiring
+        .iter()
+        .map(|m| {
+            let (route_count, manual_routes) = counts.get(&m.id).copied().unwrap_or((0, 0));
+            RemovedModelInfo {
+                id: m.id,
+                upstream_model: m.upstream_model.clone(),
+                route_count,
+                in_use: manual_routes > 0,
+            }
+        })
+        .collect();
 
     // One report per endpoint that was asked.
     let reports: Vec<EndpointSyncReport> = answers
@@ -650,6 +684,7 @@ pub(crate) async fn apply_sync(
         new_models: new_models.clone(),
         removed,
         endpoints: reports,
+        unattended_refuses,
         ..Default::default()
     };
     if mode == SyncMode::Manual {

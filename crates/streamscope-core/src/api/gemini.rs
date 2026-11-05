@@ -47,7 +47,9 @@ pub struct GeminiContent {
     pub parts: Vec<GeminiPart>,
 }
 
-/// A single content part — text, inline media, function call/response.
+/// A single content part — text, inline media, function call/response. Proto3
+/// JSON accepts a field's original name beside its camelCase one, so the members
+/// that carry media read both: an unread spelling would pass every capability gate.
 ///
 /// Uses untagged deserialization: the first variant whose fields are present wins.
 /// Order matters — more specific variants (FunctionCall, InlineData) must come
@@ -75,17 +77,17 @@ pub enum GeminiPart {
     },
     /// Function response from the client.
     FunctionResponse {
-        #[serde(rename = "functionResponse")]
+        #[serde(rename = "functionResponse", alias = "function_response")]
         function_response: GeminiFunctionResponseData,
     },
     /// Inline binary data (images, audio, video, PDF).
     InlineData {
-        #[serde(rename = "inlineData")]
+        #[serde(rename = "inlineData", alias = "inline_data")]
         inline_data: GeminiInlineData,
     },
     /// File reference (Files API or Cloud Storage URI).
     FileData {
-        #[serde(rename = "fileData")]
+        #[serde(rename = "fileData", alias = "file_data")]
         file_data: GeminiFileData,
     },
     /// Plain text part.
@@ -101,6 +103,7 @@ pub enum GeminiPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiInlineData {
+    #[serde(alias = "mime_type")]
     pub mime_type: String,
     pub data: String,
 }
@@ -109,8 +112,9 @@ pub struct GeminiInlineData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeminiFileData {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "mime_type", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    #[serde(alias = "file_uri")]
     pub file_uri: String,
 }
 
@@ -134,8 +138,9 @@ pub struct GeminiFunctionResponseData {
     pub name: String,
     #[serde(default)]
     pub response: Value,
-    /// The response's media, each part an `inlineData` blob.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The response's media, each part an `inlineData` blob or a `fileData`
+    /// reference.
+    #[serde(default, deserialize_with = "camel_case_media_parts", skip_serializing_if = "Vec::is_empty")]
     pub parts: Vec<Value>,
     /// The response's other members (`willContinue`, `scheduling`), sent on as
     /// the client wrote them on a same-protocol forward.
@@ -319,6 +324,29 @@ pub struct GeminiUsageMetadata {
 /// The prefix a name Gemini would refuse is sent under.
 pub const FUNCTION_NAME_PREFIX: &str = "_fn_";
 
+/// A function response's raw parts with their media members under the one
+/// spelling every reader reads: proto3 JSON accepts a field's original name too.
+fn camel_case_media_parts<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<Value>, D::Error> {
+    fn rename(object: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+        if let Some(value) = object.remove(from) {
+            object.entry(to.to_string()).or_insert(value);
+        }
+    }
+    let mut parts = Vec::<Value>::deserialize(deserializer)?;
+    for part in parts.iter_mut().filter_map(Value::as_object_mut) {
+        rename(part, "inline_data", "inlineData");
+        rename(part, "file_data", "fileData");
+        for member in ["inlineData", "fileData"] {
+            if let Some(media) = part.get_mut(member).and_then(Value::as_object_mut) {
+                rename(media, "mime_type", "mimeType");
+                rename(media, "file_uri", "fileUri");
+                rename(media, "display_name", "displayName");
+            }
+        }
+    }
+    Ok(parts)
+}
+
 /// Whether Gemini accepts `name`'s first character.
 fn starts_legally(name: &str) -> bool {
     name.chars().next().is_none_or(|c| c.is_ascii_alphabetic() || c == '_')
@@ -458,6 +486,22 @@ mod tests {
         let json = r#"{"thought": true, "text": "Let me think..."}"#;
         let part: GeminiPart = serde_json::from_str(json).unwrap();
         assert_matches!(&part, GeminiPart::ThoughtText { thought: true, text, .. } if text == "Let me think...");
+    }
+
+    #[test]
+    fn a_function_responses_media_reads_under_one_spelling() {
+        let data: GeminiFunctionResponseData = serde_json::from_value(serde_json::json!({
+            "name": "shot",
+            "parts": [
+                {"inline_data": {"mime_type": "image/png", "data": "AAAA"}},
+                {"file_data": {"mime_type": "image/png", "file_uri": "gs://b/o", "display_name": "o"}},
+                {"inlineData": {"mimeType": "image/png", "data": "BBBB"}},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(data.parts[0], serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "AAAA"}}));
+        assert_eq!(data.parts[1], serde_json::json!({"fileData": {"mimeType": "image/png", "fileUri": "gs://b/o", "displayName": "o"}}));
+        assert_eq!(data.parts[2], serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "BBBB"}}));
     }
 
     #[test]

@@ -848,9 +848,10 @@ pub async fn update_provider(
     security(("bearer_auth" = []))
 )]
 pub async fn delete_provider(
+    // First: a preview is marked before any other extractor can refuse it.
+    crate::middleware::DryRun(dry_run): crate::middleware::DryRun,
     mut db: TenantConn,
     Path(id): Path<Uuid>,
-    Query(q): Query<DryRunQuery>,
 ) -> Result<Json<DeletionResponse>, ApiError> {
     // Built-in BYOK pass-through downstreams are seed-managed and controlled by
     // turning their server on/off and by workspace grants, not deletion —
@@ -901,7 +902,6 @@ pub async fn delete_provider(
         if !done.took_passthrough(id) {
             return Err(gone());
         }
-        let dry_run = q.dry_run.unwrap_or(false);
         let ended = if dry_run { tx.rollback().await } else { tx.commit().await };
         ended.map_err(|e| {
             tracing::error!("delete pass-through end: {e}");
@@ -926,7 +926,7 @@ pub async fn delete_provider(
     .await
     .unwrap_or(0);
 
-    if q.dry_run.unwrap_or(false) {
+    if dry_run {
         let bound = super::key_lifecycle::count_keys_bound_to(db.conn(), id).await.map_err(|e| {
             tracing::error!("count keys bound to downstream provider: {e}");
             ApiError::internal("Failed to delete downstream provider")

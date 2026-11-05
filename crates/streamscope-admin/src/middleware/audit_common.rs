@@ -39,8 +39,20 @@ pub const AUDIT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// `change_diff` captures the EFFECT (what the row looked like before vs after
 /// the handler). Both fields are useful side-by-side for "did this PATCH
 /// actually change anything?".
+///
+/// A handler that answered a preview (`?dry_run=true`) and changed nothing
+/// says so with [`AuditDiffSink::mark_dry_run`]: the row is then recorded
+/// under its own action (`<action>_dry_run`), never as the mutation it
+/// previewed. Only the handler can say it — a query string the route does not
+/// read would otherwise label a real deletion a preview.
 #[derive(Clone, Default)]
-pub struct AuditDiffSink(Arc<Mutex<Option<Value>>>);
+pub struct AuditDiffSink(Arc<Mutex<SinkState>>);
+
+#[derive(Default)]
+struct SinkState {
+    diff: Option<Value>,
+    dry_run: bool,
+}
 
 impl AuditDiffSink {
     /// Stamp a `{before, after}` change diff onto this request's audit row.
@@ -50,8 +62,19 @@ impl AuditDiffSink {
     pub fn set(&self, before: Value, after: Value) {
         let diff = serde_json::json!({ "before": before, "after": after });
         if let Ok(mut guard) = self.0.lock() {
-            *guard = Some(diff);
+            guard.diff = Some(diff);
         }
+    }
+
+    /// This request was a preview: the handler changed nothing.
+    pub fn mark_dry_run(&self) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.dry_run = true;
+        }
+    }
+
+    pub(crate) fn is_dry_run(&self) -> bool {
+        self.0.lock().is_ok_and(|g| g.dry_run)
     }
 
     /// Record a structured diff from typed values. `None` serializes to JSON
@@ -79,8 +102,39 @@ impl AuditDiffSink {
     }
 
     pub(crate) fn take(&self) -> Option<Value> {
-        self.0.lock().ok().and_then(|mut g| g.take())
+        self.0.lock().ok().and_then(|mut g| g.diff.take())
     }
+}
+
+#[derive(serde::Deserialize)]
+struct DryRunParam {
+    dry_run: Option<bool>,
+}
+
+/// A destructive endpoint's `?dry_run=true`, read once. A preview marks the
+/// request's audit sink, so its row is recorded as the preview and never as
+/// the mutation ([`AuditDiffSink::mark_dry_run`]): a handler
+/// cannot read the flag without marking it. A handler taking it MUST change
+/// nothing when it is true.
+pub struct DryRun(pub bool);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for DryRun {
+    type Rejection = axum::extract::rejection::QueryRejection;
+
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let axum::extract::Query(q) = axum::extract::Query::<DryRunParam>::from_request_parts(parts, state).await?;
+        let dry_run = q.dry_run.unwrap_or(false);
+        if dry_run && let Some(sink) = parts.extensions.get::<AuditDiffSink>() {
+            sink.mark_dry_run();
+        }
+        Ok(DryRun(dry_run))
+    }
+}
+
+/// The action a request is recorded under: a preview the handler confirmed is
+/// its own action, so an auditor never reads it as the mutation itself.
+pub(crate) fn recorded_action(action: String, sink: &AuditDiffSink) -> String {
+    if sink.is_dry_run() { format!("{action}_dry_run") } else { action }
 }
 
 /// Handle for a portal handler to record the **member it acted on behalf of**

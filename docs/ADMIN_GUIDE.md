@@ -717,8 +717,14 @@ as they are).
    protocol, and its traffic is audited, budgeted, screened and cached exactly like any other
    upstream.
 
-   Sync never removes models on a failed, empty, or implausibly short discovery — your data
-   stays intact and the failure is recorded. Anything you set by hand — a capability, a price, a
+   Auto-sync and **Sync now** never remove models on a failed, empty, or implausibly short
+   discovery (under half of what the server, or one of its endpoints, listed before) — your data stays intact and the failure is
+   recorded. A server that really shrank (a router serving four models replaced by an engine
+   serving one) is reconciled in **Review**: it judges no list's length and offers every model the
+   server no longer lists, unticked, for you to remove (while one of the server's endpoints does not
+   answer, an endpoint's own implausibly short list still removes nothing) — with a warning when Sync now would not
+   make those removals, the case to check the server is fully up first. An empty list (a server
+   still starting) removes nothing, even there. Anything you set by hand — a capability, a price, a
    context window — is never overwritten; everything else takes the provider's current value, so a
    provider that changes its rates reprices your models on the next sync instead of leaving them at
    whatever they cost the day you added them. A provider that simply stops publishing a field keeps
@@ -2367,7 +2373,9 @@ admin-console only (read-only accounts see them too).
   search box says so instead of searching. A search always runs within the period selected.
 - **Admin Audit** (`/admin-audit`) — the control-plane trail: who changed what, every
   create/edit/delete/action with a **before → after diff** (secrets redacted) and the actor, IP, and
-  request. The portal has its own equivalent for manager/member actions.
+  request. A deletion's preview (the impact shown before you confirm a delete) is recorded under
+  its own action, ending in `_dry_run`, so it never reads as the deletion itself. The portal has
+  its own equivalent for manager/member actions.
 
 Agent (expert) traffic is tagged separately and can be excluded from analytics and audit with one
 toggle, so it never skews your real-usage numbers. Retention is set in Settings (§ 8).

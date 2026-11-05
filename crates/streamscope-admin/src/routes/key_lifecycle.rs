@@ -6,7 +6,7 @@
 //! deletes end keys: the owning user's, and a provider's — a BYOK `vk-` key
 //! bound to it is revoked with it ([`revoke_keys_bound_to`]).
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 use crate::db::tenant::Scoped;
@@ -40,10 +40,14 @@ pub struct DeletionResponse {
     pub affected_oauth_sessions: i64,
 }
 
-#[derive(Deserialize, IntoParams)]
+/// The OpenAPI shape of [`crate::middleware::DryRun`]'s query, for a route's
+/// `params(...)`. It does not deserialize: a handler reads the flag only
+/// through `DryRun`, which marks the audit row.
+#[derive(IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct DryRunQuery {
     /// When true, return impact preview without mutating.
+    #[allow(dead_code, reason = "documentation only; `DryRun` parses the flag")]
     pub dry_run: Option<bool>,
 }
 

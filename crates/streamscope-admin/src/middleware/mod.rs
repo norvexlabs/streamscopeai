@@ -10,7 +10,7 @@ pub mod run_to_completion;
 pub mod security_audit;
 
 pub use admin_audit::admin_audit_mw;
-pub use audit_common::{AuditDiffSink, PortalAuditTarget};
+pub use audit_common::{AuditDiffSink, DryRun, PortalAuditTarget};
 pub use error_body::json_error_body_mw;
 pub use ip_rate_limit::{
     automation_key_ip_rate_limit_mw, claim_exchange_ip_rate_limit_mw, pre_auth_ip_rate_limit_mw,
