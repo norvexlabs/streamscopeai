@@ -753,7 +753,7 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
             job.manifest.save(&job.paths)?;
         }
 
-        // A tool whose user-level config outranks what was just written says so
+        // A tool whose other configs outrank what was just written says so
         // now, not when it silently runs on another provider.
         if !args.dry_run && !args.print {
             for m in group_results.iter().flat_map(|gr| &gr.managed) {

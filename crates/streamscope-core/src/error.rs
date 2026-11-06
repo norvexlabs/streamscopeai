@@ -147,15 +147,6 @@ pub enum AuthError {
     #[error("cache error: {0}")]
     Cache(String),
 
-    /// The key's workspace does not allow the resolved downstream provider.
-    /// Surfaces as 403 — the model route exists but this workspace's allowlist
-    /// excludes its provider.
-    #[error("workspace {workspace_id} does not permit provider {provider_id}")]
-    WorkspaceProviderAccessDenied {
-        workspace_id: uuid::Uuid,
-        provider_id: uuid::Uuid,
-    },
-
     /// The key's workspace does not allow the resolved MCP virtual server.
     /// Surfaces as 403.
     #[error("workspace {workspace_id} does not permit MCP server {virtual_server_id}")]
@@ -250,8 +241,7 @@ impl AppError {
             // matches it. The detail is not lost — the variant is logged with
             // its full `Display` where the decision is made.
             AppError::Auth(
-                AuthError::WorkspaceProviderAccessDenied { .. }
-                | AuthError::WorkspaceMcpAccessDenied { .. }
+                AuthError::WorkspaceMcpAccessDenied { .. }
                 | AuthError::WorkspaceA2aAccessDenied { .. },
             ) => (
                 StatusCode::FORBIDDEN,
@@ -484,7 +474,6 @@ impl AppError {
                 else if matches!(
                     e,
                     AuthError::Forbidden(_)
-                        | AuthError::WorkspaceProviderAccessDenied { .. }
                         | AuthError::WorkspaceMcpAccessDenied { .. }
                         | AuthError::WorkspaceA2aAccessDenied { .. }
                 ) { 403 }

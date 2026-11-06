@@ -925,9 +925,11 @@ mod tests {
     /// the user's global provider. Both forms therefore pin every built-in
     /// agent to the provisioned provider and model: in the global form a pin
     /// the user left on a built-in agent would send `opencode` elsewhere just
-    /// the same. The project form carries no `experimental.policies`: policies
-    /// are evaluated broadest config last, so a project pair can neither lift
-    /// a global deny nor hide a global allow. The global form appends one
+    /// the same. Both forms deny OpenCode's own hosted provider, whose free
+    /// models would otherwise be offered beside the gateway's. The project form
+    /// states nothing else: policies are evaluated broadest config last, so a
+    /// project pair can neither lift a global deny nor hide a global allow.
+    /// The deny comes first, so the merge keeps the allow last. The global form appends one
     /// statement allowing its provider: inside one file the last
     /// matching statement wins, so it lifts a user's `deny *` written before
     /// it. `update` is honoured only in the global file, so only the global
@@ -972,7 +974,14 @@ mod tests {
                 }
                 assert_eq!(alias, str_of(&phs, "model_alias"), "{}", t.title);
                 if project_scope {
-                    assert!(doc.get("experimental").is_none(), "{}: project form emits a policy", t.title);
+                    assert_eq!(
+                        doc["experimental"]["policies"],
+                        serde_json::json!([
+                            {"action": "provider.use", "resource": "opencode", "effect": "deny"},
+                        ]),
+                        "{}",
+                        t.title
+                    );
                     assert!(doc.get("update").is_none(), "{}: project form carries update", t.title);
                     assert_eq!(
                         t.project_filename.as_deref(),
@@ -984,14 +993,15 @@ mod tests {
                     assert_eq!(
                         doc["experimental"]["policies"],
                         serde_json::json!([
+                            {"action": "provider.use", "resource": "opencode", "effect": "deny"},
                             {"action": "provider.use", "resource": provider_key, "effect": "allow"},
                         ]),
                         "{}",
                         t.title
                     );
-                    assert!(t.keyed_arrays.contains_key("/experimental/policies"), "{}", t.title);
                     assert_eq!(doc["update"], "disable", "{}", t.title);
                 }
+                assert!(t.keyed_arrays.contains_key("/experimental/policies"), "{}", t.title);
             }
             checked += 1;
         }

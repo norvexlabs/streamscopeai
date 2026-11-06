@@ -732,6 +732,7 @@ pub async fn get_profile(mut db: TenantConn, Path(id): Path<Uuid>) -> Result<Jso
     request_body = UpdateProfileRequest,
     responses(
         (status = 200, description = "Profile updated", body = ProfileRow),
+        (status = 400, description = "The judge model is not one the agent can use", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -745,8 +746,8 @@ pub async fn update_profile(
     // The judge model rides the expert kind only; clearing it back to
     // inherit is a non-default-profile action (the Default IS the base).
     if let Some(model) = &req.model {
-        let target: Option<(String, bool)> =
-            sqlx::query_as("SELECT kind, is_default FROM profiles WHERE id = $1")
+        let target: Option<(String, bool, Option<String>)> =
+            sqlx::query_as("SELECT kind, is_default, model FROM profiles WHERE id = $1")
                 .bind(id)
                 .fetch_optional(db.conn())
                 .await
@@ -754,7 +755,7 @@ pub async fn update_profile(
                     tracing::error!("update profile (kind check): {e}");
                     ApiError::internal("failed to update profile")
                 })?;
-        let Some((kind, is_default)) = target else {
+        let Some((kind, is_default, stored)) = target else {
             return Err(ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound));
         };
         if kind != "expert" {
@@ -769,6 +770,13 @@ pub async fn update_profile(
                 "the Default expert profile's model cannot be cleared — it is the base other profiles inherit",
             )
             .code(ApiErrorCode::SettingInvalid));
+        }
+        // Only a change is judged: a model whose grant was since revoked does
+        // not block saving the rest of the profile.
+        if let Some(model) = model.as_deref().map(str::trim).filter(|m| !m.is_empty())
+            && stored.as_deref() != Some(model)
+        {
+            crate::routes::refuse_unusable_judge_model(db.conn(), model).await?;
         }
     }
     let row = sqlx::query_as::<_, ProfileRow>(
@@ -1041,6 +1049,14 @@ pub fn profiles_router() -> axum::Router<Arc<AdminState>> {
         )
         .route("/{id}/actions/set-default", post(set_default_profile))
         .route("/{id}/actions/reset-to-seed", post(reset_profile_to_seed))
+        .route(
+            "/{id}/analysis-start",
+            get(super::expert_profiles::get_analysis_start),
+        )
+        .route(
+            "/{id}/actions/set-analysis-start",
+            post(super::expert_profiles::set_analysis_start),
+        )
         // Per-profile guardrail policy sub-resource (content owned by the
         // guardrail module, validation reused).
         .route(

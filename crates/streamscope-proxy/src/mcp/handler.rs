@@ -8690,10 +8690,9 @@ fn auth_error_for_response(e: &AppError) -> (StatusCode, &'static str, String) {
     // workspace just can't reach it); everything else stays a generic 401 so a
     // probing client can't distinguish a wrong/non-existent key.
     let (status, wire_message, audit_detail) = match e {
-        AppError::Auth(
-            AuthError::WorkspaceProviderAccessDenied { .. }
-            | AuthError::WorkspaceMcpAccessDenied { .. },
-        ) => (StatusCode::FORBIDDEN, "forbidden", "workspace access denied"),
+        AppError::Auth(AuthError::WorkspaceMcpAccessDenied { .. }) => {
+            (StatusCode::FORBIDDEN, "forbidden", "workspace access denied")
+        }
         AppError::Auth(AuthError::MissingHeader) => {
             (StatusCode::UNAUTHORIZED, "unauthorized", "missing authorization")
         }

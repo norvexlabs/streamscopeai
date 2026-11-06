@@ -1378,23 +1378,6 @@ export interface paths {
         patch: operations["update_expert"];
         trace?: never;
     };
-    "/api/v1/admin/experts/{id}/actions/reset": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Reset an expert's watermark so it rescans all sessions on the next cycle. */
-        post: operations["reset_expert"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/admin/experts/{id}/memory": {
         parameters: {
             query?: never;
@@ -2631,6 +2614,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/profiles/{id}/actions/set-analysis-start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["set_analysis_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/profiles/{id}/actions/set-default": {
         parameters: {
             query?: never;
@@ -2641,6 +2640,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["set_default_profile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/profiles/{id}/analysis-start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_analysis_start"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -6272,6 +6287,11 @@ export interface components {
         };
         /** @description One upstream model a judge-model alias resolves to, and the server serving it. */
         AgentModelTarget: {
+            /**
+             * @description Whether the Agent workspace holds a live grant on a provider routing the
+             *     alias to this target. Only such a target can serve the agent's calls.
+             */
+            granted_to_agent: boolean;
             provider: string;
             server_name: string;
             upstream_model: string;
@@ -6324,6 +6344,38 @@ export interface components {
             alias: string;
             targets: components["schemas"]["CollisionTarget"][];
         };
+        /** @description Response for `GET /api/v1/admin/profiles/{id}/analysis-start`. */
+        AnalysisStartResponse: {
+            /**
+             * Format: date-time
+             * @description How far the profile's enabled experts have analyzed: the oldest of their
+             *     cursors. `null` while any of them has no position yet.
+             */
+            analyzed_through?: string | null;
+            /**
+             * Format: date-time
+             * @description The newest of those cursors. A restart earlier than this analyzes again
+             *     what at least one expert already analyzed.
+             */
+            furthest_through?: string | null;
+            /**
+             * @description False when a restart would move nothing: the profile runs no enabled
+             *     expert that reads sessions, or no workspace uses it.
+             */
+            restartable: boolean;
+            /**
+             * @description The workspaces a restart moves: analysis keeps one cursor per expert and
+             *     profile, so it moves for every workspace using this profile. The Default
+             *     also covers sessions attributed to no workspace.
+             */
+            workspaces: components["schemas"]["AnalysisStartWorkspace"][];
+        };
+        /** @description A workspace an expert profile's analysis covers. */
+        AnalysisStartWorkspace: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
         /** @description Error details within an API error response. */
         ApiErrorBody: {
             code?: components["schemas"]["ApiErrorCode"] | null;
@@ -6339,7 +6391,7 @@ export interface components {
          *     never on the message.
          * @enum {string}
          */
-        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "profile_kind_default_only" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short";
+        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "profile_kind_default_only" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted";
         /** @description Structured error response body matching the proxy's `ErrorResponse` format. */
         ApiErrorResponse: {
             error: components["schemas"]["ApiErrorBody"];
@@ -19008,6 +19060,16 @@ export interface components {
             /** Format: int32 */
             turn_number: number;
         };
+        /** @description Body for `POST /api/v1/admin/profiles/{id}/actions/set-analysis-start`. */
+        SetAnalysisStartRequest: {
+            /**
+             * Format: date-time
+             * @description Analyze sessions with activity after this instant. Absent or `null` = now,
+             *     which drops the backlog. Earlier than the current position analyzes again what
+             *     was already analyzed. A future instant is refused.
+             */
+            from?: string | null;
+        };
         SetMemberKeyBudgetRequest: {
             budget?: components["schemas"]["KeyBudget"] | null;
         };
@@ -28862,54 +28924,13 @@ export interface operations {
                     "application/json": components["schemas"]["StatusMessageResponse"];
                 };
             };
-            /** @description Unauthorized */
-            401: {
+            /** @description The override is not a model the agent can use */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["ApiErrorResponse"];
-                };
-            };
-            /** @description Expert not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiErrorResponse"];
-                };
-            };
-            /** @description Internal server error */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ApiErrorResponse"];
-                };
-            };
-        };
-    };
-    reset_expert: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Expert ID */
-                id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Expert watermark reset */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["StatusMessageResponse"];
                 };
             };
             /** @description Unauthorized */
@@ -33550,6 +33571,15 @@ export interface operations {
                     "application/json": components["schemas"]["ProfileRow"];
                 };
             };
+            /** @description The judge model is not one the agent can use */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Not found */
             404: {
                 headers: {
@@ -33652,6 +33682,60 @@ export interface operations {
             };
         };
     };
+    set_analysis_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Expert profile id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAnalysisStartRequest"];
+            };
+        };
+        responses: {
+            /** @description Analysis restarts from the given instant */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description The instant is in the future, or before 1970 */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Profile not found / not an expert profile */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
     set_default_profile: {
         parameters: {
             query?: never;
@@ -33674,6 +33758,47 @@ export interface operations {
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    get_analysis_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Expert profile id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Where the profile's analysis stands and what it covers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AnalysisStartResponse"];
+                };
+            };
+            /** @description Profile not found / not an expert profile */
             404: {
                 headers: {
                     [name: string]: unknown;

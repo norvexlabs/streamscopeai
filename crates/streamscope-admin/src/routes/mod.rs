@@ -846,6 +846,9 @@ pub enum ApiErrorCode {
     /// characters once trimmed): it would read every row in the window.
     /// Append-only.
     SearchTermTooShort,
+    /// A judge model the analysis agent could not call: no enabled text route
+    /// serves it on a provider granted to the Agent workspace. Append-only.
+    JudgeModelNotGranted,
 }
 
 /// Structured error response body matching the proxy's `ErrorResponse` format.
@@ -2076,6 +2079,53 @@ const AGENT_GRANTED: &str = "EXISTS(
     JOIN workspaces w ON w.id = g.workspace_id
     WHERE w.role = 'agent' AND g.downstream_provider_id = r.provider_id
 )";
+
+/// One query behind [`refuse_unusable_judge_model`]: a live, judge-capable route
+/// under exactly this alias, on a provider the Agent workspace holds a live grant
+/// on. The same parts as the judge-model list, so what it offers is what is saved.
+static USABLE_JUDGE_MODEL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    with_agent_route_parts(concat!(
+        r#"SELECT EXISTS(
+            SELECT 1
+              FROM downstream_routes r
+              JOIN upstream_models m ON m.id = r.model_id
+              JOIN upstream_servers s ON s.id = m.server_id
+             WHERE "#,
+        live_route_sql!(),
+        r#"
+               AND r.alias = $1
+               AND
+--{agent_granted}
+               AND
+--{judge_capable}
+        )"#
+    ))
+});
+
+/// Refuse a judge model the analysis agent could not call. A write path checks
+/// this only when the value changes: a grant revoked later leaves a stored model
+/// that analysis holds on, and that model's row must stay editable.
+pub(crate) async fn refuse_unusable_judge_model(
+    conn: &mut Scoped,
+    model: &str,
+) -> Result<(), ApiError> {
+    let usable: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(USABLE_JUDGE_MODEL.as_str()))
+        .bind(model)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| {
+            tracing::error!("judge model check: {e}");
+            ApiError::internal("failed to check the judge model")
+        })?;
+    if usable {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(format!(
+        "{model} cannot be a judge model: no enabled text route serves it on a provider granted to \
+         the Agent workspace. Grant one on that workspace's Access tab, or pick another model."
+    ))
+    .code(ApiErrorCode::JudgeModelNotGranted))
+}
 
 /// Marker a SQL literal carries on its own line where [`JUDGE_CAPABLE`] belongs.
 pub(crate) const JUDGE_CAPABLE_MARKER: &str = "--{judge_capable}";

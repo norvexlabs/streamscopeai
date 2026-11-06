@@ -17,6 +17,7 @@
   import type { components } from '#lib/generated/api-types.js';
   import { cardState, membershipChanged, runningCount, selectAll as allSelected } from '#lib/expertMembership.js';
   import ExpertCard from './ExpertCard.svelte';
+  import ExpertAnalysisStart from './ExpertAnalysisStart.svelte';
   import JudgeModelSelect from './JudgeModelSelect.svelte';
 
   type Profile = components['schemas']['Profile'];
@@ -44,6 +45,8 @@
   // membership editable and the picker saying why it cannot offer models.
   let modelsError = $state('');
   let saving = $state(false);
+  // Bumped per save: the Analysis start section reads what a save changes.
+  let savedCount = $state(0);
 
   let models = $state<AgentModelOption[]>([]);
   let defaultModel = $state('');
@@ -188,7 +191,7 @@
         params: { path: { id: profileId } },
         body: { model: model === '' ? null : model },
       });
-      if (error) failed.push(`judge model: ${extractError(error)}`);
+      if (error) failed.push(`Could not save the judge model: ${extractError(error)}`);
       else savedModel = model = data?.model ?? '';
     }
     if (membershipDirty) {
@@ -196,12 +199,13 @@
         params: { path: { id: profileId } },
         body: { expert_ids: [...selected] },
       });
-      if (error) failed.push(`experts: ${extractError(error)}`);
+      if (error) failed.push(`Could not save the experts: ${extractError(error)}`);
       else {
         savedSelected = new Set(data?.expert_ids ?? []);
         selected = new Set(savedSelected);
       }
     }
+    savedCount += 1;
     if (failed.length > 0) toast.error('Not everything was saved', { body: failed.join('\n') });
     else toast.success('Profile saved');
   }
@@ -242,6 +246,8 @@
       </div>
     </div>
   </section>
+
+  <ExpertAnalysisStart {profileId} {isDefault} reloadKey={savedCount} unsaved={membershipDirty} />
 
   <section>
     <div class="flex items-end justify-between gap-4 mb-3 flex-wrap">

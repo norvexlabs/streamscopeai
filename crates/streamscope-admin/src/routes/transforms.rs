@@ -382,6 +382,9 @@ pub struct AgentModelTarget {
     pub upstream_model: String,
     pub server_name: String,
     pub provider: String,
+    /// Whether the Agent workspace holds a live grant on a provider routing the
+    /// alias to this target. Only such a target can serve the agent's calls.
+    pub granted_to_agent: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -2047,6 +2050,11 @@ pub async fn create_expert(
             .map(|c| c.to_string())
     };
 
+    let model_override = req.model_override.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    if let Some(model) = model_override {
+        crate::routes::refuse_unusable_judge_model(db.conn(), model).await?;
+    }
+
     let row = sqlx::query_as::<_, (uuid::Uuid,)>(
         "INSERT INTO agent_experts (axis, description, prompt, enabled, is_builtin, input_types, output_types, model_override, prompt_snippets, color, merge_enabled, tenant_id) \
          VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
@@ -2057,7 +2065,7 @@ pub async fn create_expert(
     .bind(req.enabled)
     .bind(input_types)
     .bind(output_types)
-    .bind(&req.model_override)
+    .bind(model_override)
     .bind(&prompt_snippets)
     .bind(&color)
     .bind(req.merge_enabled)
@@ -2113,6 +2121,7 @@ pub struct UpdateExpertRequest {
     request_body = UpdateExpertRequest,
     responses(
         (status = 200, description = "Expert updated", body = StatusMessageResponse),
+        (status = 400, description = "The override is not a model the agent can use", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 404, description = "Expert not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -2124,6 +2133,27 @@ pub async fn update_expert(
     Path(id): Path<uuid::Uuid>,
     Json(req): Json<UpdateExpertRequest>,
 ) -> Result<Json<StatusMessageResponse>, ApiError> {
+    // Only a change is judged: an expert already on a model whose grant was
+    // since revoked can still be edited, and clearing is always allowed.
+    if let Some(Some(model)) = &req.model_override
+        && let model = model.trim()
+        && !model.is_empty()
+    {
+        let stored: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT model_override FROM agent_experts WHERE id = $1 AND NOT suppressed",
+        )
+        .bind(id)
+        .fetch_optional(db.conn())
+        .await
+        .map_err(|e| {
+            tracing::error!("update expert (model check): {e}");
+            ApiError::internal("failed to update expert")
+        })?;
+        if stored.is_some_and(|current| current.as_deref() != Some(model)) {
+            crate::routes::refuse_unusable_judge_model(db.conn(), model).await?;
+        }
+    }
+
     // A content edit detaches the expert from seed-sync (is_builtin = false);
     // toggling merge_enabled alone doesn't — the flag is already excluded from
     // the sync overwrite, so the builtin keeps receiving prompt updates.
@@ -2289,49 +2319,6 @@ pub async fn agent_status(
         last_cycle_at: last_cycle,
         pending_suggestions: pending,
         expert_count,
-    }))
-}
-
-/// Reset an expert's watermark so it rescans all sessions on the next cycle.
-#[utoipa::path(
-    post,
-    path = "/api/v1/admin/experts/{id}/actions/reset",
-    tag = "Experts",
-    params(("id" = Uuid, Path, description = "Expert ID")),
-    responses(
-        (status = 200, description = "Expert watermark reset", body = StatusMessageResponse),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
-        (status = 404, description = "Expert not found", body = ApiErrorResponse),
-        (status = 500, description = "Internal server error", body = ApiErrorResponse),
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn reset_expert(
-    State(state): State<Arc<AdminState>>,
-    mut db: TenantConn,
-    Path(id): Path<uuid::Uuid>,
-) -> Result<Json<StatusMessageResponse>, ApiError> {
-    let result = sqlx::query(
-        "UPDATE agent_experts SET last_processed_at = NULL, sessions_analyzed = 0, updated_at = now() WHERE id = $1 AND NOT suppressed",
-    )
-    .bind(id)
-    .execute(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("reset expert: {e}");
-        ApiError::internal("internal error")
-    })?;
-
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("expert not found", ApiErrorCode::ExpertNotFound));
-    }
-
-    // Trigger immediate agent cycle
-    crate::leader::insert_agent_trigger(&state.db, None).await;
-
-    Ok(Json(StatusMessageResponse {
-        status: "reset".into(),
-        message: Some("Expert watermark cleared. Agent cycle triggered.".into()),
     }))
 }
 
@@ -2892,13 +2879,18 @@ pub async fn get_agent_models(
     let mut seen: Vec<(uuid::Uuid, String)> = Vec::new();
     for (alias, server_id, upstream_model, server_name, provider, granted) in rows {
         let key = (server_id, upstream_model.clone());
-        let target = AgentModelTarget { upstream_model, server_name, provider };
+        let target = AgentModelTarget { upstream_model, server_name, provider, granted_to_agent: granted };
         match models.last_mut() {
             Some(m) if m.alias == alias => {
                 m.granted_to_agent |= granted;
-                if !seen.contains(&key) {
-                    seen.push(key);
-                    m.targets.push(target);
+                // `seen` and `targets` stay aligned, so a target two providers
+                // route is granted when either provider is.
+                match seen.iter().position(|k| *k == key) {
+                    Some(i) => m.targets[i].granted_to_agent |= granted,
+                    None => {
+                        seen.push(key);
+                        m.targets.push(target);
+                    }
                 }
             }
             _ => {
@@ -2940,7 +2932,6 @@ pub fn experts_router() -> axum::Router<Arc<AdminState>> {
     axum::Router::new()
         .route("/", get(list_experts).post(create_expert))
         .route("/{id}", patch(update_expert).delete(delete_expert))
-        .route("/{id}/actions/reset", post(reset_expert))
         .route("/{id}/memory", get(get_expert_memory).put(update_expert_memory))
         // Agent controls (tenant-scoped collection actions)
         .route("/agent-status", get(agent_status))

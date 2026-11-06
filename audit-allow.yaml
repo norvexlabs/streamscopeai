@@ -3,131 +3,6 @@
 # binary, the file it is narrowed to, why, and the last day it holds. Each waits on an upstream
 # rebuild: when the rebuilt image or package is pinned, its entries go.
 
-- id: CVE-2026-107928
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-107929
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-111497
-  artifact: postgres
-  package: brotli-libs
-  reason: "brotli 1.2.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 1.2.1 since 2026-10-22, the image's next rebuild carries it"
-  expires: 2027-01-01
-- id: CVE-2026-86409
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-86410
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-86411
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-86412
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-86413
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-86414
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-86415
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-87861
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-87862
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-87863
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-87864
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-87865
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-87866
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92386
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92387
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92388
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92389
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92390
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92391
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-92392
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-94265
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
-- id: CVE-2026-94266
-  artifact: postgres
-  package: libcurl
-  reason: "libcurl 8.22.0 in the official postgres image (built 2026-10-21; re-checked 2026-11-03); Alpine 3.24 ships 8.23.0 since 2026-10-25, the image's next rebuild carries it. nothing in the deployment uses PostgreSQL OAuth, the one part of it that loads libcurl"
-  expires: 2027-01-01
 - id: GO-2025-4006
   artifact: postgres
   package: stdlib
@@ -469,4 +344,46 @@
   package: golang.org/x/net
   path: /usr/bin/runc
   reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04; no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd
+  reason: "golang.org/x/net in containerd, Docker's latest package for Ubuntu 26.04 (containerd 2.4.2, x/net 0.58.0); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/containerd-shim-runc-v2
+  reason: "golang.org/x/net in containerd-shim-runc-v2, Docker's latest package for Ubuntu 26.04 (containerd 2.4.2, x/net 0.58.0); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/ctr
+  reason: "golang.org/x/net in ctr, Docker's latest package for Ubuntu 26.04 (containerd 2.4.2, x/net 0.58.0); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net in runc, Docker's latest package for Ubuntu 26.04 (runc 1.5.2, x/net 0.55.0); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/libexec/docker/cli-plugins/docker-compose
+  reason: "golang.org/x/net in docker-compose, Docker's package for Ubuntu 26.04 (the latest Compose, 5.7.0, is still on x/net 0.60.0); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/kairos
+  reason: "golang.org/x/net in the kairos binary of Kairos 4.4.0, its latest release (x/net 0.61.0; 0.62.0 is on its main branch, unreleased); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6860
+  artifact: os
+  package: golang.org/x/net
+  path: /system/installer/kairos-installer
+  reason: "golang.org/x/net in the kairos-installer binary of Kairos 4.4.0, its latest release (x/net 0.61.0; 0.62.0 is on its main branch, unreleased); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
   expires: 2027-01-01

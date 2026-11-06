@@ -790,8 +790,7 @@ as they are).
    Deleting a catalog entry — on its own, with **Remove seeded**, or by a **Reset** — returns every
    model picked onto it to automatic matching; a deleted entry cannot be picked. A shipped entry you
    delete — edited first or not — stays deleted across restarts and upgrades; only a list's own
-   reset of its built-ins, where it has one, brings shipped entries back (an expert's **Reset**
-   restarts its analysis and is not one). The same holds for every built-in list (MCP catalog, transform programs,
+   reset of its built-ins, where it has one, brings shipped entries back. The same holds for every built-in list (MCP catalog, transform programs,
    experts, tool rules and field profiles, client profiles, priority classes, the app registry). Creating a
    rule, profile, catalog entry or app with a deleted one's name makes it yours. A deleted expert's,
    priority class's or program's name stays taken, and a list with no reset cannot bring a deleted
@@ -2134,7 +2133,9 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
   and set the analysis cadence; the judge model is set on the expert **profile** (below). The **quality** expert judges broad session quality —
   response relevance, instruction & format adherence, faithfulness to the context the model
   was given, multi-turn coherence, and agentic tool-use effectiveness. Each expert can also
-  run on its own model (a per-expert override on its edit panel); point a judging expert such
+  run on its own model (a per-expert override on its edit panel), which wins over the judge
+  model of every profile, so the workspaces of a profile on another model still reach it for
+  that expert; point a judging expert such
   as **quality** at a model different from the one it is evaluating so its scoring isn't
   biased toward that model's own style. Review proposals under **Transforms → Suggestions** and
   **Policy → Suggestions** (approve to activate, reject to teach the expert). An approval
@@ -2154,10 +2155,20 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
   carries the model its experts analyze with. The **Default** profile holds the tenant
   baseline model (always set); another profile left on **Inherit** uses the Default's. To
   analyze one workspace with a different model, copy the Default, change the copy's judge
-  model, and assign it to that workspace. The judge model list offers each text model once, by
-  the name the agent calls it with; it warns when the **Agent** workspace has no access to a
-  provider serving the chosen model (grant one on that workspace's Access tab, or the agent's
-  calls are refused). A profile's page shows every expert as a card — what it looks for, what it
+  model, and assign it to that workspace. The judge model list offers each text model the
+  **Agent** workspace can call, once, by the name the agent calls it with: grant a provider on
+  that workspace's Access tab to add its models, and saving any other model is refused. If a
+  grant is revoked later, or the provider stops serving the model, the saved model stays in place
+  and analysis **waits** rather than skipping sessions: the Dashboard notifies you, and analysis
+  resumes where it stopped once the model can be called again or another one is chosen. A profile's **Analysis
+  start** section shows how far its analysis has reached and which workspaces it covers, and
+  restarts it from a date, and optionally a time: today means from now and skips a backlog, an earlier date analyzes
+  sessions with activity since then again (this spends the Agent workspace's budget, alerts are never downgraded, and
+  a suggestion may surface sooner). An identical alert note or issue is stored once; one the model words differently is
+  stored again, because it may be a different finding. The time is for a single session its provider refuses, which the notification
+  dates: restart from the minute after it, which also skips every other session before then that the profile has not reached. It applies at
+  the next analysis cycle, inside the run window, keeps a disabled expert's own position, and moves for every workspace using the profile; to move
+  one workspace alone, give it its own profile. A profile's page shows every expert as a card — what it looks for, what it
   reads, what it can propose, how many sessions it has analyzed — and clicking a card adds it to
   or removes it from the profile; one **Save** saves the model and the experts. On a Layered
   profile the Default's experts are marked **From Default** and cannot be removed there.
@@ -2734,15 +2745,32 @@ gateway's models (the table under *Set up tools with the `ssai` CLI*), so a pin 
 home-directory provisioning replaces a model you had pinned to one of those agents, and every later
 `provision` or `sync` does the same to a model you pin there again — to run an agent on another
 gateway model for yourself, pin it in a project config. Agents of your own, and providers and policy
-entries you define yourself in that file, are kept. A home-directory provider rule still wins over any project, so
+entries you define yourself in that file, are kept, except a rule of your own for `opencode` (below). A home-directory provider rule still wins over any project, so
 `provision` and `status` name the file and the exact line that would allow the gateway's
 provider when yours leaves it out (then restart OpenCode's background service with `opencode service
-restart`), and list every agent your home config still pins to another provider (one of your own, or a pin under
-the older `agent` key). A **global** OpenCode
+restart`), and list every agent your home config, or another OpenCode config it loads, still pins to another provider it can use (one of your own, or a pin under
+the older `agent` key). An agent pinned to a provider your rules deny runs on the default model, so it is not listed. A **global** OpenCode
 provisioning adds that allow line itself: at the end of the file's provider rules, where OpenCode
 reads it last, or — when the file already has a rule for the gateway's provider — in that rule's
 place, which it then manages. Your other rules are kept, and a deny you add after it still wins. A project
-provisioning never writes your home-directory config. Every OpenCode config the gateway writes also
+provisioning never writes your home-directory config.
+
+Every OpenCode config for the gateway's models, from the CLI or Web Quickstart, project or home
+directory, also adds a provider rule denying `opencode`, OpenCode's own hosted provider. OpenCode otherwise offers that provider's free models in
+its model list even without an account, and a request to one goes to OpenCode's service, so the
+gateway never audits it or applies policy to it. A rule of yours for `opencode` in that same file is
+replaced, and a user with their own OpenCode account loses that provider too. An MCP-only OpenCode config leaves
+your providers alone and adds no such rule. A rule that allows it, `*` included, can still win: plain
+`opencode` reads your home-directory config first, then a repository's own `opencode.json`, then
+`.opencode/opencode.json`, and the first of those with a rule for the provider decides. Under `ssai run`
+in a project, `.opencode/opencode.json` comes first. `provision` and `status` name the file that
+brings the provider back, and say which launch it reaches. Edit the OpenCode client profile to allow
+the provider again. A tenant whose profile was edited before this rule existed keeps its version, so
+add the rule to it by hand. `ssai forget` removes the rule, so it does not bring back one of your own
+that it replaced: restore that from the backup `provision` took. A provider OpenCode finds through its own API key in your environment is not
+covered by this rule.
+
+Every OpenCode config the gateway writes also
 turns off OpenCode's session sharing and its own web search, so the agent searches through the
 gateway's MCP web tools when the workspace has access to them (without them OpenCode has no web
 search); edit the OpenCode client profile to change that default.
@@ -2766,8 +2794,8 @@ project**; run from anywhere else they act on your global setup.
 
 `ssai status` lists every gateway you're logged in to or have provisioned tools from (one
 you're no longer logged in to is marked so, with its files), and whether any managed file was edited
-since provisioning; for OpenCode it also reports the home-directory settings described above instead
-of `ok`. `ssai sync` re-converges every provisioned config in one go: it does nothing
+since provisioning; for OpenCode it also reports the settings described above, in your home-directory config
+or in another OpenCode config it loads, instead of `ok`. `ssai sync` re-converges every provisioned config in one go: it does nothing
 when the gateway-side setup hasn't changed, rewrites the managed entries when it has (templates,
 models, MCP servers), and — for each tool whose gateway key was revoked — mints that tool a
 replacement and rewrites its config; `sync --watch` keeps doing that on an interval (default 5 minutes), and a cron or
@@ -2892,8 +2920,11 @@ agent's tools can never escape the confinement through it. In a project whose Op
 one, so a provider rule or agent pin there cannot send a run elsewhere — and, for the same reason,
 nothing else in your home-directory OpenCode config applies under `run` there either: its agents,
 plugins and commands, and its `permissions` rules (a deny you set on a shell command, say). Put a
-rule you want under `run` in the project's `.opencode/opencode.json` (or in `~/.opencode`, which
-OpenCode always loads). Outside such a project (a global provisioning), OpenCode reads your
+rule you want under `run` in the project's `.opencode/opencode.json`. `~/.opencode` and a repository's own
+`opencode.json` apply under `run` too (`~/.opencode` for a project under your home directory): that project file
+decides a provider rule ahead of them, and a model they pin on an agent replaces the one it pins, which `provision`
+and `status` report. A config in a subdirectory applies only when you start OpenCode there, and they do not read it, nor a default
+model set in one of those other files, nor an agent defined in a Markdown file. Outside such a project (a global provisioning), OpenCode reads your
 home-directory config as usual, and `provision` and `status` report a rule there that would keep it
 off the gateway. When a run fails, `run` keeps the private
 server's log and names it. The OpenCode TUI, `opencode run` and its

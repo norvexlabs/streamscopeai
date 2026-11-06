@@ -228,16 +228,6 @@ For each proposed program you MUST explain:
     }
   }
 
-  async function resetExpert(id: string) {
-    try {
-      const { error: err } = await adminApi.POST('/api/v1/admin/experts/{id}/actions/reset', { params: { path: { id } } });
-      if (err) { error = extractError(err, 'Unknown error'); return; }
-      await loadData();
-    } catch (err: unknown) {
-      error = err instanceof Error ? err.message : String(err);
-    }
-  }
-
   async function openMemory(e: AgentExpert) {
     memoryExpertId = e.id;
     memoryExpertAxis = e.axis;
@@ -327,7 +317,6 @@ For each proposed program you MUST explain:
             {#snippet actions()}
               <button onclick={() => openEditExpert(e)} class="text-(--accent) hover:underline">Edit</button>
               <button onclick={() => openMemory(e)} class="text-(--tag-violet-text) hover:underline">Memory</button>
-              <button onclick={() => resetExpert(e.id)} class="text-(--warning) hover:underline" title="Reset the watermark and rescan every session">Reset</button>
               <button onclick={() => removeExpert(e.id, !!e.is_builtin)} class="ml-auto text-(--error) hover:underline">Delete</button>
             {/snippet}
           </ExpertCard>
@@ -578,6 +567,7 @@ For each proposed program you MUST explain:
       <div>
         <label for="expert-model-override" class="block text-sm text-(--text-secondary) mb-1">Model Override</label>
         <JudgeModelSelect id="expert-model-override" bind:value={expertModelOverride} models={agentModels} loaded={agentModelsLoaded} emptyLabel="None: use the profile's judge model" />
+        <p class="text-xs text-(--text-secondary) mt-1.5">An override applies in every expert profile, whatever that profile's judge model.</p>
         {#if agentModelsError}
           <p class="text-xs text-(--error-text) mt-1.5">{agentModelsError}: the list cannot be checked right now.</p>
         {/if}

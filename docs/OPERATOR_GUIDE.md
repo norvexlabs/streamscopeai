@@ -689,7 +689,7 @@ On the VM (over SSH):
 |---|---|
 | `ssai-stow status [--json]` | The release and channel, the install's state, each route's URL, the advanced settings in effect, the system booted (active / passive / recovery), the last failed boot, the disk and its pressure, the services |
 | `ssai-stow health [--json]` | Ready, or why not — the health gate's check, from inside the VM, even when the public URLs are down |
-| `ssai-stow ps [--json]` | The services, their state and health |
+| `ssai-stow ps [--json]` | The services, their state and health; a service that is down is named with its exit code, the signal, whether its memory limit killed it, and that limit (`status` says the same) |
 | `ssai-stow logs <service> [--tail N]` | A service's last lines (default 200, at most 5000) |
 | `ssai-stow restart \| stop \| start <service>` | One service |
 | `ssai-stow events [--after N] [--follow]` | The appliance's journal: jobs, reboots, boots, the health gate's verdicts, the backup settings the console changed |

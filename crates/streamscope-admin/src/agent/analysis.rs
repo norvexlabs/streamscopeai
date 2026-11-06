@@ -62,6 +62,27 @@ enum GroupPath {
     Cluster,
 }
 
+/// Which position a member's advance moves. An expert reading both paths keeps
+/// one position per path, so neither passes what the other has yet to analyze.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CursorKind {
+    /// Reads one path: `last_processed_at`, and any path position left from
+    /// when it read two is cleared.
+    Sole,
+    /// The session path of an expert reading both: `last_processed_at`.
+    BothSession,
+    /// The cluster path of an expert reading both: `cluster_processed_at`.
+    BothCluster,
+}
+
+fn cursor_kind(path: GroupPath, reads_both: bool) -> CursorKind {
+    match (path, reads_both) {
+        (_, false) => CursorKind::Sole,
+        (GroupPath::Session, true) => CursorKind::BothSession,
+        (GroupPath::Cluster, true) => CursorKind::BothCluster,
+    }
+}
+
 /// Pure grouping key for one (expert, profile, path) participation. An expert
 /// with both `session` and `session_cluster` inputs contributes one entry per
 /// path, per expert profile it is an effective member of.
@@ -167,17 +188,22 @@ struct GroupRun {
     /// member's own assembled prompt.
     system_prompt: Option<String>,
     rejected: Vec<Vec<String>>,
-    /// Per-member scan cursor, seeded from `last_processed_at`.
+    /// Per-member scan cursor, seeded from the position `kinds` names.
     cursors: Vec<Option<chrono::DateTime<chrono::Utc>>>,
+    /// Per-member `cursor_generation` read with the cursor. An advance applies
+    /// only while it still matches, so an admin's restart wins over this cycle.
+    generations: Vec<i64>,
+    /// Per-member: which position `cursors` is.
+    kinds: Vec<CursorKind>,
     /// Sticky per-member hold: a transient failure or an omitted axis keeps
     /// the member's watermark below the failure and skips its end-of-cycle
-    /// jump to effective-now.
+    /// jump to where the scan looked.
     held: Vec<bool>,
     acc: Vec<MemberAcc>,
     total_sessions: i64,
     done: bool,
     /// True once a turn observed the end of the backlog (empty fetch or a
-    /// short batch). The end-of-cycle jump to effective-now is gated on it: a
+    /// short batch). The end-of-cycle jump to where the scan looked is gated on it: a
     /// group retired early (transient hold, no-progress guard) has NOT scanned
     /// past its window, and jumping un-held members would silently skip every
     /// later session forever.
@@ -189,6 +215,15 @@ struct GroupRun {
     deterministic_skips: usize,
     /// One representative deterministic-failure message for the notification.
     deterministic_sample: Option<String>,
+    /// The judge model the gateway does not route for the agent's key, when a
+    /// call found so. The group holds and the cycle end notifies the operator.
+    model_unavailable: Option<String>,
+    /// The newest activity the refused request covered: restarting after it passes
+    /// that request.
+    refused_through: Option<chrono::DateTime<chrono::Utc>>,
+    /// The instant the latest scan looked up to. A session active after it is not
+    /// in what the scan fetched, so the end-of-cycle jump goes no further.
+    scanned_to: chrono::DateTime<chrono::Utc>,
 }
 
 impl GroupRun {
@@ -216,6 +251,7 @@ async fn run_session_group_turn(
     run: &mut GroupRun,
     active_programs: &[String],
 ) -> anyhow::Result<()> {
+    run.scanned_to = effective_now(cooldown);
     let sessions = fetch_sessions_via_db(
         pool,
         tenant_id,
@@ -323,6 +359,11 @@ async fn run_session_group_turn(
             }
         });
         outcomes.extend(futures::future::join_all(futs).await);
+        // An unavailable model fails every remaining session the same way; the
+        // sessions not tried stay ahead of the hold the failed one sets.
+        if outcomes.iter().any(|o| matches!(o, Err(e) if model_unavailable(e).is_some())) {
+            break;
+        }
     }
 
     // Fold per member.
@@ -337,6 +378,12 @@ async fn run_session_group_turn(
         .zip(&applicable_per_session)
         .zip(outcomes)
     {
+        if let Err(e) = &res
+            && let Some(model) = model_unavailable(e)
+        {
+            run.model_unavailable = Some(model.to_string());
+            run.refused_through = run.refused_through.or(session.last_timestamp);
+        }
         let Some(ts) = session.last_timestamp else {
             continue;
         };
@@ -428,6 +475,7 @@ async fn run_session_group_turn(
     // Advance each member's watermark across its contiguous run of successes
     // and deterministic skips, never past its oldest hold.
     let mut cursor_moved = false;
+    let mut superseded = false;
     for p in 0..n {
         let (new_wm, covered) = contiguous_watermark(&advanceable[p], &successes[p], min_hold[p]);
         if let Some(nw) = new_wm
@@ -435,11 +483,13 @@ async fn run_session_group_turn(
         {
             run.cursors[p] = Some(nw);
             cursor_moved = true;
-            update_expert_profile_watermark(
+            superseded |= !update_expert_profile_watermark(
                 pool,
                 tenant_id,
                 run.profile_id,
                 experts[run.member_idx[p]].id,
+                run.generations[p],
+                run.kinds[p],
                 covered,
                 nw,
             )
@@ -447,8 +497,17 @@ async fn run_session_group_turn(
         }
     }
 
+    // Both retire the whole group with no end-of-cycle jump: a restart moved
+    // the cursors this scan was reading, and an unavailable model left sessions
+    // untried that a member with no hold of its own would otherwise jump past.
+    if superseded || run.model_unavailable.is_some() {
+        run.held.fill(true);
+        run.done = true;
+        return Ok(());
+    }
+
     // A short batch means the scan reached the end of the backlog — safe to
-    // jump un-held members to effective-now at finalize even if this turn also
+    // jump un-held members to where the scan looked at finalize even if this turn also
     // held someone.
     if batch_size < crate::settings::admin_settings().agent_session_batch_limit {
         run.drained = true;
@@ -474,10 +533,11 @@ async fn run_session_group_turn(
 
 /// One round-robin turn of a cluster-path group: fetch one batch, cluster it
 /// by (key_id, app_id) — singleton clusters included — and run one pooled call
-/// per cluster over the members it applies to. Whole-call failures stay lossy
-/// (the watermark still advances past the failed cluster — holding would wedge
-/// the whole group on one bad cluster); an
-/// omitted axis holds only that member.
+/// per cluster over the members it applies to. A deterministic whole-call
+/// failure stays lossy (the watermark still advances past the failed cluster —
+/// holding would wedge the whole group on one bad cluster); a transient one
+/// holds at the cluster; an unavailable model holds the whole batch; an omitted
+/// axis holds only that member.
 #[allow(clippy::too_many_arguments)]
 async fn run_cluster_group_turn(
     pool: &crate::db::Db,
@@ -489,6 +549,7 @@ async fn run_cluster_group_turn(
     run: &mut GroupRun,
     active_programs: &[String],
 ) -> anyhow::Result<()> {
+    run.scanned_to = effective_now(cooldown);
     let sessions = fetch_sessions_via_db(
         pool,
         tenant_id,
@@ -554,7 +615,10 @@ async fn run_cluster_group_turn(
         }
     };
 
-    for ((key_id, app_id), cluster_sessions) in &clusters {
+    // Oldest first, so a hold at one cluster leaves no unvisited one behind it.
+    let mut ordered: Vec<_> = clusters.iter().collect();
+    ordered.sort_by_key(|(_, sessions)| sessions.iter().filter_map(|s| s.last_timestamp).min());
+    for ((key_id, app_id), cluster_sessions) in ordered {
         let cluster_max_ts = cluster_sessions.iter().filter_map(|s| s.last_timestamp).max();
         let cluster_min_ts = cluster_sessions.iter().filter_map(|s| s.last_timestamp).min();
         let applicable: Vec<usize> = (0..run.member_idx.len())
@@ -699,6 +763,21 @@ async fn run_cluster_group_turn(
             // every cycle — skip the cluster with a loud warning and advance
             // past it. Anything else is transient: hold every applicable
             // member at the cluster so it retries whole next cycle.
+            Err(e) if model_unavailable(&e).is_some() => {
+                // Every member holds here, even one this cluster does not apply
+                // to: the clusters left unvisited may apply to it.
+                tracing::error!(
+                    key_id = %key_id,
+                    app_id,
+                    "cluster analysis held, the judge model is unavailable: {e}"
+                );
+                run.model_unavailable = model_unavailable(&e).map(str::to_string);
+                run.refused_through = run.refused_through.or(cluster_max_ts);
+                for p in 0..n_members {
+                    hold(&mut min_hold, p, cluster_min_ts);
+                }
+                break;
+            }
             Err(e) if is_deterministic_failure(&e) => {
                 tracing::warn!(
                     key_id = %key_id,
@@ -730,9 +809,10 @@ async fn run_cluster_group_turn(
 
     // Advance each member to its contiguous frontier: the whole window when
     // nothing held, else the max advanceable cluster strictly below its
-    // earliest held cluster. Held members block the finalize effective-now
+    // earliest held cluster. Held members block the finalize end-of-cycle
     // jump (run.held) so their pending clusters aren't skipped.
     let mut cursor_moved = false;
+    let mut superseded = false;
     for p in 0..n_members {
         let target = match min_hold[p] {
             None => batch_max_ts,
@@ -751,11 +831,13 @@ async fn run_cluster_group_turn(
                 .filter(|(ts, _)| *ts <= target)
                 .map(|(_, n)| n)
                 .sum();
-            update_expert_profile_watermark(
+            superseded |= !update_expert_profile_watermark(
                 pool,
                 tenant_id,
                 run.profile_id,
                 experts[run.member_idx[p]].id,
+                run.generations[p],
+                run.kinds[p],
                 covered,
                 target,
             )
@@ -763,8 +845,15 @@ async fn run_cluster_group_turn(
         }
     }
 
+    // See the session path: neither may reach the end-of-cycle jump.
+    if superseded || run.model_unavailable.is_some() {
+        run.held.fill(true);
+        run.done = true;
+        return Ok(());
+    }
+
     // A short batch means the scan reached the end of the backlog — safe to
-    // jump un-held members to effective-now at finalize.
+    // jump un-held members to where the scan looked at finalize.
     if batch_size < crate::settings::admin_settings().agent_session_batch_limit {
         run.drained = true;
     }
@@ -775,36 +864,36 @@ async fn run_cluster_group_turn(
     Ok(())
 }
 
+fn effective_now(cooldown: i64) -> chrono::DateTime<chrono::Utc> {
+    if cooldown > 0 {
+        chrono::Utc::now() - chrono::Duration::minutes(cooldown)
+    } else {
+        chrono::Utc::now()
+    }
+}
+
 /// End-of-cycle bookkeeping for one group: per-member watermark jump to
-/// effective-now (skipped for held members — that would jump past their
+/// where its last scan looked (skipped for held members — that would jump past their
 /// pending sessions), suggestion stores (once per cycle, insert-or-bump), and
 /// memory merges.
 async fn finalize_group_run(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
-    cooldown: i64,
     experts: &[ExpertWithProgress],
     run: &GroupRun,
 ) {
-    let effective_now = if cooldown > 0 {
-        chrono::Utc::now() - chrono::Duration::minutes(cooldown)
-    } else {
-        chrono::Utc::now()
-    };
-
     for (p, &ei) in run.member_idx.iter().enumerate() {
         let ewp = &experts[ei];
         let acc = &run.acc[p];
 
-        // Advance to effective_now so alert writes (which bump
-        // sessions.updated_at) don't cause re-analysis next cycle. Gated on
+        // Advance to where the last scan looked, past everything it found. Gated on
         // BOTH: the member wasn't held, AND the group actually drained its
         // backlog — a group retired early (transient hold, no-progress guard)
         // never scanned past its window, so jumping an un-held member here
         // would silently skip every later session forever.
-        if run.drained && !run.held[p] && run.cursors[p].is_none_or(|c| effective_now > c) {
+        if run.drained && !run.held[p] && run.cursors[p].is_none_or(|c| run.scanned_to > c) {
             update_expert_profile_watermark(
-                pool, tenant_id, run.profile_id, ewp.id, 0, effective_now,
+                pool, tenant_id, run.profile_id, ewp.id, run.generations[p], run.kinds[p], 0, run.scanned_to,
             )
             .await;
         }
@@ -918,7 +1007,7 @@ struct SessionMeta {
 /// Experts are pooled into merged-call groups (`group_experts`) and the groups
 /// are scheduled ROUND-ROBIN — each live group processes one batch per turn —
 /// so a large backlog on one axis can no longer starve the others. Each expert
-/// keeps its own `last_processed_at` watermark; a pooled call advances every
+/// keeps its own position, one per path it reads; a pooled call advances every
 /// member it answered and holds the ones it omitted (partial accept).
 pub async fn run_analysis_cycle(
     state: &Arc<AdminState>,
@@ -934,8 +1023,8 @@ pub async fn run_analysis_cycle(
 
     // Resolve judge-model routing: profile model → alias (for proxy) + context
     // budget. The agent runs as a normal Agent-workspace key, so the alias must
-    // resolve to a route the Agent workspace is granted (else the proxy 403s —
-    // `resolve_agent_routing` warns when it isn't).
+    // resolve to a route the Agent workspace is granted (else the gateway answers
+    // 404, which holds the group — `resolve_agent_routing` warns when it isn't).
     // Load experts (+ the snippet map for merged-prompt assembly).
     let (experts, snippet_map) = load_experts_with_progress(pool, tenant_id).await?;
 
@@ -955,10 +1044,7 @@ pub async fn run_analysis_cycle(
         tracing::warn!("no default expert profile — skipping analysis cycle");
         return Ok(());
     };
-    let default_model = default_profile
-        .model
-        .clone()
-        .unwrap_or_else(|| super::DEFAULT_AGENT_MODEL.to_string());
+    let default_model = default_profile.model.as_deref();
 
     // Resolve routing once per distinct model string (profile models + the
     // per-expert overrides all funnel through here).
@@ -972,7 +1058,7 @@ pub async fn run_analysis_cycle(
         if !ewp.input_types.iter().any(|t| t == "tool_inventory") {
             continue;
         }
-        let model = ewp.model_override.clone().unwrap_or_else(|| default_model.clone());
+        let model = judge_model(ewp.model_override.as_deref(), None, default_model).to_string();
         if !routing_cache.contains_key(&model) {
             let r = resolve_agent_routing(pool, tenant_id, &model).await;
             routing_cache.insert(model.clone(), r);
@@ -984,6 +1070,9 @@ pub async fn run_analysis_cycle(
         .await
         {
             tracing::error!(axis = %ewp.expert.axis, "tool inventory expert cycle failed: {e}");
+            if let Some(model) = model_unavailable(&e) {
+                notify_model_unavailable(pool, tenant_id, model, None, ModelWait::default()).await;
+            }
         }
     }
 
@@ -1003,10 +1092,12 @@ pub async fn run_analysis_cycle(
             if !has_session && !has_cluster {
                 continue;
             }
-            let model = ewp
-                .model_override
-                .clone()
-                .unwrap_or_else(|| profile.model.clone().unwrap_or_else(|| default_model.clone()));
+            let model = judge_model(
+                ewp.model_override.as_deref(),
+                profile.model.as_deref(),
+                default_model,
+            )
+            .to_string();
             if !routing_cache.contains_key(&model) {
                 let r = resolve_agent_routing(pool, tenant_id, &model).await;
                 routing_cache.insert(model.clone(), r);
@@ -1038,16 +1129,33 @@ pub async fn run_analysis_cycle(
     // from now instead of re-scanning history its workspaces already had
     // analyzed under their previous profile.
     let mut cursors_map = load_profile_watermarks(pool, tenant_id).await?;
-    let effective_now = if cooldown > 0 {
-        chrono::Utc::now() - chrono::Duration::minutes(cooldown)
-    } else {
-        chrono::Utc::now()
-    };
+    let effective_now = effective_now(cooldown);
     for input in &inputs {
         let key = (profiles[input.profile_idx].id, experts[input.expert_idx].id);
         if let std::collections::hash_map::Entry::Vacant(entry) = cursors_map.entry(key) {
-            entry.insert(Some(effective_now));
+            entry.insert(ProfileCursor {
+                position: Some(effective_now),
+                generation: 0,
+                cluster_position: None,
+            });
             seed_profile_watermark(pool, tenant_id, key.0, key.1, effective_now).await;
+        }
+    }
+
+    // One (expert, profile) with two participations reads both paths. Its cluster
+    // position starts where its only position stands, before either path moves.
+    let mut paths_per_member: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+    for input in &inputs {
+        *paths_per_member.entry((input.expert_idx, input.profile_idx)).or_default() += 1;
+    }
+    let reads_both = |ei: usize, pidx: usize| paths_per_member.get(&(ei, pidx)).is_some_and(|n| *n > 1);
+    for (&(ei, pidx), _) in paths_per_member.iter().filter(|(_, n)| **n > 1) {
+        let key = (profiles[pidx].id, experts[ei].id);
+        if let Some(cursor) = cursors_map.get_mut(&key)
+            && cursor.cluster_position.is_none()
+        {
+            cursor.cluster_position = seed_cluster_position(pool, tenant_id, key.0, key.1).await?;
         }
     }
 
@@ -1068,14 +1176,31 @@ pub async fn run_analysis_cycle(
             rejected
                 .push(fetch_rejected_suggestions(pool, tenant_id, &experts[i].expert.axis).await);
         }
+        let kinds: Vec<CursorKind> =
+            member_idx.iter().map(|&i| cursor_kind(path, reads_both(i, pidx))).collect();
         let cursors = member_idx
             .iter()
-            .map(|&i| cursors_map.get(&(profile.id, experts[i].id)).copied().flatten())
+            .map(|&i| {
+                let cursor = cursors_map.get(&(profile.id, experts[i].id))?;
+                // An expert that stopped reading sessions still stands at its own
+                // cluster position until its next advance.
+                if path == GroupPath::Cluster {
+                    cursor.cluster_position.or(cursor.position)
+                } else {
+                    cursor.position
+                }
+            })
             .collect();
-        let first_model = experts[first]
-            .model_override
-            .clone()
-            .unwrap_or_else(|| profile.model.clone().unwrap_or_else(|| default_model.clone()));
+        let generations = member_idx
+            .iter()
+            .map(|&i| cursors_map.get(&(profile.id, experts[i].id)).map_or(0, |c| c.generation))
+            .collect();
+        let first_model = judge_model(
+            experts[first].model_override.as_deref(),
+            profile.model.as_deref(),
+            default_model,
+        )
+        .to_string();
         let n = member_idx.len();
         runs.push(GroupRun {
             path,
@@ -1087,6 +1212,8 @@ pub async fn run_analysis_cycle(
             system_prompt,
             rejected,
             cursors,
+            generations,
+            kinds,
             held: vec![false; n],
             acc: (0..n).map(|_| MemberAcc::default()).collect(),
             total_sessions: 0,
@@ -1094,6 +1221,9 @@ pub async fn run_analysis_cycle(
             drained: false,
             deterministic_skips: 0,
             deterministic_sample: None,
+            model_unavailable: None,
+            refused_through: None,
+            scanned_to: effective_now,
             member_idx,
         });
     }
@@ -1111,9 +1241,19 @@ pub async fn run_analysis_cycle(
     // Round-robin: one batch per live group per turn, until every group is
     // exhausted or held. A turn error retires the group for this cycle (its
     // members' watermarks hold wherever they stopped).
+    //
+    // Session groups go first and a model found unavailable retires the profile's
+    // other groups on it unadvanced, which saves calls that would fail. Another
+    // profile has its own cursors and finds out for itself.
+    runs.sort_by_key(|r| r.path != GroupPath::Session);
+    let mut unavailable = std::collections::HashSet::new();
     loop {
         let mut any_live = false;
         for run in &mut runs {
+            if unavailable.contains(&(run.profile_id, run.routing.alias.clone())) {
+                run.held.fill(true);
+                run.done = true;
+            }
             if run.done {
                 continue;
             }
@@ -1142,6 +1282,9 @@ pub async fn run_analysis_cycle(
                 run.held.fill(true);
                 run.done = true;
             }
+            if run.model_unavailable.is_some() {
+                unavailable.insert((run.profile_id, run.routing.alias.clone()));
+            }
         }
         if !any_live {
             break;
@@ -1151,7 +1294,18 @@ pub async fn run_analysis_cycle(
     // Per-group end-of-cycle bookkeeping: watermark jumps, suggestion stores,
     // memory merges.
     for run in &runs {
-        finalize_group_run(pool, tenant_id, cooldown, &experts, run).await;
+        finalize_group_run(pool, tenant_id, &experts, run).await;
+    }
+
+    let mut held_on: std::collections::BTreeMap<(&str, &str), &GroupRun> = std::collections::BTreeMap::new();
+    for run in &runs {
+        if let Some(model) = run.model_unavailable.as_deref() {
+            held_on.entry((model, run.profile_name.as_str())).or_insert(run);
+        }
+    }
+    for ((model, profile), run) in held_on {
+        let waiting = ModelWait { position: run.scan_cursor(), refused_through: run.refused_through };
+        notify_model_unavailable(pool, tenant_id, model, Some(profile), waiting).await;
     }
 
     // A handful of deterministic skips is a poison payload; a pile in one
@@ -1190,6 +1344,73 @@ pub async fn run_analysis_cycle(
     }
 
     Ok(())
+}
+
+/// Where a profile stands while its judge model cannot be called.
+#[derive(Default)]
+struct ModelWait {
+    /// The position held. Moves only when analysis progresses or restarts, so past
+    /// one refused session the next is told too, however often sessions get traffic.
+    position: Option<chrono::DateTime<chrono::Utc>>,
+    /// The newest activity the refused request covered.
+    refused_through: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Tell the operator analysis is paused on a judge model that cannot be called.
+/// `profile` is the expert profile held; the tool-inventory leg has none. Deduped
+/// per model, profile and held position per day; best-effort.
+async fn notify_model_unavailable(
+    pool: &crate::db::Db,
+    tenant_id: uuid::Uuid,
+    model: &str,
+    profile: Option<&str>,
+    wait: ModelWait,
+) {
+    let refused = wait.refused_through.map_or(String::new(), |at| {
+        format!(
+            " The refused request covered activity up to {}. A restart from after that also skips \
+             every other session before it that this profile has not reached.",
+            at.format("%Y-%m-%d %H:%M:%S UTC")
+        )
+    });
+    // The tool-inventory leg has no cursor to hold and no sessions to restart past.
+    let summary = match profile {
+        Some(profile) => format!(
+            "Expert profile {profile} is waiting: {model} answered not found. It is not granted \
+             to the Agent workspace, its route is gone, or its provider refused it. No session \
+             is skipped: analysis resumes once it can be called or another judge model is \
+             chosen. If one session's request is what the provider refuses, restart that \
+             profile's analysis from just after it.{refused}"
+        ),
+        None => format!(
+            "Tool inventory analysis could not run: {model} answered not found. It is not \
+             granted to the Agent workspace, its route is gone, or its provider refused it. It \
+             runs again once it can be called or another judge model is chosen."
+        ),
+    };
+    let Ok(mut db) = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await else {
+        return;
+    };
+    let _ = crate::notifications::notify(
+        db.conn(),
+        tenant_id,
+        crate::notifications::NewNotification {
+            workspace_id: None,
+            kind: crate::notifications::NotificationKind::AgentAnalysisFailing,
+            dedup_key: format!(
+                "agent_model_unavailable:{model}:{}:{}:{}",
+                chrono::Utc::now().format("%Y-%m-%d"),
+                profile.unwrap_or_default(),
+                wait.position.map_or(0, |at| at.timestamp_micros()),
+            ),
+            title: "Expert analysis is paused: its judge model is unavailable".to_string(),
+            summary,
+            target_kind: Some("agent_experts"),
+            target_id: None,
+            payload: serde_json::json!({ "model": model }),
+        },
+    )
+    .await;
 }
 
 /// Deterministic skips in one cycle at or past this count notify the operator
@@ -2140,7 +2361,7 @@ async fn resolve_agent_routing(
     // Query through downstream_routes → upstream_models → upstream_servers.
     // Tries alias match first, then upstream_model name match. The agent is now a
     // normal keyed workspace, so the route it resolves to MUST be granted to the
-    // Agent workspace (`workspace_downstream_access`) or the proxy refuses it —
+    // Agent workspace (`workspace_downstream_access`) or the gateway answers 404 —
     // `granted_to_agent` flags an ungranted route so we can warn the operator
     // (grants are manual, via the workspace Access UI).
     #[allow(clippy::type_complexity)]
@@ -2164,7 +2385,7 @@ async fn resolve_agent_routing(
 --{catalog_join}
                WHERE "#, live_route_sql!(), r#"
                  AND (r.alias = $1 OR m.upstream_model = $1)
-               ORDER BY CASE WHEN r.alias = $1 THEN 0 ELSE 1 END
+               ORDER BY CASE WHEN r.alias = $1 THEN 0 ELSE 1 END, granted_to_agent DESC, r.alias
                LIMIT 1"#),
             "m",
             "s",
@@ -2187,8 +2408,8 @@ async fn resolve_agent_routing(
         }
     };
 
-    // The agent's route exists but isn't granted to the Agent workspace — the
-    // proxy will 403. Tell the operator to grant the provider in the Access tab.
+    // No route it resolves to is granted to the Agent workspace — the gateway
+    // will answer 404. Tell the operator to grant the provider in the Access tab.
     if let Some((_, _, _, _, granted)) = &row
         && !*granted
     {
@@ -2358,43 +2579,78 @@ async fn fetch_rejected_suggestions(pool: &crate::db::Db, tenant_id: uuid::Uuid,
 /// The expert's legacy display columns follow: `sessions_analyzed` accumulates
 /// the total across profiles, and `last_processed_at` becomes the MIN across
 /// the expert's profile watermarks (the conservative "processed through").
+///
+/// Invariant: the write applies only while `generation` is still the row's, so
+/// a cycle already running can never undo an admin's restart. Returns `false`
+/// when a restart superseded it; a database failure is logged and is not one.
+#[allow(clippy::too_many_arguments)]
 async fn update_expert_profile_watermark(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
     profile_id: uuid::Uuid,
     expert_id: uuid::Uuid,
+    generation: i64,
+    kind: CursorKind,
     sessions: i64,
     watermark_at: chrono::DateTime<chrono::Utc>,
-) {
+) -> bool {
     if expert_id.is_nil() {
-        return;
+        return true;
     }
     let Ok(mut db) = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await else {
-        return;
+        return true;
     };
-    if let Err(e) = sqlx::query(
-        "INSERT INTO expert_profile_watermarks \
-            (profile_id, expert_id, tenant_id, last_processed_at, sessions_analyzed) \
-         VALUES ($1, $2, $3, $4, $5) \
-         ON CONFLICT (tenant_id, profile_id, expert_id) DO UPDATE SET \
-            last_processed_at = EXCLUDED.last_processed_at, \
-            sessions_analyzed = expert_profile_watermarks.sessions_analyzed + EXCLUDED.sessions_analyzed, \
-            updated_at = now()",
-    )
-    .bind(profile_id)
-    .bind(expert_id)
-    .bind(tenant_id)
-    .bind(watermark_at)
-    .bind(sessions)
-    .execute(db.conn())
-    .await
-    {
-        tracing::error!("agent expert profile watermark update failed: {e}");
-        return;
+    let written = if kind == CursorKind::BothCluster {
+        // The row exists: its cluster position was seeded on it.
+        sqlx::query(
+            "UPDATE expert_profile_watermarks SET \
+                cluster_processed_at = $4, \
+                sessions_analyzed = sessions_analyzed + $5, \
+                updated_at = now() \
+             WHERE tenant_id = $3 AND profile_id = $1 AND expert_id = $2 AND cursor_generation = $6",
+        )
+        .bind(profile_id)
+        .bind(expert_id)
+        .bind(tenant_id)
+        .bind(watermark_at)
+        .bind(sessions)
+        .bind(generation)
+        .execute(db.conn())
+        .await
+    } else {
+        sqlx::query(
+            "INSERT INTO expert_profile_watermarks \
+                (profile_id, expert_id, tenant_id, last_processed_at, sessions_analyzed, cursor_generation) \
+             VALUES ($1, $2, $3, $4, $5, $6) \
+             ON CONFLICT (tenant_id, profile_id, expert_id) DO UPDATE SET \
+                last_processed_at = EXCLUDED.last_processed_at, \
+                cluster_processed_at = CASE WHEN $7 THEN NULL \
+                                            ELSE expert_profile_watermarks.cluster_processed_at END, \
+                sessions_analyzed = expert_profile_watermarks.sessions_analyzed + EXCLUDED.sessions_analyzed, \
+                updated_at = now() \
+             WHERE expert_profile_watermarks.cursor_generation = EXCLUDED.cursor_generation",
+        )
+        .bind(profile_id)
+        .bind(expert_id)
+        .bind(tenant_id)
+        .bind(watermark_at)
+        .bind(sessions)
+        .bind(generation)
+        .bind(kind == CursorKind::Sole)
+        .execute(db.conn())
+        .await
+    };
+    match written {
+        Ok(done) if done.rows_affected() == 0 => return false,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!("agent expert profile watermark update failed: {e}");
+            return true;
+        }
     }
     if let Err(e) = sqlx::query(
         "UPDATE agent_experts SET \
-         last_processed_at = (SELECT MIN(w.last_processed_at) \
+         last_processed_at = (SELECT MIN(NULLIF(LEAST(COALESCE(w.last_processed_at, 'epoch'), w.cluster_processed_at), 'epoch')) \
                               FROM expert_profile_watermarks w WHERE w.expert_id = $1), \
          sessions_analyzed = sessions_analyzed + $2, \
          updated_at = now() \
@@ -2407,6 +2663,7 @@ async fn update_expert_profile_watermark(
     {
         tracing::error!("agent expert watermark refresh failed: {e}");
     }
+    true
 }
 
 /// Bump the expert's display session counter without touching any watermark —
@@ -2559,6 +2816,12 @@ async fn agent_proxy_call(
                 // so the batch skips it instead of holding the watermark forever.
                 // Auth/permission (401/403) and exhausted 429/5xx stay transient
                 // (a held stall + warnings is the right signal for those).
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Err(anyhow::Error::new(ModelUnavailable {
+                        model: body["model"].as_str().unwrap_or_default().to_string(),
+                        detail: text,
+                    }));
+                }
                 if proxy_status_is_deterministic(status) {
                     return Err(anyhow::Error::new(DeterministicFailure {
                         msg: format!("proxy returned {status}: {text}"),
@@ -2630,6 +2893,47 @@ impl std::fmt::Display for DeterministicFailure {
 
 impl std::error::Error for DeterministicFailure {}
 
+/// A 404 on the agent's call: the judge model is not routed for the agent's key
+/// (not granted to the Agent workspace, or its route is gone), or the upstream
+/// has lost it. Skipping would lose the backlog, so the group holds until an
+/// admin fixes the model. The rare upstream 404 about one request holds too, and
+/// the notification says how to pass it: an admin restarts past that session.
+#[derive(Debug)]
+struct ModelUnavailable {
+    model: String,
+    detail: String,
+}
+
+impl std::fmt::Display for ModelUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the gateway does not route {} for the agent: {}", self.model, self.detail)
+    }
+}
+
+impl std::error::Error for ModelUnavailable {}
+
+/// The model named by a [`ModelUnavailable`] in the error chain.
+fn model_unavailable(err: &anyhow::Error) -> Option<&str> {
+    err.chain().find_map(|c| c.downcast_ref::<ModelUnavailable>()).map(|m| m.model.as_str())
+}
+
+/// The one precedence of a judge model: the expert's override, else its
+/// profile's model, else the Default profile's, else the built-in default. A
+/// blank value is unset. The tool-inventory leg has no workspace dimension, so
+/// it passes no profile.
+fn judge_model<'a>(
+    expert_override: Option<&'a str>,
+    profile: Option<&'a str>,
+    default_profile: Option<&'a str>,
+) -> &'a str {
+    [expert_override, profile, default_profile]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|m| !m.is_empty())
+        .unwrap_or(super::DEFAULT_AGENT_MODEL)
+}
+
 /// True when the error chain carries a [`DeterministicFailure`] — the batch skips
 /// the session and advances; otherwise the failure is transient (hold + retry).
 fn is_deterministic_failure(err: &anyhow::Error) -> bool {
@@ -2652,8 +2956,9 @@ fn deterministic(err: anyhow::Error) -> anyhow::Error {
 /// A proxy `4xx` that is specific to this request/session (so it recurs every
 /// cycle) and is therefore skip-and-advance. Excludes the recoverable/auth 4xx
 /// that must stay transient (hold + retry): auth/permission (`401`/`403`),
-/// throttle (`429`), and the time-based transients (`408 Request Timeout`,
-/// `425 Too Early`).
+/// throttle (`429`), the time-based transients (`408 Request Timeout`,
+/// `425 Too Early`), and `404`, which names the agent's model or route
+/// ([`ModelUnavailable`]).
 fn proxy_status_is_deterministic(status: reqwest::StatusCode) -> bool {
     use reqwest::StatusCode;
     status.is_client_error()
@@ -2661,6 +2966,7 @@ fn proxy_status_is_deterministic(status: reqwest::StatusCode) -> bool {
             status,
             StatusCode::UNAUTHORIZED
                 | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
                 | StatusCode::TOO_MANY_REQUESTS
                 | StatusCode::REQUEST_TIMEOUT
                 | StatusCode::TOO_EARLY
@@ -2829,14 +3135,12 @@ async fn load_expert_profile_partition(
 
     let mut out = Vec::with_capacity(profiles.len());
     for (id, name, is_default, standalone, model) in profiles {
-        // Effective members: Default and Standalone own their set; a Layered
-        // profile inherits the Default's and layers its own on top.
-        let mut ids = own(id);
-        if !is_default && !standalone {
-            ids.extend(default_members.iter().copied());
-        }
-        ids.sort_unstable();
-        ids.dedup();
+        let ids = crate::routes::expert_profiles::effective_expert_ids(
+            own(id),
+            &default_members,
+            is_default,
+            standalone,
+        );
         let member_idx: Vec<usize> =
             ids.iter().filter_map(|e| expert_pos.get(e).copied()).collect();
 
@@ -2881,21 +3185,60 @@ async fn load_expert_profile_partition(
     Ok(out)
 }
 
-/// Load every `(profile_id, expert_id) → last_processed_at` watermark row.
+/// One watermark row.
+struct ProfileCursor {
+    /// `last_processed_at`.
+    position: Option<chrono::DateTime<chrono::Utc>>,
+    generation: i64,
+    /// `cluster_processed_at`.
+    cluster_position: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Load every `(profile_id, expert_id)` watermark row.
 async fn load_profile_watermarks(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
 ) -> anyhow::Result<
-    std::collections::HashMap<(uuid::Uuid, uuid::Uuid), Option<chrono::DateTime<chrono::Utc>>>,
+    std::collections::HashMap<(uuid::Uuid, uuid::Uuid), ProfileCursor>,
 > {
     let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
-    let rows: Vec<(uuid::Uuid, uuid::Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            "SELECT profile_id, expert_id, last_processed_at FROM expert_profile_watermarks",
-        )
-        .fetch_all(db.conn())
-        .await?;
-    Ok(rows.into_iter().map(|(p, e, ts)| ((p, e), ts)).collect())
+    type At = Option<chrono::DateTime<chrono::Utc>>;
+    let rows: Vec<(uuid::Uuid, uuid::Uuid, At, i64, At)> = sqlx::query_as(
+        "SELECT profile_id, expert_id, last_processed_at, cursor_generation, cluster_processed_at \
+         FROM expert_profile_watermarks",
+    )
+    .fetch_all(db.conn())
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(p, e, position, generation, cluster_position)| {
+            ((p, e), ProfileCursor { position, generation, cluster_position })
+        })
+        .collect())
+}
+
+/// Give an expert reading both paths its cluster position, from where its only
+/// position stands. In one statement, so no advance falls between the read and the
+/// write. A cursor not yet started becomes the epoch: unset would later read the
+/// session path's position as this one's.
+async fn seed_cluster_position(
+    pool: &crate::db::Db,
+    tenant_id: uuid::Uuid,
+    profile_id: uuid::Uuid,
+    expert_id: uuid::Uuid,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
+    let seeded = sqlx::query_scalar(
+        "UPDATE expert_profile_watermarks SET \
+            cluster_processed_at = COALESCE(cluster_processed_at, last_processed_at, 'epoch'::timestamptz) \
+         WHERE profile_id = $1 AND expert_id = $2 \
+         RETURNING cluster_processed_at",
+    )
+    .bind(profile_id)
+    .bind(expert_id)
+    .fetch_optional(db.conn())
+    .await?;
+    Ok(seeded)
 }
 
 /// First sight of a live (profile, expert) pair: seed its watermark at
@@ -3404,7 +3747,10 @@ fn render_conversation(out: &mut String, events: &[ConvEvent], budget: usize) {
 }
 
 /// Write a session alert via `sessions.alert_level` / `alert_expert_axis` /
-/// `alert_note` — the one place an alert is stored.
+/// `alert_note` — the one place an alert is stored. A note already held word for
+/// word (each starts a line with its `[axis:level]` tag) adds nothing: a session analyzed again by a model saying the same
+/// thing. Anything else is appended, because a differently worded note may be a
+/// different finding.
 async fn write_session_alert(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
@@ -3437,7 +3783,8 @@ async fn write_session_alert(
            ELSE alert_expert_axis || ', ' || $3 END, \
          alert_note = CASE WHEN alert_note IS NULL THEN $4 \
            ELSE alert_note || E'\\n' || $4 END \
-         WHERE session_id = $1",
+         WHERE session_id = $1 \
+           AND COALESCE(position(E'\\n' || $4 || E'\\n[' IN E'\\n' || alert_note || E'\\n['), 0) = 0",
     )
     .bind(sid)
     .bind(level)
@@ -3479,10 +3826,11 @@ async fn write_session_alert(
 /// Best-effort / log-only: an insert error must never hold or double-advance the
 /// per-(profile,expert) watermark (same contract as `write_session_alert`).
 ///
-/// Issues are **append-only observations**, deliberately NOT deduped: each is one
-/// cycle's finding, and the watermark only re-analyzes a cluster when new turns
-/// arrive, so a static pattern is recorded once. Retention ages them out
-/// reference-driven (see `retention.rs`); the dashboard shows the most recent.
+/// Issues are **append-only observations**: each is one cycle's finding, and the
+/// watermark re-analyzes a cluster when new turns arrive. Only an issue identical
+/// in axis, profile, level, note and subject sessions is not recorded twice; one
+/// worded differently may be a different finding, and stands. Retention ages them
+/// out reference-driven (see `retention.rs`); the dashboard shows the most recent.
 async fn store_cross_session_relations(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
@@ -3527,6 +3875,30 @@ async fn store_cross_session_relations(
 
     let mut stored = 0usize;
     for (level, note, source_ids) in issues {
+        let mut subjects = source_ids.clone();
+        subjects.sort_unstable();
+        let recorded: Result<bool, _> = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cross_session_relation_members first_subject \
+             JOIN cross_session_relations r ON r.id = first_subject.relation_id \
+             WHERE first_subject.session_id = $5[1] AND first_subject.role = 'subject' \
+               AND r.kind = 'issue' AND r.axis = $1 AND r.level = $2 AND r.note = $3 \
+               AND r.expert_profile_id = $4 \
+               AND (SELECT array_agg(m.session_id ORDER BY m.session_id) \
+                    FROM cross_session_relation_members m \
+                    WHERE m.relation_id = r.id AND m.role = 'subject') = $5)",
+        )
+        .bind(axis)
+        .bind(level)
+        .bind(note)
+        .bind(profile_id)
+        .bind(&subjects)
+        .fetch_one(db.conn())
+        .await;
+        match recorded {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => tracing::error!(axis, "cross-session issue lookup failed: {e}"),
+        }
         // Relation + its members in one small tx so a partial member insert can't
         // leave an issue with no linked sessions.
         let mut tx = match db.conn().begin().await {
@@ -4845,13 +5217,81 @@ mod tests {
     }
 
     #[test]
+    fn the_override_beats_the_profile_beats_the_default_beats_the_built_in() {
+        let built_in = crate::agent::DEFAULT_AGENT_MODEL;
+        let cases = [
+            (Some("over"), Some("prof"), Some("dflt"), "over"),
+            (Some("over"), None, Some("dflt"), "over"),
+            (Some("over"), None, None, "over"),
+            (None, Some("prof"), Some("dflt"), "prof"),
+            (None, Some("prof"), None, "prof"),
+            (None, None, Some("dflt"), "dflt"),
+            (None, None, None, built_in),
+            (Some(""), Some("prof"), Some("dflt"), "prof"),
+            (Some("  "), Some(" "), Some("dflt"), "dflt"),
+            (Some(" "), None, Some(""), built_in),
+            (Some(" over "), Some("prof"), None, "over"),
+        ];
+        for (expert, profile, default, want) in cases {
+            assert_eq!(judge_model(expert, profile, default), want, "{expert:?} {profile:?} {default:?}");
+        }
+    }
+
+    /// A proxy answering every call with `status` and `body`.
+    async fn proxy_answering(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let len = body.len();
+                let reply = format!("HTTP/1.1 {status}\r\ncontent-length: {len}\r\nconnection: close\r\n\r\n{body}");
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn refused_call(status: &'static str, body: &'static str) -> anyhow::Error {
+        let url = proxy_answering(status, body).await;
+        agent_analysis_call(
+            &reqwest::Client::new(),
+            &proxy_config(url),
+            serde_json::json!({"model": "the-model", "tool_choice": "auto", "tools": []}),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("the call is refused")
+    }
+
+    #[tokio::test]
+    async fn a_404_names_the_model_and_is_not_a_failure_the_batch_skips() {
+        let gateway = r#"{"error":{"message":"no such model","type":"model_not_found"}}"#;
+        let upstream = r#"{"error":{"message":"gone","type":"upstream_error"}}"#;
+        for body in [gateway, upstream, "not found"] {
+            let err = refused_call("404 Not Found", body).await;
+            assert_eq!(model_unavailable(&err), Some("the-model"), "{body}");
+            assert!(!is_deterministic_failure(&err), "a skipped session is never analyzed again");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_specific_refusal_is_still_skipped_and_names_no_model() {
+        let err = refused_call("422 Unprocessable Entity", "{}").await;
+        assert_eq!(model_unavailable(&err), None);
+        assert!(is_deterministic_failure(&err));
+    }
+
+    #[test]
     fn deterministic_status_classification() {
         use reqwest::StatusCode;
         // Session-specific 4xx → skip.
         assert!(proxy_status_is_deterministic(StatusCode::BAD_REQUEST));
         assert!(proxy_status_is_deterministic(StatusCode::UNPROCESSABLE_ENTITY));
-        assert!(proxy_status_is_deterministic(StatusCode::NOT_FOUND));
         // Auth/permission/throttle/time-based/server → transient (hold/retry).
+        assert!(!proxy_status_is_deterministic(StatusCode::NOT_FOUND));
         assert!(!proxy_status_is_deterministic(StatusCode::UNAUTHORIZED));
         assert!(!proxy_status_is_deterministic(StatusCode::FORBIDDEN));
         assert!(!proxy_status_is_deterministic(StatusCode::TOO_MANY_REQUESTS));

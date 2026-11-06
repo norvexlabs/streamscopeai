@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.16]
+
+- `ssai-stow status` and `ps` name a service that is down, with its exit code, the signal, whether its memory limit
+  killed it and that limit. On the VM appliance, the system's `/etc/resolv.conf` now lists the DNS servers, so the host
+  and a service on the host's network resolve names, and the appliance journals a service going down. The installer
+  moves to a newer release of its deployment tool.
+- The database image moves to the official PostgreSQL 18.6 rebuild on Alpine 3.24.4, carrying the libcurl and brotli
+  security fixes.
+
+## [2026.11.15]
+
+- `ssai provision` and `ssai status` read OpenCode's configs the way OpenCode does: your home-directory config, a
+  repository's own `opencode.json` and `.opencode/opencode.json`, in OpenCode's order. They now name a file in the
+  repository that denies the gateway, pins an agent elsewhere or brings the hosted provider back, say whether plain `opencode`,
+  `ssai run opencode` or both are affected, and stop warning about `~/.opencode` for a project outside your home
+  directory, where OpenCode does not load it.
+- `ssai provision` and `ssai status` no longer say OpenCode runs an agent on the provider it is pinned to when your
+  rules deny that provider: OpenCode runs it on the default model, so such a pin is not reported.
+
+## [2026.11.14]
+
+- OpenCode configs for the gateway's models, written by the CLI or Web Quickstart, no longer leave OpenCode's own hosted
+  provider on offer: its free models appeared beside the gateway's, and a request to one never
+  reached the gateway. Both the project and the home-directory form now deny it. `ssai provision`
+  and `ssai status` name a home-directory rule that allows it again. Existing setups get the deny on
+  their next `ssai sync` or `ssai provision`, or by pasting a new Web Quickstart config. A tenant
+  that edited its OpenCode client profile keeps its version, so its admin adds the rule there.
+
+## [2026.11.13]
+
+- Analyzing sessions again stores an identical alert note or issue only once. One the model words
+  differently is still stored, because it may be a different finding.
+- Analysis start takes an optional time, so a restart can pass one session its provider refuses
+  without dropping the rest of that day. The notification for a paused profile dates that session.
+- An expert reading both single sessions and clusters no longer skips sessions when only one of the
+  two fails: each keeps its own position, and the expert shows the older one.
+- A session active while another expert's analysis was finishing a cycle could be passed unread by
+  an expert that had already finished; it is now read at the next cycle.
+
+## [2026.11.12]
+
+- An expert analysis whose judge model can no longer be called, because it is not granted to the
+  Agent workspace or its provider stopped serving it, now waits instead of skipping sessions: they
+  used to be passed over for good. The Dashboard says which model it is, and analysis resumes where
+  it stopped once it can be called or another model is chosen.
+- The judge model and per-expert override lists offer only models the Agent workspace can call, and
+  saving another one is refused. A model saved before its grant was revoked stays shown, with a
+  warning.
+- An expert profile can restart its analysis from a date, in its new **Analysis start** section:
+  today to skip a backlog, an earlier date to analyze sessions again. It names the workspaces it
+  covers.
+- **BREAKING**: the per-expert **Reset** button and `POST /api/v1/admin/experts/{id}/actions/reset`
+  are removed. They said they rescanned every session and rescanned none; use Analysis start.
+- A save that fails says which part could not be saved, in a full sentence.
+
 ## [2026.11.11]
 
 - An image in a type Anthropic refuses (HEIC, BMP), or a document in a user message the target cannot

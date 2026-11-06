@@ -112,9 +112,9 @@
     {#if !expert.enabled}
       <span class="relative z-10 text-(--warning)" title="Switched off in Definitions: it analyzes nothing, in any profile.">Off everywhere</span>
     {/if}
-    <span title="Sessions this expert has analyzed">{formatCount(expert.sessions_analyzed ?? 0)} sessions analyzed</span>
+    <span title="Analyses this expert has run: a session analyzed again counts again">{formatCount(expert.sessions_analyzed ?? 0)} sessions analyzed</span>
     <span title={expert.last_processed_at ?? undefined}>
-      {expert.last_processed_at ? `last run ${formatTimeAgo(expert.last_processed_at)}` : 'never run'}
+      {expert.last_processed_at ? `analyzed up to ${formatTimeAgo(expert.last_processed_at)}` : 'never run'}
     </span>
     {#if expert.model_override}
       <TagBadge color="neutral" class="relative z-10 text-[10px] font-mono" title="Analyzes with its own model, whatever the profile's judge model">

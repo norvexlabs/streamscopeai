@@ -104,7 +104,7 @@ pub async fn run(selector: Option<&str>) -> Result<()> {
                         client.client_id,
                         client.last_provisioned.format("%Y-%m-%d %H:%M UTC")
                     );
-                    // A config the client's own user config overrides is not
+                    // A config the client's own rules or pins override is not
                     // `ok`, however intact the file is.
                     // The warnings are about the client's main config (its first file).
                     let warnings = crate::opencode_global::for_managed(client);
@@ -114,10 +114,10 @@ pub async fn run(selector: Option<&str>) -> Result<()> {
                         let marker = match std::fs::read(&path) {
                             Err(_) => "MISSING — re-run: ssai provision",
                             Ok(bytes) if sha256_hex(&bytes) == file.file_hash => {
-                                if overridden { "overridden by your user config — see below" } else { "ok" }
+                                if overridden { "not in full effect — see below" } else { "ok" }
                             }
                             Ok(_) if overridden => {
-                                "edited since provisioning, and overridden by your user config — see below"
+                                "edited since provisioning, and not in full effect — see below"
                             }
                             Ok(_) => "edited since provisioning (your edits are kept on re-runs)",
                         };
