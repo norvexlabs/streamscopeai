@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.17]
+
+- The installer moves to a newer release of its deployment tool. The front, the backup runner and the audit scanner it
+  publishes now run fixed versions of their compression libraries.
+
 ## [2026.11.16]
 
 - `ssai-stow status` and `ps` name a service that is down, with its exit code, the signal, whether its memory limit

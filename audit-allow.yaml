@@ -387,3 +387,21 @@
   path: /system/installer/kairos-installer
   reason: "golang.org/x/net in the kairos-installer binary of Kairos 4.4.0, its latest release (x/net 0.61.0; 0.62.0 is on its main branch, unreleased); quadratic time parsing hostile HTML, re-checked 2026-11-06: no release of it is built with the fix yet"
   expires: 2027-01-01
+- id: GO-2026-6865
+  artifact: os
+  package: github.com/klauspost/compress
+  path: /usr/bin/containerd
+  reason: "github.com/klauspost/compress in containerd, Docker's latest package for Ubuntu 26.04 (containerd 2.4.2, compress 1.20.0); a crafted zstd frame panics the reader; re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6865
+  artifact: os
+  package: github.com/klauspost/compress
+  path: /usr/bin/ctr
+  reason: "github.com/klauspost/compress in ctr, Docker's latest package for Ubuntu 26.04 (containerd 2.4.2, compress 1.20.0); a crafted zstd frame panics the reader; re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
+- id: GO-2026-6865
+  artifact: os
+  package: github.com/klauspost/compress
+  path: /usr/libexec/docker/cli-plugins/docker-compose
+  reason: "github.com/klauspost/compress in docker-compose, Docker's latest package for Ubuntu 26.04 (Compose 5.7.0, compress 1.20.0); a crafted zstd frame panics the reader; re-checked 2026-11-06: no release of it is built with the fix yet"
+  expires: 2027-01-01
