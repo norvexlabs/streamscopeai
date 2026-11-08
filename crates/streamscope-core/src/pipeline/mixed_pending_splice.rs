@@ -120,24 +120,27 @@ pub fn apply_inbound_mixed_pending_splice(
     // The client's own request, re-rendered in its own protocol: its thinking
     // goes as sent, for the forward (wherever it is routed) to settle.
     domain.upstream.rerenders_client_request = true;
-    domain.append_assistant_tool_calls(None, &assistant_calls);
-    domain.append_tool_results(&tool_results);
 
     // Re-serialise to client api version. Model and reasoning_effort do not
     // change; we keep the existing model on the api_request (the splice is
-    // pre-routing-finalisation and pre-model-clamp).
+    // pre-routing-finalisation and pre-model-clamp). The client's own cap
+    // field is restored from its wire request below.
     let model = api_request.model().to_string();
-    let translated = match domain.translate_to(
-        client_api_version,
-        &model,
-        // The client's own cap field is restored from its wire request below.
-        crate::api::domain_request::ChatCapField::default(),
-    ) {
+    let render = |domain: &crate::api::domain_request::DomainRequest| {
+        domain.translate_to(client_api_version, &model, crate::api::domain_request::ChatCapField::default())
+    };
+    // The client's items are sent as it wrote them, ahead of the spliced pair
+    // (see `OwnConversation`): read before the splice, rendered as after it.
+    let own = render(&domain).ok().and_then(|(rendered, _)| crate::api::OwnConversation::of(api_request, &rendered));
+    domain.append_assistant_tool_calls(None, &assistant_calls);
+    domain.append_tool_results(&tool_results);
+
+    let translated = match render(&domain).map(|(bytes, v)| (own.as_ref().and_then(|own| own.keep_in(&bytes)).unwrap_or(bytes), v)) {
         // This is the client's own request with history spliced in, rendered in
         // the client's own protocol: every parameter the client set — including
         // WHICH cap field it used (`max_completion_tokens` is the only one an
         // OpenAI reasoning model accepts) — is restored from its wire request,
-        // so only the conversation comes from the domain.
+        // so only the spliced pair comes from the domain.
         //
         // A manual thinking budget cannot go with it: the spliced assistant
         // turn carries no thinking block, which manual thinking refuses.
@@ -473,70 +476,56 @@ mod tests {
     }
 
     #[test]
-    fn a_same_protocol_splice_folds_in_array_system_content_to_the_front() {
-        // The splice re-renders through the target walk on the CLIENT's own
-        // protocol, so it reaches `to_chat_completions` even for a request the
-        // ordinary path would forward untranslated. That makes a same-protocol
-        // request's system handling the splice's business too: a mid-array
-        // `system` message that survived here would still be a 400 from a
-        // strict chat template, and no cross-protocol test can see it.
-        let cache = MixedPendingCache::new(Duration::from_secs(60));
-        let tenant = Uuid::new_v4();
-        let user = Uuid::new_v4();
-        let session_uuid = crate::proxy::content::session_id_from_client(
-            "client-session-1",
-            tenant,
-            user,
-        );
-        cache.record(session_uuid, make_entry(tenant));
+    fn a_same_protocol_splice_sends_the_clients_items_as_written() {
+        // The splice re-renders the client's request in its own protocol, and
+        // the domain it goes through has no field for some of what a client
+        // item carries — nor keeps a mid-array Chat `system` message in place.
+        // The client's items go as a forward of the request sends them, and
+        // only the spliced pair comes from the domain.
+        let cases = [
+            (ApiVersion::ChatCompletions, "messages", serde_json::json!({"model": "m", "messages": [
+                {"role": "system", "content": "Base."},
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "ok"},
+                {"role": "system", "content": "Skills."},
+                {"role": "user", "content": "go on"}]})),
+            (ApiVersion::AnthropicMessages, "messages", serde_json::json!({"model": "m", "max_tokens": 10, "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "shot", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "toolset_name": "browser", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"},
+                     "transformations": {"oversized_image": "error"}}]}]}]})),
+            (ApiVersion::Responses, "input", serde_json::json!({"model": "m", "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Hi", "prompt_cache_breakpoint": {"ttl": "1h"}}]}]})),
+            (ApiVersion::GoogleGemini, "contents", serde_json::json!({"contents": [{"role": "user", "parts": [
+                {"text": "look"},
+                {"inlineData": {"mimeType": "image/png", "data": "iVBO"}, "mediaResolution": {"level": "MEDIA_RESOLUTION_HIGH"}},
+                {"fileData": {"mimeType": "video/mp4", "fileUri": "gs://b/v.mp4"}, "videoMetadata": {"startOffset": "2s"}}]}]})),
+        ];
+        for (version, key, body) in cases {
+            let client = ApiRequest::parse(version, &bytes::Bytes::from(body.to_string())).unwrap();
+            let own = client.wire_value().unwrap()[key].as_array().unwrap().clone();
+            // Control: a rendering through the domain alone does not send them so.
+            let (rendered, _) = crate::api::domain_request::DomainRequest::from_api_request(&client)
+                .translate_to(version, "m", Default::default())
+                .unwrap();
+            let rendered: serde_json::Value = serde_json::from_slice(&rendered).unwrap();
+            assert_ne!(rendered[key].as_array().unwrap(), &own, "{version:?}: the control renders the items as sent");
 
-        let chat: crate::api::chat::ChatCompletionsRequest = serde_json::from_value(
-            serde_json::json!({
-                "model": "qwen3",
-                "messages": [
-                    {"role": "system", "content": "Base."},
-                    {"role": "user", "content": "Hi"},
-                    {"role": "assistant", "content": "ok"},
-                    {"role": "system", "content": "Skills."},
-                    {"role": "user", "content": "go on"}
-                ]
-            }),
-        )
-        .unwrap();
-        let mut req = ApiRequest::ChatCompletions(chat);
-
-        let out = apply_inbound_mixed_pending_splice(
-            &mut req,
-            &cache,
-            tenant,
-            user,
-            Some("client-session-1"),
-            ApiVersion::ChatCompletions,
-        );
-        assert_eq!(out.spliced_count, 1);
-
-        let ApiRequest::ChatCompletions(r) = &req else {
-            panic!("splice must preserve the client's protocol");
-        };
-        let system_at: Vec<usize> = r
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.role == "system")
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(
-            system_at,
-            vec![0],
-            "a spliced same-protocol request must carry one leading system \
-             message; roles were {:?}",
-            r.messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
-        );
-        let folded = match r.messages[0].content.as_ref().unwrap() {
-            crate::api::domain::MessageContent::Text(t) => t.clone(),
-            other => panic!("expected text system content, got {other:?}"),
-        };
-        assert_eq!(folded, "Base.\n\nSkills.");
+            let cache = MixedPendingCache::new(Duration::from_secs(60));
+            let (tenant, user) = (Uuid::new_v4(), Uuid::new_v4());
+            cache.record(crate::proxy::content::session_id_from_client("s", tenant, user), make_entry(tenant));
+            let mut req = client.clone();
+            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, user, Some("s"), version);
+            assert_eq!(out.spliced_count, 1, "{version:?}");
+            let sent: serde_json::Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+            let sent = sent[key].as_array().unwrap();
+            assert_eq!(sent[..own.len()], own[..], "{version:?}: {sent:?}");
+            // The spliced call and its result follow.
+            assert_eq!(sent.len(), own.len() + 2, "{version:?}: {sent:?}");
+            assert!(serde_json::to_string(&sent[own.len()..]).unwrap().contains("rust async"), "{version:?}: {sent:?}");
+        }
     }
 
     #[test]

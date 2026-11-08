@@ -228,8 +228,9 @@ key:
   console is built on the same API.
 - **Signed and scanned releases**: every image, chart, installer and VM disk is signed and carries
   its SBOM, and is scanned for known vulnerabilities before it is published — a fixable high or
-  critical finding stops the release. Every install and upgrade verifies the signature before it
-  runs anything, and `ssai-stow audit` checks a release against today's advisories.
+  critical finding stops the release, unless a dated, reasoned exception accepts it for a while.
+  Every install and upgrade verifies the signature before it runs anything, and `ssai-stow audit`
+  checks a release against today's advisories.
 - **Backups**: off-host and encrypted to public keys whose private halves stay with you, on the VM
   appliance and the Docker deployment; on Kubernetes, the database platform's continuous archive.
 - **Prometheus metrics** for the gateway and the admin API, on hostnames of their own, open only to

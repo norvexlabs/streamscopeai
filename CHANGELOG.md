@@ -5,6 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.21]
+
+- Inline AI documentation: the Admin Guide now covers both ways an inline gateway hands over intercepted traffic.
+  - **Redirect**, for a provider's own API: Streamscope calls the provider with the client's own key, and policy
+    is applied in both directions.
+  - **Analyze API**, for the AI web and desktop apps and any request the gateway does not redirect: answers are
+    only observed.
+
+  It also covers what an operator turns on to accept a redirect — the provider's pass-through, granted to the
+  Inline AI workspace — and states that a redirected request naming its host reaches only the pass-through
+  serving that host.
+
+## [2026.11.20]
+
+- The settings a Gemini message part carries beside its media — a video clip's interval, frame rate and processing
+  mode, an image's or document's media resolution, a model turn's thought signature — reach a Gemini model as the
+  client sent them. A request translated to another protocol names on its row the settings that protocol cannot
+  carry. A Gemini system instruction's image or file reaches no other protocol, and a request translated to one
+  now names it on its row. A system instruction's text marked `thought: false` is read as part of the system
+  prompt — by a translation, the audit and a transform script — and a transform script that shortens a system
+  prompt of several text parts to its first one now has its edit applied. A cached answer for a message's media is reused only for the same settings on the same part.
+- The response cache matches a request on what the client sent: the conversation with every setting on every
+  message and part — another provider's reasoning, a message's `name`, a text part's `cache_control`, an image's
+  `detail` or `transformations`, a tool result's `toolset_name` — wherever it sits. Two requests the gateway read
+  alike but the model would read differently were served one answer. The same conversation sent through two API
+  formats is now cached separately, a question that shares its turn with a tool result is matched exactly, not by
+  meaning, and a client's per-user bookkeeping (`safety_identifier`, `prompt_cache_key`) splits no shared cache.
+  A Chat Completions text, image or audio part's settings beside its data now reach a Chat Completions upstream
+  as the client wrote them, and a request translated to another protocol names them and a message's `name` on
+  its row.
+- When the gateway continues a conversation itself — answering a tool call it ran, or completing a call parked by an
+  earlier request — a model on the client's own protocol receives the client's messages as an ordinary request of
+  the client's would send them, followed by the gateway's turns, rather than rebuilt with what the gateway models
+  of them. A Chat Completions system message in the middle of a conversation now stays where the client put it, as
+  it does on every other request.
+- The Tool Calls page lists each call of a turn on its own row with its own policy record when a Gemini model calls
+  one tool twice without call ids, and every call policy removed is listed. A blocked or would-block banner lands on
+  the call the policy read, even when its arguments were repaired first, and a Gemini call's id is recorded with its
+  policy record. A call is shown with the result that names its id — calls repeating an id take its results in turn,
+  and a call without an id or one policy removed shows none rather than another call's; the session view pairs them
+  the same way. A link to one call from an earlier release opens its turn without expanding the call.
+- A Gemini model's function call without an id — the Gemini API usually leaves it out — is given one by the gateway,
+  whatever the client's protocol, streamed or not: the client returns it with the call's result, and the audit records
+  the same id, so the session view and the Tool Calls page show each such call with its result. A Gemini model is
+  still sent its calls back without the gateway's id. A tool-result rule's record of a Gemini function response that
+  names no call is shown on that response, and its rule reads the arguments of the call it answers rather than of the
+  last call of that name.
+
+## [2026.11.19]
+
+- The installer moves to a newer release of its deployment tool. The gateway, control plane, console and provisioning
+  images move to Alpine 3.24.4, and their system zlib, as the front's and the backup runner's, is 1.4, past a critical
+  decompression flaw (the console's node runtime carries a zlib of its own, built without the module the flaw is in).
+  The database image, the official PostgreSQL build pinned by digest, still carries zlib 1.3.2.
+- `vm create` now takes a `byo` certificate and the secret inputs (in the answers file), sending them over SSH to the
+  first install, so a VM can start in `byo`. An answers file may carry the front's TLS settings in a `tls` section, and
+  `install --given`, `k8s install --given` and `k8s upgrade --given` take install answers, a secret one included, from
+  a file or standard input.
+- A VM whose first boot took a newer release's OS while its first install waited for what `vm create` sends over SSH no
+  longer falls back to the older OS at its next reboot, whose installer refused that install.
+
+## [2026.11.18]
+
+- **BREAKING for an inline gateway**: the analyze API's contract moves to version 2. A response half must state
+  `upstream_status`, the HTTP status the upstream answered with. Version 1 is refused. A rewrite caller asking for no
+  transformed body now counts as forwarding the original: a change is recorded not applied and an enforce finding is
+  answered `block`.
+- An analyzed answer carrying an error is recorded as an error, as on the proxied path: its status, finish and detail. A 2xx
+  carrying one reached the client, so its row keeps the answer and says **Not applied**; a relayed refusal keeps none.
+- A tool call an inline gateway did not stop no longer reads as blocked: it shows **Would block**, an amber card in the
+  conversation, with its own filter on the tool calls page, and is counted apart from blocks on the dashboards and the tool
+  inventory. A rule's activity still counts it, as a match.
+- Inbound screening now reads the text documents the model reads, in a user message or a tool result: Anthropic `document`
+  blocks (a user message's title and context too, and a `content` source given as a string), Responses and Chat files, and
+  Gemini text blobs. An enforce edit lands in the document, which stays a document.
+- Inbound screening now reads the results of tools the server ran, which a stateless client sends back and could forge:
+  Responses `mcp_call`, `code_interpreter_call`, `file_search_call` and off-spec `computer_call_output` text, an MCP
+  approval's reason, and Anthropic's `mcp_tool_result`, web fetch and code execution results, and a `search_result` block.
+- A finding on a message with no text of its own, a document alone or a server-run result, now shows in the conversation.
+- A text file's unpadded or line-wrapped `data:` URL is read as the text it encodes, and a Responses message without its optional `type`
+  keeps its images and files when it sits among other items.
+
 ## [2026.11.17]
 
 - The installer moves to a newer release of its deployment tool. The front, the backup runner and the audit scanner it

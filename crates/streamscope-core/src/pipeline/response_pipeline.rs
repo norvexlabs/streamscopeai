@@ -267,16 +267,10 @@ async fn dispatch_pending(
     crate::web::dispatch_intercept(&p.binding, &p.arguments_json, ctx).await
 }
 
-/// Record one `InjectionBlock` per dropped pending intercepted call so the
-/// audit's `transform_diff.injection_blocks[]` surfaces *which* tool calls
-/// were lost (not just the badge count). Drop happens on cap_hit, truncated
-/// stream, mixed-pending fallthrough, or any of the early-break failure
-/// paths in the agent loop (missing request state, serialize error, missing
-/// forward closure, upstream re-issue error). `content` is a JSON object so
-/// downstream consumers don't need to parse a delimited string.
-/// Resolve the stable per-call `tool_use_id` for a substitution dispatch.
-/// Falls back to a `request_id`-scoped synthetic id when the upstream is
-/// positional (e.g. Gemini emits no tool id on the wire). MUST be the single
+/// Resolve the stable per-call `tool_use_id` for a substitution dispatch: the
+/// call's own — a Gemini call the upstream left unidentified carries the
+/// gateway's once its answer is read (`call_ids`) — else a `request_id`-scoped
+/// synthetic id. MUST be the single
 /// source for this id so the `web_audit` row, the replayed `InterceptedToolCall`,
 /// and the `guardrail_steps` finding all correlate by the same value — keep the
 /// synthetic shape identical to the agent loop's per-round computation.
@@ -344,6 +338,14 @@ fn push_dropped_pending_injection_blocks(
     push_dropped_pending_injection_blocks_into(&mut acc.injection_blocks, pending, reason);
 }
 
+/// Record one `InjectionBlock` per dropped pending intercepted call so the
+/// audit's `transform_diff.injection_blocks[]` surfaces *which* tool calls
+/// were lost (not just the badge count). Drop happens on cap_hit, truncated
+/// stream, mixed-pending fallthrough, or any of the early-break failure
+/// paths in the agent loop (missing request state, serialize error, missing
+/// forward closure, upstream re-issue error). `content` is a JSON object so
+/// downstream consumers don't need to parse a delimited string.
+///
 /// Free-standing variant — used by the non-streaming agent loop where there
 /// is no `BlockAccumulator`. The accumulated blocks are merged into
 /// `transform_state.response_injection_blocks` at the end of the function.
@@ -691,10 +693,30 @@ fn substitution_domain(
     domain
 }
 
+/// The client's own conversation for a round in its own protocol, read before
+/// the first splice from `domain` — the request's domain, as yet unspliced —
+/// rendered as every round is. `None` on a translated round, which sends no
+/// client item.
+fn own_conversation(
+    domain: &crate::api::domain_request::DomainRequest,
+    client: &ApiRequest,
+    client_version: ApiVersion,
+    target: ApiVersion,
+    model: &str,
+    cap_field: crate::api::domain_request::ChatCapField,
+) -> Option<crate::api::OwnConversation> {
+    if target != client_version {
+        return None;
+    }
+    let (rendered, _) = domain.translate_to(target, model, cap_field).ok()?;
+    crate::api::OwnConversation::of(client, &rendered)
+}
+
 /// The body of a substitution round: the domain — which carries the spliced
 /// tool call and its result — translated for the upstream, with the client's
-/// own request parameters restored when the upstream speaks the client's
-/// protocol (see [`ApiRequest::carry_knobs_onto`]). Every re-translation of a
+/// own conversation items (`own`, see [`crate::api::OwnConversation`]) and
+/// request parameters restored when the upstream speaks the client's protocol
+/// (see [`ApiRequest::carry_knobs_onto`]). Every re-translation of a
 /// round goes through here, including the history-cap passes, so the byte cap
 /// measures the body that is actually sent.
 ///
@@ -714,6 +736,7 @@ fn substitution_domain(
 /// stays.
 fn render_substitution_round(
     domain: &crate::api::domain_request::DomainRequest,
+    own: Option<&crate::api::OwnConversation>,
     client: &ApiRequest,
     target: ApiVersion,
     model: &str,
@@ -721,6 +744,7 @@ fn render_substitution_round(
 ) -> Result<Bytes, AppError> {
     let unsealed = target == ApiVersion::AnthropicMessages && !domain.final_assistant_turn_is_sealed();
     let (bytes, _) = domain.translate_to(target, model, cap_field)?;
+    let bytes = own.and_then(|own| own.keep_in(&bytes)).unwrap_or(bytes);
     let restored = client.carry_knobs_onto_with(&bytes, target, |body| {
         if let Some(choice) = body.get_mut("tool_choice") {
             *choice = crate::api::tool_choice::relax_wire_for_continuation(target, choice);
@@ -1337,6 +1361,9 @@ impl ResponsePipeline {
             // and after this boundary so the original conversation prefix
             // is preserved.
             let mut agent_loop_original_message_count: Option<usize> = None;
+            // The client's own conversation, sent ahead of the splices on a
+            // round in its own protocol; captured with the boundary above.
+            let mut agent_loop_own: Option<crate::api::OwnConversation> = None;
             // `cumulative_usage` is the cross-round usage total. Each round's
             // `Usage` event overwrites `local_state.usage` (replace-not-merge);
             // it is summed into the total before each substitution so the final
@@ -1348,7 +1375,7 @@ impl ResponsePipeline {
             // client's calls keep one numbering across rounds — the audit
             // records calls by number, so a round restarting at 0 would merge
             // its calls into an earlier round's.
-            let mut stream_parser = sse::StreamParser::new(upstream_api_version);
+            let mut stream_parser = sse::StreamParser::new(upstream_api_version).identifying_calls(request_id);
             'rounds: for round in 0..=max_iter {
                 // Reset round-local stream counters so timeout / Done
                 // detection fires per round.
@@ -1376,6 +1403,10 @@ impl ResponsePipeline {
 
                                 // Parse upstream SSE into domain events
                                 let mut domain_events = stream_parser.parse(&event);
+                                // A pass-through client reads the frame: it is
+                                // given the ids the parser gave its Gemini
+                                // calls, as every other reader is.
+                                crate::api::call_ids::give_call_ids(&mut event, &stream_parser.take_settled_ids());
                                 if let Some(echo) = &mut prefix_echo {
                                     echo.filter(&mut domain_events);
                                 }
@@ -2428,6 +2459,14 @@ impl ResponsePipeline {
             // conversation prefix).
             if agent_loop_original_message_count.is_none() {
                 agent_loop_original_message_count = Some(domain.messages.len());
+                agent_loop_own = own_conversation(
+                    domain,
+                    api_req,
+                    client_api_version,
+                    upstream_api_version,
+                    &upstream_model_owned,
+                    upstream_chat_cap_field,
+                );
             }
             let thinking_left_out = domain.append_assistant_round(
                 &round_parts.take(),
@@ -2442,6 +2481,7 @@ impl ResponsePipeline {
             // Re-serialize for upstream protocol.
             let mut new_body = match render_substitution_round(
                 domain,
+                agent_loop_own.as_ref(),
                 api_req,
                 upstream_api_version,
                 &upstream_model_owned,
@@ -2503,6 +2543,7 @@ impl ResponsePipeline {
                     passes += 1;
                     match render_substitution_round(
                         domain,
+                        agent_loop_own.as_ref(),
                         api_req,
                         upstream_api_version,
                         &upstream_model_owned,
@@ -2880,9 +2921,7 @@ impl ResponsePipeline {
             // `AppError::client_error` lets through.
             let err = self.upstream_refusal(upstream_status.as_u16(), &body_bytes);
             let mut ts = TransformState::new_with_start(self.meta.api_version, self.meta.request_started_at);
-            ts.upstream_status_code = Some(upstream_status.as_u16());
-            ts.finish_reason = Some(FinishReason::Error);
-            ts.error_message = Some(err.audit_error_info().2);
+            record_refusal(&mut ts, &err);
             finalize_audit(&mut ts, &mut self.meta, false, &self.state, &self.tenant_config, false).await;
             return Err(err);
         }
@@ -2939,7 +2978,12 @@ impl ResponsePipeline {
         // immediately after detection; this covers the silent-break paths
         // (serialize_failed / forward_failed / cancelled / missing_*).
         let mut bail_marker: Option<&'static str> = None;
+        // Where the gateway's numbering of the Gemini calls it identifies
+        // starts in the round the client is answered from (`call_ids`): each
+        // round's calls are numbered after the earlier rounds', as a stream's.
+        let mut final_round_calls_from = 0usize;
         if agent_loop_active {
+            let mut calls_numbered = 0usize;
             // Cancellation token — drop guard fires when the response future
             // is dropped (client disconnect / handler cancellation), short-
             // circuiting in-flight `dispatch_intercept` HTTP calls and the
@@ -2960,6 +3004,7 @@ impl ResponsePipeline {
             // top of the prior round's history.
             let mut agent_loop_domain: Option<crate::api::domain_request::DomainRequest> = None;
             let mut agent_loop_original_message_count: Option<usize> = None;
+            let mut agent_loop_own: Option<crate::api::OwnConversation> = None;
 
             let upstream_model_owned = self.upstream_model.clone();
             let ws_settings_owned = self.tenant_config.web.clone();
@@ -2999,6 +3044,20 @@ impl ResponsePipeline {
                         &mut response_json,
                         &self.client_tools.gemini_encoded,
                     );
+                }
+                // Every Gemini call carries an id before the round's calls are
+                // read, policed or run (`call_ids`).
+                final_round_calls_from = calls_numbered;
+                if self.upstream_api_version == ApiVersion::GoogleGemini {
+                    calls_numbered = crate::api::call_ids::settle_call_ids(&mut response_json, request_id, calls_numbered);
+                    // The round's body carries its ids from here on, so a body
+                    // the loop leaves with (a bail, a splice) keeps the ids
+                    // every reader in the loop read.
+                    if calls_numbered > final_round_calls_from
+                        && let Ok(settled) = serde_json::to_vec(&response_json)
+                    {
+                        body_bytes = Bytes::from(settled);
+                    }
                 }
 
                 let bindings = &self.meta.intercept_bindings;
@@ -3536,6 +3595,14 @@ impl ResponsePipeline {
                     });
                 if agent_loop_original_message_count.is_none() {
                     agent_loop_original_message_count = Some(domain.messages.len());
+                    agent_loop_own = own_conversation(
+                        domain,
+                        api_req,
+                        self.client_api_version,
+                        self.upstream_api_version,
+                        &upstream_model_owned,
+                        self.upstream_chat_cap_field,
+                    );
                 }
                 let thinking_left_out = domain.append_assistant_round(
                     &response_blocks::extract_round_parts_from_response_json(
@@ -3553,6 +3620,7 @@ impl ResponsePipeline {
                 // Re-serialise for upstream protocol.
                 let mut new_body = match render_substitution_round(
                     domain,
+                    agent_loop_own.as_ref(),
                     api_req,
                     self.upstream_api_version,
                     &upstream_model_owned,
@@ -3592,6 +3660,7 @@ impl ResponsePipeline {
                         passes += 1;
                         match render_substitution_round(
                             domain,
+                            agent_loop_own.as_ref(),
                             api_req,
                             self.upstream_api_version,
                             &upstream_model_owned,
@@ -3970,6 +4039,11 @@ impl ResponsePipeline {
 
         let mut response_json: serde_json::Value =
             serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+        // Every Gemini call carries an id from here on, the one policy, the
+        // audit and the client read (`call_ids`).
+        if self.upstream_api_version == ApiVersion::GoogleGemini {
+            crate::api::call_ids::settle_call_ids(&mut response_json, request_id, final_round_calls_from);
+        }
 
         // Path I: a success answer the client must not be handed as one.
         // Either it carries an error payload (`error_in`: vLLM answers 200
@@ -3999,20 +4073,12 @@ impl ResponsePipeline {
                     let mut answer = TransformState::new(self.upstream_api_version);
                     extract_upstream_response(&response_json, self.upstream_api_version, &mut answer);
                     ts.usage = answer.usage;
-                    // The HTTP status the error names (OpenRouter's `code`: 502
-                    // for a provider that failed mid-generation), else the one
-                    // the upstream answered with.
-                    let status = crate::error::envelope::error_http_status(error)
-                        .unwrap_or(current_status.as_u16());
-                    self.upstream_refusal(status, &body_bytes)
+                    self.upstream_refusal(carried_error_status(error, current_status.as_u16()), &body_bytes)
                 }
                 None => AppError::upstream_unreadable(current_status.as_u16(), &body_bytes)
                     .for_model(&self.meta.model_requested),
             };
-            let (refused_with, _, detail) = err.audit_error_info();
-            ts.upstream_status_code = Some(refused_with);
-            ts.finish_reason = Some(FinishReason::Error);
-            ts.error_message = Some(detail);
+            record_refusal(&mut ts, &err);
             apply_sub_state(
                 &mut ts,
                 &sub_badges,
@@ -5369,10 +5435,35 @@ fn police_replayed_answer(
     }
     ts.badges.add(crate::audit::AuditBadge::ModifiedNotApplied);
     for name in blocked_names {
-        ts.badges.add_tool_blocked(crate::audit::Phase::Response, name);
+        ts.badges.add_tool_block_not_applied(crate::audit::Phase::Response, name);
     }
-    ts.response_blocked_tools.extend(blocked_infos);
+    ts.response_blocked_tools
+        .extend(blocked_infos.into_iter().map(|info| crate::proxy::content::BlockedToolInfo { not_applied: true, ..info }));
     ts.tool_arg_modifications.extend(arg_mods);
+}
+
+/// The HTTP status of an answer carrying an error: the one the error names
+/// (OpenRouter's `code`: 502 for a provider that failed mid-generation), else
+/// the one the upstream answered with.
+fn carried_error_status(error: &serde_json::Value, answered: u16) -> u16 {
+    crate::error::envelope::error_http_status(error).unwrap_or(answered)
+}
+
+/// What a refused answer leaves on its row, on the proxied and the analyzed
+/// path alike: the refusal's status and detail, finished in error.
+fn record_refusal(ts: &mut TransformState, err: &AppError) {
+    let (refused_with, _, detail) = err.audit_error_info();
+    ts.upstream_status_code = Some(refused_with);
+    ts.finish_reason = Some(FinishReason::Error);
+    ts.error_message = Some(detail);
+}
+
+/// An analyzed exchange's answer: the body the enforcement point observed and
+/// the HTTP status the upstream answered it with.
+pub(crate) struct ReplayedAnswer<'a> {
+    pub status: u16,
+    /// The answer, which the row's reading settles (`call_ids`) in place.
+    pub body: &'a mut serde_json::Value,
 }
 
 /// Finalize an out-of-band (`/v1/analyze`) exchange as if it had been proxied.
@@ -5386,23 +5477,48 @@ fn police_replayed_answer(
 /// carries the full request-phase snapshot (content, session, badges, BYOK-zero
 /// pricing) recorded when the request half was analyzed.
 ///
-/// `response_json = None` finalizes a request-only row — a request that never
+/// `answer = None` finalizes a request-only row — a request that never
 /// reached an upstream (a verdict-only block the gateway enforced by refusing
 /// the request). No response content, zero usage, cost zero.
+///
+/// An error answer reads as the proxied path reads it. A non-2xx status is a
+/// refusal the client received, recorded as Path H records it, with no answer.
+/// A 2xx carrying an error (`error_in`) is what the proxied path refuses
+/// (Path I), and here it reached the client: the row records the error and
+/// the delivered answer, and says the refusal was not applied.
 pub(crate) async fn finalize_replayed_exchange(
     meta: &mut RequestMeta,
     tenant_config: &crate::config::TenantConfig,
     state: &AppState,
     upstream_api_version: ApiVersion,
-    response_json: Option<&serde_json::Value>,
+    answer: Option<ReplayedAnswer<'_>>,
 ) {
     let mut ts = TransformState::new_with_start(meta.api_version, meta.request_started_at);
     ts.pipeline_path = Some("analyze");
-    if let Some(json) = response_json {
-        read_whole_answer(json, upstream_api_version, &mut ts);
-        // The whole answer arrived at once, so ttft == total.
-        ts.first_token_at = Some(std::time::Instant::now());
-        police_replayed_answer(json, upstream_api_version, meta, tenant_config, &mut ts);
+    if let Some(ReplayedAnswer { status, body }) = answer {
+        // Read as the proxied path reads a whole answer: each Gemini call the
+        // upstream left unidentified under the gateway's id (`call_ids`), so
+        // the row records what the same answer proxied records.
+        if (200..300).contains(&status) && upstream_api_version == ApiVersion::GoogleGemini {
+            crate::api::call_ids::settle_call_ids(body, meta.request_id, 0);
+        }
+        let body = &*body;
+        let refusal = |status: u16| {
+            let text = body.as_str().map_or_else(|| body.to_string(), str::to_string);
+            AppError::upstream(status, text).for_model(&meta.model_requested)
+        };
+        if (200..300).contains(&status) {
+            read_whole_answer(body, upstream_api_version, &mut ts);
+            // The whole answer arrived at once, so ttft == total.
+            ts.first_token_at = Some(std::time::Instant::now());
+            police_replayed_answer(body, upstream_api_version, meta, tenant_config, &mut ts);
+            if let Some(error) = crate::error::envelope::error_in(body) {
+                record_refusal(&mut ts, &refusal(carried_error_status(error, status)));
+                ts.badges.add(crate::audit::AuditBadge::ModifiedNotApplied);
+            }
+        } else {
+            record_refusal(&mut ts, &refusal(status));
+        }
     }
     // The bytes already reached the end client (the gateway delivered the
     // upstream leg), so the response PII scan can only ever OBSERVE — there is no
@@ -5845,7 +5961,8 @@ pub fn cache_store_payload(
     // with no index filter, so a multi-choice stream accumulates every choice's
     // deltas into one string. Storing that would file a garbled merge under a
     // key that a later multi-choice request now legitimately matches (`n` is
-    // part of the identity), i.e. a wrong answer rather than a missing one.
+    // part of the request the key reads), i.e. a wrong answer rather than a
+    // missing one.
     if multi_choice_request {
         return Err("multi_choice");
     }
@@ -5893,9 +6010,9 @@ pub fn cache_store_payload(
             if text.is_empty() && reasoning.is_empty() {
                 // The body holds prose (`accumulated_text` is non-empty, checked
                 // above) in a shape this splitter does not understand. Refusing
-                // is the safe direction: a same-protocol hit would replay the
-                // body fine, but a streaming or cross-protocol hit would render
-                // from channels we could not populate.
+                // is the safe direction: a non-streaming hit would replay the
+                // body fine, but a streaming hit would render from channels we
+                // could not populate.
                 return Err("unrenderable_response");
             }
             (b.clone(), client_api_version, text, reasoning)
@@ -10065,7 +10182,7 @@ mod tests {
         domain.append_assistant_tool_calls(None, &[crate::api::domain_request::RoundCall::unsigned("call_1", "web_search", serde_json::json!({"q": "x"}))]);
         domain.append_tool_results(&[("call_1".into(), "result text".into(), false)]);
 
-        let out = render_substitution_round(&domain, &client, ApiVersion::ChatCompletions, "upstream-model", Default::default()).unwrap();
+        let out = render_substitution_round(&domain, None, &client, ApiVersion::ChatCompletions, "upstream-model", Default::default()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["seed"], 42);
         assert_eq!(v["n"], 1);
@@ -10079,7 +10196,7 @@ mod tests {
 
         // A translated pair carries no client extra: the body is the
         // translation alone.
-        let out = render_substitution_round(&domain, &client, ApiVersion::AnthropicMessages, "claude", Default::default()).unwrap();
+        let out = render_substitution_round(&domain, None, &client, ApiVersion::AnthropicMessages, "claude", Default::default()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert!(v.get("seed").is_none() && v.get("chat_template_kwargs").is_none(), "{v}");
     }
@@ -10113,7 +10230,7 @@ mod tests {
             let mut domain = substitution_domain(client, ApiVersion::ChatCompletions, true, ApiVersion::AnthropicMessages, "upstream", Default::default());
             domain.append_assistant_tool_calls(None, &[crate::api::domain_request::RoundCall::unsigned("call_1", "web_search", serde_json::json!({"q": "x"}))]);
             domain.append_tool_results(&[("call_1".into(), "result".into(), false)]);
-            let out = render_substitution_round(&domain, client, ApiVersion::AnthropicMessages, model, Default::default()).unwrap();
+            let out = render_substitution_round(&domain, None, client, ApiVersion::AnthropicMessages, model, Default::default()).unwrap();
             let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
             body["thinking"].clone()
         };
@@ -10143,7 +10260,7 @@ mod tests {
             )
             .unwrap();
             let domain = substitution_domain(&client, ApiVersion::AnthropicMessages, true, ApiVersion::ChatCompletions, "upstream", Default::default());
-            let out = render_substitution_round(&domain, &client, ApiVersion::ChatCompletions, "m", Default::default()).unwrap();
+            let out = render_substitution_round(&domain, None, &client, ApiVersion::ChatCompletions, "m", Default::default()).unwrap();
             serde_json::from_slice(&out).unwrap()
         };
         assert!(body(false).get("stream_options").is_none());
@@ -10247,7 +10364,7 @@ mod tests {
             let mut domain = substitution_domain(&client, ApiVersion::ChatCompletions, true, ApiVersion::AnthropicMessages, model, Default::default());
             domain.append_assistant_tool_calls(None, &[crate::api::domain_request::RoundCall::unsigned("call_1", "web_search", serde_json::json!({"q": "x"}))]);
             domain.append_tool_results(&[("call_1".into(), "result".into(), false)]);
-            let out = render_substitution_round(&domain, &client, ApiVersion::AnthropicMessages, model, Default::default()).unwrap();
+            let out = render_substitution_round(&domain, None, &client, ApiVersion::AnthropicMessages, model, Default::default()).unwrap();
             let next: serde_json::Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(names(&next), names(&first), "{model}: {next}");
         }
@@ -10274,7 +10391,7 @@ mod tests {
             ],
         );
         domain.append_tool_results(&[("c1".into(), "r1".into(), false), ("c2".into(), "r2".into(), false)]);
-        let out = render_substitution_round(&domain, &client, ApiVersion::GoogleGemini, "gemini-3-pro", Default::default()).unwrap();
+        let out = render_substitution_round(&domain, None, &client, ApiVersion::GoogleGemini, "gemini-3-pro", Default::default()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let parts = v["contents"][1]["parts"].as_array().unwrap();
         assert_eq!(parts[0]["functionCall"]["name"], "web_search", "{v}");
@@ -10309,7 +10426,7 @@ mod tests {
                 &[crate::api::domain_request::RoundCall::unsigned("c1", "web_search", serde_json::json!({"q": "a"}))],
             );
             domain.append_tool_results(&[("c1".into(), "r1".into(), false)]);
-            let out = render_substitution_round(&domain, &client, ApiVersion::AnthropicMessages, "a", Default::default()).unwrap();
+            let out = render_substitution_round(&domain, None, &client, ApiVersion::AnthropicMessages, "a", Default::default()).unwrap();
             serde_json::from_slice(&out).unwrap()
         };
         let kinds = |v: &serde_json::Value| -> Vec<String> {
@@ -10357,7 +10474,7 @@ mod tests {
             ],
         );
         domain.append_tool_results(&[("c1".into(), "r1".into(), false), ("c2".into(), "r2".into(), false)]);
-        let out = render_substitution_round(&domain, &client, ApiVersion::AnthropicMessages, "a", Default::default()).unwrap();
+        let out = render_substitution_round(&domain, None, &client, ApiVersion::AnthropicMessages, "a", Default::default()).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let order: Vec<String> = v["messages"][1]["content"]
             .as_array()
@@ -10392,7 +10509,7 @@ mod tests {
                 turn.splice(0..0, sealed.iter().cloned());
             }
             domain.append_tool_results(&[("call_1".into(), "result".into(), false)]);
-            let out = render_substitution_round(&domain, &client, ApiVersion::AnthropicMessages, model, Default::default())
+            let out = render_substitution_round(&domain, None, &client, ApiVersion::AnthropicMessages, model, Default::default())
                 .unwrap();
             serde_json::from_slice(&out).unwrap()
         };
@@ -10464,11 +10581,76 @@ mod tests {
             let mut domain = substitution_domain(&client, version, true, version, "upstream", Default::default());
             domain.append_assistant_tool_calls(None, &[crate::api::domain_request::RoundCall::unsigned("call_1", "web_search", serde_json::json!({"q": "x"}))]);
             domain.append_tool_results(&[("call_1".into(), "result".into(), false)]);
-            let out = render_substitution_round(&domain, &client, version, "upstream", Default::default()).unwrap();
+            let out = render_substitution_round(&domain, None, &client, version, "upstream", Default::default()).unwrap();
             let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
             assert_eq!(v["tool_choice"], expected, "{version:?}: {v}");
             assert_eq!(v["seed"], 7, "{version:?}: the client's own knobs still travel");
         }
+    }
+
+    #[test]
+    fn a_same_protocol_round_sends_the_clients_items_as_written() {
+        use super::{own_conversation, render_substitution_round, substitution_domain, ApiRequest, ApiVersion, Bytes};
+        // Each item carries what the domain has no field for (or, in Chat, a
+        // system message the domain would fold to the front).
+        let cases = [
+            (ApiVersion::ChatCompletions, "messages", serde_json::json!({"model": "a", "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "system", "content": "Skills."},
+                {"role": "user", "content": "go on"}]})),
+            (ApiVersion::AnthropicMessages, "messages", serde_json::json!({"model": "a", "max_tokens": 10, "messages": [
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "shot", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "toolset_name": "browser", "content": "ok"}]}]})),
+            (ApiVersion::Responses, "input", serde_json::json!({"model": "a", "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "Hi", "prompt_cache_breakpoint": {"ttl": "1h"}}]}]})),
+            (ApiVersion::GoogleGemini, "contents", serde_json::json!({"contents": [{"role": "user", "parts": [
+                {"text": "look"},
+                {"inlineData": {"mimeType": "image/png", "data": "iVBO"}, "mediaResolution": {"level": "MEDIA_RESOLUTION_HIGH"}}]}]})),
+        ];
+        for (version, key, body) in cases {
+            let client = ApiRequest::parse(version, &Bytes::from(body.to_string())).unwrap();
+            let own_items = serde_json::from_slice::<serde_json::Value>(&client.serialize().unwrap()).unwrap()[key].clone();
+            let n = own_items.as_array().unwrap().len();
+            let mut domain = substitution_domain(&client, version, true, version, "upstream", Default::default());
+            let own = own_conversation(&domain, &client, version, version, "upstream", Default::default());
+            assert!(own.is_some(), "{version:?}");
+            // A translated round sends no client item.
+            let other = if version == ApiVersion::ChatCompletions { ApiVersion::AnthropicMessages } else { ApiVersion::ChatCompletions };
+            assert!(own_conversation(&domain, &client, version, other, "upstream", Default::default()).is_none());
+            let splice = |domain: &mut crate::api::domain_request::DomainRequest, id: &str| {
+                domain.append_assistant_tool_calls(None, &[crate::api::domain_request::RoundCall::unsigned(id, "web_search", serde_json::json!({"q": "x"}))]);
+                domain.append_tool_results(&[(id.into(), "result".into(), false)]);
+            };
+            let start = domain.messages.len();
+            splice(&mut domain, "call_1");
+            let sent = |domain: &crate::api::domain_request::DomainRequest, own| {
+                let out = render_substitution_round(domain, own, &client, version, "upstream", Default::default()).unwrap();
+                serde_json::from_slice::<serde_json::Value>(&out).unwrap()[key].as_array().unwrap().clone()
+            };
+            // Control: through the domain alone, the client's items are not sent so.
+            assert_ne!(sent(&domain, None)[..n], own_items.as_array().unwrap()[..], "{version:?}");
+            let out = sent(&domain, own.as_ref());
+            assert_eq!(out[..n], own_items.as_array().unwrap()[..], "{version:?}: {out:?}");
+            assert_eq!(out.len(), n + 2, "{version:?}: {out:?}");
+            // A later round, and one the history cap cut, keep them too.
+            splice(&mut domain, "call_2");
+            assert_eq!(sent(&domain, own.as_ref()).len(), n + 4, "{version:?}");
+            assert!(super::truncate_oldest_splice(&mut domain, start), "{version:?}");
+            let cut = sent(&domain, own.as_ref());
+            assert_eq!(cut[..n], own_items.as_array().unwrap()[..], "{version:?}: {cut:?}");
+        }
+        // A single-turn Gemini content may leave its role unset; with the
+        // gateway's turns after it, it goes as the user's turn it was read as.
+        let client = ApiRequest::parse(ApiVersion::GoogleGemini, &Bytes::from(r#"{"contents":[{"parts":[{"text":"x"}]}]}"#)).unwrap();
+        let mut domain = substitution_domain(&client, ApiVersion::GoogleGemini, true, ApiVersion::GoogleGemini, "g", Default::default());
+        let own = own_conversation(&domain, &client, ApiVersion::GoogleGemini, ApiVersion::GoogleGemini, "g", Default::default());
+        domain.append_assistant_tool_calls(None, &[crate::api::domain_request::RoundCall::unsigned("c", "web_search", serde_json::json!({}))]);
+        domain.append_tool_results(&[("c".into(), "result".into(), false)]);
+        let out = render_substitution_round(&domain, own.as_ref(), &client, ApiVersion::GoogleGemini, "g", Default::default()).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["contents"][0], serde_json::json!({"role": "user", "parts": [{"text": "x"}]}), "{out}");
     }
 
     #[test]
@@ -11615,11 +11797,13 @@ mod tests {
 
         let mut meta = crate::proxy::tests::make_meta(vec![]);
         meta.withheld_tools = vec![crate::proxy::content::BlockedToolInfo {
+            not_applied: false,
             name: "WebFetch".into(),
             title: "withheld".into(),
             description: "not for this workspace".into(),
             rule_id: "R-W".into(),
             tool_use_id: None,
+            call_index: None,
             arguments: None,
         }];
         let ts = police(&meta);
@@ -11627,11 +11811,13 @@ mod tests {
         assert!(badges.contains(&AuditBadge::ModifiedNotApplied), "{badges:?}");
         assert!(!badges.contains(&AuditBadge::Modified), "{badges:?}");
         assert!(
-            badges.iter().any(|b| matches!(b, AuditBadge::ToolBlocked { phase: Phase::Response, names, .. } if names == &["WebFetch".to_string()])),
+            badges.iter().any(|b| matches!(b, AuditBadge::ToolBlockNotApplied { phase: Phase::Response, names, .. } if names == &["WebFetch".to_string()])),
             "{badges:?}"
         );
-        let blocked: Vec<_> = ts.response_blocked_tools.iter().map(|b| (b.name.as_str(), b.tool_use_id.as_deref())).collect();
-        assert_eq!(blocked, [("WebFetch", Some("toolu_1"))]);
+        // The call ran: a block it never was is counted by no reader of the chip.
+        assert!(!badges.iter().any(|b| matches!(b, AuditBadge::ToolBlocked { .. })), "{badges:?}");
+        let blocked: Vec<_> = ts.response_blocked_tools.iter().map(|b| (b.name.as_str(), b.tool_use_id.as_deref(), b.not_applied)).collect();
+        assert_eq!(blocked, [("WebFetch", Some("toolu_1"), true)]);
         assert_eq!(ts.accumulated_tool_calls.len(), 2, "the answer is recorded as the client got it");
 
         let ts = police(&crate::proxy::tests::make_meta(vec![]));

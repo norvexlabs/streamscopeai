@@ -101,14 +101,79 @@ pub struct InputAudioData {
 #[serde(tag = "type")]
 pub enum ContentPart {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        /// The part's members beside its text (a `cache_control` some
+        /// clients send), which the domain does not model: kept for a
+        /// same-protocol forward, named on a translation.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
     #[serde(rename = "image_url")]
-    ImageUrl { image_url: ImageUrl },
+    ImageUrl {
+        image_url: ImageUrl,
+        /// The part's members beside its image (a `cache_control`), kept
+        /// for a same-protocol forward and named on a translation.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
     #[serde(rename = "input_audio")]
-    InputAudio { input_audio: InputAudioData },
+    InputAudio {
+        input_audio: InputAudioData,
+        /// The part's members beside its audio, as an image part's.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
     /// Catch-all for unrecognized content parts.
     #[serde(untagged)]
     Unknown(Value),
+}
+
+impl ContentPart {
+    /// A text part with nothing beside its text.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text { text: text.into(), extra: BTreeMap::new() }
+    }
+
+    /// Set `text` as the text of the first of `parts` that `is_text` reads as
+    /// text, and remove the others: the text parts become one, at the first
+    /// one's place. A kept typed text part takes every member a removed typed
+    /// text part carried beside its text (a later part's winning), so a merge
+    /// drops no `cache_control`; a removed untyped part's members (a Responses
+    /// `output_text`'s `annotations`, offsets into its own text) describe text
+    /// that is gone and go with it. A kept untyped part keeps its own, which
+    /// its protocol may require. Returns whether a text part was there to keep.
+    pub fn merge_text_parts(parts: &mut Vec<ContentPart>, text: &str, is_text: impl Fn(&ContentPart) -> bool) -> bool {
+        let members = |part: &ContentPart| -> Vec<(String, Value)> {
+            match part {
+                Self::Text { extra, .. } => extra.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                _ => Vec::new(),
+            }
+        };
+        let Some(first) = parts.iter().position(&is_text) else {
+            return false;
+        };
+        let merged: Vec<(String, Value)> = parts[first + 1..].iter().filter(|p| is_text(p)).flat_map(members).collect();
+        let mut at = 0;
+        parts.retain(|p| {
+            let keep = at <= first || !is_text(p);
+            at += 1;
+            keep
+        });
+        match &mut parts[first] {
+            Self::Text { text: t, extra } => {
+                *t = text.to_string();
+                extra.extend(merged);
+            }
+            // An untyped part's protocol defines its own members: it takes
+            // none of a typed text part's.
+            Self::Unknown(Value::Object(m)) => {
+                m.insert("text".into(), Value::String(text.to_string()));
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

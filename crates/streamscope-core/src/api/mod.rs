@@ -13,6 +13,7 @@
 //! For cross-protocol translation, requests convert through the canonical
 //! [`domain_request::DomainRequest`] form (O(n) conversions, not O(n²)).
 
+pub mod call_ids;
 pub mod chat;
 pub mod domain;
 pub mod domain_request;
@@ -392,6 +393,102 @@ pub(crate) fn replace_builtin_output(item: &mut Value, text: String) {
     }
 }
 
+/// A result a tool the SERVER ran left in a request's history — what a stateless
+/// client sends back, and a client can forge: the model reads it as the
+/// tool's. A closed list by item type; no claim about any other (a Gemini
+/// `codeExecutionResult`, a Responses `mcp_list_tools`). The fields of a Responses item or an Anthropic block that hold it,
+/// the call beside it left out (`arguments`, `code`, `queries`): that is the
+/// model's. `None` for anything else, a client-run tool's result among them
+/// ([`BuiltinOutput`], a `tool_result`).
+fn server_run_fields(item: &Value) -> Option<&'static [&'static str]> {
+    let kind = item.get("type").and_then(Value::as_str)?;
+    Some(match kind {
+        "mcp_call" => &["output", "error"],
+        "code_interpreter_call" => &["outputs"],
+        "file_search_call" => &["results"],
+        "mcp_approval_response" => &["reason"],
+        "computer_call_output" => &["output", "acknowledged_safety_checks"],
+        // Anthropic's server tools, each `<tool>_tool_result` with a `content`
+        // (a client tool's plain `tool_result` is no such type).
+        // A search a client supplies as a block, the model reading it as text.
+        "search_result" => &["content", "title"],
+        other if other.ends_with("_tool_result") => &["content"],
+        _ => return None,
+    })
+}
+
+/// Whether a key of a server-run result names no text: an id, a kind, a link,
+/// a status, or bytes the model does not read as text.
+fn is_structural_key(key: &str) -> bool {
+    key.starts_with("encrypted_")
+        || matches!(
+            key,
+            "type" | "id" | "call_id" | "tool_use_id" | "tool_name" | "file_id" | "file_type" | "url" | "image_url" | "media_type" | "error_code"
+                | "code" | "page_age" | "retrieved_at" | "status" | "cache_control"
+        )
+}
+
+/// Every string a server-run result holds as text, in order. A base64 source's
+/// `data` is bytes, not text. Deliberately NOT a claim about those fields, ids
+/// or links: a withhold could not take them away without breaking the item.
+fn visit_text_leaves(value: &mut Value, visit: &mut impl FnMut(&mut String)) {
+    match value {
+        Value::String(text) if !text.is_empty() => visit(text),
+        Value::Array(items) => items.iter_mut().for_each(|v| visit_text_leaves(v, visit)),
+        Value::Object(obj) => {
+            let bytes = obj.get("type").and_then(Value::as_str) == Some("base64");
+            for (key, v) in obj.iter_mut() {
+                if !is_structural_key(key) && !(bytes && key == "data") {
+                    visit_text_leaves(v, visit);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The result [`server_run_fields`] names, as the inbound guardrail reads it:
+/// its strings, by line. `None` when `item` holds none, or is no such result.
+pub fn server_run_text(item: &Value) -> Option<String> {
+    let fields = server_run_fields(item)?;
+    let mut own = item.clone();
+    let mut read = Vec::new();
+    for field in fields {
+        if let Some(v) = own.get_mut(*field) {
+            visit_text_leaves(v, &mut |text| read.push(text.clone()));
+        }
+    }
+    (!read.is_empty()).then(|| read.join("\n"))
+}
+
+/// Write `text` over every string [`server_run_text`] read: none of the original
+/// stays, and no field the spec requires goes empty. Everything else — the ids,
+/// the call — stays as it came.
+pub(crate) fn set_server_run_text(item: &mut Value, text: &str) {
+    let Some(fields) = server_run_fields(item) else {
+        return;
+    };
+    for field in fields {
+        if let Some(v) = item.get_mut(*field) {
+            visit_text_leaves(v, &mut |leaf| *leaf = text.to_string());
+        }
+    }
+}
+
+/// Whether `item` is a server-run result ([`server_run_fields`]).
+pub fn is_server_run_result(item: &Value) -> bool {
+    server_run_fields(item).is_some()
+}
+
+/// The call a server-run result answers, for the finding that names it.
+pub fn server_run_call_id(item: &Value) -> String {
+    ["call_id", "tool_use_id", "approval_request_id", "id"]
+        .into_iter()
+        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Write `text` over a call output's `output` as a result rule writes it: a
 /// shell output's chunks through [`set_shell_output_text`]; a list of parts —
 /// the first text part takes it, the other text parts go, every part with no
@@ -465,6 +562,82 @@ pub fn strip_gateway_owned_json(body: &mut Value) -> Vec<(&'static str, Value)> 
         .collect()
 }
 
+/// A client request's own conversation, kept ahead of the turns the gateway
+/// appends when it re-renders that request in the client's own protocol (a
+/// substitution round, the mixed-pending splice).
+///
+/// The re-render goes through the domain, which has no field for what a
+/// block carries beyond what it models (a Gemini clip's `videoMetadata`, a
+/// tool result's `toolset_name`). The client's items are sent instead of their
+/// rendering — exactly what a same-protocol forward of the request sends — and
+/// only the appended turns come from the domain. `rendered` holds a digest of
+/// each item of the domain read from the request, rendered before anything was
+/// appended: the items of a later rendering past its length are the appended
+/// turns.
+pub struct OwnConversation {
+    conversation: &'static str,
+    system: Option<&'static str>,
+    items: Vec<Value>,
+    system_value: Option<Value>,
+    rendered: Vec<String>,
+}
+
+impl OwnConversation {
+    /// The conversation `client` sent, beside `rendered` — the domain read from
+    /// it, rendered for the client's own protocol. `None` when either side has
+    /// no conversation array (a Responses `input` given as one string carries
+    /// nothing a rendering loses).
+    pub fn of(client: &ApiRequest, rendered: &[u8]) -> Option<Self> {
+        let (conversation, system) = client.conversation_keys();
+        let Some(Value::Object(mut own)) = client.wire_value() else { return None };
+        let Value::Array(mut items) = own.remove(conversation)? else { return None };
+        // A Gemini content may leave its role unset in a single-turn request;
+        // once the gateway's turns follow it, it is the user's turn it was read as.
+        if let ApiRequest::GoogleGemini(_) = client {
+            for item in items.iter_mut().filter_map(Value::as_object_mut) {
+                item.entry("role").or_insert_with(|| Value::from("user"));
+            }
+        }
+        let Ok(Value::Object(mut from_domain)) = serde_json::from_slice::<Value>(rendered) else { return None };
+        let Value::Array(rendered) = from_domain.remove(conversation)? else { return None };
+        let rendered = rendered.iter().map(crate::api::domain_request::json_digest::Hashable::sha256_hex).collect();
+        Some(Self { conversation, system, items, system_value: system.and_then(|k| own.remove(k)), rendered })
+    }
+
+    /// `body` — a later rendering of the same domain, with the gateway's turns
+    /// appended — with the client's own items (and system channel, which goes
+    /// with them) in place of their rendering. `None` when `body` does not open
+    /// with the rendering [`Self::of`] was given: an appended turn was merged
+    /// into the client's last item, which then cannot be sent as the client
+    /// wrote it, and the domain's rendering stands (logged: what the domain does
+    /// not model is then not sent).
+    pub fn keep_in(&self, body: &[u8]) -> Option<Bytes> {
+        use crate::api::domain_request::json_digest::Hashable;
+        let Ok(Value::Object(mut body)) = serde_json::from_slice::<Value>(body) else { return None };
+        let Some(Value::Array(all)) = body.get_mut(self.conversation) else { return None };
+        if all.len() < self.rendered.len() || all.iter().zip(&self.rendered).any(|(item, digest)| item.sha256_hex() != *digest) {
+            tracing::warn!(
+                conversation = self.conversation,
+                "re-render: an appended turn changed the client's own items; they go as the domain renders them"
+            );
+            return None;
+        }
+        let appended = all.split_off(self.rendered.len());
+        *all = self.items.iter().cloned().chain(appended).collect();
+        if let Some(key) = self.system {
+            match &self.system_value {
+                Some(v) => {
+                    body.insert(key.to_string(), v.clone());
+                }
+                None => {
+                    body.remove(key);
+                }
+            }
+        }
+        serde_json::to_vec(&Value::Object(body)).ok().map(Bytes::from)
+    }
+}
+
 /// Top-level API request — dispatched by API version.
 #[derive(Debug, Clone)]
 pub enum ApiRequest {
@@ -475,6 +648,29 @@ pub enum ApiRequest {
 }
 
 impl ApiRequest {
+    /// The request as its wire JSON — what a same-protocol forward sends.
+    pub fn wire_value(&self) -> Option<Value> {
+        match self {
+            Self::ChatCompletions(r) => serde_json::to_value(r),
+            Self::Responses(r) => serde_json::to_value(r),
+            Self::AnthropicMessages(r) => serde_json::to_value(r),
+            Self::GoogleGemini(r) => serde_json::to_value(r),
+        }
+        .ok()
+    }
+
+    /// The key holding this request's conversation, and the key of its system
+    /// channel where that is not a conversation item. One table, read by every
+    /// re-render that keeps the client's own conversation or parameters.
+    pub fn conversation_keys(&self) -> (&'static str, Option<&'static str>) {
+        match self {
+            Self::ChatCompletions(_) => ("messages", None),
+            Self::Responses(_) => ("input", Some("instructions")),
+            Self::AnthropicMessages(_) => ("messages", Some("system")),
+            Self::GoogleGemini(_) => ("contents", Some("systemInstruction")),
+        }
+    }
+
     /// Parse a raw request body into the appropriate domain type.
     pub fn parse(api_version: ApiVersion, body: &Bytes) -> Result<Self, AppError> {
         match api_version {
@@ -729,7 +925,7 @@ impl ApiRequest {
     /// Runs once, at the start of the request phase: after the audit has
     /// captured what the client sent and before scripts, presets or any target
     /// is chosen, so every forward built from this request — the primary, a
-    /// failover, a substitution round — and the response-cache identity see the
+    /// failover, a substitution round — and the response-cache key see the
     /// body without them. Gemini's wire struct keeps no unknown field, so there
     /// is nothing to remove there.
     pub fn strip_gateway_owned_fields(&mut self) -> Vec<(&'static str, Value)> {
@@ -750,9 +946,8 @@ impl ApiRequest {
     ///
     /// The domain carries the conversation (which is where the loop splices the
     /// intercepted tool call and its result) but not every parameter the client
-    /// set: the `extra` catch-all and the typed knobs it lifts only for the
-    /// cache identity (`seed`, `n`, `logit_bias`, …) are not re-emitted by a
-    /// translation. Round 1 forwarded them, so without this every later round
+    /// set: the `extra` catch-all and the typed knobs it lifts (`seed`, `n`,
+    /// `logit_bias`, …) are not re-emitted by a translation. Round 1 forwarded them, so without this every later round
     /// would be answered under different settings. The result is the client's
     /// request with only the conversation-carrying keys (and `model`,
     /// `stream`) taken from the translation.
@@ -773,23 +968,17 @@ impl ApiRequest {
         target: ApiVersion,
         adjust: impl FnOnce(&mut serde_json::Map<String, Value>),
     ) -> Option<Bytes> {
-        let (client, conversation): (Value, &[&str]) = match (self, target) {
-            (Self::ChatCompletions(r), ApiVersion::ChatCompletions) => {
-                (serde_json::to_value(r).ok()?, &["messages", "model", "stream"])
-            }
-            (Self::Responses(r), ApiVersion::Responses) => {
-                (serde_json::to_value(r).ok()?, &["input", "instructions", "model", "stream"])
-            }
-            (Self::AnthropicMessages(r), ApiVersion::AnthropicMessages) => {
-                (serde_json::to_value(r).ok()?, &["messages", "system", "model", "stream"])
-            }
-            _ => return None,
-        };
-        let Value::Object(mut body) = client else { return None };
+        // A Gemini request has no parameter the domain does not carry back.
+        if target != self.api_version() || target == ApiVersion::GoogleGemini {
+            return None;
+        }
+        let (messages, system) = self.conversation_keys();
+        let conversation = [Some(messages), system, Some("model"), Some("stream")];
+        let Some(Value::Object(mut body)) = self.wire_value() else { return None };
         let Ok(Value::Object(from_domain)) = serde_json::from_slice::<Value>(translated) else {
             return None;
         };
-        for &key in conversation {
+        for key in conversation.into_iter().flatten() {
             match from_domain.get(key) {
                 Some(v) => {
                     body.insert(key.to_string(), v.clone());
@@ -1132,8 +1321,9 @@ impl ApiRequest {
     /// `computer_call_output` is a screenshot, no text a rule could read or
     /// rewrite, and is left as it is), OpenAI Chat Completions (role="tool"
     /// messages — non-text Parts preserved), Google Gemini
-    /// (functionResponse parts in user-role contents — id falls back to
-    /// `name` when not set, response is rewritten to a JSON string).
+    /// (functionResponse parts in user-role contents — named by the call each
+    /// answers as the request's parse reads it, `GeminiCallIds`; response is
+    /// rewritten to a JSON string).
     ///
     /// The returned Vec is a complete audit record — the closure carries
     /// the matching rule's name, description, and stable id through alongside
@@ -1381,7 +1571,7 @@ impl ApiRequest {
                         Some(self::domain::MessageContent::Parts(parts)) => parts
                             .iter()
                             .filter_map(|p| match p {
-                                self::domain::ContentPart::Text { text } => Some(text.as_str()),
+                                self::domain::ContentPart::Text { text, .. } => Some(text.as_str()),
                                 _ => None,
                             })
                             .collect::<Vec<_>>()
@@ -1396,23 +1586,13 @@ impl ApiRequest {
                         // image / unknown parts untouched.
                         match &mut msg.content {
                             Some(self::domain::MessageContent::Parts(parts)) => {
-                                let mut first_text = true;
-                                parts.retain_mut(|p| match p {
-                                    self::domain::ContentPart::Text { text } => {
-                                        if first_text {
-                                            first_text = false;
-                                            *text = new.clone();
-                                            true
-                                        } else {
-                                            false
-                                        }
-                                    }
-                                    _ => true,
+                                let no_text = !self::domain::ContentPart::merge_text_parts(parts, &new, |p| {
+                                    matches!(p, self::domain::ContentPart::Text { .. })
                                 });
-                                if first_text {
+                                if no_text {
                                     parts.insert(
                                         0,
-                                        self::domain::ContentPart::Text { text: new.clone() },
+                                        self::domain::ContentPart::text(new.clone()),
                                     );
                                 }
                             }
@@ -1439,38 +1619,44 @@ impl ApiRequest {
             }
             Self::GoogleGemini(req) => {
                 // Gemini's request-side tool results live in user-role
-                // contents as `functionResponse` parts. Each part carries
-                // `name` and `response` (an arbitrary JSON value); `id` is
-                // optional and we fall back to `name` as the surrogate
-                // id (matches the response-side block path and the
-                // scripting bridge in `gemini_to_rhai_expansion`).
+                // contents as `functionResponse` parts. Each is named by the
+                // call it answers as the request's parse reads it
+                // (`GeminiCallIds`): its own `id`, else the earliest
+                // unanswered call of its name — the id its result event
+                // carries.
                 use self::gemini::GeminiPart;
-                // Pass 1: collect functionCall args keyed by the same
-                // (id-or-name) surrogate the response side uses.
-                let mut id_to_input: std::collections::HashMap<String, serde_json::Value> =
-                    std::collections::HashMap::new();
-                for content in &req.contents {
-                    for part in &content.parts {
-                        if let GeminiPart::FunctionCall { function_call, .. } = part {
-                            let surrogate = function_call
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| function_call.name.clone());
-                            if !surrogate.is_empty() {
-                                id_to_input.insert(surrogate, function_call.args.clone());
-                            }
-                        }
-                    }
-                }
-                for content in &mut req.contents {
-                    for part in &mut content.parts {
+                let ids = domain_request::GeminiCallIds::of(&req.contents);
+                let args_at = |(c, p): (usize, usize), contents: &[gemini::GeminiContent]| match contents.get(c).and_then(|c| c.parts.get(p)) {
+                    Some(GeminiPart::FunctionCall { function_call, .. }) => Some(function_call.args.clone()),
+                    _ => None,
+                };
+                // The call a response answers, else — a response naming a call
+                // already answered (a result sent twice) — the call of its id.
+                let call_of_id = |id: &str| {
+                    req.contents.iter().enumerate().find_map(|(turn, content)| {
+                        (0..content.parts.len()).find(|&idx| ids.call(turn, idx) == id).map(|idx| (turn, idx))
+                    })
+                };
+                let originating: std::collections::HashMap<(usize, usize), serde_json::Value> = req
+                    .contents
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(turn, content)| (0..content.parts.len()).map(move |idx| (turn, idx)))
+                    .filter_map(|at| {
+                        let call = ids.answered(at.0, at.1).or_else(|| {
+                            matches!(req.contents[at.0].parts[at.1], GeminiPart::FunctionResponse { .. })
+                                .then(|| call_of_id(ids.response(at.0, at.1)))
+                                .flatten()
+                        })?;
+                        Some((at, args_at(call, &req.contents)?))
+                    })
+                    .collect();
+                for (turn, content) in req.contents.iter_mut().enumerate() {
+                    for (idx, part) in content.parts.iter_mut().enumerate() {
                         if let GeminiPart::FunctionResponse { function_response } = part {
                             let name_hint = function_response.name.clone();
-                            let id_surrogate = function_response
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| function_response.name.clone());
-                            let originating_args = id_to_input.get(&id_surrogate);
+                            let id_surrogate = ids.response(turn, idx).to_string();
+                            let originating_args = originating.get(&(turn, idx));
                             let original = if function_response.response.is_string() {
                                 function_response
                                     .response
@@ -1524,7 +1710,7 @@ impl ApiRequest {
                                 existing.push_str(text);
                             }
                             domain::MessageContent::Parts(parts) => {
-                                parts.push(domain::ContentPart::Text { text: format!("\n\n{text}") });
+                                parts.push(domain::ContentPart::text(format!("\n\n{text}")));
                             }
                         }
                     } else {
@@ -1796,6 +1982,27 @@ mod tests {
     use bytes::Bytes;
     use sse::ApiVersion;
 
+    #[test]
+    fn own_items_replace_only_a_rendering_that_opens_with_their_own() {
+        let client = ApiRequest::parse(
+            ApiVersion::ChatCompletions,
+            &Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi","name":"own"}]}"#),
+        )
+        .unwrap();
+        let rendered = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let own = OwnConversation::of(&client, rendered).unwrap();
+        let tail = serde_json::json!({"role": "assistant", "content": "ok"});
+        let kept = own
+            .keep_in(serde_json::json!({"messages": [{"role": "user", "content": "hi"}, tail]}).to_string().as_bytes())
+            .unwrap();
+        let kept: Value = serde_json::from_slice(&kept).unwrap();
+        assert_eq!(kept["messages"], serde_json::json!([{"role": "user", "content": "hi", "name": "own"}, tail]));
+        // A rendering whose opening an appended turn changed keeps the domain's.
+        let merged = serde_json::json!({"messages": [{"role": "user", "content": "hi\nmore"}, tail]});
+        assert!(own.keep_in(merged.to_string().as_bytes()).is_none());
+        assert!(own.keep_in(br#"{"messages":[]}"#).is_none());
+    }
+
     mod built_in_output_reads {
         use super::super::*;
         use proptest::prelude::*;
@@ -2050,7 +2257,7 @@ mod tests {
         assert_eq!(snake.tool_names(), ["read"]);
 
         // A built-in tool survives the domain round trip a substitution round
-        // takes, and reaches the cache identity.
+        // takes.
         let with = parsed(ApiVersion::GoogleGemini, serde_json::json!({
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "tools": [{"googleSearch": {}}],
@@ -2951,8 +3158,8 @@ mod tests {
 
     #[test]
     fn redact_tool_results_gemini_forwards_function_call_args() {
-        // Gemini: functionCall parts carry `args` as a JSON object directly.
-        // The walker keys by `id` when present, otherwise by `name`.
+        // Gemini: functionCall parts carry `args` as a JSON object directly,
+        // read for the call the response answers (`GeminiCallIds`).
         let json = r#"{"contents":[
             {"role":"model","parts":[
                 {"functionCall":{"name":"shell","args":{"command":"echo hi"}}}
@@ -2973,6 +3180,101 @@ mod tests {
             args.get("command").and_then(|v| v.as_str()),
             Some("echo hi")
         );
+    }
+
+    /// A Gemini response with no `id` is recorded under the call it answers
+    /// as the request's parse pairs them — the id its result event carries —
+    /// with that call's arguments, never its function's name or another call
+    /// of that name.
+    #[test]
+    fn a_gemini_redaction_names_the_call_its_response_answers() {
+        // Calls with no id, and calls whose id is empty — which names nothing.
+        for id in ["", r#""id":"","#] {
+            let json = format!(r#"{{"contents":[
+                {{"role":"model","parts":[
+                    {{"functionCall":{{{id}"name":"shell","args":{{"command":"one"}}}}}},
+                    {{"functionCall":{{{id}"name":"shell","args":{{"command":"two"}}}}}}
+                ]}},
+                {{"role":"user","parts":[
+                    {{"functionResponse":{{"name":"shell","response":"first"}}}},
+                    {{"functionResponse":{{"name":"shell","response":"second"}}}}
+                ]}}
+            ]}}"#);
+            let mut req = ApiRequest::parse(ApiVersion::GoogleGemini, &Bytes::from(json)).unwrap();
+            let results: Vec<String> = crate::api::domain_request::DomainRequest::from_api_request(&req)
+                .messages
+                .iter()
+                .filter_map(|m| match &m.role {
+                    crate::api::domain_request::DomainRole::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            let mut args = Vec::new();
+            let redactions = req.redact_tool_results(|_name, _id, content, call_args| {
+                args.push(call_args.and_then(|a| a["command"].as_str()).map(str::to_string));
+                Some((content.to_string(), String::new(), String::new(), "T".to_string()))
+            });
+            let named: Vec<&str> = redactions.iter().map(|r| r.tool_use_id.as_str()).collect();
+            assert_eq!(results.len(), 2, "{id}");
+            assert!(results.iter().all(|r| !r.is_empty()) && results[0] != results[1], "{id}: {results:?}");
+            assert_eq!(named, results.iter().map(String::as_str).collect::<Vec<_>>(), "{id}");
+            assert_eq!(args, [Some("one".to_string()), Some("two".to_string())], "{id}");
+        }
+    }
+
+    /// A response sent again under the id of a call already answered reads
+    /// that call's arguments too.
+    #[test]
+    fn a_gemini_result_sent_twice_reads_its_calls_arguments_both_times() {
+        let json = r#"{"contents":[
+            {"role":"model","parts":[{"functionCall":{"id":"c1","name":"shell","args":{"command":"rm"}}}]},
+            {"role":"user","parts":[
+                {"functionResponse":{"id":"c1","name":"shell","response":"one"}},
+                {"functionResponse":{"id":"c1","name":"shell","response":"two"}}]}
+        ]}"#;
+        let mut req = ApiRequest::parse(ApiVersion::GoogleGemini, &Bytes::from(json)).unwrap();
+        let mut args = Vec::new();
+        let _ = req.redact_tool_results(|_name, _id, content, call_args| {
+            args.push(call_args.and_then(|a| a["command"].as_str()).map(str::to_string));
+            Some((content.to_string(), String::new(), String::new(), "T".to_string()))
+        });
+        assert_eq!(args, [Some("rm".to_string()), Some("rm".to_string())]);
+    }
+
+    /// An id generated for a Gemini call with none is never one the request
+    /// states: a call the client named `call_0` and a later id-less call are
+    /// two calls, each answered by its own response.
+    #[test]
+    fn a_generated_gemini_call_id_never_takes_one_the_client_wrote() {
+        let json = r#"{"contents":[
+            {"role":"model","parts":[{"functionCall":{"id":"call_0","name":"a","args":{}}}]},
+            {"role":"user","parts":[{"functionResponse":{"id":"call_0","name":"a","response":"ra"}}]},
+            {"role":"model","parts":[{"functionCall":{"name":"b","args":{}}}]},
+            {"role":"user","parts":[{"functionResponse":{"name":"b","response":"rb"}}]}
+        ]}"#;
+        let req = ApiRequest::parse(ApiVersion::GoogleGemini, &Bytes::from(json)).unwrap();
+        let domain = crate::api::domain_request::DomainRequest::from_api_request(&req);
+        let calls: Vec<&str> = domain
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| match b {
+                crate::api::domain_request::DomainContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<&str> = domain
+            .messages
+            .iter()
+            .filter_map(|m| match &m.role {
+                crate::api::domain_request::DomainRole::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "call_0");
+        assert_ne!(calls[1], "call_0", "{calls:?}");
+        assert_eq!(results, calls);
     }
 
     #[test]
@@ -3014,5 +3316,101 @@ mod tests {
         assert!(wire_str.contains("and me"));
         assert!(wire_str.contains("\"new\""));
         assert!(!wire_str.contains("\"old\""));
+    }
+}
+
+#[cfg(test)]
+mod server_run_result_properties {
+    use super::{is_server_run_result, server_run_text, set_server_run_text};
+    use proptest::prelude::*;
+    use serde_json::{Value, json};
+
+    const KINDS: [(&str, &[&str]); 7] = [
+        ("mcp_call", &["output", "error"]),
+        ("code_interpreter_call", &["outputs"]),
+        ("file_search_call", &["results"]),
+        ("mcp_approval_response", &["reason"]),
+        ("computer_call_output", &["output", "acknowledged_safety_checks"]),
+        ("mcp_tool_result", &["content"]),
+        ("web_fetch_tool_result", &["content"]),
+    ];
+
+    /// Any JSON an attacker can put under a result's field, keyed only by what
+    /// is no structural key.
+    fn tree() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof!["[A-Z]{4,8}".prop_map(Value::String), any::<i32>().prop_map(|n| json!(n)), Just(Value::Null)];
+        leaf.prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                proptest::collection::btree_map("[a-z]{3,6}x", inner, 0..4)
+                    .prop_map(|m| Value::Object(m.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        /// Every string under a result's field is read, wherever it hides, and
+        /// a write leaves none of them; what pairs the result with its call
+        /// stays. Not a property: that a read is meaningful text, or that a
+        /// write is idempotent in the wire's order of keys.
+        #[test]
+        fn no_string_under_a_result_is_unread_or_survives_a_write(
+            kind in 0..KINDS.len(),
+            field in 0usize..2,
+            payload in tree(),
+            path in proptest::collection::vec("[a-z]{3,6}x", 0..4),
+            hidden in "[A-Z]{9,12}",
+        ) {
+            let (kind, fields) = KINDS[kind];
+            let field = fields[field % fields.len()];
+            let mut nested = json!({"keep": payload, "hidden": hidden});
+            for key in path.iter().rev() {
+                nested = json!({ key: [nested] });
+            }
+            let mut item = json!({"type": kind, "id": "the-id", "call_id": "the-call", "tool_use_id": "the-use", field: nested});
+            prop_assert!(is_server_run_result(&item));
+            let read = server_run_text(&item).unwrap_or_default();
+            prop_assert!(read.contains(&hidden), "{read} of {item}");
+
+            set_server_run_text(&mut item, "W");
+            let written = server_run_text(&item).unwrap_or_default();
+            prop_assert!(written.split('\n').all(|line| line == "W"), "{written}");
+            prop_assert_eq!(written.split('\n').count(), read.split('\n').count());
+            prop_assert!(!item.to_string().contains(&hidden));
+            for (key, want) in [("type", kind), ("id", "the-id"), ("call_id", "the-call"), ("tool_use_id", "the-use")] {
+                prop_assert_eq!(item[key].as_str(), Some(want));
+            }
+        }
+
+        /// What names no text is read by nothing, and left as sent: an id, a
+        /// link, encrypted bytes, a base64 source's data. The positive control
+        /// is the property above.
+        #[test]
+        fn a_structural_key_is_neither_read_nor_written(secret in "[A-Z]{9,12}", kind in 0..KINDS.len()) {
+            let (kind, fields) = KINDS[kind];
+            let held = json!({
+                "url": secret, "image_url": secret, "file_id": secret, "encrypted_content": secret,
+                "encrypted_stdout": secret, "tool_use_id": secret, "code": secret, "media_type": secret,
+                "source": {"type": "base64", "data": secret},
+            });
+            let mut item = json!({"type": kind, "id": secret, fields[0]: held});
+            let sent = item.clone();
+            prop_assert_eq!(server_run_text(&item), None);
+            set_server_run_text(&mut item, "W");
+            prop_assert_eq!(item, sent);
+        }
+    }
+
+    /// A client-run tool's result and everything else is not this reader's: the
+    /// names the two kinds differ by, on both sides.
+    #[test]
+    fn only_a_server_run_result_is_one() {
+        for kind in ["tool_result", "function_call_output", "shell_call_output", "web_search_call", "reasoning", "message", "text", "image"] {
+            assert!(!is_server_run_result(&json!({"type": kind})), "{kind}");
+        }
+        for kind in ["mcp_tool_result", "code_execution_tool_result", "bash_code_execution_tool_result", "a_future_tool_result"] {
+            assert!(is_server_run_result(&json!({"type": kind})), "{kind}");
+        }
+        assert!(!is_server_run_result(&json!({"content": "no type"})));
     }
 }

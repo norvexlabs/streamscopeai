@@ -567,6 +567,7 @@
                     <div class="flex items-center gap-2 text-xs mt-1">
                       <span class="text-(--error) font-semibold">−</span>
                       <span class="font-mono text-(--text-primary)">{bt.name}</span>
+                      {#if bt.not_applied}<span class="text-[9px] uppercase font-semibold text-(--warning)">{m.conv_not_applied()}</span>{/if}
                       {#if bt.rule_id}
                         <span class="inline-flex items-center px-1 py-0 rounded-sm text-[9px] font-mono text-(--error) bg-(--error-bg) border border-(--error)/30">{bt.rule_id}</span>
                       {/if}
@@ -604,6 +605,7 @@
                     <div class="flex items-center gap-2 text-xs mt-1">
                       <span class="text-(--error) font-semibold">!</span>
                       <span class="font-mono text-(--text-primary)">{bt.name}</span>
+                      {#if bt.not_applied}<span class="text-[9px] uppercase font-semibold text-(--warning)">{m.conv_not_applied()}</span>{/if}
                       {#if bt.rule_id}
                         <span class="inline-flex items-center px-1 py-0 rounded-sm text-[9px] font-mono text-(--error) bg-(--error-bg) border border-(--error)/30">{bt.rule_id}</span>
                       {/if}

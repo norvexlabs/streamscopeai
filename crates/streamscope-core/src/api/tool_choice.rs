@@ -327,18 +327,6 @@ impl DomainToolChoice {
         }
     }
 
-    /// A canonical JSON form for the response cache's identity hash: two
-    /// requests meaning the same choice hash alike whichever grammar spelled it.
-    pub fn identity(&self) -> Value {
-        match self {
-            Self::Auto => Value::from("auto"),
-            Self::None => Value::from("none"),
-            Self::Required => Value::from("required"),
-            Self::Function(n) => serde_json::json!({"function": n}),
-            Self::Allowed { names, required } => serde_json::json!({"allowed": names, "required": required}),
-            Self::Native { source, value } => serde_json::json!({"native": format!("{source:?}"), "value": value}),
-        }
-    }
 
     /// The choice for a continuation turn the GATEWAY issues — a substitution
     /// round answering a tool call the gateway executed itself. A forced choice
@@ -726,13 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn the_identity_is_the_meaning_not_the_spelling() {
+    fn the_choice_is_its_meaning_not_its_spelling() {
         let chat = DomainToolChoice::from_chat(&json!({"type": "function", "function": {"name": "f"}}));
         let responses = DomainToolChoice::from_responses(&json!({"type": "function", "name": "f"}));
         let anthropic = DomainToolChoice::from_anthropic(&json!({"type": "tool", "name": "f"})).0;
-        assert_eq!(chat.identity(), responses.identity());
-        assert_eq!(chat.identity(), anthropic.identity());
-        assert_ne!(chat.identity(), DomainToolChoice::Function("g".into()).identity());
+        assert_eq!(chat, responses);
+        assert_eq!(chat, anthropic);
+        assert_ne!(chat, DomainToolChoice::Function("g".into()));
     }
 
     #[test]

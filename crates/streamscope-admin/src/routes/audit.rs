@@ -1124,7 +1124,7 @@ pub async fn get_trace_impl(
     // before any message when the turn's response carries a call and its own
     // protocol parses, so both turns' messages come back in one read.
     // Otherwise — or when that early read fails — it is read below, only when
-    // the rendered history names a call, and only that later read fails the
+    // the turn's answer renders a call, and only that later read fails the
     // trace.
     let response_calls = t_response_tool_calls
         .as_ref()
@@ -1298,19 +1298,12 @@ pub async fn get_trace_impl(
             // A call is emitted in this turn's assistant response; its
             // tool_result arrives in the messages the answering turn added
             // (`trace::answer_laterals`: this turn's child when it extends
-            // it, else the session's next turn). The session view and the
-            // /tools activity feed pair them by the same rule. Fetch the
-            // answering turn, run it through the same canonical
-            // `build_events` pipeline, and append any `ToolResult` events
-            // whose `tool_call_id` matches a `ToolCall` id emitted here.
-            let call_ids: HashSet<String> = evts
-                .iter()
-                .filter_map(|e| match e {
-                    ConversationEvent::ToolCall { id, .. } => Some(id.clone()),
-                    _ => None,
-                })
-                .collect();
-            if !call_ids.is_empty()
+            // it, else the session's next turn). Fetch the answering turn, run
+            // it through the same canonical `build_events` pipeline, and
+            // append the result of each call emitted here, paired as the
+            // /tools activity feed pairs them (`pair_results`).
+            let has_calls = evts.iter().any(crate::conversation::takes_a_result);
+            if has_calls
                 && let Some(session_id) = t_session_id
             {
                 let next = match answer.take() {
@@ -1329,8 +1322,6 @@ pub async fn get_trace_impl(
                         turn_number: next_turn_number,
                         tools_available_hash: next_tools_available_hash,
                         request_params: next_request_params,
-                        response_content: next_response_content,
-                        response_tool_calls: next_response_tool_calls,
                         api_version: next_api_version,
                         model_requested: next_model_requested,
                         model_used: next_model_used,
@@ -1377,7 +1368,8 @@ pub async fn get_trace_impl(
                     let next_turn = TurnRow {
                         turn_number: next_turn_number,
                         protocol: next_protocol,
-                        // Only its ToolResult events are read.
+                        // Only its request is read: its ToolResult events and
+                        // the calls it sends back.
                         system_prompt: None,
                         messages_json: &next_messages_arr,
                         request_tools: next_request_tools.as_ref(),
@@ -1386,8 +1378,8 @@ pub async fn get_trace_impl(
                         // the tool_result reconciliation path in this trace.
                         tools_effective_hash: None,
                         request_params: next_request_params.as_ref(),
-                        response_content: next_response_content.as_deref(),
-                        response_tool_calls: next_response_tool_calls.as_ref(),
+                        response_content: None,
+                        response_tool_calls: None,
                         thinking: None,
                         model: &next_model,
                         metadata: None,
@@ -1399,18 +1391,8 @@ pub async fn get_trace_impl(
                     };
                     match build_events(&next_turn) {
                         Ok(b) => {
-                            for ev in b.events {
-                                if let ConversationEvent::ToolResult {
-                                    tool_call_id,
-                                    is_new,
-                                    ..
-                                } = &ev
-                                    && *is_new
-                                    && call_ids.contains(tool_call_id)
-                                {
-                                    evts.push(ev);
-                                }
-                            }
+                            let paired = crate::conversation::pair_results(&evts, &b.events);
+                            evts.extend(paired.into_iter().flatten());
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -3466,6 +3448,8 @@ fn a2a_call_event(row: A2aCallRowForSession, turn: i32) -> ConversationEvent {
                             .or_else(|| p.title.clone())
                             .unwrap_or_else(|| "blocked by tool policy".to_string()),
                         phase: p.phase.clone(),
+                        not_applied: false,
+                        record: None,
                     })
                 });
             (blocked, d.guardrail_steps)

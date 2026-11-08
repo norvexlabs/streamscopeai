@@ -79,12 +79,26 @@ pub struct BlockedToolInfo {
     /// same-tool-twice turns attribute the banner correctly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
+    /// The call's place among the client calls the row records (0-based, in
+    /// the order the model sent them): its identity when it carries no id, as
+    /// a Gemini call need not. Set only by the pass over a whole answer, whose
+    /// row records every call the model made, the ones policy removed
+    /// included — never for a streamed answer (its row records only what was
+    /// delivered), a substitution round the loop continues, or a Chat choice
+    /// past the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_index: Option<u32>,
     /// Arguments the model attempted. Only populated for response-phase blocks
     /// (the LLM emitted a real call); request-phase blocks strip the tool
     /// before the LLM runs, so there is nothing to capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Object)]
     pub arguments: Option<serde_json::Value>,
+    /// Policy would have blocked it and it was not stopped: an out-of-band
+    /// exchange's enforcement point is verdict-only, or its answer had already
+    /// reached the client. Such an entry is never counted as a block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applied: bool,
 }
 
 /// Info about a tool_result redacted by request-phase policy — mirrors
@@ -426,7 +440,8 @@ pub fn hash_tools_blob(value: &serde_json::Value) -> String {
 }
 
 /// Hash a Message for content-addressed dedup.
-/// Deterministic: same message always produces same hash. Content runs
+/// Deterministic: same message always produces same hash. Content is hashed
+/// without its `cache_control` breakpoints, and runs
 /// through [`canonicalize_content_value`] so framework-injected volatile
 /// text parts (e.g. OpenCode's `<system-reminder>`) do not change the
 /// hash when they appear/disappear across turns.
@@ -443,6 +458,9 @@ fn hash_message_exact(msg: &Message) -> (String, bool) {
     hasher.update(b"|");
     if let Some(content) = &msg.content {
         let mut v = serde_json::to_value(content).unwrap_or_default();
+        // A part's `cache_control` moves from turn to turn, as an Anthropic
+        // block's does: the hash survives the move.
+        strip_breakpoints(&mut v);
         dropped = canonicalize_content_value(&mut v);
         let content_json = serde_json::to_string(&v).unwrap_or_default();
         hasher.update(content_json.as_bytes());
@@ -675,7 +693,7 @@ fn extract_user_prompt_chat(messages: &[Message]) -> Option<String> {
             Some(MessageContent::Parts(parts)) => {
                 // Walk parts forward to find the first meaningful user text
                 for part in parts {
-                    if let crate::api::domain::ContentPart::Text { text } = part {
+                    if let crate::api::domain::ContentPart::Text { text, .. } = part {
                         let t = text.trim();
                         if !t.is_empty() && !is_injected_content(t) {
                             return Some(truncate_prompt(t));
@@ -710,7 +728,7 @@ fn extract_user_prompt_responses(input: &ResponseInput) -> Option<String> {
                 MessageContent::Parts(parts) => parts
                     .iter()
                     .filter_map(|p| match p {
-                        crate::api::domain::ContentPart::Text { text } => Some(text.as_str()),
+                        crate::api::domain::ContentPart::Text { text, .. } => Some(text.as_str()),
                         crate::api::domain::ContentPart::Unknown(v) => {
                             v.get("text").and_then(|t| t.as_str())
                         }
@@ -1201,7 +1219,7 @@ fn extract_text_from_message_content(content: &crate::api::domain::MessageConten
         MessageContent::Text(s) => s.clone(),
         MessageContent::Parts(parts) => {
             let texts: Vec<&str> = parts.iter().filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             }).collect();
             texts.join(" ")
@@ -1704,16 +1722,7 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 req.contents.iter().map(hash_gemini_content_exact).unzip();
             let request_size_bytes = body_size;
 
-            let system_prompt = req.system_instruction.as_ref().map(|si| {
-                si.parts
-                    .iter()
-                    .filter_map(|p| match p {
-                        crate::api::gemini::GeminiPart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            });
+            let system_prompt = req.system_instruction.as_ref().and_then(crate::api::gemini::GeminiContent::system_text);
 
             // All message hashes are stable (Gemini has no volatile fields like cache_control)
             let session_hashes = message_hashes.clone();
@@ -1826,12 +1835,7 @@ pub fn build_transform_diff(
             ApiRequest::ChatCompletions(req) => chat_system_prompt(&req.messages),
             ApiRequest::Responses(req) => req.instructions.clone(),
             ApiRequest::AnthropicMessages(req) => req.system.as_ref().map(|s| s.to_text()),
-            ApiRequest::GoogleGemini(req) => req.system_instruction.as_ref().map(|si| {
-                si.parts.iter().filter_map(|p| match p {
-                    crate::api::gemini::GeminiPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("\n")
-            }),
+            ApiRequest::GoogleGemini(req) => req.system_instruction.as_ref().and_then(crate::api::gemini::GeminiContent::system_text),
         }
     } else {
         None
@@ -3014,6 +3018,22 @@ fn extract_and_replace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_messages_hash_survives_a_moved_breakpoint() {
+        let msg = |marked: bool| {
+            let mut part = serde_json::json!({"type": "text", "text": "q"});
+            if marked {
+                part["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+            serde_json::from_value::<Message>(serde_json::json!({"role": "user", "content": [part, {"type": "text", "text": "r"}]})).unwrap()
+        };
+        assert_eq!(hash_message(&msg(true)), hash_message(&msg(false)));
+        // Positive control: the text still keys the hash.
+        let other: Message = serde_json::from_value(serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": "q2"}, {"type": "text", "text": "r"}]})).unwrap();
+        assert_ne!(hash_message(&msg(false)), hash_message(&other));
+    }
     use std::assert_matches;
 
     /// A whole answer's other choices and candidates are read as the first
@@ -4081,12 +4101,8 @@ mod tests {
         let messages = vec![Message {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "<system-reminder>injected context</system-reminder>".to_string(),
-                },
-                ContentPart::Text {
-                    text: "actual user question".to_string(),
-                },
+                ContentPart::text("<system-reminder>injected context</system-reminder>".to_string()),
+                ContentPart::text("actual user question".to_string()),
             ])),
             name: None,
             tool_calls: None,
@@ -4414,7 +4430,7 @@ mod tests {
     fn extract_text_from_message_content_parts() {
         use crate::api::domain::{ContentPart, MessageContent};
         let content = MessageContent::Parts(vec![
-            ContentPart::Text { text: "CAN you write hello world in c?".to_string() },
+            ContentPart::text("CAN you write hello world in c?".to_string()),
         ]);
         assert_eq!(
             extract_text_from_message_content(&content),
@@ -4426,9 +4442,9 @@ mod tests {
     fn extract_text_from_message_content_multiple_parts() {
         use crate::api::domain::{ContentPart, MessageContent};
         let content = MessageContent::Parts(vec![
-            ContentPart::Text { text: "Part 1".to_string() },
+            ContentPart::text("Part 1".to_string()),
             ContentPart::Unknown(serde_json::json!({"type": "image_url", "image_url": {"url": "data:..."}})),
-            ContentPart::Text { text: "Part 2".to_string() },
+            ContentPart::text("Part 2".to_string()),
         ]);
         assert_eq!(
             extract_text_from_message_content(&content),
@@ -4466,8 +4482,8 @@ mod tests {
         let with_reminder = Message {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "<system-reminder>plan mode</system-reminder>".to_string() },
-                ContentPart::Text { text: "Look if we need update".to_string() },
+                ContentPart::text("<system-reminder>plan mode</system-reminder>".to_string()),
+                ContentPart::text("Look if we need update".to_string()),
             ])),
             name: None,
             tool_calls: None,
@@ -4477,7 +4493,7 @@ mod tests {
         let without_reminder = Message {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![
-                ContentPart::Text { text: "Look if we need update".to_string() },
+                ContentPart::text("Look if we need update".to_string()),
             ])),
             name: None,
             tool_calls: None,
@@ -4693,9 +4709,7 @@ mod tests {
         };
         let as_single_part = Message {
             role: "user".to_string(),
-            content: Some(MessageContent::Parts(vec![ContentPart::Text {
-                text: "hello".to_string(),
-            }])),
+            content: Some(MessageContent::Parts(vec![ContentPart::text("hello".to_string())])),
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -4725,9 +4739,7 @@ mod tests {
         use crate::api::domain::ContentPart;
         let reminder_only_user = Message {
             role: "user".to_string(),
-            content: Some(MessageContent::Parts(vec![ContentPart::Text {
-                text: "<system-reminder>x</system-reminder>".to_string(),
-            }])),
+            content: Some(MessageContent::Parts(vec![ContentPart::text("<system-reminder>x</system-reminder>".to_string())])),
             name: None,
             tool_calls: None,
             tool_call_id: None,

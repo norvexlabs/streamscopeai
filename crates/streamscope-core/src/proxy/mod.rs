@@ -1600,7 +1600,6 @@ async fn proxy_handler_inner(
             &ctx.user,
             &ctx.config,
             &upstream_target,
-            &api_request,
             c,
         )
         .await;

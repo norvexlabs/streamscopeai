@@ -6965,6 +6965,13 @@ export interface components {
             phase: components["schemas"]["Phase"];
         } | {
             /** @enum {string} */
+            code: "tool_block_not_applied";
+            /** Format: int32 */
+            count: number;
+            names: string[];
+            phase: components["schemas"]["Phase"];
+        } | {
+            /** @enum {string} */
             code: "block_overflow";
             /** Format: int32 */
             count: number;
@@ -8186,8 +8193,25 @@ export interface components {
              *     before the LLM runs, so there is nothing to capture.
              */
             arguments?: Record<string, never>;
+            /**
+             * Format: int32
+             * @description The call's place among the client calls the row records (0-based, in
+             *     the order the model sent them): its identity when it carries no id, as
+             *     a Gemini call need not. Set only by the pass over a whole answer, whose
+             *     row records every call the model made, the ones policy removed
+             *     included — never for a streamed answer (its row records only what was
+             *     delivered), a substitution round the loop continues, or a Chat choice
+             *     past the first.
+             */
+            call_index?: number | null;
             description: string;
             name: string;
+            /**
+             * @description Policy would have blocked it and it was not stopped: an out-of-band
+             *     exchange's enforcement point is verdict-only, or its answer had already
+             *     reached the client. Such an entry is never counted as a block.
+             */
+            not_applied?: boolean;
             /** @description Stable identifier (e.g. `ASI02-06`) of the rule that blocked the tool. */
             rule_id: string;
             title: string;
@@ -15624,7 +15648,7 @@ export interface components {
                 latency_total_ms?: number | null;
                 /**
                  * @description Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-                 *     `redacted`, `args_modified`.
+                 *     `not_applied_response`, `redacted`, `args_modified`.
                  */
                 outcomes: string[];
                 redaction?: components["schemas"]["RedactedToolResultInfo"] | null;
@@ -19854,6 +19878,11 @@ export interface components {
          */
         ToolCallBlock: {
             /**
+             * @description Policy would have blocked the call and it was not stopped: the console
+             *     shows it apart from a call that was.
+             */
+            not_applied?: boolean;
+            /**
              * @description Where the block fired: `request` (tool stripped before LLM) or
              *     `response` (LLM emitted an arg-based-blocked call). Today only
              *     `response`-phase blocks attach to a `ToolCall` event — request-phase
@@ -19887,7 +19916,7 @@ export interface components {
          * @description The `outcome` a tool-call feed can narrow to.
          * @enum {string}
          */
-        ToolCallOutcome: "ok" | "blocked" | "redacted" | "args_modified";
+        ToolCallOutcome: "ok" | "blocked" | "not_applied" | "redacted" | "args_modified";
         /**
          * @description `kind`-discriminated row family for the unified tool-calls feed. UI
          *     branches on `row.kind` and dispatches to the matching detail component.
@@ -19916,7 +19945,7 @@ export interface components {
             latency_total_ms?: number | null;
             /**
              * @description Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-             *     `redacted`, `args_modified`.
+             *     `not_applied_response`, `redacted`, `args_modified`.
              */
             outcomes: string[];
             redaction?: components["schemas"]["RedactedToolResultInfo"] | null;
@@ -20160,6 +20189,13 @@ export interface components {
             /** Format: date-time */
             last_used: string;
             /**
+             * Format: int64
+             * @description What policy would have blocked and nothing stopped in an out-of-band
+             *     exchange, a tool it removed from a request or a call in an answer, entry
+             *     for entry as `blocked_count` counts them: not in `blocked_count`.
+             */
+            not_applied_count: number;
+            /**
              * @description Highest-severity risk seen across all calls to this tool in the window.
              *     Drives the card's border accent and the `?risk=` row filter; the UI
              *     renders the per-risk breakdown via the *_count fields below.
@@ -20227,7 +20263,7 @@ export interface components {
             latency_total_ms?: number | null;
             /**
              * @description Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-             *     `redacted`, `args_modified`.
+             *     `not_applied_response`, `redacted`, `args_modified`.
              */
             outcomes: string[];
             redaction?: components["schemas"]["RedactedToolResultInfo"] | null;
@@ -20429,6 +20465,12 @@ export interface components {
             blocked_count: number;
             caution_count: number;
             danger_count: number;
+            /**
+             * Format: int64
+             * @description Entries policy would have blocked and nothing stopped: not in
+             *     `blocked_count`.
+             */
+            not_applied_count: number;
             /**
              * Format: int64
              * @description Total tool_result blocks rewritten by `replace` rules in the same window.

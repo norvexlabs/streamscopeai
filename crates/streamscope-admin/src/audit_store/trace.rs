@@ -238,8 +238,8 @@ pub(crate) async fn answering_turn(
 
 /// The turn that answers a call turn, resolved: its real turn number, the
 /// hashes [`answer_hashes`] narrows, and what `build_events` needs to render
-/// its tool results — no system prompt (a trace reads it only for those
-/// results).
+/// its tool results and the calls it sends back — no system prompt and no
+/// answer (a trace reads it only for those results).
 #[derive(sqlx::FromRow)]
 pub(crate) struct NextTurn {
     pub(crate) request_id: Uuid,
@@ -250,8 +250,6 @@ pub(crate) struct NextTurn {
     pub(crate) hashes: Option<Vec<String>>,
     pub(crate) tools_available_hash: Option<String>,
     pub(crate) request_params: Option<serde_json::Value>,
-    pub(crate) response_content: Option<String>,
-    pub(crate) response_tool_calls: Option<serde_json::Value>,
     pub(crate) api_version: String,
     pub(crate) model_requested: Option<String>,
     pub(crate) model_used: Option<String>,
@@ -273,7 +271,6 @@ pub(crate) async fn next_turn(
         "SELECT nct.request_id, $4::int AS turn_number, $3 AS sliced, \
          CASE WHEN $3 THEN nct.added_hashes ELSE nct.message_hashes END AS hashes, \
          nct.tools_available_hash, nct.request_params, \
-         nct.response_content, nct.response_tool_calls, \
          nct.api_version, \
          na.model_requested, na.model_used \
          FROM conversation_turns_resolved nct \

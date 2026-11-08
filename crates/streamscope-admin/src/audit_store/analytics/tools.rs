@@ -184,6 +184,7 @@ pub(crate) async fn tool_inventory_impl(
         tool_id: Option<String>,
         call_count: i64,
         blocked_count: i64,
+        not_applied_count: i64,
         // Per-risk-level call counts (drive the chip row on the dashboard card).
         safe_count: i64,
         caution_count: i64,
@@ -242,6 +243,7 @@ pub(crate) async fn tool_inventory_impl(
             tool_id: None,
             call_count: 0,
             blocked_count: 0,
+            not_applied_count: 0,
             safe_count: 0,
             caution_count: 0,
             danger_count: 0,
@@ -289,7 +291,8 @@ pub(crate) async fn tool_inventory_impl(
     // Both UNION branches reference the same placeholders, so binds happen
     // once and PostgreSQL substitutes them in both halves.
     let blocked_sql = format!(
-        r#"SELECT bt_elem->>'name' AS tool_name, s.app_id, s.session_id, s.user_id, ct.timestamp
+        r#"SELECT bt_elem->>'name' AS tool_name, s.app_id, s.session_id, s.user_id, ct.timestamp,
+                COALESCE((bt_elem->>'not_applied')::boolean, false) AS not_applied
             FROM conversation_turns ct
             JOIN sessions s ON s.session_id = ct.session_id
             CROSS JOIN LATERAL jsonb_array_elements(ct.transform_diff->'blocked_tools') AS bt_elem
@@ -298,7 +301,8 @@ pub(crate) async fn tool_inventory_impl(
               AND jsonb_array_length(ct.transform_diff->'blocked_tools') > 0
               {where_extra}
         UNION ALL
-        SELECT bt_elem->>'name' AS tool_name, s.app_id, s.session_id, s.user_id, ct.timestamp
+        SELECT bt_elem->>'name' AS tool_name, s.app_id, s.session_id, s.user_id, ct.timestamp,
+                COALESCE((bt_elem->>'not_applied')::boolean, false) AS not_applied
             FROM conversation_turns ct
             JOIN sessions s ON s.session_id = ct.session_id
             CROSS JOIN LATERAL jsonb_array_elements(ct.transform_diff->'response_blocked_tools') AS bt_elem
@@ -315,6 +319,7 @@ pub(crate) async fn tool_inventory_impl(
         session_id: Uuid,
         user_id: Uuid,
         timestamp: chrono::DateTime<chrono::Utc>,
+        not_applied: bool,
     }
 
     let blocked_query = filters.apply_query_as(
@@ -330,17 +335,24 @@ pub(crate) async fn tool_inventory_impl(
         .context("tool inventory blocked-call aggregate")?;
 
     let mut total_blocked: i64 = 0;
+    let mut total_not_applied: i64 = 0;
     for row in &blocked_rows {
         let name = match &row.tool_name {
             Some(n) if !n.is_empty() => n.clone(),
             _ => continue,
         };
-        total_blocked += 1;
+        // An entry not applied did not stop its call: counted apart.
+        if row.not_applied {
+            total_not_applied += 1;
+        } else {
+            total_blocked += 1;
+        }
 
         let agg = tool_aggs.entry(name).or_insert_with(|| ToolAgg {
             tool_id: None,
             call_count: 0,
             blocked_count: 0,
+            not_applied_count: 0,
             safe_count: 0,
             caution_count: 0,
             danger_count: 0,
@@ -349,11 +361,24 @@ pub(crate) async fn tool_inventory_impl(
             users: std::collections::HashSet::new(),
             app_ids: std::collections::HashSet::new(),
             last_used: row.timestamp,
-            worst_risk: "danger".to_string(),
-            worst_title: Some("Blocked by policy".to_string()),
-            worst_description: Some("Tool call blocked by policy".to_string()),
+            worst_risk: if row.not_applied { "caution" } else { "danger" }.to_string(),
+            worst_title: Some(if row.not_applied { "Would be blocked by policy" } else { "Blocked by policy" }.to_string()),
+            worst_description: Some(
+                if row.not_applied { "Tool call policy would have blocked; it was not stopped" } else { "Tool call blocked by policy" }
+                    .to_string(),
+            ),
         });
-        agg.blocked_count += 1;
+        if row.not_applied {
+            agg.not_applied_count += 1;
+        } else {
+            agg.blocked_count += 1;
+            // Whichever row came first: a real block outranks one that stopped nothing.
+            if agg.worst_risk == "caution" && agg.call_count == 0 {
+                agg.worst_risk = "danger".to_string();
+                agg.worst_title = Some("Blocked by policy".to_string());
+                agg.worst_description = Some("Tool call blocked by policy".to_string());
+            }
+        }
         agg.sessions.insert(row.session_id);
         agg.users.insert(row.user_id);
         if let Some(app) = &row.app_id { agg.app_ids.insert(app.clone()); }
@@ -368,6 +393,7 @@ pub(crate) async fn tool_inventory_impl(
             risk_level: agg.worst_risk,
             call_count: agg.call_count,
             blocked_count: agg.blocked_count,
+            not_applied_count: agg.not_applied_count,
             safe_count: agg.safe_count,
             caution_count: agg.caution_count,
             danger_count: agg.danger_count,
@@ -426,6 +452,7 @@ pub(crate) async fn tool_inventory_impl(
         total_tools: tools.len(),
         total_calls,
         blocked_count: total_blocked,
+        not_applied_count: total_not_applied,
         safe_count: risk_counts.get("safe").copied().unwrap_or(0),
         caution_count: risk_counts.get("caution").copied().unwrap_or(0),
         danger_count: risk_counts.get("danger").copied().unwrap_or(0),
@@ -486,8 +513,6 @@ pub(crate) struct InvocationRow {
     #[sqlx(skip)]
     pub(crate) next_request_tools: Option<std::sync::Arc<serde_json::Value>>,
     pub(crate) next_request_params: Option<serde_json::Value>,
-    pub(crate) next_response_content: Option<String>,
-    pub(crate) next_response_tool_calls: Option<serde_json::Value>,
     /// The answering turn's real turn number (`trace::answer_laterals`).
     pub(crate) next_turn_number: Option<i32>,
     /// `true`: [`Self::next_hashes`] is the slice the call turn's child added;
@@ -639,8 +664,6 @@ impl ToolCallTurns {
             nxt.api_version        AS next_api_version,
             nxt.tools_available_hash AS next_request_tools_hash,
             nxt.request_params     AS next_request_params,
-            nxt.response_content   AS next_response_content,
-            nxt.response_tool_calls AS next_response_tool_calls,
             nxt.turn_number        AS next_turn_number,
             nxt.sliced             AS next_sliced,
             nxt.hashes             AS next_hashes,
@@ -664,8 +687,8 @@ impl ToolCallTurns {
             -- the planner probes it per page row, never resolving (walking
             -- the history of) every turn of the window to join them.
             SELECT r.request_id, r.timestamp, r.turn_number, r.api_version,
-                   r.tools_available_hash, r.request_params, r.response_content,
-                   r.response_tool_calls, r.transform_diff, ans.answer_sliced AS sliced,
+                   r.tools_available_hash, r.request_params,
+                   r.transform_diff, ans.answer_sliced AS sliced,
                    CASE WHEN ans.answer_sliced THEN r.added_hashes ELSE r.message_hashes END AS hashes
             FROM conversation_turns_resolved r
             WHERE r.tenant_id = ct.tenant_id

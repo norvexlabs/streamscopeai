@@ -181,13 +181,29 @@ It walks the whole preparation end-to-end, asking what it was not given as a fla
    install has finished. It never replaces a seed it finds: to run it again for the same host
    name, move away the one an earlier run wrote.
 
-**The VM's configuration carries no secret** — but for `vm create --secrets`, whose configuration
-carries a one-time SSH host key (written readable by you alone), which the VM stops serving once
-it is installed. Every secret — the encryption key, the signing secret,
+**The VM's configuration carries no secret** — but for a one-time SSH host key (written readable by
+you alone) whenever `vm create` sends something over SSH (`--secrets`, a secret input, a `byo`
+certificate), which the VM stops serving once it is installed: keep the seed as private as the
+key. Every secret — the encryption key, the signing secret,
 the database passwords — is generated on the VM at its first install and never leaves it unless you
-export it (see *Secrets & security model*). A secret input — a Cloudflare token — is never written
-into the configuration either: `vm create` refuses one given to it, and names one
-the install still needs at the end, for you to give over SSH:
+export it (see *Secrets & security model*). A secret input — a Cloudflare token — and a `byo`
+certificate never enter the configuration either. Give them to `vm create` — a secret input in the
+`--answers` file (`vm create` refuses one in `--set`), the certificate with
+`--cert`/`--key`/`--ca` or the answers file's `tls` section — and they are checked before the VM
+exists, the first boot waits for them, and they are sent over SSH to the first install, pinned to
+the VM's one-time host key. With a VM you create by hand, `vm create` writes them to a private
+`<hostname>.given` file beside the seed — it holds them in the clear — and prints the one command
+that delivers them: run that one as printed, which pins the VM's one-time host key (kept in a
+`.known_hosts` file beside it) and deletes both files once the install took them, rather than a
+plain `ssh … install --given -`. Until you run it, `status` says the VM is not installed, and a
+plain `install` is refused, naming `--given`; the file lost, `install --new-secrets` goes on
+without it, given the certificate and secret inputs again by their flags (`--cert`, `--key`,
+`--ca`, `--answers`). A boot after the install began retires the one-time key, and ssh then refuses
+it: check the VM's own key on its console, and run the printed command without its host-key
+options. `--secrets` takes
+no `byo` certificate: it restores an install (the Cloudflare token comes back with the exported
+secrets), so create a `byo` VM with `--secrets` in another mode and move it to `byo` by a re-run.
+One not given is named at the end, for you to give over SSH:
 
 ```bash
 ssh -t <user>@<vm> sudo ssai-stow install             # asks for what is still due, then installs
@@ -206,8 +222,9 @@ ssh -t <user>@<vm> sudo ssai-stow install             # asks for what is still d
 | `--ssh-allow CIDR,…` | The sources SSH accepts (IPv4 or IPv6). Leave out the address you reach the VM from and you lock yourself out. Without it, a VM on AWS, Azure or Google Cloud accepts SSH from your workstation's public address alone (`0.0.0.0/0,::/0` accepts every source); on the other platforms, from every source. |
 | `--timezone ZONE` | IANA zone name, e.g. `Europe/Paris`. |
 | `--tls MODE` `--domains route=host,…` | How the appliance serves (see *TLS modes*). |
+| `--cert FILE` `--key FILE` `--ca FILE` | The `byo` certificate, its key and its issuing CA, sent over SSH to the first install. Give `--ca` for a private CA: without it the chain is checked against your workstation's trusted CAs. |
 | `--http-port N` `--https-port N` | Move the front's ports. |
-| `--set KEY=VALUE`, `--answers FILE` | The install answers and the advanced settings of § E. `--answers` is a YAML map, `KEY: value`. |
+| `--set KEY=VALUE`, `--answers FILE` | The install answers and the advanced settings of § E. `--answers` is a YAML map, `KEY: value`, and may carry the front's TLS settings in a `tls` section (`mode`, `cert`, `key`, `ca`, paths relative to the file); a flag wins over the file. |
 | `--secrets FILE` | A decrypted secrets export: rebuild a VM with the secrets of one that was lost (see *Recovery playbook*). The secrets go only to the VM `vm create` made: until its install, the VM serves a one-time SSH host key its seed carries, and `vm create` refuses any other. It then records the VM's own key and prints its fingerprint; without automated creation, it prints the one-time key's fingerprint for you to check before you send the secrets. |
 | `--registry PREFIX` `--registry-ca FILE` | Install from a mirror (§ A). |
 | `--tune-profile default\|network` | The VM's network tuning (default `network`, for the gateway's many connections). On an installed VM, `sudo ssai-stow install --tune-profile P` changes it, and `--tune-profile release` returns to the release's own. |
@@ -340,7 +357,7 @@ origins — command-line tools and integrations discover the API address from th
 |---|---|---|
 | `acme` | Let's Encrypt, HTTP-01 / TLS-ALPN | ports 80 and 443 reachable from the internet; optional `--set STOWAGE_ACME_EMAIL=ops@example.com` for expiry notices |
 | `dns-cloudflare` | Let's Encrypt, DNS-01 through Cloudflare | `STOWAGE_CLOUDFLARE_API_TOKEN` (secret; *Zone → DNS → Edit* on each zone). Works even when 80/443 are not public |
-| `byo` | your certificate | `--cert FILE --key FILE` (PEM, covering every domain, unexpired); optional `--ca FILE`, the issuing CA — see CLI trust below. On the VM, given over SSH after install (below) |
+| `byo` | your certificate | `--cert FILE --key FILE` (PEM, covering every domain, unexpired); optional `--ca FILE`, the issuing CA — see CLI trust below. On the VM, `vm create` takes them too and sends them over SSH to the first install (below) |
 | `internal` | the front end's own local CA | none — smoke tests and evaluation; browsers warn |
 | `none` | plain HTTP on a loopback address | Docker only (§ G) |
 
@@ -354,12 +371,18 @@ browser trusts that CA before the first visit.
 ```bash
 sudo ssai-stow install --tls byo --cert cert.pem --key key.pem [--ca ca.pem]          # move to your own certificate
 sudo ssai-stow install --cert new-cert.pem --key new-key.pem                          # renew a byo certificate
-sudo ssai-stow install --set STOWAGE_CLOUDFLARE_API_TOKEN=<new token>                  # rotate the Cloudflare token
-sudo ssai-stow install --tls dns-cloudflare --set STOWAGE_CLOUDFLARE_API_TOKEN=<token>
+sudo ssai-stow install --given - < token.yaml                                           # rotate the Cloudflare token
+sudo ssai-stow install --tls dns-cloudflare --given - < token.yaml                     # move to DNS-01
 ```
 
-`--tls` moves between `acme`, `dns-cloudflare`, `byo` and `internal`. The VM cannot take `byo` at
-`vm create` (its configuration never carries a private key) — create it with another mode and move.
+`token.yaml` keeps the token off the command line and out of the shell history: `project:
+streamscopeai` and `inputs:` holding `STOWAGE_CLOUDFLARE_API_TOKEN: <token>`; delete it once given.
+
+`--tls` moves between `acme`, `dns-cloudflare`, `byo` and `internal`. A VM can start in `byo`:
+`vm create --tls byo --cert FILE --key FILE [--ca FILE]` checks the certificate before the VM exists,
+and sends it over SSH to the first install, pinned to the VM's one-time host key — never in its
+configuration. A `byo` VM rebuilt with `--secrets` (*Recovery playbook*) is created in another
+mode and moved to `byo` by a re-run.
 
 > **CLI trust for private CAs.** When TLS is publicly trusted (`acme`/`dns-cloudflare`), the
 > `ssai` CLI installer needs no extra setup. When the gateway uses a **private** CA — the
@@ -386,7 +409,8 @@ sudo ssai-stow install --tls dns-cloudflare --set STOWAGE_CLOUDFLARE_API_TOKEN=<
    name, administrator and SSH key, network, SSH allowlist, time zone and the install answers.
 2. Its recovery system installs the OS, resets and reboots into the active system; the persistent
    data partition grows to fill the attached disk.
-3. The boot loads the bundled images and makes the first install from the answers: generates the
+3. The boot loads the bundled images and makes the first install from the answers — or, when
+   `vm create` sends something over SSH, the install that delivery runs: generates the
    secrets, starts the stack and runs provisioning. `ssai-stow status` says `not finished` until
    that is done, and names the command that runs it again if it failed.
 4. A health gate judges every boot: the install must be up, on the release the OS carries, and ready.
@@ -654,8 +678,8 @@ Scenarios from least to most severe:
    the schema *and* the record of which migrations produced it, so restoring onto another release is
    refused. Roll the OS back first, then restore.
 3. **The front end can't get a certificate** — with `dns-cloudflare`, usually a token without
-   *Zone → DNS → Edit* on the zone: give a new one with `sudo ssai-stow install --set
-   STOWAGE_CLOUDFLARE_API_TOKEN=<token>`. With `acme`, ports 80/443 must reach the VM and DNS must
+   *Zone → DNS → Edit* on the zone: give a new one with `sudo ssai-stow install --given - < token.yaml`
+   (*TLS modes*). With `acme`, ports 80/443 must reach the VM and DNS must
    point at it. Let's Encrypt retries on a backoff.
 4. **Lost SSH** — SSH is key-only and there is no password anywhere, so a lost key or an
    `--ssh-allow` that leaves you out is not repairable from inside: rebuild the VM from the secrets
@@ -669,7 +693,8 @@ Scenarios from least to most severe:
 
    ```bash
    age --decrypt -i secrets.key streamscope-secrets.age > secrets.yaml
-   sh streamscopeai.sh vm create --secrets secrets.yaml …     # same release as the backup
+   sh streamscopeai.sh vm create --secrets secrets.yaml …     # same release as the backup; not --tls byo
+   ssh <user>@<vm> sudo ssai-stow install --given - < byo.yaml   # if it served byo: project, tls of cert and key as PEM (§ D)
    ssh <user>@<vm> ssai-stow backup config --destination … --rclone-config - --recipient age1… < rclone.conf
    ssh <user>@<vm> ssai-stow backup list
    ssh -t <user>@<vm> ssai-stow restore <object> --identity - < backup.key
@@ -704,6 +729,7 @@ On the VM (over SSH):
 | `ssai-stow network [set \| confirm \| revert \| reset]` | The network settings (see below) |
 | `ssai-stow provision [--set KEY=VALUE]…` | Run provisioning again (idempotent); `--set` corrects a value it recorded (§ E) |
 | `sudo ssai-stow install [--set KEY=VALUE]… [--tls …] [--domains …] [--cert … --key …]` | Change the install's settings (see below); on a VM without an install, make it |
+| `sudo ssai-stow install --given FILE\|-` | The same from a YAML file — `project: streamscopeai`, `inputs` of `KEY: value`, `tls` of `cert`, `key`, `ca` as PEM — read from a file or standard input, keeping a secret off the command line; how `vm create`'s `.given` file is delivered. The Docker install takes it too, and `k8s install` / `k8s upgrade` (without `tls`) |
 | `ssai-stow reset-db [--yes] [--no-provision]` | **Destructive.** Wipe the database and the gateway's buffers (certificates kept), start again as first installed, with new passwords. Not a routine operation |
 
 `--yes` skips a confirmation and is required without a terminal.
@@ -1387,6 +1413,9 @@ between yours and the target first: a **BREAKING** entry names what to do around
 sh streamscopeai.sh k8s upgrade --version <release> [--values values.yaml]
 # Or, with the new release's own installer:
 sh streamscopeai.sh k8s upgrade [--values values.yaml]
+# Replace recorded install answers (a secret one included) from a file, restarting what reads them:
+# `project: streamscopeai` and `inputs` of `KEY: value` (a `tls` section is left out: the ingress owns TLS).
+sh streamscopeai.sh k8s upgrade --given answers-given.yaml
 
 # Roll back to the previous release (or name a helm revision with --revision N).
 sh streamscopeai.sh k8s rollback
@@ -1636,8 +1665,10 @@ users' portal at `/`, the organisation's console at `/admin`, the platform's at 
 gateway on `http://127.0.0.1:8080/v1`. `ssai-stow status` prints every route's URL.
 
 To install without being asked anything, add `--no-input` and give the answers with `--set KEY=VALUE`
-or `--answers answers.yaml` (a YAML map, `KEY: value`); add `--no-provision` to create even the
-platform administrator yourself, in the console's setup page.
+or `--answers answers.yaml` (a YAML map, `KEY: value`, with an optional `tls` section — `mode`, `cert`,
+`key`, `ca`, paths relative to the file — so one file describes the whole install), or `--given FILE|-`
+(the same answers and TLS material as PEM, from a file or standard input: § D); add `--no-provision`
+to create even the platform administrator yourself, in the console's setup page.
 
 Useful options:
 

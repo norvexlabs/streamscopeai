@@ -19,7 +19,7 @@ use crate::api::messages::{
 };
 use crate::api::gemini::{
     GeminiContent, GeminiFunctionCallData, GeminiFunctionDecl,
-    GeminiFunctionResponseData, GeminiGenerationConfig, GeminiInlineData, GeminiPart,
+    GeminiFunctionResponseData, GeminiGenerationConfig, GeminiPart,
     GeminiRequest, GeminiThinkingConfig, GeminiTool,
 };
 use crate::api::responses::ResponsesRequest;
@@ -37,10 +37,9 @@ use crate::error::AppError;
 /// Invariant to preserve: `extra` is a `#[serde(flatten)]` catch-all, so it
 /// holds only fields the wire struct did **not** name. Every *typed* field that
 /// can change the model's answer must be lifted here explicitly, or it becomes
-/// invisible to everything reading the domain view — most sharply the response
-/// cache's identity hash, for which an unseen knob is a wrong hit rather than a
-/// miss. `None` is not inserted: an absent parameter must hash identically to
-/// one that was never sent.
+/// invisible to everything reading the domain view — most sharply
+/// `not_carried_to`, which names a lifted knob a translation drops. `None` is
+/// not inserted: an absent parameter must read as one that was never sent.
 ///
 /// The prefix keeps these out of the way of genuine unknown-field passthrough
 /// and marks provenance. Nothing reads any of them back on the Chat Completions,
@@ -50,8 +49,8 @@ use crate::error::AppError;
 /// (`ApiRequest::carry_knobs_onto`), so they need no restoration here. Four
 /// `gemini_*` keys predate this helper and *are* restored by `translate_to`
 /// (`gemini_top_k`, `gemini_presence_penalty`, `gemini_frequency_penalty`,
-/// `gemini_seed`); the rest, including the newer `gemini_*` ones, exist purely
-/// so the value reaches the response cache's identity hash.
+/// `gemini_seed`); the rest, including the newer `gemini_*` ones, exist so a
+/// translation that drops them names them.
 fn push_wire_param<T: Into<Value>>(
     extra: &mut BTreeMap<String, Value>,
     key: &str,
@@ -85,12 +84,14 @@ pub struct DomainRequest {
     /// the translation site for that target — never by a parser, which knows
     /// no target. See [`UpstreamFacts`].
     pub upstream: UpstreamFacts,
-    /// What a Chat system, assistant or tool message carried beside its text,
-    /// and the members of an Anthropic or Gemini block, which the domain does
-    /// not model (`chat_history_parts`, `anthropic_history_parts`,
-    /// `gemini_history_parts`): named by
-    /// `not_carried_to` on a translation, and part of the response-cache
-    /// identity. Its own field, never a key in `extra`, which holds the
+    /// What a Chat message carried that the domain does not model (its `name`,
+    /// what a system, assistant or tool message carried beside its text), the
+    /// members of an Anthropic or Gemini block, which the domain does not
+    /// model (`chat_history_parts`, `anthropic_history_parts`,
+    /// `gemini_history_parts`), and a Gemini system instruction's parts other
+    /// than its text (`gemini_system_parts`): named by `not_carried_to` on a
+    /// translation.
+    /// Its own field, never a key in `extra`, which holds the
     /// client's own unknown fields — a client cannot write here.
     pub history_parts: Vec<Value>,
     pub stop_sequences: Option<Vec<String>>,
@@ -1684,46 +1685,54 @@ pub(crate) fn asks_nothing(value: &Value) -> bool {
     }
 }
 
-/// The parts of a non-user Chat message the domain does not model, each as
-/// `{"role": …, "kind": …, "sha256": …}` — what naming it and keying the cache
-/// need, never a copy of the part (a screenshot in a tool result would be
-/// copied again on every domain build): a content part other than text, an
-/// assistant's reasoning (a `reasoning_content` / `reasoning` key, a Mistral
-/// `thinking` chunk — another provider's reasoning, which no target verifies),
-/// and a message key with no domain field — Mistral's `prefix` among them: its
-/// answer repeats the prefix, every other protocol's prefill is answered with
-/// the continuation alone.
+/// One [`DomainRequest::history_parts`] entry: a member or part the domain
+/// does not model, by its kind and the role of the message it sits on — what
+/// naming it needs. The response cache keys the client's own request, so it reads none.
+fn history_entry(role: &str, kind: &str) -> Value {
+    serde_json::json!({"role": role, "kind": kind})
+}
+
+/// What a Chat message carries that the domain does not model: the `name` of
+/// a message other than a tool result (whose name its call holds) and a text,
+/// image or audio part's members beside its data on any role, and on a non-user message a
+/// content part other than text, an assistant's reasoning (a
+/// `reasoning_content` / `reasoning` key, a Mistral `thinking` chunk — another
+/// provider's reasoning, which no target verifies) and a message key with no
+/// domain field — Mistral's `prefix` among them: its answer repeats the
+/// prefix, every other protocol's prefill is answered with the continuation
+/// alone.
 fn chat_history_parts(msg: &Message) -> Vec<Value> {
     let role = msg.role.as_str();
-    // Serialized straight into the hasher: no copy of the part is made.
-    let entry = |kind: &str, part: &dyn json_digest::Hashable| {
-        let digest = part.sha256_hex();
-        serde_json::json!({"role": role, "kind": kind, "sha256": digest})
-    };
+    let user = role == "user";
     let mut out = Vec::new();
+    if msg.name.is_some() && !matches!(role, "tool" | "function") {
+        out.push(history_entry(role, "name"));
+    }
     if let Some(MessageContent::Parts(parts)) = &msg.content {
         for part in parts {
+            // A part's members beside its data, on any role.
+            if let ContentPart::Text { extra, .. } | ContentPart::ImageUrl { extra, .. } | ContentPart::InputAudio { extra, .. } = part {
+                out.extend(extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, _)| history_entry(role, k)));
+            }
             let kind = match part {
                 ContentPart::Text { .. } => continue,
+                _ if user => continue,
                 ContentPart::ImageUrl { .. } => "image_url",
                 ContentPart::InputAudio { .. } => "input_audio",
                 ContentPart::Unknown(v) => v.get("type").and_then(Value::as_str).unwrap_or("untyped"),
             };
-            out.push(entry(kind, part));
+            out.push(history_entry(role, kind));
         }
     }
-    for (key, value) in &msg.extra {
-        if asks_nothing(value) {
-            continue;
-        }
-        out.push(entry(key, value));
+    if !user {
+        out.extend(msg.extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, _)| history_entry(role, k)));
     }
     out
 }
 
 /// A value's SHA-256 over its JSON serialization, written straight into the
 /// hasher.
-mod json_digest {
+pub(crate) mod json_digest {
     use sha2::Digest;
 
     /// Feeds the bytes it is written straight to the hasher.
@@ -1857,7 +1866,7 @@ fn extract_text_content(content: &MessageContent) -> String {
         MessageContent::Parts(parts) => parts
             .iter()
             .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
+                ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1956,19 +1965,19 @@ fn anthropic_history_parts(msg: &AnthropicMessage) -> Vec<Value> {
         return Vec::new();
     };
     let role = msg.role.as_str();
-    let entry = |kind: &str, value: &Value| {
-        serde_json::json!({"role": role, "kind": kind, "sha256": json_digest::Hashable::sha256_hex(value)})
-    };
     let mut out = Vec::new();
+    let mut members = |extra: &BTreeMap<String, Value>| {
+        out.extend(extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, _)| history_entry(role, k)));
+    };
     for block in blocks {
         match block {
-            ContentBlock::Image { extra, .. } => out.extend(extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, v)| entry(k, v))),
+            ContentBlock::Image { extra, .. } => members(extra),
             ContentBlock::ToolResult { content, extra, .. } => {
-                out.extend(extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, v)| entry(k, v)));
+                members(extra);
                 if let Some(ToolResultContent::Blocks(inner)) = content {
                     for b in inner {
                         if let ToolResultBlock::Image { extra, .. } = b {
-                            out.extend(extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, v)| entry(k, v)));
+                            members(extra);
                         }
                     }
                 }
@@ -2415,11 +2424,11 @@ fn convert_chat_content_to_domain(content: Option<&MessageContent>) -> Vec<Domai
         Some(MessageContent::Parts(parts)) => parts
             .iter()
             .map(|p| match p {
-                ContentPart::Text { text } => DomainContentBlock::Text {
+                ContentPart::Text { text, .. } => DomainContentBlock::Text {
                     text: text.clone(),
                     cache_control: None,
                 },
-                ContentPart::ImageUrl { image_url } => {
+                ContentPart::ImageUrl { image_url, .. } => {
                     if let Some((media_type, data)) = split_data_uri(&image_url.url) {
                             return DomainContentBlock::Image {
                                 data: data.to_string(),
@@ -2435,12 +2444,12 @@ fn convert_chat_content_to_domain(content: Option<&MessageContent>) -> Vec<Domai
                 }
                 // An empty clip is not the clip the client sent: kept as the
                 // unknown part it is (`input_audio_of`'s rule).
-                ContentPart::InputAudio { input_audio } if input_audio.data.is_empty() => {
+                ContentPart::InputAudio { input_audio, .. } if input_audio.data.is_empty() => {
                     DomainContentBlock::Unknown {
                         value: serde_json::json!({"type": "input_audio", "input_audio": input_audio}),
                     }
                 }
-                ContentPart::InputAudio { input_audio } => DomainContentBlock::Audio {
+                ContentPart::InputAudio { input_audio, .. } => DomainContentBlock::Audio {
                     data: input_audio.data.clone(),
                     format: input_audio.format.clone(),
                     cache_control: None,
@@ -2535,6 +2544,34 @@ fn sniff_audio_format(b64: &str) -> Option<String> {
     Some(format.to_string())
 }
 
+/// The text body of a data URL: `head` as it came (`data:text/plain;base64,`,
+/// parameters included) and `text` encoded.
+pub(crate) fn text_data_url(url: &str, text: &str) -> Option<String> {
+    use base64::Engine;
+    let (head, _) = url.split_once(";base64,")?;
+    Some(format!("{head};base64,{}", base64::engine::general_purpose::STANDARD.encode(text)))
+}
+
+/// Whether a Chat or Responses content part reads as a document.
+pub(crate) fn part_is_document(part: &Value) -> bool {
+    matches!(parse_responses_content_part(part), DomainContentBlock::Document { .. })
+}
+
+/// Whether a Gemini blob reads as a document.
+pub(crate) fn gemini_blob_is_document(mime_type: &str, data: &str) -> bool {
+    matches!(gemini_inline_block(mime_type, data), Some(DomainContentBlock::Document { .. }))
+}
+
+/// Whether a function response's part reads as a document.
+pub(crate) fn gemini_response_part_is_document(part: &Value) -> bool {
+    matches!(gemini_function_response_part(part), DomainContentBlock::Document { .. })
+}
+
+/// Encode a text as a Gemini blob's `data`.
+pub(crate) fn gemini_text_data(text: &str) -> String {
+    gemini_text_blob_data(text)
+}
+
 /// Parse a Responses API content part (JSON Value) into a domain block.
 /// Used by both `convert_chat_content_to_domain` (for Unknown parts) and
 /// `convert_raw_items_to_domain` (for message content arrays).
@@ -2617,15 +2654,15 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                 // decoding narrower leaves base64 to be inlined as prose. Both
                 // are silent corruption, in opposite directions.
                 // A text file is its text; bytes that are not UTF-8 stay the
-                // client's part, as sent. A data URL's base64 is the standard,
-                // padded alphabet; a payload that is not — most likely
-                // already prose — is passed through unchanged rather than lost.
-                if mime.starts_with("text/") {
-                    use base64::Engine;
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                        return text_file_document(mime, bytes, filename)
-                            .unwrap_or_else(|| DomainContentBlock::Unknown { value: part.clone() });
-                    }
+                // client's part, as sent. A data URL's base64 reads as a
+                // data URL's reader decodes it, padded or not and wrapped or
+                // not; a payload that is not base64 — most likely already
+                // prose — is passed through unchanged rather than lost.
+                if mime.starts_with("text/")
+                    && let Some(bytes) = decode_proto_bytes(b64)
+                {
+                    return text_file_document(mime, bytes, filename)
+                        .unwrap_or_else(|| DomainContentBlock::Unknown { value: part.clone() });
                 }
                 return DomainContentBlock::Document {
                     data: b64.to_string(),
@@ -2726,11 +2763,10 @@ const RESPONSES_ITEM_TYPES: &[&str] = &[
 /// and the audit row, so only a short plain name is used; anything else is
 /// `unknown`.
 pub fn unknown_part_kind(value: &Value) -> &str {
-    const PART_FIELDS: [&str; 5] = ["thought", "thoughtSignature", "partMetadata", "mediaResolution", "videoMetadata"];
     value
         .get("type")
         .and_then(Value::as_str)
-        .or_else(|| value.as_object()?.keys().map(String::as_str).find(|k| !PART_FIELDS.contains(k)))
+        .or_else(|| value.as_object()?.keys().map(String::as_str).find(|k| !crate::api::gemini::is_part_member(k)))
         .filter(|kind| kind.len() <= 64 && kind.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)))
         .unwrap_or("unknown")
 }
@@ -3056,8 +3092,13 @@ fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
                             cache_control: None,
                         });
                     } else if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
+                        // The spec's message without its optional `type`: a
+                        // part reads as on any message, an untyped one by its
+                        // `text`.
                         for part in parts {
-                            if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            if part.get("type").is_some() {
+                                content.push(parse_responses_content_part(part));
+                            } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 content.push(DomainContentBlock::Text {
                                     text: text.to_string(),
                                     cache_control: None,
@@ -3182,7 +3223,6 @@ fn anthropic_conversation(items: &[AnthropicMessage]) -> Vec<DomainMessage> {
 struct ChatConversation {
     system_prompt_parts: Vec<String>,
     messages: Vec<DomainMessage>,
-    history_parts: Vec<Value>,
 }
 
 /// How many leading Chat Completions messages carry the system prompt: every
@@ -3204,15 +3244,8 @@ pub fn chat_system_lead(messages: &[Message]) -> usize {
 fn chat_conversation(items: &[Message]) -> ChatConversation {
     let mut system_prompt_parts: Vec<String> = Vec::new();
     let mut messages = Vec::new();
-    // What a system, assistant or tool message carries beside its text,
-    // which the domain does not model: named by `not_carried_to` on every
-    // translation, and hashed into the response-cache identity.
-    let mut history_parts: Vec<Value> = Vec::new();
 
     for msg in items {
-        if msg.role != "user" {
-            history_parts.extend(chat_history_parts(msg));
-        }
         if msg.role == "system" || msg.role == "developer" {
             let text = msg
                 .content
@@ -3305,7 +3338,7 @@ fn chat_conversation(items: &[Message]) -> ChatConversation {
             }
         }
     }
-    ChatConversation { system_prompt_parts, messages, history_parts }
+    ChatConversation { system_prompt_parts, messages }
 }
 
 /// The domain messages of a Responses `input`, from its item `from` on (a bare
@@ -3343,8 +3376,7 @@ fn responses_conversation(input: &ResponseInput, from: usize) -> Vec<DomainMessa
 
 /// The domain messages of Gemini `contents`.
 fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
-    let mut unanswered: Vec<(&str, String)> = Vec::new();
-    let mut generated_ids = std::collections::HashSet::new();
+    let ids = GeminiCallIds::of(items);
     let mut messages = Vec::new();
     for (turn, content) in items.iter().enumerate() {
         let role_str = content.role.as_deref().unwrap_or("user");
@@ -3357,11 +3389,8 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
 
         for (idx, part) in content.parts.iter().enumerate() {
             match part {
-                GeminiPart::Text { text } => {
-                    content_blocks.push(DomainContentBlock::Text {
-                        text: text.clone(),
-                        cache_control: None,
-                    });
+                GeminiPart::Text { text } | GeminiPart::ThoughtText { thought: false, text, .. } => {
+                    content_blocks.push(DomainContentBlock::Text { text: text.clone(), cache_control: None });
                 }
                 GeminiPart::ThoughtText { thought: true, text, thought_signature } => {
                     content_blocks.push(DomainContentBlock::Thinking {
@@ -3370,26 +3399,19 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
                         signed_by: thought_signature.as_ref().map(|_| ApiVersion::GoogleGemini),
                     });
                 }
-                GeminiPart::ThoughtText { thought: false, text, .. } => {
-                    content_blocks.push(DomainContentBlock::Text {
-                        text: text.clone(),
-                        cache_control: None,
-                    });
-                }
-                GeminiPart::InlineData { inline_data } => {
-                    // A blob the domain has no block for travels as sent.
+                GeminiPart::InlineData { inline_data, .. } => {
+                    // A blob the domain has no block for travels as sent, the
+                    // part's members beside it included (a clip's interval).
                     content_blocks.push(gemini_inline_block(&inline_data.mime_type, &inline_data.data).unwrap_or_else(
-                        || DomainContentBlock::Unknown { value: serde_json::json!({ "inlineData": inline_data }) },
+                        || DomainContentBlock::Unknown { value: serde_json::to_value(part).unwrap_or(Value::Null) },
                     ));
                 }
                 // A clip by URI is of no kind the domain has a block for, like a
                 // clip's bytes (`gemini_inline_block`).
-                GeminiPart::FileData { file_data }
-                    if file_data.mime_type.as_deref().is_some_and(|m| m.starts_with("video/")) =>
-                {
-                    content_blocks.push(DomainContentBlock::Unknown { value: serde_json::json!({ "fileData": file_data }) });
+                GeminiPart::FileData { file_data, .. } if gemini_file_is_unknown(file_data) => {
+                    content_blocks.push(DomainContentBlock::Unknown { value: serde_json::to_value(part).unwrap_or(Value::Null) });
                 }
-                GeminiPart::FileData { file_data } => {
+                GeminiPart::FileData { file_data, .. } => {
                     content_blocks.push(DomainContentBlock::File {
                         file_id: None,
                         url: Some(file_data.file_uri.clone()),
@@ -3399,15 +3421,8 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
                     });
                 }
                 GeminiPart::FunctionCall { function_call, thought_signature } => {
-                    // A call with no `id` takes a generated one, unique in the request:
-                    // each model turn numbers its parts from zero.
-                    let id = function_call.id.clone().unwrap_or_else(|| {
-                        let id = format!("call_{idx}");
-                        if generated_ids.insert(id.clone()) { id } else { format!("call_{turn}_{idx}") }
-                    });
-                    unanswered.push((function_call.name.as_str(), id.clone()));
                     content_blocks.push(DomainContentBlock::ToolUse {
-                        id,
+                        id: ids.call(turn, idx).to_string(),
                         name: function_call.name.clone(),
                         input: function_call.args.clone(),
                         input_raw: None,
@@ -3441,7 +3456,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
 
         // Emit each functionResponse as a separate Tool-role message: its
         // `response` as text, then its media parts.
-        for (fr, _idx) in func_responses {
+        for (fr, idx) in func_responses {
             let text = if fr.response.is_string() {
                 fr.response.as_str().unwrap_or("").to_string()
             } else {
@@ -3451,7 +3466,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
             content.extend(fr.parts.iter().map(gemini_function_response_part));
             messages.push(DomainMessage {
                 role: DomainRole::Tool {
-                    tool_call_id: gemini_response_call_id(fr, &mut unanswered),
+                    tool_call_id: ids.response(turn, idx).to_string(),
                     is_error: None,
                     cache_control: None,
                 },
@@ -3462,16 +3477,92 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
     messages
 }
 
-/// The call a function response answers: its own `id`, optional on Gemini, else
-/// the earliest unanswered call of its name. A walk to a protocol that pairs by id
-/// reads the two as one exchange, or the repair of an orphaned pair drops both.
-fn gemini_response_call_id(response: &GeminiFunctionResponseData, unanswered: &mut Vec<(&str, String)>) -> String {
-    let position = match &response.id {
-        Some(id) => unanswered.iter().position(|(_, call)| call == id),
-        None => unanswered.iter().position(|(name, _)| *name == response.name),
-    };
-    let answered = position.map(|at| unanswered.remove(at).1);
-    response.id.clone().or(answered).unwrap_or_else(|| response.name.clone())
+/// Each call of a Gemini request's `contents` and the call each function
+/// response answers, by `(content, part)` — the one reading of them, shared by
+/// the request's parse and every rewrite of its responses
+/// (`ApiRequest::redact_tool_results`).
+///
+/// A call with no `id` takes a generated one, unique in the request: each
+/// content numbers its parts from zero. A response answers the call of its own
+/// `id` (optional on Gemini), else the earliest unanswered call of its name; a
+/// walk to a protocol that pairs by id reads the two as one exchange, or the
+/// repair of an orphaned pair drops both. A content's calls are read before
+/// its responses.
+pub(crate) struct GeminiCallIds {
+    calls: std::collections::HashMap<PartAt, String>,
+    /// Each response's call id, and the place of the call it answers.
+    responses: std::collections::HashMap<PartAt, (String, Option<PartAt>)>,
+}
+
+/// A part's place in Gemini `contents`: `(content, part)`.
+type PartAt = (usize, usize);
+
+impl GeminiCallIds {
+    pub(crate) fn of(contents: &[GeminiContent]) -> Self {
+        let mut ids = Self { calls: Default::default(), responses: Default::default() };
+        // An empty id names nothing, like an absent one.
+        let named = |id: &Option<String>| id.clone().filter(|id| !id.is_empty());
+        let mut unanswered: Vec<(&str, String, PartAt)> = Vec::new();
+        // A generated id is unique among the request's calls: never one a call
+        // states, nor one generated before.
+        let mut taken: std::collections::HashSet<String> = contents
+            .iter()
+            .flat_map(|c| &c.parts)
+            .filter_map(|p| match p {
+                GeminiPart::FunctionCall { function_call, .. } => named(&function_call.id),
+                _ => None,
+            })
+            .collect();
+        for (turn, content) in contents.iter().enumerate() {
+            for (idx, part) in content.parts.iter().enumerate() {
+                if let GeminiPart::FunctionCall { function_call, .. } = part {
+                    let id = named(&function_call.id).unwrap_or_else(|| {
+                        let id = [format!("call_{idx}"), format!("call_{turn}_{idx}")]
+                            .into_iter()
+                            .chain((1..).map(|k| format!("call_{turn}_{idx}_{k}")))
+                            .find(|id| !taken.contains(id))
+                            .unwrap_or_default();
+                        taken.insert(id.clone());
+                        id
+                    });
+                    unanswered.push((function_call.name.as_str(), id.clone(), (turn, idx)));
+                    ids.calls.insert((turn, idx), id);
+                }
+            }
+            for (idx, part) in content.parts.iter().enumerate() {
+                if let GeminiPart::FunctionResponse { function_response: response } = part {
+                    let own = named(&response.id);
+                    let position = match &own {
+                        Some(id) => unanswered.iter().position(|(_, call, _)| call == id),
+                        None => unanswered.iter().position(|(name, _, _)| *name == response.name),
+                    };
+                    let answered = position.map(|at| unanswered.remove(at));
+                    let call = answered.as_ref().map(|(_, _, at)| *at);
+                    let id = own.or(answered.map(|(_, id, _)| id)).unwrap_or_else(|| response.name.clone());
+                    ids.responses.insert((turn, idx), (id, call));
+                }
+            }
+        }
+        ids
+    }
+
+    /// The id of the call at part `part` of content `content`.
+    pub(crate) fn call(&self, content: usize, part: usize) -> &str {
+        self.calls.get(&(content, part)).map_or("", String::as_str)
+    }
+
+    /// The id of the call the response at part `part` of content `content`
+    /// answers — its function's name where it answers none.
+    pub(crate) fn response(&self, content: usize, part: usize) -> &str {
+        self.responses.get(&(content, part)).map_or("", |(id, _)| id.as_str())
+    }
+
+    /// Where the call the response at part `part` of content `content`
+    /// answers sits, as `(content, part)` — none where it answers no call of
+    /// the request.
+    pub(crate) fn answered(&self, content: usize, part: usize) -> Option<PartAt> {
+        self.responses.get(&(content, part)).and_then(|(_, at)| *at)
+    }
 }
 
 /// A `text/*` file's bytes as a text document — the one reading of a text
@@ -3535,6 +3626,11 @@ fn gemini_text_blob_data(text: &str) -> String {
 /// UTF-8, or the media type is of a kind the domain has no block for (a
 /// `video/*` clip, which only Gemini takes).
 fn gemini_inline_block(mt: &str, data: &str) -> Option<DomainContentBlock> {
+    // The kinds read as a block are `gemini_inline_is_typed`'s, which decides
+    // whether a part's members are named on a translation.
+    if !gemini_inline_is_typed(mt) {
+        return None;
+    }
     let standard = |data: &str| -> Option<String> {
         use base64::Engine;
         if is_standard_base64(data) {
@@ -3618,39 +3714,110 @@ fn gemini_function_response_part(part: &Value) -> DomainContentBlock {
     }
 }
 
-/// The members of a Gemini content's function responses the domain does not
-/// model — `willContinue`, `scheduling`, a blob's `displayName` — each as a
-/// [`DomainRequest::history_parts`] entry, so a walk that leaves them behind
+/// Whether a message part's `inlineData` of this media type is read as a typed
+/// block rather than kept whole as `Unknown` — by its type alone, with no copy
+/// of the blob; `gemini_inline_block` reads no other kind. A typed blob that
+/// fails to decode is kept whole as well, and its members are then named though
+/// they travel.
+fn gemini_inline_is_typed(mime_type: &str) -> bool {
+    matches!(mime_type.split_once('/'), Some(("text" | "audio" | "application" | "image", _)))
+}
+
+/// Whether a message part's `fileData` is kept whole as `Unknown`: a clip by
+/// URI, of no kind the domain has a block for.
+fn gemini_file_is_unknown(file_data: &crate::api::gemini::GeminiFileData) -> bool {
+    file_data.mime_type.as_deref().is_some_and(|m| m.starts_with("video/"))
+}
+
+/// The members of a Gemini content the domain does not model — a media
+/// part's `mediaResolution`, `thoughtSignature` or `thought`, a function
+/// response's `willContinue` or `scheduling`, a blob's `displayName` — each as
+/// a [`DomainRequest::history_parts`] entry, so a walk that leaves them behind
 /// names them.
 fn gemini_history_parts(content: &GeminiContent) -> Vec<Value> {
     let role = content.role.as_deref().unwrap_or("user");
-    let entry = |kind: &str, value: &Value| {
-        serde_json::json!({"role": role, "kind": kind, "sha256": json_digest::Hashable::sha256_hex(value)})
-    };
+    let entry = |kind: &str| history_entry(role, kind);
     let mut out = Vec::new();
     for part in &content.parts {
+        // A media part's members beside its blob: a part the domain keeps as
+        // `Unknown` travels whole, so only one read as a typed block loses them.
+        // An empty setting (`videoMetadata: {}`) asks for nothing.
+        let members = match part {
+            GeminiPart::InlineData { inline_data, members } if gemini_inline_is_typed(&inline_data.mime_type) => {
+                Some(members)
+            }
+            GeminiPart::FileData { file_data, members } if !gemini_file_is_unknown(file_data) => Some(members),
+            _ => None,
+        };
+        out.extend(
+            members
+                .into_iter()
+                .flatten()
+                .filter(|(_, v)| !asks_nothing(v) && !v.as_object().is_some_and(serde_json::Map::is_empty))
+                .map(|(k, _)| entry(k)),
+        );
         let GeminiPart::FunctionResponse { function_response } = part else {
             continue;
         };
-        out.extend(function_response.extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, v)| entry(k, v)));
+        out.extend(function_response.extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, _)| entry(k)));
         for p in &function_response.parts {
             if let Some(Value::Object(inline)) = p.get("inlineData") {
                 out.extend(
                     inline
                         .iter()
                         .filter(|(k, v)| !matches!(k.as_str(), "mimeType" | "data") && !asks_nothing(v))
-                        .map(|(k, v)| entry(k, v)),
+                        .map(|(k, _)| entry(k)),
                 );
             }
             // An image reference's title has no place on an image anywhere else.
-            if let Some(name) = p.pointer("/fileData/displayName")
+            if p.pointer("/fileData/displayName").is_some()
                 && p.pointer("/fileData/mimeType").and_then(Value::as_str).is_some_and(|m| m.starts_with("image/"))
             {
-                out.push(entry("displayName", name));
+                out.push(entry("displayName"));
             }
         }
     }
     out
+}
+
+/// A Gemini `systemInstruction`'s parts other than its text
+/// ([`GeminiContent::system_text`], the domain's system prompt) — each as a
+/// system-role [`DomainRequest::history_parts`] entry, by
+/// [`gemini_part_kind`], so a translation that leaves them behind names them.
+fn gemini_system_parts(system: Option<&GeminiContent>) -> impl Iterator<Item = Value> + '_ {
+    system
+        .into_iter()
+        .flat_map(|si| &si.parts)
+        .filter_map(|part| match part {
+            // Its text is the prompt's; a signature over it has no channel elsewhere.
+            GeminiPart::ThoughtText { thought: false, thought_signature: Some(_), .. } => Some("thoughtSignature"),
+            p if p.system_text().is_some() => None,
+            p => Some(gemini_part_kind(p)),
+        })
+        .map(|kind| history_entry("system", kind))
+}
+
+/// What a Gemini part is, by its data member's kind — an image, audio or a
+/// document by its MIME type where a message's part of that type is read as a
+/// block (`gemini_inline_is_typed`), else by the member's own name.
+fn gemini_part_kind(part: &GeminiPart) -> &str {
+    match part {
+        GeminiPart::Text { .. } | GeminiPart::ThoughtText { thought: false, .. } => "text",
+        GeminiPart::ThoughtText { .. } => "thought",
+        GeminiPart::FunctionCall { .. } => "function call",
+        GeminiPart::FunctionResponse { .. } => "function response",
+        GeminiPart::InlineData { inline_data, .. } if gemini_inline_is_typed(&inline_data.mime_type) => {
+            match inline_data.mime_type.split_once('/').map(|(kind, _)| kind) {
+                Some("image") => "image",
+                Some("audio") => "audio",
+                _ => "document",
+            }
+        }
+        GeminiPart::InlineData { .. } => "inlineData",
+        GeminiPart::FileData { file_data, .. } if gemini_file_is_unknown(file_data) => "fileData",
+        GeminiPart::FileData { .. } => "file",
+        GeminiPart::Unknown(v) => unknown_part_kind(v),
+    }
 }
 
 // ─── to_* helpers ───
@@ -3668,7 +3835,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
             .iter()
             .filter_map(|b| match b {
                 DomainContentBlock::Text { text, .. } => {
-                    Some(ContentPart::Text { text: text.clone() })
+                    Some(ContentPart::text(text.clone()))
                 }
                 DomainContentBlock::Image {
                     data, media_type, ..
@@ -3680,6 +3847,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                     };
                     Some(ContentPart::ImageUrl {
                         image_url: ImageUrl { url, detail: None },
+                        extra: BTreeMap::new(),
                     })
                 }
                 DomainContentBlock::Document {
@@ -3695,7 +3863,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                     // its title instead was silently losing the document for a
                     // model the operator had declared capable of reading it.
                     if media_type.starts_with("text/") {
-                        Some(ContentPart::Text { text: data.clone() })
+                        Some(ContentPart::text(data.clone()))
                     } else if media_type != "document/url" && !data.is_empty() {
                         Some(ContentPart::Unknown(serde_json::json!({
                             "type": "file",
@@ -3722,9 +3890,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                             .as_deref()
                             .or_else(|| (media_type == "document/url").then_some(data.as_str()))
                             .unwrap_or("untitled");
-                        Some(ContentPart::Text {
-                            text: format!("[Document: {label}]"),
-                        })
+                        Some(ContentPart::text(format!("[Document: {label}]")))
                     }
                 }
                 DomainContentBlock::Audio { data, format, .. } => {
@@ -3733,6 +3899,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                             data: data.clone(),
                             format: format.clone(),
                         },
+                        extra: BTreeMap::new(),
                     })
                 }
                 // Chat Completions locates a file by `file.file_id` (or by
@@ -3741,7 +3908,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                 // URL-only reference is named rather than dropped.
                 // An image by URL is an image.
                 b @ DomainContentBlock::File { url: Some(url), .. } if file_reference_is_web_image(b) => {
-                    Some(ContentPart::ImageUrl { image_url: ImageUrl { url: url.clone(), detail: None } })
+                    Some(ContentPart::ImageUrl { image_url: ImageUrl { url: url.clone(), detail: None }, extra: BTreeMap::new() })
                 }
                 DomainContentBlock::File { file_id, url, filename, .. } => {
                     if let Some(id) = file_id {
@@ -3758,9 +3925,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                             .as_deref()
                             .or(url.as_deref())
                             .unwrap_or("untitled");
-                        Some(ContentPart::Text {
-                            text: format!("[File: {label}]"),
-                        })
+                        Some(ContentPart::text(format!("[File: {label}]")))
                     }
                 }
                 block @ (DomainContentBlock::BlobRef { .. } | DomainContentBlock::Stripped { .. }) => {
@@ -3917,28 +4082,13 @@ fn domain_to_gemini_parts(
                 // bytes, so routing it to `inlineData` would put a URL where
                 // base64 belongs AND a non-MIME string in `mimeType`.
                 if media_type == "image/url" {
-                    Some(GeminiPart::FileData {
-                        file_data: crate::api::gemini::GeminiFileData {
-                            mime_type: None,
-                            file_uri: data.clone(),
-                        },
-                    })
+                    Some(GeminiPart::file(None, data.clone()))
                 } else {
-                    Some(GeminiPart::InlineData {
-                        inline_data: GeminiInlineData {
-                            mime_type: media_type.clone(),
-                            data: data.clone(),
-                        },
-                    })
+                    Some(GeminiPart::inline(media_type.clone(), data.clone()))
                 }
             }
             DomainContentBlock::Audio { data, format, .. } => {
-                Some(GeminiPart::InlineData {
-                    inline_data: GeminiInlineData {
-                        mime_type: format!("audio/{format}"),
-                        data: data.clone(),
-                    },
-                })
+                Some(GeminiPart::inline(format!("audio/{format}"), data.clone()))
             }
             DomainContentBlock::Document { data, media_type, title, .. } => {
                 // `inlineData.data` is base64 under a real media type, so neither
@@ -3946,31 +4096,16 @@ fn domain_to_gemini_parts(
                 // document is text, and a bodiless one is named — the same split
                 // the Chat and Responses walks make.
                 if media_type.starts_with("text/") && text_documents_as_blobs {
-                    Some(GeminiPart::InlineData {
-                        inline_data: GeminiInlineData {
-                            mime_type: media_type.clone(),
-                            data: gemini_text_blob_data(data),
-                        },
-                    })
+                    Some(GeminiPart::inline(media_type.clone(), gemini_text_blob_data(data)))
                 } else if media_type.starts_with("text/") {
                     Some(GeminiPart::Text { text: data.clone() })
                 } else if data.is_empty() || media_type.is_empty() {
                     let label = title.as_deref().unwrap_or("untitled");
                     Some(GeminiPart::Text { text: format!("[Document: {label}]") })
                 } else if media_type == "document/url" {
-                    Some(GeminiPart::FileData {
-                        file_data: crate::api::gemini::GeminiFileData {
-                            mime_type: None,
-                            file_uri: data.clone(),
-                        },
-                    })
+                    Some(GeminiPart::file(None, data.clone()))
                 } else {
-                    Some(GeminiPart::InlineData {
-                        inline_data: GeminiInlineData {
-                            mime_type: media_type.clone(),
-                            data: data.clone(),
-                        },
-                    })
+                    Some(GeminiPart::inline(media_type.clone(), data.clone()))
                 }
             }
             DomainContentBlock::ToolUse { id, name, input, thought_signature, .. } => {
@@ -3999,12 +4134,7 @@ fn domain_to_gemini_parts(
                 })
             }
             DomainContentBlock::File { url, media_type, .. } => {
-                url.as_ref().map(|u| GeminiPart::FileData {
-                    file_data: crate::api::gemini::GeminiFileData {
-                        mime_type: media_type.clone(),
-                        file_uri: u.clone(),
-                    },
-                })
+                url.as_ref().map(|u| GeminiPart::file(media_type.clone(), u.clone()))
             }
             block @ (DomainContentBlock::BlobRef { .. } | DomainContentBlock::Stripped { .. }) => {
                 // Streamscope-synthetic placeholders — forward as passthrough Unknown
@@ -5257,23 +5387,17 @@ impl DomainRequest {
         // Gemini client's, never translated to Gemini).
         out.extend(self.extra.iter().flat_map(|(k, v)| extra_not_carried(k, v)));
         // History parts no walk renders, named once per kind and role.
-        let mut parts: Vec<(String, usize)> = Vec::new();
-        for entry in &self.history_parts {
-            let role = entry.get("role").and_then(Value::as_str).unwrap_or("?");
-            let label = format!(
-                "{} on {} {role} message",
-                entry.get("kind").and_then(Value::as_str).unwrap_or("untyped"),
-                crate::api::mistral::a(role),
-            );
-            match parts.iter_mut().find(|(l, _)| *l == label) {
-                Some((_, n)) => *n += 1,
-                None => parts.push((label, 1)),
-            }
-        }
-        out.extend(parts.into_iter().map(|(label, n)| match n {
-            1 => label,
-            n => format!("{label} (×{n})"),
-        }));
+        out.extend(counted(
+            self.history_parts.iter().map(|entry| {
+                let role = entry.get("role").and_then(Value::as_str).unwrap_or("?");
+                format!(
+                    "{} on {} {role} message",
+                    entry.get("kind").and_then(Value::as_str).unwrap_or("untyped"),
+                    crate::api::mistral::a(role),
+                )
+            }),
+            str::to_string,
+        ));
         // A Gemini client's built-in tools exist only on Gemini.
         if target != ApiVersion::GoogleGemini
             && let Some(Value::Array(builtins)) = self.extra.get("gemini_builtin_tools")
@@ -5871,8 +5995,8 @@ impl DomainRequest {
         // message that appears *after* conversational content is in-array
         // system content and is preserved as a `DomainRole::System` message
         // at its position. `developer` is OpenAI's renamed system channel.
-        let ChatConversation { system_prompt_parts, messages, history_parts } =
-            chat_conversation(items);
+        let ChatConversation { system_prompt_parts, messages } = chat_conversation(items);
+        let history_parts = items.iter().flat_map(chat_history_parts).collect();
 
         let tools = req.tools.as_ref().map(|tools| {
             tools
@@ -5931,10 +6055,9 @@ impl DomainRequest {
 
         // Answer-affecting knobs Chat Completions types but the domain does not
         // model. `extra` only captures *unknown* fields, so without this they
-        // would be invisible to every consumer of the domain view — including
-        // the response cache's identity hash, which would then serve one
-        // request's answer to another that differs only in `seed` / `n` /
-        // `logit_bias`. A passthrough forward re-serializes this struct, so the
+        // would be invisible to every consumer of the domain view — a
+        // translation would drop `seed` / `n` / `logit_bias` without naming
+        // them. A passthrough forward re-serializes this struct, so the
         // upstream really does act on them.
         let mut extra = req.extra.clone();
         push_wire_param(&mut extra, "openai_frequency_penalty", req.frequency_penalty);
@@ -5949,8 +6072,8 @@ impl DomainRequest {
         // `max_tokens`), but a passthrough forwards the spellings as sent and a
         // server reading only `max_tokens` answers them differently. Mark only
         // what that one cap cannot say — `max_completion_tokens` was used, and
-        // the `max_tokens` beside it — so a plain `max_tokens` keys exactly like
-        // the same cap from another protocol (a cross-protocol hit).
+        // the `max_tokens` beside it — so a plain `max_tokens` reads exactly
+        // like the same cap from another protocol.
         push_wire_param(&mut extra, "openai_max_completion_tokens", req.max_completion_tokens);
         push_wire_param(
             &mut extra,
@@ -6930,22 +7053,13 @@ impl DomainRequest {
     /// `from` on.
     fn gemini_from(req: &GeminiRequest, from: usize) -> Self {
         // System instruction → DomainSystemPrompt
-        let system_prompt = req.system_instruction.as_ref().map(|si| {
-            let text = si
-                .parts
-                .iter()
-                .filter_map(|p| match p {
-                    GeminiPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            DomainSystemPrompt::Text(text)
-        });
+        let system_prompt = req.system_instruction.as_ref().and_then(GeminiContent::system_text).map(DomainSystemPrompt::Text);
 
         // Contents → DomainMessages
         let messages = gemini_conversation(tail(&req.contents, from));
-        let history_parts = tail(&req.contents, from).iter().flat_map(gemini_history_parts).collect();
+        let history_parts = gemini_system_parts(req.system_instruction.as_ref())
+            .chain(tail(&req.contents, from).iter().flat_map(gemini_history_parts))
+            .collect();
 
         // Tools → DomainTools
         let tools = req.tools.as_ref().map(|tools| {
@@ -7014,8 +7128,7 @@ impl DomainRequest {
         // Gemini-specific extras for passthrough
         let mut extra = BTreeMap::new();
         // Built-in tools are Gemini's own, not domain tools: carried for the
-        // Gemini walk to restore and for the cache identity, which must see
-        // everything a same-protocol forward sends.
+        // Gemini walk to restore, and named where a translation drops them.
         let builtins: Vec<Value> = req
             .tools
             .iter()
@@ -7045,7 +7158,7 @@ impl DomainRequest {
                 extra.insert("gemini_seed".to_string(), serde_json::json!(seed));
             }
             // Not restored by `translate_to`, but they change the answer or its
-            // shape, so they must reach the cache identity — see
+            // shape, so a translation that drops them names them — see
             // `push_wire_param`. `candidate_count` is Gemini's `n`;
             // `response_mime_type` only reaches `response_format` above when it
             // is `application/json`, so any other mime type (enum output, XML)
@@ -8155,7 +8268,7 @@ mod tests {
             MessageContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
                 match &parts[0] {
-                    ContentPart::ImageUrl { image_url } => {
+                    ContentPart::ImageUrl { image_url, .. } => {
                         assert_eq!(image_url.url, "data:image/png;base64,abc");
                     }
                     other => panic!("expected ImageUrl, got {other:?}"),
@@ -8967,8 +9080,8 @@ mod tests {
             },
         ]);
         let parts = chat_parts(&dr);
-        assert_matches!(&parts[1], ContentPart::Text { text } if text == "plain words");
-        assert_matches!(&parts[2], ContentPart::Text { text }
+        assert_matches!(&parts[1], ContentPart::Text { text, .. } if text == "plain words");
+        assert_matches!(&parts[2], ContentPart::Text { text, .. }
             if text == "[Document: https://x/d.pdf]");
     }
 
@@ -8995,7 +9108,7 @@ mod tests {
             filename: None,
             cache_control: None,
         }]);
-        assert_matches!(&chat_parts(&by_url)[0], ContentPart::Text { text }
+        assert_matches!(&chat_parts(&by_url)[0], ContentPart::Text { text, .. }
             if text == "[File: https://x/f.pdf]");
     }
 
@@ -9022,7 +9135,7 @@ mod tests {
         ]);
         let parts = chat_parts(&dr);
         assert_eq!(parts.len(), 3, "{parts:?}");
-        assert_matches!(&parts[1], ContentPart::Text { text } if text.contains("`future_block`"));
+        assert_matches!(&parts[1], ContentPart::Text { text, .. } if text.contains("`future_block`"));
         assert_matches!(&parts[2], ContentPart::Unknown(v) if v["type"] == "stripped");
         dr.upstream.rerenders_client_request = true;
         let parts = chat_parts(&dr);
@@ -9088,9 +9201,9 @@ mod tests {
         ]);
         let gr = dr.to_gemini();
         let parts = &gr.contents[0].parts;
-        assert_matches!(&parts[0], GeminiPart::FileData { file_data }
+        assert_matches!(&parts[0], GeminiPart::FileData { file_data, .. }
             if file_data.file_uri == "https://x/d.pdf" && file_data.mime_type.is_none());
-        assert_matches!(&parts[1], GeminiPart::InlineData { inline_data }
+        assert_matches!(&parts[1], GeminiPart::InlineData { inline_data, .. }
             if inline_data.mime_type == "application/pdf" && inline_data.data == "Q0M=");
         assert_matches!(&parts[2], GeminiPart::Text { text } if text == "plain words");
         assert_matches!(&parts[3], GeminiPart::Text { text } if text == "[Document: Untyped]");
@@ -9284,7 +9397,7 @@ mod tests {
         let Some(MessageContent::Parts(parts)) = cc.messages[0].content.as_ref() else {
             panic!("a multimodal turn must render as parts");
         };
-        assert_matches!(&parts[1], ContentPart::ImageUrl { image_url }
+        assert_matches!(&parts[1], ContentPart::ImageUrl { image_url, .. }
             if image_url.url == "data:image/png;base64,AAAA");
 
         // Responses: `input_image` whose `image_url` is a PLAIN STRING.
@@ -9295,7 +9408,7 @@ mod tests {
         // Gemini: `inlineData` carrying the raw base64 under a real media type.
         let gr = dr.to_gemini();
         assert_matches!(&gr.contents[0].parts[1],
-            GeminiPart::InlineData { inline_data }
+            GeminiPart::InlineData { inline_data, .. }
             if inline_data.mime_type == "image/png" && inline_data.data == "AAAA");
     }
 
@@ -9317,7 +9430,7 @@ mod tests {
         let Some(MessageContent::Parts(parts)) = cc.messages[0].content.as_ref() else {
             panic!("a multimodal turn must render as parts");
         };
-        assert_matches!(&parts[0], ContentPart::ImageUrl { image_url }
+        assert_matches!(&parts[0], ContentPart::ImageUrl { image_url, .. }
             if image_url.url == "https://x/i.png");
 
         let parts = responses_user_parts(&dr);
@@ -9326,7 +9439,7 @@ mod tests {
 
         let gr = dr.to_gemini();
         assert_matches!(&gr.contents[0].parts[0],
-            GeminiPart::FileData { file_data }
+            GeminiPart::FileData { file_data, .. }
             if file_data.file_uri == "https://x/i.png" && file_data.mime_type.is_none());
     }
 
@@ -10305,7 +10418,7 @@ mod tests {
         match &cc.messages[0].content {
             Some(MessageContent::Parts(parts)) => {
                 match &parts[0] {
-                    ContentPart::Text { text } => assert_eq!(text, "Hello world"),
+                    ContentPart::Text { text, .. } => assert_eq!(text, "Hello world"),
                     other => panic!("expected Text, got {other:?}"),
                 }
             }
@@ -10407,7 +10520,7 @@ mod tests {
         match &cc.messages[0].content {
             Some(MessageContent::Parts(parts)) => {
                 match &parts[0] {
-                    ContentPart::InputAudio { input_audio } => {
+                    ContentPart::InputAudio { input_audio, .. } => {
                         assert_eq!(input_audio.data, "base64audio");
                         assert_eq!(input_audio.format, "wav");
                     }
@@ -10763,10 +10876,10 @@ mod tests {
         let named_r = DomainRequest::from_responses(&responses).not_carried_to(ApiVersion::AnthropicMessages, "claude-sonnet-4-5", true);
         assert!(named_r.contains(&"parameter text.verbosity".to_string()), "{named_r:?}");
         assert!(!named_r.iter().any(|n| n.contains("text.format") || n == "parameter text"), "{named_r:?}");
-        // The parts key the cache: a different history reasoning is a different request.
+        // They key the cache: a different history reasoning is a different request.
         let mut other = req.clone();
         other.messages[2].extra.insert("reasoning_content".into(), Value::from("other"));
-        assert_ne!(DomainRequest::from_chat_completions(&other).history_parts, dr.history_parts);
+        assert_ne!(crate::proxy::response_cache::tests::content_hash(&crate::api::ApiRequest::ChatCompletions(other)), crate::proxy::response_cache::tests::content_hash(&crate::api::ApiRequest::ChatCompletions(req.clone())));
         // A client cannot forge them: a top-level field of that name is the
         // client's own unknown parameter, named as one.
         let mut forged = req.clone();
@@ -10875,7 +10988,7 @@ mod tests {
                 assert_eq!(parts.len(), 2, "the file reference must survive: {parts:?}");
                 assert_matches!(&parts[0], ContentPart::Unknown(v)
                     if v["type"] == "file" && v["file"]["file_id"] == "file_abc123");
-                assert_matches!(&parts[1], ContentPart::Text { text } if text == "Describe this");
+                assert_matches!(&parts[1], ContentPart::Text { text, .. } if text == "Describe this");
             }
             other => panic!("expected Parts, got {other:?}"),
         }
@@ -12411,29 +12524,29 @@ mod tests {
     // with no `..` rest pattern, so ADDING A FIELD TO A WIRE REQUEST BREAKS
     // COMPILATION HERE until someone classifies it.
     //
-    // This exists because the cost of forgetting is asymmetric: an unclassified
-    // knob that reaches the upstream but not the response cache's identity hash
-    // makes one request's answer serve another's — a wrong answer, not a miss.
+    // This exists because a typed knob the domain neither models nor lifts
+    // reaches a same-protocol upstream but no other: a translation drops it
+    // without naming it on the row. (The response cache keys the client's
+    // body whole, `UNKEYED` aside, whatever this classification says.)
 
-    /// Fields the domain models directly, so `identity_hash`/`content_hash`
-    /// already see them.
+    /// Fields the domain models directly.
     const CC_DOMAIN_MODELLED: &[&str] = &[
         "model", "messages", "stream", "tools", "max_tokens", "temperature", "top_p",
         "stop", "response_format", "max_completion_tokens", "tool_choice", "store",
         "metadata", "parallel_tool_calls",
     ];
-    /// Fields lifted into `extra` by `from_chat_completions` so they key.
+    /// Fields lifted into `extra` by `from_chat_completions`, so a translation
+    /// names them.
     const CC_LIFTED: &[&str] = &[
         "frequency_penalty", "presence_penalty", "seed", "n", "logit_bias", "logprobs",
         "top_logprobs", "service_tier",
     ];
-    /// Deliberately NOT part of the cache identity, each for a stated reason.
+    /// Deliberately neither modelled nor lifted, each for a stated reason.
     const CC_IGNORED: &[&str] = &[
         // Caller identity for upstream abuse tracking — does not change the
-        // answer, and keying on it would split every shared-scope cache per user.
+        // answer (and the response cache leaves it out of its key).
         "user",
         // Governs whether usage rides the stream, not what the model says.
-        // `stream` itself is excluded from the identity for the same reason.
         "stream_options",
     ];
 
@@ -13813,7 +13926,7 @@ mod tests {
         let unclassified: Vec<_> = actual.difference(&classified).collect();
         assert!(
             unclassified.is_empty(),
-            "wire fields with no cache-identity classification: {unclassified:?} — model them in \
+            "wire fields with no classification: {unclassified:?} — model them in \
              DomainRequest, lift them with push_wire_param, or add them to the ignored list with a \
              reason"
         );
@@ -14412,6 +14525,202 @@ mod tests {
     }
 
     #[test]
+    fn a_gemini_media_parts_members_are_forwarded_kept_on_a_clip_and_named_on_a_translation() {
+        let clip = serde_json::json!({
+            "inlineData": {"mimeType": "video/mp4", "data": "AAAA"},
+            "videoMetadata": {"startOffset": "1s", "endOffset": "5s", "fps": 2.0},
+            "mediaProcessing": "AGENTIC",
+        });
+        let clip_by_uri = serde_json::json!({
+            "fileData": {"mimeType": "video/mp4", "fileUri": "gs://b/v.mp4"},
+            "videoMetadata": {"startOffset": "2s"},
+        });
+        let contents = serde_json::json!([{"role": "user", "parts": [
+            {"text": "look"},
+            {"inlineData": {"mimeType": "image/png", "data": "iVBO"}, "mediaResolution": {"level": "MEDIA_RESOLUTION_HIGH"}},
+            {"fileData": {"mimeType": "application/pdf", "fileUri": "gs://b/r.pdf"}, "mediaResolution": {"level": "MEDIA_RESOLUTION_LOW"}},
+            clip.clone(),
+            clip_by_uri.clone(),
+        ]}]);
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": contents})).unwrap();
+        // A same-protocol forward re-serializes the typed request: every member is sent on.
+        assert_eq!(serde_json::to_value(&req).unwrap()["contents"], contents);
+
+        let mut dr = DomainRequest::from_gemini(&req);
+        // A clip is kept whole, so a re-render of the client's request keeps its interval.
+        dr.upstream.rerenders_client_request = true;
+        let rerendered = serde_json::to_value(dr.to_gemini()).unwrap();
+        assert_eq!(rerendered["contents"][0]["parts"][3], clip);
+        assert_eq!(rerendered["contents"][0]["parts"][4], clip_by_uri);
+        dr.upstream.rerenders_client_request = false;
+        // A translation names what the typed image and file blocks leave behind,
+        // and nothing of the clip's own members.
+        let mut got: Vec<String> = dr
+            .not_carried_to(ApiVersion::AnthropicMessages, "m", true)
+            .into_iter()
+            .filter(|n| n.ends_with(" on a user message") || n.contains(" on a user message ("))
+            .collect();
+        got.sort();
+        assert_eq!(got, ["mediaResolution on a user message (×2)"]);
+
+        // The members key the response cache: it reads the client's request.
+        let other: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "image/png", "data": "iVBO"}, "mediaResolution": {"level": "MEDIA_RESOLUTION_LOW"}},
+        ]}]}))
+        .unwrap();
+        let high: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "image/png", "data": "iVBO"}, "mediaResolution": {"level": "MEDIA_RESOLUTION_HIGH"}},
+        ]}]}))
+        .unwrap();
+        assert_ne!(crate::proxy::response_cache::tests::content_hash(&crate::api::ApiRequest::GoogleGemini(other)), crate::proxy::response_cache::tests::content_hash(&crate::api::ApiRequest::GoogleGemini(high)));
+        // So is the part it sits on: the same setting on the other of two images.
+        let on = |first: bool| {
+            let image = |high: bool| match high {
+                true => serde_json::json!({
+                    "inlineData": {"mimeType": "image/png", "data": "iVBO"},
+                    "mediaResolution": {"level": "MEDIA_RESOLUTION_HIGH"},
+                }),
+                false => serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "iVBO"}}),
+            };
+            let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+                {"role": "user", "parts": [image(first), image(!first)]},
+            ]}))
+            .unwrap();
+            crate::proxy::response_cache::tests::content_hash(&crate::api::ApiRequest::GoogleGemini(req))
+        };
+        assert_ne!(on(true), on(false));
+        // A part with nothing beside its blob names nothing (the positive control
+        // of the naming above is the same request without its members).
+        let bare: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "image/png", "data": "iVBO"}},
+            {"fileData": {"mimeType": "application/pdf", "fileUri": "gs://b/r.pdf"}},
+        ]}]}))
+        .unwrap();
+        assert!(DomainRequest::from_gemini(&bare).history_parts.is_empty());
+    }
+
+    #[test]
+    fn a_gemini_system_instructions_parts_other_than_text_are_named_on_a_translation() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "systemInstruction": {"parts": [
+                {"text": "be brief"},
+                {"inlineData": {"mimeType": "image/png", "data": "iVBO"}},
+                {"fileData": {"mimeType": "application/pdf", "fileUri": "gs://b/r.pdf"}},
+                {"inlineData": {"mimeType": "image/png", "data": "iVBO"}},
+                {"thought": true, "text": "t"},
+                {"thought": false, "text": "in French", "thoughtSignature": "sig"},
+                {"executableCode": {"language": "PYTHON", "code": "1"}},
+                {"inlineData": {"mimeType": "audio/wav", "data": "AAAA"}},
+            ]},
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        }))
+        .unwrap();
+        // A same-protocol forward sends the instruction as the client wrote it.
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["systemInstruction"]["parts"].as_array().map(Vec::len), Some(8));
+        let dr = DomainRequest::from_gemini(&req);
+        // A part marked `thought: false` is text of the prompt.
+        assert_matches!(&dr.system_prompt, Some(DomainSystemPrompt::Text(t)) if t == "be brief\nin French");
+        for target in [ApiVersion::AnthropicMessages, ApiVersion::ChatCompletions, ApiVersion::Responses] {
+            let mut got: Vec<String> = dr
+                .not_carried_to(target, "m", true)
+                .into_iter()
+                .filter(|n| n.contains(" on a system message"))
+                .collect();
+            got.sort();
+            assert_eq!(
+                got,
+                [
+                    "audio on a system message",
+                    "executableCode on a system message",
+                    "file on a system message",
+                    "image on a system message (×2)",
+                    "thought on a system message",
+                    "thoughtSignature on a system message",
+                ],
+                "{target:?}"
+            );
+        }
+        // Text alone names nothing; nor does a request without one.
+        let text: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "systemInstruction": {"parts": [{"text": "a"}, {"text": "b"}]},
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        }))
+        .unwrap();
+        assert!(DomainRequest::from_gemini(&text).history_parts.is_empty());
+        // An instruction of media alone is no system prompt, not an empty one.
+        let media: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "systemInstruction": {"parts": [{"inlineData": {"mimeType": "image/png", "data": "iVBO"}}]},
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        }))
+        .unwrap();
+        let media = DomainRequest::from_gemini(&media);
+        assert!(media.system_prompt.is_none());
+        assert_eq!(media.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["image on a system message"]);
+        let none: GeminiRequest =
+            serde_json::from_value(serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]})).unwrap();
+        assert!(DomainRequest::from_gemini(&none).history_parts.is_empty());
+    }
+
+    #[test]
+    fn a_gemini_system_instructions_text_reaches_every_targets_system_channel_and_its_media_none() {
+        let sent = |si: Value, target: ApiVersion| -> Value {
+            let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+                "systemInstruction": si,
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            }))
+            .unwrap();
+            let dr = DomainRequest::from_gemini(&req);
+            serde_json::from_slice(&dr.translate_to(target, "m", ChatCapField::default()).unwrap().0).unwrap()
+        };
+        let image = serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "iVBO"}});
+        let si = serde_json::json!({"parts": [{"text": "be brief"}, image.clone(), {"thought": false, "text": "in French"}]});
+        // Anthropic `system`, the one leading Chat system message, Responses `instructions`.
+        assert_eq!(sent(si.clone(), ApiVersion::AnthropicMessages)["system"], "be brief\nin French");
+        let chat = sent(si.clone(), ApiVersion::ChatCompletions);
+        assert_eq!(chat["messages"][0], serde_json::json!({"role": "system", "content": "be brief\nin French"}));
+        assert_eq!(chat["messages"].as_array().map(Vec::len), Some(2));
+        assert_eq!(sent(si.clone(), ApiVersion::Responses)["instructions"], "be brief\nin French");
+        // An instruction of media alone is no system channel on any target.
+        let media = serde_json::json!({"parts": [image]});
+        assert!(sent(media.clone(), ApiVersion::AnthropicMessages).get("system").is_none());
+        assert_eq!(sent(media.clone(), ApiVersion::ChatCompletions)["messages"][0]["role"], "user");
+        assert!(sent(media, ApiVersion::Responses).get("instructions").is_none());
+    }
+
+    #[test]
+    fn a_gemini_parts_kind_is_its_data_member_never_a_member_beside_it() {
+        for part in [
+            serde_json::json!({"audioTranscription": {"text": "x"}, "inlineData": {"data": "AA"}}),
+            serde_json::json!({"partMetadata": {}, "speech_metadata": {}, "inlineData": {}, "thought_signature": "s"}),
+        ] {
+            assert_eq!(unknown_part_kind(&part), "inlineData", "{part}");
+        }
+    }
+
+    #[test]
+    fn a_nested_function_response_parts_member_keys_the_cache_by_its_own_place() {
+        let on = |first: bool| {
+            let image = |named: bool| match named {
+                true => serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "iVBO", "displayName": "x"}}),
+                false => serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "iVBO"}}),
+            };
+            let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [{"role": "user", "parts": [
+                {"functionResponse": {"name": "f", "response": {}, "parts": [image(first), image(!first)]}},
+            ]}]}))
+            .unwrap();
+            crate::proxy::response_cache::tests::content_hash(&crate::api::ApiRequest::GoogleGemini(req))
+        };
+        assert_ne!(on(true), on(false));
+        // Positive control: the same placement keys alike.
+        assert_eq!(on(true), on(true));
+        assert_eq!(DomainRequest::from_gemini(&serde_json::from_value(serde_json::json!({"contents": [{"role": "user", "parts": [
+            {"functionResponse": {"name": "f", "response": {}, "parts": [
+                {"inlineData": {"mimeType": "image/png", "data": "iVBO", "displayName": "x"}}]}},
+        ]}]})).unwrap()).history_parts.len(), 1);
+    }
+
+    #[test]
     fn a_gemini_response_is_always_an_object() {
         assert_eq!(gemini_response("{\"r\":1}".into(), None), serde_json::json!({"r": 1}));
         assert_eq!(gemini_response("{\"r\":1}".into(), Some(true)), serde_json::json!({"r": 1}));
@@ -14466,6 +14775,66 @@ mod tests {
         let mut got = dr.not_carried_to(ApiVersion::Responses, "m", true);
         got.sort();
         assert_eq!(got, ["toolset_name on a user message", "transformations on a user message (×2)"]);
+    }
+
+    #[test]
+    fn a_merge_of_text_parts_keeps_the_members_of_every_part_it_merges() {
+        let image = serde_json::json!({"type": "image_url", "image_url": {"url": "https://x/i.png"}});
+        let mut parts: Vec<ContentPart> = serde_json::from_value(serde_json::json!([
+            {"type": "text", "text": "a"}, image, {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}},
+        ]))
+        .unwrap();
+        assert!(ContentPart::merge_text_parts(&mut parts, "ab", |p| matches!(p, ContentPart::Text { .. })));
+        assert_eq!(
+            serde_json::to_value(&parts).unwrap(),
+            serde_json::json!([{"type": "text", "text": "ab", "cache_control": {"type": "ephemeral"}}, image])
+        );
+        // No text part: nothing is kept, nothing changes.
+        let mut bare: Vec<ContentPart> = serde_json::from_value(serde_json::json!([image])).unwrap();
+        assert!(!ContentPart::merge_text_parts(&mut bare, "x", |p| matches!(p, ContentPart::Text { .. })));
+        assert_eq!(serde_json::to_value(&bare).unwrap(), serde_json::json!([image]));
+    }
+
+    #[test]
+    fn a_chat_text_parts_member_is_kept_for_its_own_protocol_and_named_on_a_translation() {
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({"model": "m", "messages": [
+            {"role": "system", "content": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "user", "content": "q"},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&req.messages[0]).unwrap()["content"][0],
+            serde_json::json!({"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}})
+        );
+        let named = DomainRequest::from_chat_completions(&req).not_carried_to(ApiVersion::GoogleGemini, "m", true);
+        assert!(named.contains(&"cache_control on a system message".to_string()), "{named:?}");
+        // An image part's members likewise.
+        let image: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://x/i.png"}, "cache_control": {"type": "ephemeral"}}]},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&image.messages[0]).unwrap()["content"][0]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+        let named = DomainRequest::from_chat_completions(&image).not_carried_to(ApiVersion::GoogleGemini, "m", true);
+        assert!(named.contains(&"cache_control on a user message".to_string()), "{named:?}");
+        // A message's `name` is named too, but not a tool result's, whose name
+        // its call carries to every target.
+        let named: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "q", "name": "example_user"},
+            {"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c", "name": "f", "content": "r"},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            DomainRequest::from_chat_completions(&named)
+                .not_carried_to(ApiVersion::GoogleGemini, "m", true)
+                .into_iter()
+                .filter(|n| n.starts_with("name "))
+                .collect::<Vec<_>>(),
+            ["name on a user message"]
+        );
     }
 
     #[test]

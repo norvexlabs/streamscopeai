@@ -62,6 +62,8 @@ impl ToolRiskFilter {
 pub enum ToolCallOutcome {
     Ok,
     Blocked,
+    /// A call policy would have blocked, which ran: an out-of-band exchange's.
+    NotApplied,
     Redacted,
     ArgsModified,
 }
@@ -347,6 +349,10 @@ pub struct ToolEntry {
     pub risk_level: String,
     pub call_count: i64,
     pub blocked_count: i64,
+    /// What policy would have blocked and nothing stopped in an out-of-band
+    /// exchange, a tool it removed from a request or a call in an answer, entry
+    /// for entry as `blocked_count` counts them: not in `blocked_count`.
+    pub not_applied_count: i64,
     /// Calls classified `safe` in the window.
     pub safe_count: i64,
     /// Calls classified `caution`.
@@ -377,6 +383,9 @@ pub struct ToolSummary {
     pub total_tools: usize,
     pub total_calls: i64,
     pub blocked_count: i64,
+    /// Entries policy would have blocked and nothing stopped: not in
+    /// `blocked_count`.
+    pub not_applied_count: i64,
     pub safe_count: usize,
     pub caution_count: usize,
     pub danger_count: usize,
@@ -992,7 +1001,7 @@ pub struct ToolInvocation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_total_ms: Option<i64>,
     /// Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-    /// `redacted`, `args_modified`.
+    /// `not_applied_response`, `redacted`, `args_modified`.
     pub outcomes: Vec<String>,
     /// Canonical `ConversationEvent::ToolCall` event — rendered by the UI with
     /// the same component the session view uses.
@@ -1384,24 +1393,35 @@ async fn collect_tool_invocations(
                 // `ToolResult` events it emits and stamps `redacted` on them.
                 // Without this the /tools feed would silently drop the redaction
                 // banner that the session view already shows correctly.
+                // Only its redaction records: its own answer is not read, so
+                // its response-phase records name nothing here.
                 let next_transform_diff: Option<streamscope_core::proxy::content::TransformDiff> = r
                     .next_transform_diff
                     .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .map(|diff: streamscope_core::proxy::content::TransformDiff| {
+                        streamscope_core::proxy::content::TransformDiff {
+                            response_blocked_tools: None,
+                            intercepted_tool_calls: None,
+                            ..diff
+                        }
+                    });
                 let next_turn = TurnRow {
                     // The answering turn's own number: a child need not be the
                     // call turn's next turn by number.
                     turn_number: next_turn_number,
                     protocol: next_proto,
-                    // Only its ToolResult events are read.
+                    // Only its request is read: its ToolResult events, and the
+                    // calls it sends back. Its own answer's calls are none of
+                    // those, so it is left out.
                     system_prompt: None,
                     messages_json: &next_messages_filtered,
                     request_tools: r.next_request_tools.as_deref(),
                     tools_available_hash: None,
                     tools_effective_hash: None,
                     request_params: r.next_request_params.as_ref(),
-                    response_content: r.next_response_content.as_deref(),
-                    response_tool_calls: r.next_response_tool_calls.as_ref(),
+                    response_content: None,
+                    response_tool_calls: None,
                     thinking: None,
                     model: next_model,
                     metadata: None,
@@ -1421,53 +1441,18 @@ async fn collect_tool_invocations(
             (Vec::new(), None)
         };
 
-        let mut result_by_id: std::collections::HashMap<String, ConversationEvent> =
-            std::collections::HashMap::new();
-        for ev in &result_events {
-            if let ConversationEvent::ToolResult { tool_call_id, is_new, .. } = ev {
-                // Only pair with tool_results the client SENT on this next turn
-                // (is_new=true). Anthropic's next-next turn echoes the same
-                // tool_result in history; without this filter we'd happily
-                // match against a duplicate from further downstream.
-                if !is_new {
-                    continue;
-                }
-                result_by_id.insert(tool_call_id.clone(), ev.clone());
-            }
-        }
+        // Each of this turn's calls with its result, by the call's place.
+        let mut results = crate::conversation::pair_results(&call_events, &result_events);
 
         // Request-phase block records (`transform_diff.blocked_tools`) are
         // intentionally NOT listed in the /tools invocations feed — the tool
         // was stripped before the model ran so there is no call to show. They
         // surface on the turn's REQUEST PARAMS header in the session view.
-        let blocked_resp_infos = r
-            .transform_diff
+        // The list `build_events` read, so a pinned record names its entry.
+        let blocked_resp_infos: &[streamscope_core::proxy::content::BlockedToolInfo] = parsed_transform_diff
             .as_ref()
-            .and_then(|d| d.get("response_blocked_tools"))
-            .and_then(|v| {
-                serde_json::from_value::<Vec<streamscope_core::proxy::content::BlockedToolInfo>>(
-                    v.clone(),
-                )
-                .ok()
-            })
+            .and_then(|diff| diff.response_blocked_tools.as_deref())
             .unwrap_or_default();
-        // Tool-result redactions fire on the REQUEST of the result turn (when
-        // the client posts the `tool_result` for this invocation's tool_use),
-        // so they live on `next_transform_diff` — not on the call turn's own
-        // `transform_diff`. Reading from the wrong turn made the /tools feed
-        // silently drop the redaction outcome that the session view shows.
-        let redacted_infos = r
-            .next_transform_diff
-            .as_ref()
-            .and_then(|d| d.get("redacted_tool_results"))
-            .and_then(|v| {
-                serde_json::from_value::<Vec<streamscope_core::proxy::content::RedactedToolResultInfo>>(
-                    v.clone(),
-                )
-                .ok()
-            })
-            .unwrap_or_default();
-
         // Canonical, protocol-normalized tool definitions — same helper the
         // proxy/session view uses. Never parse raw `request_tools` JSON here.
         let normalized_tools: Vec<streamscope_core::api::domain_request::DomainToolSummary> = r
@@ -1511,8 +1496,18 @@ async fn collect_tool_invocations(
         let call_hits: Vec<bool> = call_events
             .iter()
             .map(|ev| match (ev, search_term.as_deref()) {
-                (ConversationEvent::ToolCall { name, arguments, is_new: true, .. }, Some(term)) => {
+                (ConversationEvent::ToolCall { name, arguments, is_new: true, blocked, .. }, Some(term)) => {
+                    // A record pinned on the call speaks for it, as for a stripped
+                    // one — the arguments policy read (healed) included.
                     call_matches(name, arguments, term)
+                        || blocked.as_ref().is_some_and(|pinned| {
+                            pinned.reason.to_lowercase().contains(term)
+                                || pinned.rule_title.as_deref().is_some_and(|t| t.to_lowercase().contains(term))
+                                || pinned
+                                    .record
+                                    .and_then(|at| blocked_resp_infos.get(at))
+                                    .is_some_and(|info| blocked_matches(info, term))
+                        })
                 }
                 _ => true,
             })
@@ -1525,12 +1520,20 @@ async fn collect_tool_invocations(
                 || blocked_resp_infos.iter().any(|info| blocked_matches(info, term))
         });
 
-        for (ev, call_hit) in call_events.iter().zip(&call_hits) {
+        // The records pinned on a call, so the rows below list only the others.
+        let mut pinned_records: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // A call's place among this turn's calls: its row's key.
+        let mut place: usize = 0;
+        for (event_at, (ev, call_hit)) in call_events.iter().zip(&call_hits).enumerate() {
+            if let ConversationEvent::ToolCall { is_new: true, blocked: Some(pinned), .. } = ev {
+                pinned_records.extend(pinned.record);
+            }
             if let ConversationEvent::ToolCall {
                 name,
                 id,
                 arguments,
                 is_new,
+                blocked,
                 ..
             } = ev
             {
@@ -1541,6 +1544,8 @@ async fn collect_tool_invocations(
                 if !is_new {
                     continue;
                 }
+                let call_place = place;
+                place += 1;
                 if let Some(f) = &tool_name_filter
                     && !name.to_ascii_lowercase().contains(f)
                 {
@@ -1558,17 +1563,24 @@ async fn collect_tool_invocations(
                     Some(arguments),
                 );
                 let mut outcomes = Vec::new();
-                let block_info = blocked_resp_infos.iter().find(|b| b.name == *name).cloned();
-                if block_info.is_some() {
-                    outcomes.push("blocked_response".to_string());
-                }
-                // Match strictly by tool_use_id — the previous name fallback
-                // mis-attributed a single redaction to multiple invocations
-                // when the same tool was called twice in one turn.
-                let redaction = redacted_infos
-                    .iter()
-                    .find(|rd| rd.tool_use_id == *id)
+                // The record `build_events` pinned on this call, so a row and the
+                // conversation name one call: an answer an out-of-band exchange
+                // recorded keeps calls of the same tool policy let through.
+                let block_info = blocked
+                    .as_ref()
+                    .and_then(|pinned| pinned.record)
+                    .and_then(|at| blocked_resp_infos.get(at))
                     .cloned();
+                if let Some(pinned) = blocked {
+                    outcomes.push(if pinned.not_applied { "not_applied_response" } else { "blocked_response" }.to_string());
+                }
+                // The call's own result, and the redaction `build_events` pinned
+                // on it from the answering turn's record.
+                let result_event_val = results.get_mut(event_at).and_then(Option::take);
+                let redaction = match &result_event_val {
+                    Some(ConversationEvent::ToolResult { redacted, .. }) => redacted.clone(),
+                    _ => None,
+                };
                 if redaction.is_some() {
                     outcomes.push("redacted".to_string());
                 }
@@ -1581,6 +1593,7 @@ async fn collect_tool_invocations(
                     let matches = match of {
                         ToolCallOutcome::Ok => outcomes.iter().any(|o| o == "ok"),
                         ToolCallOutcome::Blocked => outcomes.iter().any(|o| o.starts_with("blocked_")),
+                        ToolCallOutcome::NotApplied => outcomes.iter().any(|o| o == "not_applied_response"),
                         ToolCallOutcome::Redacted => outcomes.iter().any(|o| o == "redacted"),
                         ToolCallOutcome::ArgsModified => outcomes.iter().any(|o| o == "args_modified"),
                     };
@@ -1589,10 +1602,8 @@ async fn collect_tool_invocations(
                     }
                 }
 
-                let result_event_val = result_by_id.get(id).cloned();
-
                 invocations.push(ToolInvocation {
-                    invocation_id: format!("{}:{}", r.request_id, id),
+                    invocation_id: format!("{}:{}", r.request_id, call_place),
                     tool_name: name.clone(),
                     tool_use_id: id.clone(),
                     timestamp: r.timestamp,
@@ -1616,23 +1627,31 @@ async fn collect_tool_invocations(
             }
         }
 
-        // Synthesize invocations for response-phase blocks only. The
-        // BlockAccumulator strips the tool_call from response_tool_calls
-        // fail-closed, so no `ConversationEvent::ToolCall` exists naturally
-        // for these — the synthesized row is what the operator sees in the
-        // feed, with the rule-identity banner attached via `blocked`.
+        // List a response-phase record that pinned no call (`build_events`
+        // pins each on its call, rebuilding a stripped one) on a row of its
+        // own, with the rule-identity banner attached via `blocked`.
         //
         // Request-phase blocks are NOT synthesized here: the tool never
         // reached the model, so there is no call to show in the tool log.
         // Those surface on the turn's REQUEST PARAMS header in the session
-        // view instead.
-        for (info, phase_tag) in blocked_resp_infos.iter().map(|b| (b, "blocked_response")) {
+        // view instead. An entry not applied stripped nothing: its call has its own
+        // row, unless the row keeps only the answer's first choice.
+        for (at, info) in blocked_resp_infos.iter().enumerate() {
+            // A record pinned on a call is that call's row.
+            if pinned_records.contains(&at) {
+                continue;
+            }
+            let (phase_tag, phase_outcome) = if info.not_applied {
+                ("not_applied_response", ToolCallOutcome::NotApplied)
+            } else {
+                ("blocked_response", ToolCallOutcome::Blocked)
+            };
             if let Some(f) = &tool_name_filter
                 && !info.name.to_ascii_lowercase().contains(f)
             {
                 continue;
             }
-            if outcome_filter.is_some_and(|of| of != ToolCallOutcome::Blocked) {
+            if outcome_filter.is_some_and(|of| of != phase_outcome) {
                 continue;
             }
             // The same rule as the ToolCall branch above: narrow to the blocked
@@ -1643,25 +1662,7 @@ async fn collect_tool_invocations(
             {
                 continue;
             }
-            // Response-phase blocks skip the synthesized row here when a
-            // ToolCall event already exists for the same name — that row
-            // already carries the `blocked_response` outcome and the real
-            // arguments via `response_tool_calls`.
-            if phase_tag == "blocked_response"
-                && invocations.iter().any(|iv| {
-                    iv.call_request_id == r.request_id.to_string()
-                        && iv.tool_name == info.name
-                        && iv.outcomes.iter().any(|o| o == "blocked_response")
-                })
-            {
-                continue;
-            }
-            let synthetic_block = Some(Box::new(crate::conversation::ToolCallBlock {
-                rule_id: Some(info.rule_id.clone()),
-                rule_title: Some(info.title.clone()),
-                reason: info.description.clone(),
-                phase: "response".to_string(),
-            }));
+            let synthetic_block = Some(Box::new(crate::conversation::ToolCallBlock::of_record(at, info)));
             let synthetic = ConversationEvent::ToolCall {
                 name: info.name.clone(),
                 arguments: info.arguments.clone().unwrap_or(serde_json::json!({})),
@@ -1677,7 +1678,7 @@ async fn collect_tool_invocations(
                 modifications: None,
             };
             invocations.push(ToolInvocation {
-                invocation_id: format!("{}:{}:{}", r.request_id, phase_tag, info.name),
+                invocation_id: format!("{}:{}:{}", r.request_id, phase_tag, at),
                 tool_name: info.name.clone(),
                 tool_use_id: String::new(),
                 timestamp: r.timestamp,
@@ -3883,6 +3884,140 @@ mod tests {
         // No cap: never a band, however much was spent.
         assert_eq!(budget_band(5.0, 0.0), 0);
         assert_eq!(budget_band(5.0, -1.0), 0);
+    }
+
+    /// The events of one stored turn: its request's messages, and its answer's
+    /// calls with the response-phase records in its transform diff.
+    fn turn_events(
+        protocol: streamscope_core::api::sse::ApiVersion,
+        messages: serde_json::Value,
+        calls: Option<serde_json::Value>,
+        blocked: Option<serde_json::Value>,
+    ) -> Vec<crate::conversation::ConversationEvent> {
+        let diff: Option<streamscope_core::proxy::content::TransformDiff> = blocked.map(|records| {
+            serde_json::from_value(serde_json::json!({
+                "transform_programs": [], "system_prompt_modified": false,
+                "messages_original_count": 0, "messages_after_count": 0, "telemetry_dropped": [],
+                "response_blocked_tools": records,
+            }))
+            .unwrap()
+        });
+        let turn = crate::conversation::TurnRow {
+            turn_number: 1,
+            protocol,
+            system_prompt: None,
+            messages_json: &messages,
+            request_tools: None,
+            tools_available_hash: None,
+            tools_effective_hash: None,
+            request_params: None,
+            response_content: None,
+            response_tool_calls: calls.as_ref(),
+            thinking: None,
+            model: "m",
+            metadata: None,
+            include_raw: false,
+            dedup_filtered: true,
+            transform_diff: diff.as_ref(),
+        };
+        crate::conversation::build_events(&turn).unwrap().events
+    }
+
+    /// Each paired result's text, by the call's place.
+    fn paired(
+        calls: &[crate::conversation::ConversationEvent],
+        answer: &[crate::conversation::ConversationEvent],
+    ) -> Vec<Option<String>> {
+        crate::conversation::pair_results(calls, answer)
+            .into_iter()
+            .zip(calls)
+            .filter(|(_, call)| matches!(call, crate::conversation::ConversationEvent::ToolCall { is_new: true, .. }))
+            .map(|(r, _)| match r {
+                Some(crate::conversation::ConversationEvent::ToolResult { content, .. }) => Some(content),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A call recorded without an id takes no result: no id
+    /// names one, so none is shown rather than a sibling's — even when a
+    /// result answers an empty id. Its sibling with an id (the control) takes
+    /// its own.
+    #[test]
+    fn a_call_recorded_without_an_id_takes_no_result() {
+        use streamscope_core::api::sse::ApiVersion;
+        let chat = ApiVersion::ChatCompletions;
+        let recorded = |at: usize| {
+            serde_json::json!({"index": at, "id": "", "function_name": "search", "arguments": "{}", "server_tool": false})
+        };
+        let calls = turn_events(
+            chat,
+            serde_json::json!([{"role": "user", "content": "go"}]),
+            Some(serde_json::json!([recorded(0), recorded(1), {"index": 2, "id": "own", "function_name": "search", "arguments": "{}", "server_tool": false}])),
+            None,
+        );
+        let minted = |id: &str| serde_json::json!({"type": "function", "id": id, "function": {"name": "search", "arguments": "{}"}});
+        let answer = turn_events(
+            chat,
+            serde_json::json!([
+                {"role": "assistant", "tool_calls": [minted("call_0"), minted("call_1")]},
+                {"role": "tool", "tool_call_id": "call_0", "content": "A"},
+                {"role": "tool", "tool_call_id": "", "content": "B"},
+                {"role": "tool", "tool_call_id": "own", "content": "C"},
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(paired(&calls, &answer), [None, None, Some("C".to_string())]);
+    }
+
+    /// Calls repeating an id take its results in order (the control: a call
+    /// with an id of its own takes only its own), and a call policy removed —
+    /// which a whole answer's row records beside its siblings — takes none.
+    #[test]
+    fn calls_repeating_an_id_take_its_results_in_order() {
+        use streamscope_core::api::sse::ApiVersion;
+        let chat = ApiVersion::ChatCompletions;
+        let call = |id: &str| serde_json::json!({"type": "function", "id": id, "function": {"name": "search", "arguments": "{}"}});
+        let calls = turn_events(
+            chat,
+            serde_json::json!([{"role": "user", "content": "go"}]),
+            Some(serde_json::json!([call("x"), call("x"), call("y")])),
+            None,
+        );
+        let answer = turn_events(
+            chat,
+            serde_json::json!([
+                {"role": "assistant", "tool_calls": [call("x"), call("x"), call("y")]},
+                {"role": "tool", "tool_call_id": "y", "content": "3"},
+                {"role": "tool", "tool_call_id": "x", "content": "1"},
+                {"role": "tool", "tool_call_id": "x", "content": "2"},
+            ]),
+            None,
+            None,
+        );
+        let text = |t: &str| Some(t.to_string());
+        assert_eq!(paired(&calls, &answer), [text("1"), text("2"), text("3")]);
+
+        let removed = serde_json::json!([{
+            "name": "search", "title": "t", "description": "d", "rule_id": "R-1", "tool_use_id": "x", "call_index": 0,
+        }]);
+        let calls = turn_events(
+            chat,
+            serde_json::json!([{"role": "user", "content": "go"}]),
+            Some(serde_json::json!([call("x"), call("x")])),
+            Some(removed),
+        );
+        let answer = turn_events(
+            chat,
+            serde_json::json!([
+                {"role": "assistant", "tool_calls": [call("x")]},
+                {"role": "tool", "tool_call_id": "x", "content": "1"},
+            ]),
+            None,
+            None,
+        );
+        assert_eq!(paired(&calls, &answer), [None, text("1")]);
     }
 
     #[test]

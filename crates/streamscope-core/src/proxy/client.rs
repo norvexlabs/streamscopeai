@@ -385,6 +385,13 @@ impl UpstreamClient {
         };
 
         guard_literal(&url)?;
+        // A Gemini model is sent its calls as it wrote them: an id the gateway
+        // gave a call it left unidentified is the gateway's alone.
+        let body = if api_version == ApiVersion::GoogleGemini {
+            crate::api::call_ids::without_gateway_call_ids(body)
+        } else {
+            body
+        };
         let mut req = self
             .client()?
             .post(&url)

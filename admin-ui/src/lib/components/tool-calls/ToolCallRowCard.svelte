@@ -43,6 +43,8 @@
         return { label: 'blocked (req)', bg: 'var(--error-bg)', fg: 'var(--error)', border: 'var(--error-border)' };
       case 'blocked_response':
         return { label: 'blocked (resp)', bg: 'var(--error-bg)', fg: 'var(--error)', border: 'var(--error-border)' };
+      case 'not_applied_response':
+        return { label: 'would block', bg: 'var(--warning-bg)', fg: 'var(--warning)', border: 'var(--warning-border)' };
       case 'redacted':
         return { label: 'redacted', bg: 'var(--warning-bg)', fg: 'var(--warning)', border: 'var(--warning-border)' };
       case 'args_modified':

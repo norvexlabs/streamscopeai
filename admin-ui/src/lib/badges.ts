@@ -105,6 +105,7 @@ export const ATTENTION_BADGE_CODES: ReadonlySet<AuditBadge['code']> = new Set([
   'guardrail_error',
   'modified_not_applied',
   'tool_blocked',
+  'tool_block_not_applied',
   'tool_blocked_overflow',
   'block_overflow',
   'script_error',
@@ -208,7 +209,7 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   modified_not_applied: {
     label: 'Not applied',
     tooltip: () =>
-      'Policy produced a rewrite that did not reach the wire — the submitting enforcement point is verdict-only, the analyzed answer had already reached the client, or the block was a signed thinking block the provider requires back unchanged',
+      'Policy produced a rewrite or a refusal that did not reach the wire — the submitting enforcement point is verdict-only, the analyzed answer had already reached the client, or the block was a signed thinking block the provider requires back unchanged',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
     iconName: 'pencil',
   },
@@ -239,6 +240,17 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
       return `${phase}-phase tool policy blocked ${b.count} tool call(s)${list}`;
     },
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
+    iconName: 'shield',
+  },
+  tool_block_not_applied: {
+    label: 'Would block',
+    tooltip: (b) => {
+      if (b.code !== 'tool_block_not_applied') return '';
+      const phase = b.phase === 'request' ? 'Request' : 'Response';
+      const list = b.names.length > 0 ? `: ${b.names.join(', ')}` : '';
+      return `${phase}-phase tool policy would have blocked ${b.count} tool call(s)${list}, and they were not stopped: the submitting enforcement point is verdict-only, or the analyzed answer had already reached the client`;
+    },
+    classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
     iconName: 'shield',
   },
   tool_blocked_overflow: {

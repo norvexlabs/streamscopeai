@@ -1662,7 +1662,10 @@ async fn write_rule(
 ///
 /// One classification stream feeds the inventory dashboard; the proxy's
 /// authoritative diffs feed block/replace numbers — together they reconcile
-/// with `summary.{blocked_count, redacted_count}` by construction.
+/// with `summary.{blocked_count, redacted_count}` by construction, beside the
+/// entries of an out-of-band exchange that stopped nothing: a rule's activity
+/// counts those as matches, and such a call, kept in its answer, is also read
+/// by the classification, which may credit the same rule.
 async fn compute_rule_activity(
     conn: &mut Scoped,
     tenant_id: uuid::Uuid,

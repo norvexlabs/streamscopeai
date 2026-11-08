@@ -34,7 +34,7 @@
   let promptPanel = $state<McpDashboardPanel>({ items: [], total_calls: 0 });
 
   let tools = $state<ToolEntry[]>([]);
-  let summary = $state<ToolSummary>({ total_tools: 0, total_calls: 0, blocked_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 });
+  let summary = $state<ToolSummary>({ total_tools: 0, total_calls: 0, blocked_count: 0, not_applied_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 });
   // Whether `summary` holds a reading — a failed fetch zeroes it, which the
   // trend chip must not read as a drop.
   let summaryLoaded = $state(false);
@@ -95,19 +95,19 @@
         toast.error(extractError(err));
         summaryLoaded = false;
         tools = [];
-        summary = { total_tools: 0, total_calls: 0, blocked_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 };
+        summary = { total_tools: 0, total_calls: 0, blocked_count: 0, not_applied_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 };
         coverage = { profiled_calls: 0, total_calls: 0, top_unprofiled: [] };
       } else if (data) {
         summaryLoaded = true;
         tools = data.tools || [];
-        summary = data.summary || { total_tools: 0, total_calls: 0, blocked_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 };
+        summary = data.summary || { total_tools: 0, total_calls: 0, blocked_count: 0, not_applied_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 };
         coverage = data.coverage || { profiled_calls: 0, total_calls: 0, top_unprofiled: [] };
       }
     } catch (e) {
       toast.error(extractError(e));
       summaryLoaded = false;
       tools = [];
-      summary = { total_tools: 0, total_calls: 0, blocked_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 };
+      summary = { total_tools: 0, total_calls: 0, blocked_count: 0, not_applied_count: 0, safe_count: 0, caution_count: 0, danger_count: 0, unknown_count: 0, redacted_count: 0 };
       coverage = { profiled_calls: 0, total_calls: 0, top_unprofiled: [] };
     } finally {
       await panels;
@@ -137,7 +137,8 @@
   function riskColor(risk: string): string {
     switch (risk) {
       case 'danger': return 'var(--error)';
-      case 'caution': return 'var(--warning)';
+      case 'caution':
+      case 'would block': return 'var(--warning)';
       case 'unknown': return 'var(--text-secondary)';
       default: return 'var(--success)';
     }
@@ -166,6 +167,7 @@
     { label: 'Caution', value: formatCount(summary.caution_count), icon: 'alert', iconTone: 'warning', valueColor: riskValueColor(summary.caution_count, 'var(--warning)'), trendValue: summaryLoaded ? summary.caution_count : undefined },
     { label: 'Danger', value: formatCount(summary.danger_count), icon: 'errorCircle', iconTone: 'error', valueColor: riskValueColor(summary.danger_count, 'var(--error)'), trendValue: summaryLoaded ? summary.danger_count : undefined },
     { label: 'Blocked', value: formatCount(summary.blocked_count), icon: 'blocked', iconTone: 'error', valueColor: riskValueColor(summary.blocked_count, 'var(--error)'), trendValue: summaryLoaded ? summary.blocked_count : undefined },
+    { label: 'Would block', value: formatCount(summary.not_applied_count), icon: 'blocked', iconTone: 'warning', valueColor: riskValueColor(summary.not_applied_count, 'var(--warning)'), trendValue: summaryLoaded ? summary.not_applied_count : undefined },
     { label: 'Unknown', value: formatCount(summary.unknown_count), icon: 'info', iconTone: 'neutral', trendValue: summaryLoaded ? summary.unknown_count : undefined },
     { label: 'Redacted', value: formatCount(summary.redacted_count), icon: 'lock', iconTone: 'info', trendValue: summaryLoaded ? summary.redacted_count : undefined },
   ]);
@@ -173,7 +175,8 @@
   function riskBg(risk: string): string {
     switch (risk) {
       case 'danger': return 'var(--error-bg)';
-      case 'caution': return 'var(--warning-bg)';
+      case 'caution':
+      case 'would block': return 'var(--warning-bg)';
       case 'unknown': return 'var(--bg-elevated)';
       default: return 'var(--success-bg)';
     }
@@ -181,11 +184,12 @@
 
   // Per-card chip rows: one chip per risk level with a non-zero count.
   // Order is fixed worst-first for the eye to catch danger / blocked first.
-  type Chip = { level: 'safe' | 'caution' | 'danger' | 'unknown' | 'blocked'; count: number };
+  type Chip = { level: 'safe' | 'caution' | 'danger' | 'unknown' | 'blocked' | 'would block'; count: number };
   function chipsFor(tool: ToolEntry): Chip[] {
     const rows: Chip[] = [
       { level: 'danger', count: tool.danger_count },
       { level: 'blocked', count: tool.blocked_count },
+      { level: 'would block', count: tool.not_applied_count },
       { level: 'caution', count: tool.caution_count },
       { level: 'unknown', count: tool.unknown_count },
       { level: 'safe', count: tool.safe_count },
@@ -348,7 +352,7 @@
             <div class="flex flex-wrap gap-1 mb-2">
               {#each chips as chip (chip.level)}
                 <a
-                  href={toolCallsHref(tool.tool_name, chip.level)}
+                  href={toolCallsHref(tool.tool_name, chip.level === 'would block' ? undefined : chip.level)}
                   onclick={(e) => e.stopPropagation()}
                   class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-sm text-[10px] font-semibold uppercase hover:ring-1 hover:ring-(--accent) transition-shadow"
                   style="color: {riskColor(chip.level)}; background: {riskBg(chip.level)}"

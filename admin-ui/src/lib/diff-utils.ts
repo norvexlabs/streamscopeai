@@ -26,8 +26,9 @@ export function summarizeTransforms(
 ): TransformSummary {
   const reqPrograms = transformDiff?.transform_programs ?? [];
   const rspPrograms = transformDiff?.response_transform_programs ?? [];
-  const blocked = transformDiff?.blocked_tools ?? [];
-  const rspBlocked = transformDiff?.response_blocked_tools ?? [];
+  // An entry not applied stopped nothing: it is no blocked tool.
+  const blocked = (transformDiff?.blocked_tools ?? []).filter((b) => !b.not_applied);
+  const rspBlocked = (transformDiff?.response_blocked_tools ?? []).filter((b) => !b.not_applied);
   const telemetry = transformDiff?.telemetry_dropped ?? [];
 
   const requestTransforms = reqPrograms.filter((p) => p.outcome === 'modified').length;

@@ -122,6 +122,16 @@ pub enum AuditBadge {
         names: Vec<String>,
     },
 
+    /// Tool policy would have blocked these calls, and they were not stopped:
+    /// the enforcement point of an out-of-band `/v1/analyze` exchange forwards
+    /// the original, or the analyzed answer had already reached the client.
+    /// Never counted as a block.
+    ToolBlockNotApplied {
+        phase: Phase,
+        count: u32,
+        names: Vec<String>,
+    },
+
     /// A streaming text/thinking block was dropped (fail-closed) because it
     /// exceeded the buffered-event cap during script analysis.
     BlockOverflow { kind: BlockKind, count: u32 },
@@ -455,6 +465,7 @@ impl AuditBadge {
             Self::JsonHealed => "json_healed",
             Self::ToolBlocked { .. } => "tool_blocked",
             Self::ToolBlockedOverflow { .. } => "tool_blocked_overflow",
+            Self::ToolBlockNotApplied { .. } => "tool_block_not_applied",
             Self::BlockOverflow { .. } => "block_overflow",
             Self::ScriptError { .. } => "script_error",
             Self::ProtocolTranslated { .. } => "protocol_translated",
@@ -527,6 +538,8 @@ pub struct BadgeBuilder {
     tool_blocked_response: Vec<String>,
     tool_blocked_overflow_request: Vec<String>,
     tool_blocked_overflow_response: Vec<String>,
+    tool_block_not_applied_request: Vec<String>,
+    tool_block_not_applied_response: Vec<String>,
     block_overflow_text: u32,
     block_overflow_thinking: u32,
     script_errors_request: Vec<String>,
@@ -621,6 +634,17 @@ impl BadgeBuilder {
                 for n in names {
                     if !bucket.contains(&n) {
                         bucket.push(n);
+                    }
+                }
+            }
+            AuditBadge::ToolBlockNotApplied { phase, names, .. } => {
+                let target = match phase {
+                    Phase::Request => &mut self.tool_block_not_applied_request,
+                    Phase::Response => &mut self.tool_block_not_applied_response,
+                };
+                for n in names {
+                    if !target.contains(&n) {
+                        target.push(n);
                     }
                 }
             }
@@ -836,6 +860,28 @@ impl BadgeBuilder {
         }
     }
 
+    /// Downgrade the request phase's `ToolBlocked` names to
+    /// `ToolBlockNotApplied`: an enforcement point forwarding the original
+    /// still offers the model what policy removed. Keeps
+    /// the audit truthful as [`Self::demote_modified_to_not_applied`] does.
+    pub fn demote_request_tool_blocks_to_not_applied(&mut self) {
+        for name in std::mem::take(&mut self.tool_blocked_request) {
+            self.add_tool_block_not_applied(Phase::Request, name);
+        }
+    }
+
+    /// A call tool policy would have blocked, and that was not stopped.
+    pub fn add_tool_block_not_applied(&mut self, phase: Phase, name: impl Into<String>) {
+        let target = match phase {
+            Phase::Request => &mut self.tool_block_not_applied_request,
+            Phase::Response => &mut self.tool_block_not_applied_response,
+        };
+        let name = name.into();
+        if !target.contains(&name) {
+            target.push(name);
+        }
+    }
+
     pub fn add_compressed(&mut self) {
         self.compressed = true;
     }
@@ -1002,6 +1048,12 @@ impl BadgeBuilder {
                 self.tool_blocked_response.push(n);
             }
         }
+        for n in other.tool_block_not_applied_request {
+            self.add_tool_block_not_applied(Phase::Request, n);
+        }
+        for n in other.tool_block_not_applied_response {
+            self.add_tool_block_not_applied(Phase::Response, n);
+        }
         for n in other.tool_blocked_overflow_request {
             if !self.tool_blocked_overflow_request.contains(&n) {
                 self.tool_blocked_overflow_request.push(n);
@@ -1142,6 +1194,8 @@ impl BadgeBuilder {
             && self.tool_blocked_response.is_empty()
             && self.tool_blocked_overflow_request.is_empty()
             && self.tool_blocked_overflow_response.is_empty()
+            && self.tool_block_not_applied_request.is_empty()
+            && self.tool_block_not_applied_response.is_empty()
             && self.block_overflow_text == 0
             && self.block_overflow_thinking == 0
             && self.script_errors_request.is_empty()
@@ -1205,6 +1259,20 @@ impl BadgeBuilder {
                 phase: Phase::Response,
                 count: self.tool_blocked_response.len() as u32,
                 names: self.tool_blocked_response,
+            });
+        }
+        if !self.tool_block_not_applied_request.is_empty() {
+            out.push(AuditBadge::ToolBlockNotApplied {
+                phase: Phase::Request,
+                count: self.tool_block_not_applied_request.len() as u32,
+                names: self.tool_block_not_applied_request,
+            });
+        }
+        if !self.tool_block_not_applied_response.is_empty() {
+            out.push(AuditBadge::ToolBlockNotApplied {
+                phase: Phase::Response,
+                count: self.tool_block_not_applied_response.len() as u32,
+                names: self.tool_block_not_applied_response,
             });
         }
         if !self.tool_blocked_overflow_request.is_empty() {
@@ -1550,6 +1618,7 @@ mod tests {
             AuditBadge::JsonHealed => {}
             AuditBadge::ToolBlocked { .. } => {}
             AuditBadge::ToolBlockedOverflow { .. } => {}
+            AuditBadge::ToolBlockNotApplied { .. } => {}
             AuditBadge::BlockOverflow { .. } => {}
             AuditBadge::ScriptError { .. } => {}
             AuditBadge::ProtocolTranslated { .. } => {}
@@ -1607,6 +1676,11 @@ mod tests {
                 names: vec!["t".into()],
             },
             AuditBadge::ToolBlockedOverflow {
+                phase: Phase::Response,
+                count: 1,
+                names: vec!["t".into()],
+            },
+            AuditBadge::ToolBlockNotApplied {
                 phase: Phase::Response,
                 count: 1,
                 names: vec!["t".into()],
@@ -1978,6 +2052,8 @@ mod tests {
             tool_blocked_response: vec!["b".into()],
             tool_blocked_overflow_request: vec!["c".into()],
             tool_blocked_overflow_response: vec!["d".into()],
+            tool_block_not_applied_request: vec!["e".into()],
+            tool_block_not_applied_response: vec!["f".into()],
             block_overflow_text: 5,
             block_overflow_thinking: 6,
             script_errors_request: vec!["e".into()],

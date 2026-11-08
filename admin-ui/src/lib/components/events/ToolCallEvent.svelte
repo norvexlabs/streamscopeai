@@ -16,6 +16,7 @@
     rule_title?: string | null;
     reason: string;
     phase: string;
+    not_applied?: boolean;
   };
 
   type ToolArgModification = {
@@ -55,7 +56,10 @@
 
   let argsObj = $derived(parseArgs(event.arguments));
   let isDanger = $derived(event.risk_level === 'danger');
-  let isBlocked = $derived(!!event.blocked);
+  // A call policy would have blocked and that ran is shown apart from one it
+  // stopped: an amber card, never the red one.
+  let notApplied = $derived(!!event.blocked?.not_applied);
+  let isBlocked = $derived(!!event.blocked && !notApplied);
   let isIntercepted = $derived(!!event.intercepted);
   let modsByField = $derived.by(() => {
     const out = new Map<string, ToolArgModification>();
@@ -67,7 +71,9 @@
   // A blocked call always overrides the border color to red; the banner
   // below makes the reason explicit.
   let borderColor = $derived(
-    isBlocked
+    notApplied
+      ? 'var(--warning)'
+      : isBlocked
       ? 'var(--error)'
       : isDanger
         ? 'var(--error)'
@@ -76,7 +82,9 @@
           : 'var(--tag-orange-bg)',
   );
   let headerColor = $derived(
-    isBlocked || isDanger
+    notApplied
+      ? 'var(--warning)'
+      : isBlocked || isDanger
       ? 'var(--error)'
       : isIntercepted
         ? 'var(--accent)'
@@ -98,6 +106,11 @@
             class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase"
             style="color: var(--error); background: var(--error-bg)"
           >{msg.event_blocked()}</span>
+        {:else if notApplied}
+          <span
+            class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase"
+            style="color: var(--warning); background: var(--warning-bg)"
+          >{msg.event_not_stopped()}</span>
         {:else if event.risk_level && event.risk_level !== 'safe'}
           <span
             class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase"
@@ -139,7 +152,27 @@
           <pre class="text-xs font-mono text-(--text-secondary) whitespace-pre-wrap">{formatArgs(event.arguments)}</pre>
         {/if}
       </div>
-      {#if event.blocked}
+      {#if event.blocked && notApplied}
+        <div class="flex items-start gap-2 px-4 py-2 border-t border-(--warning)/30 bg-(--warning-bg)">
+          {#if event.blocked.rule_id}
+            <a
+              href={selfScoped ? undefined : scopeHref(slug, page.url.pathname, `/policy?rule_id=${encodeURIComponent(event.blocked.rule_id)}`)}
+              title={msg.event_view_rule({ id: event.blocked.rule_id })}
+              class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-mono font-semibold text-(--warning) bg-(--warning)/20 border border-(--warning)/40 hover:bg-(--warning)/30 transition-colors"
+            >{event.blocked.rule_id}</a>
+          {/if}
+          <div class="flex-1 text-[11px] leading-snug">
+            <span class="font-semibold text-(--warning)">{event.blocked.rule_title ?? msg.event_would_block()}</span>
+            {#if event.blocked.rule_title}
+              <span class="text-(--warning)/80"> {msg.event_would_block_suffix()}</span>
+            {/if}
+            {#if event.blocked.reason}
+              <div class="text-[10px] text-(--warning)/80 mt-0.5 wrap-break-word">{event.blocked.reason}</div>
+            {/if}
+          </div>
+          <span class="text-[9px] uppercase tracking-wider text-(--warning)/70 font-semibold">{event.blocked.phase}</span>
+        </div>
+      {:else if event.blocked}
         <div class="flex items-start gap-2 px-4 py-2 border-t border-(--error)/30 bg-(--error-bg)">
           {#if event.blocked.rule_id}
             <a

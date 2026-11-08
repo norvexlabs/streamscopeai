@@ -946,13 +946,19 @@ fraction of the completion it can avoid, but on an alias whose prompts rarely re
 **Cached** badge naming what it saved and, when the match was by meaning, how close it was; it
 records the answer's real token counts, is billed nothing for the answer itself, and still counts
 against request rate
-limits. Answers are matched on the entire conversation — the system prompt, the full history, the
-tools offered, and the model and preset behind the alias — so a different prompt, model or preset
-can never be served someone else's answer. **Semantic mode relaxes only the wording of the latest
+limits. Answers are matched on the entire request as the client sent it — the system prompt, the
+full history with every setting on every message, the tools offered, and the model and preset behind
+the alias — so a different prompt, model or preset can never be served someone else's answer. The
+same conversation sent through two API formats (OpenAI and Anthropic, say) is two entries. What does
+not change the answer is left out of the match: whether the answer streams, and the caller's own
+bookkeeping — its end-user identifiers (`user`, `safety_identifier`), its provider prompt-cache key and
+`metadata` — so under a tenant- or workspace-wide preset two users asking the same thing share one
+answer. **Semantic mode relaxes only the wording of the latest
 question**: everything else still has to match exactly, so a question asked under different
 instructions or after a different conversation is never a match however similarly it reads. A
 question that arrives with an image or a document attached, that is not the last thing in the
-conversation, or that is very long is matched exactly rather than by meaning — in each of those the
+conversation, that shares its turn with a tool result, or that is very long is matched exactly
+rather than by meaning — in each of those the
 gateway cannot compare the part that decides the answer, and it would rather miss than guess.
 Aliases with a preset attached show a **cached** chip in the route list.
 
@@ -1475,22 +1481,38 @@ A workspace is where access, budget, and key issuance come together.
    and open a card to edit it — under **Governance → Policy** (tool), **Guardrail**,
    **Transforms**, and **Experts**.
 
-### 3b. Inline AI — connect an external analyzer
+### 3b. Inline AI — connect an inline gateway
 
 Every tenant ships with a built-in, undeletable **Inline AI** workspace and an
 **Inline AI** service account. They exist for one integration: an external
 enforcement point — typically a gateway inspecting AI traffic on your
-network — submits the LLM requests it intercepts to Streamscope's **analyze API**
-and enforces the verdict it gets back (allow, flag with a redacted body, or
-block). Streamscope never forwards the analyzed request anywhere; it applies
-policy, answers, and records an audit row.
+network — hands Streamscope the AI traffic it intercepts. It can do so in two
+ways, with one key, and usually uses both:
+
+- **Redirect** — for a provider's own API (OpenAI, Anthropic, …). The gateway
+  sends the intercepted request on to Streamscope, which calls the provider
+  itself with the client's own provider key, exactly as for a pass-through key.
+  Streamscope holds both directions, so policy is **applied** as on any
+  pass-through request: a blocked tool is removed before the model sees it,
+  and a call the policy refuses is removed from the answer the client receives.
+  A streamed answer streams through; as on every streamed reply, the PII found
+  in it is recorded, not masked.
+- **Analyze** — for traffic Streamscope cannot call on the client's behalf —
+  the AI web and desktop apps, whose wire is private to the vendor — and for
+  any provider request the gateway does not redirect. The gateway
+  submits each request it intercepts to Streamscope's **analyze API** and
+  enforces the verdict it gets back (allow, flag with a redacted body, or
+  block). Streamscope never forwards an analyzed request anywhere; it applies
+  policy, answers, and records an audit row. The model's answer has already
+  reached the client, so it is only observed.
 
 - **The policy is the workspace's policy.** The guardrail, tool-policy, and
-  transform profiles assigned to the Inline AI workspace govern what the
-  analyzer's submissions are screened with. They inherit your tenant defaults
+  transform profiles assigned to the Inline AI workspace govern both tracks:
+  what a redirected request is screened and changed with, and what an analyzed
+  one is judged by. They inherit your tenant defaults
   until you assign something else, so tightening the inline posture is the same
   three-state picker every workspace has.
-- **Responses can be observed too.** A gateway running response observation
+- **Analyzed responses can be observed too.** A gateway running response observation
   submits the model's *answers* (`direction: "response"`) after streaming them
   to the end client. The verdict comes from the response PII-leakage scan —
   enable **PII → Scan model responses** on the workspace's guardrail profile to
@@ -1502,21 +1524,35 @@ policy, answers, and records an audit row.
   **Not applied** chip.
 - **The credential is the managed Inline AI key.** Open the Inline AI service
   account on the **Keys** page and use **Rotate inline-AI key**: the new key is
-  shown once — paste it into your gateway's analyzer configuration. Rotating
+  shown once — paste it into your gateway's configuration, which uses it for both
+  tracks. Rotating
   again revokes the old key.
-- **Intercepting provider traffic.** If your gateway redirects AI provider traffic to Streamscope
-  rather than submitting it for analysis, turn on each provider's pass-through (its switch on the
-  LLM gateway's **Pass-through** tab) and grant it to the Inline AI workspace. Nothing is granted
-  there by default, so traffic for a provider not granted is refused.
+- **Accepting redirected traffic.** Turn on each provider's pass-through (its switch on the
+  LLM gateway's **Pass-through** tab) and grant it to the Inline AI workspace. A redirecting gateway
+  names the provider host the client was talking to, and Streamscope then forwards only to the
+  pass-through serving that host: traffic for a provider not granted is refused, so a client's key for
+  one provider never reaches another. **Configure the gateway to always name the host**: a request
+  that names none is sent to the workspace's only pass-through, or to the one pass-through speaking
+  the request's API format, whichever provider the client's key was issued by — and refused when
+  neither picks one. Nothing is granted there by default. A redirected request lands in the audit log
+  like any pass-through request, in the Inline AI workspace, with the end client's address, user and
+  groups the gateway reported.
 - **Least privilege by construction.** For analysis only, grant the Inline AI workspace **no
   providers**: its key cannot reach any model or spend budget, and the analyze
   API accepts **only** this key — an ordinary gateway key is refused there. A
-  leaked analyzer key can do nothing but submit content for analysis.
-- **Audit.** Every analysis lands in the audit log under provider
+  leaked analyzer key can then do nothing but submit content for analysis. Once
+  you grant providers for redirects, the key also reaches them — with a
+  provider key of its holder's own — and whoever holds it can state the end
+  client's address, user and groups on the audit rows: guard it like a
+  provider key, and rotate it if it leaks.
+- **Audit.** A redirected request is recorded as described above. Every analysis lands in the audit log under provider
   `inline-ai`, attributed by the application, session, and user agent the
   enforcement point reported. If the analyzer declared itself verdict-only and
   policy would have rewritten the content, the row carries a distinct
-  **Not applied** chip — *Modified* always means the wire actually changed. The full end-client identity and per-message
+  **Not applied** chip — *Modified* always means the wire actually changed. A tool call policy
+  would have blocked, and that nothing stopped, carries a **Would block** chip and an amber card, and
+  is counted apart from blocks. An answer that carried an error is recorded as an error, from the
+  status the enforcement point reports: one the client still received also says **Not applied**. The full end-client identity and per-message
   findings are returned to the enforcement point, which records them beside the
   response's correlation id — so the two audit trails join on one key.
 
@@ -1949,9 +1985,10 @@ observe from the Guardrail tab — the trace shows you exactly which page trippe
 
 **Scan inbound prompts (off by default).** The screening above covers untrusted content
 the assistant pulls in. Switch on **Scan inbound prompts** to also check the request the
-user sends — their own message, plus any tool-result content a client folds into it (for
-example a RAG passage, earlier tool output, or the output of a shell command or file patch a
-coding agent ran on its own machine) — for prompt-injection and jailbreak attempts,
+user sends — their own message and any text file attached to it, plus any tool-result content a
+client folds into it (for example a RAG passage, earlier tool output, a document a tool returned, the
+output of a shell command or file patch a coding agent ran on its own machine, or the result of a
+tool the provider ran that the client sends back as history) — for prompt-injection and jailbreak attempts,
 using the same classifier. It is independent of the web-content screening (turning it on
 never changes how web content is handled) and uses the same **mode**, **sensitivity**,
 **detector timeout**, and **on detector error** settings: in observe it badges a flagged

@@ -185,7 +185,9 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
         // findings for this message land on the same event — but one naming the
         // call a held tool output answers (`call_id`), which lands on that
         // output's result alone: it is about that output, never another one or
-        // a message's prose, and a view not rendering it shows it on none.
+        // a message's prose. A finding with no such event (a message holding only
+        // a document, a server-run result that renders as no result) gets a stub
+        // of its own, so the console shows what the row's badge says.
         if let Some(steps) = inbound_guardrail.get(&idx) {
             for step in steps {
                 let at = match &step.call_id {
@@ -193,7 +195,9 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
                         .iter()
                         .position(|ev| matches!(ev, ConversationEvent::ToolResult { tool_call_id, .. } if tool_call_id == call)),
                     None => events[before..].iter().position(|ev| {
-                        matches!(ev, ConversationEvent::Message { .. } | ConversationEvent::ToolResult { .. })
+                        // Never an assistant's prose, which shows no finding.
+                        matches!(ev, ConversationEvent::ToolResult { .. })
+                            || matches!(ev, ConversationEvent::Message { role, .. } if role == "user")
                     }),
                 };
                 if let Some(
@@ -201,6 +205,20 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
                 ) = at.map(|at| &mut events[before + at])
                 {
                     guardrails.push((*step).clone());
+                } else {
+                    events.push(ConversationEvent::Message {
+                        // The client sent it, whichever turn holds it, and that
+                        // side is the one the console shows a finding on.
+                        role: "user".to_string(),
+                        content: String::new(),
+                        thinking: None,
+                        turn: turn.turn_number,
+                        is_new: turn.dedup_filtered,
+                        is_from_history,
+                        metadata: None,
+                        raw: None,
+                        guardrails: vec![(*step).clone()],
+                    });
                 }
             }
         }
@@ -252,29 +270,55 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
         turn.response_tool_calls,
         thinking_for_domain.as_deref(),
     );
-    // Synthesize `ToolUse` blocks for response-phase blocks whose `tool_use` was
-    // stripped from the stored response (i.e. not already present). The attach
-    // loop further down stamps `.blocked` on the resulting `ToolCall` events, so
-    // a refused call renders inline as the blocked card — with the attempted
-    // args — exactly where it happened, instead of only as the (now-stripped)
-    // notice text. Turn metadata still lands on the first emitted event, so a
+    // Pin each response-phase block record on the call it names. A record with
+    // a place (`call_index`, set for a whole answer, whose row records every
+    // call the model made, the ones policy removed included) names the stored
+    // call at that place. A record without one (a streamed answer, whose row
+    // records only what was delivered) names a stored call by its id — an entry
+    // not applied stripped nothing, so one with no id names a call of its name,
+    // unless the answer's row keeps only its first choice and the call was in
+    // another — or else had its call stripped: a `ToolUse` is rebuilt for it,
+    // pinned to it. The attach loop further down stamps `.blocked` on the
+    // `ToolCall` events, so a refused call renders inline as the blocked card —
+    // with the attempted args — instead of only as the (now-stripped) notice
+    // text. Turn metadata still lands on the first emitted event, so a
     // block-only turn keeps its tokens/latency.
+    //
+    // `call_pins[n]` is the record pinned on the answer's `n`th call.
+    let mut call_pins: Vec<Option<usize>> = assistant_blocks
+        .iter()
+        .filter(|b| matches!(b, DomainContentBlock::ToolUse { .. }))
+        .map(|_| None)
+        .collect();
     if let Some(diff) = turn.transform_diff
         && let Some(blocks) = diff.response_blocked_tools.as_ref()
     {
-        let existing_ids: std::collections::HashSet<String> = assistant_blocks
+        let kept: Vec<(String, String)> = assistant_blocks
             .iter()
             .filter_map(|b| match b {
-                DomainContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                DomainContentBlock::ToolUse { id, name, .. } => Some((id.clone(), name.clone())),
                 _ => None,
             })
             .collect();
-        for info in blocks {
+        for (at, info) in blocks.iter().enumerate() {
+            if let Some(n) = info.call_index.map(|n| n as usize)
+                && kept.get(n).is_some_and(|(id, name)| {
+                    *name == info.name && info.tool_use_id.as_ref().is_none_or(|own| own == id)
+                })
+                && let Some(pin) = call_pins.get_mut(n)
+                && pin.is_none()
+            {
+                *pin = Some(at);
+                continue;
+            }
             let already_present = info
                 .tool_use_id
                 .as_deref()
-                .is_some_and(|id| existing_ids.contains(id));
-            if !already_present {
+                .is_some_and(|id| kept.iter().any(|(kept_id, _)| kept_id == id));
+            let kept_by_name = info.not_applied
+                && info.tool_use_id.is_none()
+                && kept.iter().any(|(_, name)| *name == info.name);
+            if !already_present && !kept_by_name {
                 assistant_blocks.push(DomainContentBlock::ToolUse {
                     id: info.tool_use_id.clone().unwrap_or_default(),
                     name: info.name.clone(),
@@ -283,6 +327,7 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
                     cache_control: None,
                     thought_signature: None,
                 });
+                call_pins.push(Some(at));
             }
         }
     }
@@ -306,6 +351,7 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
             /* is_from_history */ false,
         );
     }
+    let response_events_end = events.len();
 
     let params = domain_request_meta_from_stored(
         turn.protocol,
@@ -315,46 +361,57 @@ pub fn build_events(turn: &TurnRow<'_>) -> Result<BuildEventsResult, AppError> {
         turn.model,
     );
 
-    // Attach response-phase block records to matching `ToolCall` events.
-    // Matching prefers `tool_use_id` (unique per call, correct when the same
-    // tool fires multiple times in one turn with mixed allow/block outcomes)
-    // and falls back to tool name for a record that carries no id: a
-    // response-phase block of a Gemini call, whose `functionCall.id` the
-    // upstream may omit. Each block record is consumed exactly once so
-    // same-tool-twice turns distribute banners correctly across both calls.
-    // Request-phase records are NOT attached here (those tools never
-    // reached the model); they surface on the turn's REQUEST PARAMS header.
+    // Attach response-phase block records to matching `ToolCall` events. A
+    // call pinned above takes its record. Any other record matches by
+    // `tool_use_id` (unique per call, correct when the same tool fires
+    // multiple times in one turn with mixed allow/block outcomes), and by tool
+    // name for a record that carries no id. Each block record
+    // is consumed exactly once so same-tool-twice turns distribute banners
+    // correctly across both calls. Request-phase records are NOT attached here
+    // (those tools never reached the model); they surface on the turn's
+    // REQUEST PARAMS header.
     if let Some(diff) = turn.transform_diff
         && let Some(blocks) = diff.response_blocked_tools.as_ref()
         && !blocks.is_empty()
     {
-        let mut remaining: Vec<&streamscope_core::proxy::content::BlockedToolInfo> =
-            blocks.iter().collect();
+        let pin = |at: usize| Some(Box::new(ToolCallBlock::of_record(at, &blocks[at])));
+        let pinned: std::collections::HashSet<usize> = call_pins.iter().flatten().copied().collect();
         // This turn's response only: a call the client sent back as history is
         // no call this response's policy saw.
-        for event in events.iter_mut().skip(response_events_start) {
-            if let ConversationEvent::ToolCall { name, id, blocked, .. } = event
-                && blocked.is_none()
+        let calls: Vec<usize> = (response_events_start..response_events_end)
+            .filter(|i| matches!(events[*i], ConversationEvent::ToolCall { .. }))
+            .collect();
+        for (call, event_at) in calls.iter().enumerate() {
+            if let Some(Some(at)) = call_pins.get(call)
+                && let ConversationEvent::ToolCall { blocked, .. } = &mut events[*event_at]
             {
-                let pos = remaining
-                    .iter()
-                    .position(|b| b.tool_use_id.as_deref() == Some(id.as_str()))
-                    .or_else(|| {
-                        remaining.iter().position(|b| {
-                            // Name fallback only when the record has no id at
-                            // all — a record with a non-matching id was meant
-                            // for a different call.
-                            b.tool_use_id.is_none() && b.name == *name
-                        })
-                    });
-                if let Some(pos) = pos {
-                    let info = remaining.remove(pos);
-                    *blocked = Some(Box::new(ToolCallBlock {
-                        rule_id: Some(info.rule_id.clone()),
-                        rule_title: Some(info.title.clone()),
-                        reason: info.description.clone(),
-                        phase: "response".to_string(),
-                    }));
+                *blocked = pin(*at);
+            }
+        }
+        let mut remaining: Vec<usize> = (0..blocks.len()).filter(|at| !pinned.contains(at)).collect();
+        // Exact matches first, across every call: where a call policy refused
+        // stays in the answer, a sibling of the same name comes before it as
+        // well as after.
+        for exact in [true, false] {
+            for event_at in &calls {
+                let ConversationEvent::ToolCall { name, id, arguments, blocked, .. } = &mut events[*event_at] else {
+                    continue;
+                };
+                if blocked.is_some() {
+                    continue;
+                }
+                // Name fallback only when the record has no id at all — a record
+                // with a non-matching id was meant for a different call.
+                let found = remaining.iter().position(|at| {
+                    let b = &blocks[*at];
+                    match b.tool_use_id.as_deref() {
+                        Some(call) => exact && call == id.as_str(),
+                        None => b.name == *name && (!exact || b.arguments.as_ref() == Some(&*arguments)),
+                    }
+                });
+                if let Some(found) = found {
+                    let at = remaining.remove(found);
+                    *blocked = pin(at);
                 }
             }
         }
@@ -1240,6 +1297,211 @@ mod tests {
         }
     }
 
+    /// A transform diff from the members a case states.
+    fn diff_of(members: Value) -> &'static streamscope_core::proxy::content::TransformDiff {
+        let mut base = json!({
+            "transform_programs": [], "system_prompt_modified": false,
+            "messages_original_count": 0, "messages_after_count": 0, "telemetry_dropped": [],
+        });
+        for (key, value) in members.as_object().cloned().unwrap_or_default() {
+            base[key] = value;
+        }
+        Box::leak(Box::new(serde_json::from_value(base).unwrap()))
+    }
+
+    /// A call kept in the answer is one call, whether its record names it or not
+    /// (a Gemini call has no id): the amber card on it, no phantom beside it.
+    #[test]
+    fn an_entry_not_applied_marks_its_call_and_adds_none() {
+        for tool_use_id in [Some("call_1"), None] {
+            let mut turn = turn_for_messages(json!([{"role": "user", "content": "go"}]));
+            let calls: &'static Value =
+                Box::leak(Box::new(json!([{"type": "function", "id": "call_1", "function": {"name": "Bash", "arguments": "{}"}}])));
+            turn.response_tool_calls = Some(calls);
+            turn.transform_diff = Some(diff_of(json!({"response_blocked_tools": [{
+                "name": "Bash", "title": "t", "description": "d", "rule_id": "R-1",
+                "tool_use_id": tool_use_id, "not_applied": true,
+            }]})));
+            let events = build_events(&turn).unwrap().events;
+            let tool_calls: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    ConversationEvent::ToolCall { id, blocked, .. } => Some((id.clone(), blocked.as_ref().map(|b| b.not_applied))),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tool_calls, [("call_1".to_string(), Some(true))], "{tool_use_id:?}");
+        }
+    }
+
+    /// Two calls of one tool with no ids (Gemini's), the second refused and both
+    /// kept: its recorded arguments name it, not its place.
+    #[test]
+    fn an_entry_with_no_id_marks_the_call_with_its_arguments() {
+        let mut turn = turn_for_messages(json!([{"role": "user", "content": "go"}]));
+        let calls: &'static Value = Box::leak(Box::new(json!([
+            {"type": "function", "id": "c1", "function": {"name": "search", "arguments": "{\"x\":\"fine\"}"}},
+            {"type": "function", "id": "c2", "function": {"name": "search", "arguments": "{\"x\":\"bad\"}"}},
+        ])));
+        turn.response_tool_calls = Some(calls);
+        turn.transform_diff = Some(diff_of(json!({"response_blocked_tools": [{
+            "name": "search", "title": "t", "description": "d", "rule_id": "R-1", "arguments": {"x": "bad"}, "not_applied": true,
+        }]})));
+        let marked: Vec<_> = build_events(&turn)
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                ConversationEvent::ToolCall { id, blocked, .. } => Some((id.clone(), blocked.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marked, [("c1".to_string(), false), ("c2".to_string(), true)]);
+    }
+
+    /// A call as a row records it (`AccumulatedToolCall`): id-less, as a Gemini
+    /// call may be.
+    fn recorded_call(index: usize, name: &str, arguments: &str) -> Value {
+        json!({"index": index, "id": "", "function_name": name, "arguments": arguments, "server_tool": false})
+    }
+
+    /// A record's place (`call_index`) names its call: of two id-less Gemini
+    /// calls of one tool kept in the answer, the one at the place takes the
+    /// record, though the arguments policy read (healed) differ from the ones
+    /// stored. Without the place (the control) the arguments name no call and
+    /// the record lands on the first of its name.
+    #[test]
+    fn a_record_with_a_place_marks_the_call_there_whatever_its_arguments() {
+        for (place, expected) in [(Some(1), [false, true]), (None, [true, false])] {
+            let mut turn = turn_for_messages(json!([{"role": "user", "parts": [{"text": "go"}]}]));
+            turn.protocol = ApiVersion::GoogleGemini;
+            let calls: &'static Value = Box::leak(Box::new(json!([
+                recorded_call(0, "search", r#"{"x":"fine"}"#),
+                recorded_call(1, "search", r#"{"x":"bad"#),
+            ])));
+            turn.response_tool_calls = Some(calls);
+            turn.transform_diff = Some(diff_of(json!({"response_blocked_tools": [{
+                "name": "search", "title": "t", "description": "d", "rule_id": "R-1",
+                "arguments": {"x": "bad"}, "call_index": place, "not_applied": true,
+            }]})));
+            let marked: Vec<_> = build_events(&turn)
+                .unwrap()
+                .events
+                .iter()
+                .filter_map(|e| match e {
+                    ConversationEvent::ToolCall { blocked, .. } => Some(blocked.as_ref().map(|b| b.record)),
+                    _ => None,
+                })
+                .collect();
+            let pinned: Vec<bool> = marked.iter().map(Option::is_some).collect();
+            assert_eq!(pinned, expected, "place {place:?}");
+            assert!(marked.iter().flatten().all(|record| *record == Some(0)), "the record names its entry");
+        }
+    }
+
+    /// A place names a call only where the record's id, if it has one, is that
+    /// call's: a record whose place disagrees with its id is pinned by its id.
+    #[test]
+    fn a_place_whose_call_has_another_id_gives_way_to_the_id() {
+        let mut turn = turn_for_messages(json!([{"role": "user", "content": "go"}]));
+        let calls: &'static Value = Box::leak(Box::new(json!([
+            {"index": 0, "id": "a", "function_name": "search", "arguments": "{}", "server_tool": false},
+            {"index": 1, "id": "b", "function_name": "search", "arguments": "{}", "server_tool": false},
+        ])));
+        turn.response_tool_calls = Some(calls);
+        turn.transform_diff = Some(diff_of(json!({"response_blocked_tools": [{
+            "name": "search", "title": "t", "description": "d", "rule_id": "R-1", "tool_use_id": "b", "call_index": 0,
+        }]})));
+        let marked: Vec<_> = build_events(&turn)
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                ConversationEvent::ToolCall { id, blocked, .. } => Some((id.clone(), blocked.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(marked, [("a".to_string(), false), ("b".to_string(), true)]);
+    }
+
+    /// A whole answer's row records the calls policy removed beside the ones it
+    /// let through: each record pins the call at its place — two id-less calls
+    /// of one tool with the same arguments included — and no call is added. A
+    /// record without a place (a streamed answer's, whose row records only what
+    /// was delivered) has its call rebuilt, last, pinned to it.
+    #[test]
+    fn a_removed_calls_record_pins_the_recorded_call_at_its_place() {
+        let mut turn = turn_for_messages(json!([{"role": "user", "parts": [{"text": "go"}]}]));
+        turn.protocol = ApiVersion::GoogleGemini;
+        let calls: &'static Value = Box::leak(Box::new(json!([
+            recorded_call(0, "search", r#"{"q":1}"#),
+            recorded_call(1, "read", "{}"),
+            recorded_call(2, "search", r#"{"q":1}"#),
+        ])));
+        turn.response_tool_calls = Some(calls);
+        let record = |rule: &str, place: Option<u32>| {
+            json!({"name": "search", "title": "t", "description": "d", "rule_id": rule, "arguments": {"q": 1}, "call_index": place})
+        };
+        turn.transform_diff = Some(diff_of(json!({"response_blocked_tools": [
+            record("R-2", Some(2)), record("R-0", Some(0)), record("R-X", None),
+        ]})));
+        let calls: Vec<_> = build_events(&turn)
+            .unwrap()
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                ConversationEvent::ToolCall { name, blocked, .. } => Some((
+                    name.clone(),
+                    blocked.as_ref().and_then(|b| b.rule_id.clone()),
+                    blocked.as_ref().and_then(|b| b.record),
+                )),
+                _ => None,
+            })
+            .collect();
+        let rule = |r: &str| Some(r.to_string());
+        assert_eq!(
+            calls,
+            [
+                ("search".to_string(), rule("R-0"), Some(1)),
+                ("read".to_string(), None, None),
+                ("search".to_string(), rule("R-2"), Some(0)),
+                ("search".to_string(), rule("R-X"), Some(2)),
+            ]
+        );
+    }
+
+    /// A finding on a message that renders no text or result still shows: a
+    /// document alone in a message, a server-run result the view has no result
+    /// for. Where a message has text, the text carries it and no stub appears
+    /// (the positive control).
+    #[test]
+    fn a_finding_with_nowhere_to_land_gets_a_stub_of_its_own() {
+        let step = |call: Option<&str>| {
+            json!({"inbound_guardrail_steps": [{
+                "call_id": call, "tool_use_id": "0", "name": "guardrail:classifier", "phase": "request", "target": "",
+                "category": "prompt_injection", "confidence": 0.97, "outcome": "flagged",
+            }]})
+        };
+        let with_guardrails = |events: &[ConversationEvent]| {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    ConversationEvent::Message { content, guardrails, .. } if !guardrails.is_empty() => Some(content.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut turn = turn_for_messages(json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}]));
+        turn.transform_diff = Some(diff_of(step(None)));
+        assert_eq!(with_guardrails(&build_events(&turn).unwrap().events), [String::new()], "the stub");
+
+        let mut turn = turn_for_messages(json!([{"role": "user", "content": "prose"}]));
+        turn.transform_diff = Some(diff_of(step(None)));
+        assert_eq!(with_guardrails(&build_events(&turn).unwrap().events), ["prose".to_string()], "no stub beside its text");
+    }
+
     #[test]
     fn build_events_synthesizes_blocked_toolcall_and_strips_notice() {
         // A response-phase block strips the `tool_use` from the stored response
@@ -1265,6 +1527,7 @@ mod tests {
             response_transform_programs: None,
             response_step_diffs: None,
             response_blocked_tools: Some(vec![BlockedToolInfo {
+                not_applied: false,
                 name: "Bash".to_string(),
                 title: "System path access via shell".to_string(),
                 description:
@@ -1272,6 +1535,7 @@ mod tests {
                         .to_string(),
                 rule_id: "ASI05-01".to_string(),
                 tool_use_id: Some("call_x".to_string()),
+                call_index: None,
                 arguments: Some(json!({"command": "cat /etc/shadow"})),
             }]),
             tool_arg_modifications: None,

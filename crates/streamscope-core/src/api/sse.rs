@@ -694,6 +694,12 @@ pub struct StreamParser {
     /// Every kind of answer part the stream carried that no event reads — what
     /// a translated client is not sent.
     unread_parts: std::collections::BTreeSet<String>,
+    /// The request whose answer this is, where the parser gives a Gemini call
+    /// that opens with no id the gateway's ([`Self::identifying_calls`]).
+    request_id: Option<uuid::Uuid>,
+    /// The ids given the frame being read's calls, each by its place among
+    /// the frame's calls ([`Self::take_settled_ids`]).
+    settled: Vec<(usize, String)>,
 }
 
 impl StreamParser {
@@ -708,7 +714,26 @@ impl StreamParser {
             streamed: std::collections::BTreeMap::new(),
             unaddressed: false,
             unread_parts: std::collections::BTreeSet::new(),
+            request_id: None,
+            settled: Vec::new(),
         }
+    }
+
+    /// Read request `request_id`'s answer, giving each Gemini call that opens
+    /// with no id the gateway's ([`crate::api::call_ids`]): every reader
+    /// downstream — policy, the audit, each client's emitter — reads that id.
+    /// The other protocols' specs require every call's id.
+    pub fn identifying_calls(mut self, request_id: uuid::Uuid) -> Self {
+        self.request_id = Some(request_id);
+        self
+    }
+
+    /// The ids given the calls the last frame read opened with none, each by
+    /// its place among the frame's calls — what
+    /// [`crate::api::call_ids::give_call_ids`] gives the frame a pass-through
+    /// client reads.
+    pub fn take_settled_ids(&mut self) -> Vec<(usize, String)> {
+        std::mem::take(&mut self.settled)
     }
 
     /// The kinds of answer part the stream carried so far that no event reads.
@@ -719,6 +744,7 @@ impl StreamParser {
     /// The domain events `event` carries, with each freeform call's arguments
     /// opened and closed where the stream starts and ends the call.
     pub fn parse(&mut self, event: &SseEvent) -> Vec<DomainEvent> {
+        self.settled.clear();
         let mut facts = FrameFacts::default();
         let mut parsed = parse_frame(event, self.version, &mut facts);
         self.unread_parts.extend(std::mem::take(&mut facts.unread_parts));
@@ -787,6 +813,7 @@ impl StreamParser {
     pub(crate) fn number(&mut self, parsed: Vec<DomainEvent>) -> Vec<DomainEvent> {
         use crate::pipeline::response_blocks::CallSlot;
         let mut out = Vec::with_capacity(parsed.len() + 1);
+        let mut deltas = 0usize;
         for mut e in parsed {
             let DomainEvent::ToolCallDelta { index, id, function_name, arguments_delta, form } = &mut e else {
                 // Content that is not a call ends every freeform call still
@@ -804,6 +831,8 @@ impl StreamParser {
                 out.push(e);
                 continue;
             };
+            let delta_at = deltas;
+            deltas += 1;
             // A call event naming no item is no call's: its bytes are withheld.
             if self.unaddressed {
                 tracing::warn!("a tool-call delta names no item the response opened; withheld");
@@ -825,6 +854,17 @@ impl StreamParser {
                 CallSlot::Starts(n) | CallSlot::Continues(n) | CallSlot::Late(Some(n)) => n,
                 CallSlot::Late(None) => DomainEvent::NO_CALL,
             };
+            // A Gemini call opening with no id is given the gateway's, the one
+            // every reader downstream reads. A Gemini call arrives whole, in
+            // one delta.
+            if let (CallSlot::Starts(n), Some(request_id)) = (slot, self.request_id)
+                && self.version == ApiVersion::GoogleGemini
+                && id.as_deref().is_none_or(str::is_empty)
+            {
+                let given = crate::api::call_ids::gateway_call_id(request_id, n);
+                self.settled.push((delta_at, given.clone()));
+                *id = Some(given);
+            }
             // A call is a server tool's only as it starts. Every delta placed
             // on one is its input, however it reads; a delta calling itself a
             // server tool's but placed on a client's call is that call's —
@@ -1665,6 +1705,12 @@ enum GeminiStreamPart {
     Text { text: String },
 }
 
+/// Whether a Gemini stream part is one the stream's parse reads as a call —
+/// the reading [`crate::api::call_ids::give_call_ids`] counts a frame's calls by.
+pub(crate) fn gemini_stream_part_is_call(part: &serde_json::Value) -> bool {
+    matches!(GeminiStreamPart::deserialize(part), Ok(GeminiStreamPart::FunctionCall { .. }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiStreamFunctionCall {
@@ -1732,7 +1778,9 @@ fn parse_gemini_event(event: &SseEvent) -> Vec<DomainEvent> {
                     GeminiStreamPart::FunctionCall { function_call } => {
                         events.push(DomainEvent::ToolCallDelta {
                             index: tool_index,
-                            id: function_call.id.clone(),
+                            // An empty id names nothing — read as no id, or a
+                            // second empty-id call would restate the first.
+                            id: function_call.id.clone().filter(|id| !id.is_empty()),
                             function_name: function_call.name.clone(),
                             arguments_delta: serde_json::to_string(&function_call.args)
                                 .unwrap_or_default(),
@@ -2036,6 +2084,44 @@ mod tests {
                 "split at {split} lost or mangled an event"
             );
         }
+    }
+
+    /// A Gemini call opening with no id is given the gateway's for its number
+    /// as it opens, and the frame is told which. Another protocol's call is
+    /// read as sent (its spec requires the id), and so is any call of a parser
+    /// not identifying calls.
+    #[test]
+    fn a_gemini_call_is_read_under_the_id_the_gateway_gives_it() {
+        const RID: uuid::Uuid = uuid::Uuid::from_u128(7);
+        let ids = |events: &[DomainEvent]| -> Vec<Option<String>> {
+            events.iter().filter_map(|e| match e {
+                DomainEvent::ToolCallDelta { id, .. } => Some(id.clone()),
+                _ => None,
+            }).collect()
+        };
+        let frame = |data: serde_json::Value| SseEvent { event_type: None, data: data.to_string(), id: None };
+        let gateway = |n| Some(crate::api::call_ids::gateway_call_id(RID, n));
+        let gemini = frame(serde_json::json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"name": "a", "args": {}}},
+            {"functionCall": {"id": "own", "name": "b", "args": {}}},
+            {"functionCall": {"name": "c", "args": {}}}]}}]}));
+        let mut parser = StreamParser::new(ApiVersion::GoogleGemini).identifying_calls(RID);
+        assert_eq!(ids(&parser.parse(&gemini)), [gateway(0), Some("own".into()), gateway(2)]);
+        assert_eq!(parser.take_settled_ids(), [(0, gateway(0).unwrap()), (2, gateway(2).unwrap())]);
+        // Two calls with an empty id in one frame are two calls, each given its own.
+        let empty = frame(serde_json::json!({"candidates": [{"content": {"parts": [
+            {"functionCall": {"id": "", "name": "a", "args": {}}},
+            {"functionCall": {"id": "", "name": "b", "args": {}}}]}}]}));
+        assert_eq!(ids(&parser.parse(&empty)), [gateway(3), gateway(4)]);
+        let mut raw = StreamParser::new(ApiVersion::GoogleGemini);
+        assert_eq!(ids(&raw.parse(&gemini)), [None, Some("own".into()), None]);
+        assert!(raw.take_settled_ids().is_empty());
+
+        let chat = frame(serde_json::json!({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "a", "arguments": "{"}}]}}]}));
+        let mut parser = StreamParser::new(ApiVersion::ChatCompletions).identifying_calls(RID);
+        assert_eq!(ids(&parser.parse(&chat)), [None]);
+        assert!(parser.take_settled_ids().is_empty());
     }
 
     /// The cap is per frame, not per stream: a long stream of ordinary frames

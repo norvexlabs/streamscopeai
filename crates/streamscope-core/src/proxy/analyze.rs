@@ -11,7 +11,7 @@
 //! The caller owns enforcement — this endpoint only analyzes, mutates, and
 //! audits.
 //!
-//! The envelope is versioned (`version: 1`); `findings` and `badges` reuse the
+//! The envelope is versioned (`version: 2`); `findings` and `badges` reuse the
 //! audit-side serde types verbatim so there is no parallel schema to drift.
 
 use std::sync::Arc;
@@ -37,12 +37,13 @@ use crate::middleware::attribution;
 use crate::pipeline::TransformFlags;
 use crate::proxy::content::{self, GuardrailStepDiff};
 use crate::proxy::inline_exchange::PendingExchange;
+use crate::pipeline::response_pipeline::ReplayedAnswer;
 use crate::proxy::{AppState, ContentMeta, RequestMeta, TenantRequestCtx, send_audit};
 use crate::settings::core_settings;
 
 /// Contract version this build speaks. A request with any other `version` is
 /// refused with a 400 — the envelope has no compatibility shims.
-pub const ANALYZE_CONTRACT_VERSION: u32 = 1;
+pub const ANALYZE_CONTRACT_VERSION: u32 = 2;
 
 /// What the submitting enforcement point can DO with the analysis — the
 /// audit-truth switch. A verdict-only caller cannot apply a rewrite on the
@@ -52,7 +53,8 @@ pub const ANALYZE_CONTRACT_VERSION: u32 = 1;
 pub enum AnalyzeEnforcement {
     /// The caller can replace the on-wire body with `transformed`. Policy
     /// mutations are recorded as applied (`modified` badge) and `transformed`
-    /// is returned.
+    /// is returned. Asking for no body (`include_transformed: false`) means
+    /// forwarding the original: recorded and refused as for `verdict_only`.
     Rewrite,
     /// The caller only enforces the verdict (allow/block). `transformed` is
     /// never returned; a policy mutation is recorded as
@@ -128,13 +130,20 @@ pub struct AnalyzeRequest {
     /// audited observe-only on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_id: Option<String>,
+    /// The HTTP status the upstream answered with. Required with `direction:
+    /// response` (only it tells an answer delivered with an error inside from
+    /// a refusal the client received), refused with `direction: request`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
     /// Model identifier when the protocol does not carry it in the body
     /// (Gemini puts it in the URL path); required for `google_gemini`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Whether the response should include the transformed body when the
     /// pipeline mutated it. Defaults to true. Only meaningful with
-    /// `enforcement: "rewrite"` — a verdict-only caller never receives it.
+    /// `enforcement: "rewrite"` — a verdict-only caller never receives it. False
+    /// means the caller forwards the original, so a change is recorded not
+    /// applied and an enforce finding escalates to `block`.
     #[serde(default = "default_true")]
     pub include_transformed: bool,
     /// What the caller can do with the analysis. Defaults to `verdict_only`
@@ -363,9 +372,24 @@ pub async fn analyze_handler(
         )));
     }
     if envelope.direction == AnalyzeDirection::Response {
-        return analyze_response(&state, &ctx, envelope).await;
+        let status = response_status(envelope.upstream_status)?;
+        return analyze_response(&state, &ctx, envelope, status).await;
+    }
+    if envelope.upstream_status.is_some() {
+        return Err(AppError::BadRequest(
+            "`upstream_status` belongs to direction \"response\"".to_string(),
+        ));
     }
     analyze_request(&state, &ctx, envelope).await
+}
+
+/// A response half's `upstream_status`: stated, and an HTTP final status.
+fn response_status(status: Option<u16>) -> Result<u16, AppError> {
+    match status {
+        Some(status) if (200..=599).contains(&status) => Ok(status),
+        Some(status) => Err(AppError::BadRequest(format!("`upstream_status` {status} is not an HTTP final status"))),
+        None => Err(AppError::BadRequest("`upstream_status` is required with direction \"response\"".to_string())),
+    }
 }
 
 /// The end client's app and how it was named.
@@ -649,17 +673,26 @@ async fn analyze_request(
 
     let modified = badges.is_modified();
     let verdict_only = envelope.enforcement == AnalyzeEnforcement::VerdictOnly;
-    if verdict_only && modified {
+    // What the pipeline changed reaches the wire only in a `transformed` body:
+    // a rewrite caller that did not ask for one forwards the original.
+    let applied = !verdict_only && envelope.include_transformed;
+    if !applied && modified {
         // The caller cannot apply the rewrite, so the wire keeps the original:
         // the audit must say "would have modified", never "modified".
         badges.demote_modified_to_not_applied();
     }
+    // A caller forwarding the original cannot forward a guardrail-enforce strip,
+    // so the finding escalates to `block` — forwarding the original would bypass it.
+    let outcome = derive_verdict(&badges.clone().finish(), &inbound_guardrail_steps, modified, !applied);
+    // A call policy removes is still offered to the model when the caller
+    // forwards the original; a refused request offers nothing.
+    let tool_blocks_stand = applied || outcome.verdict == AnalyzeVerdict::Block;
+    if !tool_blocks_stand {
+        badges.demote_request_tool_blocks_to_not_applied();
+    }
     let badges_vec = badges.clone().finish();
-    // A verdict-only caller cannot forward a guardrail-enforce strip, so the
-    // finding escalates to `block` — forwarding the original would bypass it.
-    let outcome = derive_verdict(&badges_vec, &inbound_guardrail_steps, modified, verdict_only);
 
-    let transformed = if modified && !verdict_only && envelope.include_transformed {
+    let transformed = if modified && applied {
         let bytes = api_request.serialize()?;
         Some(
             serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -693,8 +726,13 @@ async fn analyze_request(
     let content_meta = if ctx.config.content_logging_enabled {
         let ib = (!transform_result.injection_blocks.is_empty())
             .then_some(transform_result.injection_blocks);
-        let bt = (!transform_result.blocked_tools.is_empty())
-            .then_some(transform_result.blocked_tools);
+        let bt = (!transform_result.blocked_tools.is_empty()).then(|| {
+            transform_result
+                .blocked_tools
+                .into_iter()
+                .map(|info| content::BlockedToolInfo { not_applied: !tool_blocks_stand, ..info })
+                .collect()
+        });
         let rtr = (!transform_result.redacted_tool_results.is_empty())
             .then_some(transform_result.redacted_tool_results);
         let (transform_diff, effective_tools) = content::build_transform_diff(
@@ -847,7 +885,8 @@ fn response_unit_count(protocol: ApiVersion, body: &serde_json::Value) -> usize 
 async fn analyze_response(
     state: &Arc<AppState>,
     ctx: &TenantRequestCtx,
-    envelope: AnalyzeRequest,
+    mut envelope: AnalyzeRequest,
+    upstream_status: u16,
 ) -> Result<Response, AppError> {
     if envelope.enforcement == AnalyzeEnforcement::Rewrite {
         return Err(AppError::BadRequest(
@@ -887,7 +926,8 @@ async fn analyze_response(
     // scan; here it only shapes the returned verdict — never enforced, the bytes
     // already reached the client.
     let pii = &ctx.config.effective_guardrail(ctx.user.workspace_id).pii;
-    let inputs = if pii.enabled && pii.scan_response {
+    // A refused answer's body is no answer, and the row reads none of it.
+    let inputs = if pii.enabled && pii.scan_response && (200..300).contains(&upstream_status) {
         read_answer(envelope.protocol, &envelope.body).response_pii_inputs()
     } else {
         Vec::new()
@@ -942,7 +982,7 @@ async fn analyze_response(
             &pending.tenant_config,
             state,
             pending.upstream_api_version,
-            Some(&envelope.body),
+            Some(ReplayedAnswer { status: upstream_status, body: &mut envelope.body }),
         )
         .await;
         rid
@@ -963,7 +1003,7 @@ async fn analyze_response(
             &ctx.config,
             state,
             envelope.protocol,
-            Some(&envelope.body),
+            Some(ReplayedAnswer { status: upstream_status, body: &mut envelope.body }),
         )
         .await;
         request_id
@@ -989,6 +1029,17 @@ async fn analyze_response(
 mod tests {
     use super::*;
     use crate::guardrail::GuardrailCategory;
+
+    /// Both sides of each bound, and the one absence the contract refuses.
+    #[test]
+    fn a_response_half_states_an_http_final_status() {
+        for status in [200, 204, 299, 300, 429, 599] {
+            assert_eq!(response_status(Some(status)).ok(), Some(status));
+        }
+        for status in [Some(0), Some(100), Some(199), Some(600), None] {
+            assert!(response_status(status).is_err(), "{status:?}");
+        }
+    }
 
     #[test]
     fn an_analyzed_client_is_attributed_as_a_proxied_one_would_be() {
@@ -1266,7 +1317,7 @@ mod tests {
             ("google_gemini", ApiVersion::GoogleGemini),
         ] {
             let json = format!(
-                r#"{{"version":1,"protocol":"{spelling}","body":{{"model":"m","messages":[]}}}}"#
+                r#"{{"version":2,"protocol":"{spelling}","body":{{"model":"m","messages":[]}}}}"#
             );
             let req: AnalyzeRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(req.protocol, expect);
@@ -1289,7 +1340,7 @@ mod tests {
             ("verdict_only", AnalyzeEnforcement::VerdictOnly),
         ] {
             let json = format!(
-                r#"{{"version":1,"protocol":"responses","body":{{}},"enforcement":"{spelling}"}}"#
+                r#"{{"version":2,"protocol":"responses","body":{{}},"enforcement":"{spelling}"}}"#
             );
             let req: AnalyzeRequest = serde_json::from_str(&json).unwrap();
             assert_eq!(req.enforcement, expect);
@@ -1298,14 +1349,14 @@ mod tests {
 
     #[test]
     fn envelope_rejects_unknown_fields() {
-        let json = r#"{"version":1,"protocol":"responses","body":{},"bogus":true}"#;
+        let json = r#"{"version":2,"protocol":"responses","body":{},"bogus":true}"#;
         assert!(serde_json::from_str::<AnalyzeRequest>(json).is_err());
     }
 
     #[test]
     fn envelope_client_meta_round_trips() {
         let json = r#"{
-            "version": 1,
+            "version": 2,
             "protocol": "anthropic_messages",
             "direction": "request",
             "body": {"model": "claude", "messages": []},

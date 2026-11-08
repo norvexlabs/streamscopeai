@@ -302,8 +302,22 @@ pub struct ImageSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
     /// Nested content blocks — for `source.type = "content"` (Anthropic document source).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The spec also takes a string: read as one text block, the same content.
+    #[serde(default, deserialize_with = "source_content", skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentBlock>>,
+}
+
+fn source_content<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Vec<ContentBlock>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Content {
+        Text(String),
+        Blocks(Vec<ContentBlock>),
+    }
+    Ok(Option::<Content>::deserialize(de)?.map(|content| match content {
+        Content::Text(text) => vec![ContentBlock::Text { text, cache_control: None }],
+        Content::Blocks(blocks) => blocks,
+    }))
 }
 
 /// Anthropic tool definition.

@@ -829,6 +829,7 @@
                     <div class="flex items-center gap-2 text-xs mt-1">
                       <span class="text-(--error)">B</span>
                       <span class="text-(--text-primary)">{bt.name}</span>
+                      {#if bt.not_applied}<span class="text-[9px] uppercase font-semibold text-(--warning)">{m.conv_not_applied()}</span>{/if}
                       <span class="text-(--text-secondary)">— {bt.description} {m.audit_detail_response_phase()}</span>
                     </div>
                   {/each}

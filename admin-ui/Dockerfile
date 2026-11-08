@@ -62,9 +62,11 @@ RUN wget -qO /NODEJS_LICENSE "https://raw.githubusercontent.com/nodejs/node/$(no
 
 # Plain Alpine, the base every runtime image shares, with the node binary of the
 # builder's own image (built for this musl) and the two libraries it links.
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
 
-RUN apk add --no-cache libstdc++ libgcc
+# zlib 1.4: the pinned base carries 1.3.2, whose critical CVE-2026-4738 the release audit
+# refuses. A base digest carrying 1.4 makes this requirement a no-op.
+RUN apk add --no-cache libstdc++ libgcc 'zlib>=1.4'
 COPY --from=deps /usr/local/bin/node /usr/local/bin/node
 
 # Fixed uid/gid 65532 so the runtime user is identical and numeric across every
@@ -80,7 +82,7 @@ COPY --from=builder /streamscopeai-console.cdx.json /usr/share/sbom/streamscopea
 LABEL org.opencontainers.image.title="Streamscope AI console" \
       org.opencontainers.image.source="https://github.com/norvexlabs/streamscopeai" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
-      org.opencontainers.image.base.name="docker.io/library/alpine:3.24.3"
+      org.opencontainers.image.base.name="docker.io/library/alpine:3.24.4"
 
 WORKDIR /app
 

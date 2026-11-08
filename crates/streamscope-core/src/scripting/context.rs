@@ -908,6 +908,35 @@ pub struct ScanMessage {
     pub held_call: Option<String>,
 }
 
+/// What the inbound guardrail reads of a document in a user or tool message:
+/// a text file's body or a content source's text, and — with `names`, where
+/// the protocol carries them as text to the model (Anthropic's `title` and
+/// `context`) — its name and context, by line. A file name elsewhere names a
+/// file and stays as sent ([`set_item_text`] could not take it away). Only a
+/// type the client labels `text/*` is a text body, as the parser settles it: the
+/// bytes of any other (a PDF, an image, a relabelled text file) are read by no
+/// detector. `None` with nothing to read.
+fn document_screen_text(block: &DomainContentBlock, names: bool) -> Option<String> {
+    let DomainContentBlock::Document { data, media_type, title, context, nested_content, .. } = block else {
+        return None;
+    };
+    let mut read: Vec<&str> = Vec::new();
+    if names {
+        read.extend(title.as_deref());
+        read.extend(context.as_deref());
+    }
+    if media_type.starts_with("text/") {
+        read.push(data);
+    }
+    if let Some(Value::Array(blocks)) = nested_content {
+        // A text block alone, what the spec gives such a source and the one kind
+        // an edit can land on ([`set_source_text`]).
+        read.extend(blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("text")).filter_map(|b| b.get("text").and_then(Value::as_str)));
+    }
+    let text = read.join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
 /// Whether the inbound guardrail reads a message: a user's or a tool
 /// result's, never the assistant's or a system message.
 fn is_scanned(m: &DomainMessage) -> bool {
@@ -925,8 +954,13 @@ fn is_scanned(m: &DomainMessage) -> bool {
 /// and system messages), and no message after one joins it, so its distance
 /// from the end is the whole list's. `None` when the two readings do not pair,
 /// role for role and text for text. Followed by the client's built-in tool
-/// outputs among those items ([`held_outputs`]), each in its item's place.
-/// Locked by `every_scanned_message_pairs_with_the_whole_projection`.
+/// outputs among those items ([`held_outputs`]) and, each as a message of its
+/// own, by the documents of its messages and the results of tools the server
+/// ran, each in its item's place. A piece's `part` is past the item's messages
+/// and its held output: [`set_item_text`] counts pieces by their place in the
+/// item, whatever their text, so an edit never moves another's.
+/// Locked by `every_scanned_message_pairs_with_the_whole_projection` and
+/// `every_text_the_model_reads_is_read_and_written_in_place`.
 pub fn scan_messages(req: &ApiRequest, start: usize) -> Option<Vec<ScanMessage>> {
     let tail = DomainRequest::conversation_from(req, start);
     let read: Vec<(usize, RhaiMessage)> = tail
@@ -935,17 +969,44 @@ pub fn scan_messages(req: &ApiRequest, start: usize) -> Option<Vec<ScanMessage>>
         .filter(|(_, m)| is_scanned(m))
         .map(|(k, m)| (tail.len() - 1 - k, domain_msg_to_rhai(m)))
         .collect();
+    let names = matches!(req, ApiRequest::AnthropicMessages(_));
     let mut paired = Vec::with_capacity(read.len());
+    // Documents: (the message's place in `paired`, the item, the piece, its text).
+    let mut documents: Vec<(usize, usize, usize, String)> = Vec::new();
+    let mut results = Vec::new();
+    let mut result_from = 0;
     for item in start..DomainRequest::conversation_len(req) {
-        for (part, m) in DomainRequest::item_conversation(req, item).iter().enumerate() {
+        let own = DomainRequest::item_conversation(req, item);
+        let mut piece = own.len() + 1;
+        for (part, m) in own.iter().enumerate() {
             if is_scanned(m) {
+                for block in m.content.iter().filter(|b| matches!(b, DomainContentBlock::Document { .. })) {
+                    if let Some(text) = document_screen_text(block, names) {
+                        documents.push((paired.len(), item, piece, text));
+                    }
+                    piece += 1;
+                }
                 paired.push((item, part, domain_msg_to_rhai(m)));
             }
+        }
+        if let ApiRequest::AnthropicMessages(r) = req {
+            results.extend(anthropic_pieces(&r.messages[item], item, piece, &tail, &mut result_from));
         }
     }
     if paired.len() != read.len() {
         return None;
     }
+    let reverses: Vec<usize> = read.iter().map(|(reverse, _)| *reverse).collect();
+    let document_messages: Vec<ScanMessage> = documents
+        .into_iter()
+        .map(|(at, item, part, content)| ScanMessage {
+            item,
+            part,
+            reverse: reverses[at],
+            message: RhaiMessage { content, tool_calls: Vec::new(), ..paired[at].2.clone() },
+            held_call: None,
+        })
+        .collect();
     let mut messages: Vec<ScanMessage> = paired
         .into_iter()
         .zip(read)
@@ -955,8 +1016,84 @@ pub fn scan_messages(req: &ApiRequest, start: usize) -> Option<Vec<ScanMessage>>
         })
         .collect::<Option<_>>()?;
     messages.extend(held_outputs(req, start, &tail));
+    messages.extend(document_messages);
+    messages.extend(results);
     messages.sort_by_key(|m| m.item);
     Some(messages)
+}
+
+/// Whether a domain block is the one a piece came from.
+type BlockTest<'a> = dyn Fn(&DomainContentBlock) -> bool + 'a;
+
+/// The pieces of an Anthropic message past its documents, in block order: each
+/// result of a tool the server ran or of a search a client supplies, at the top
+/// or inside a tool result, as a tool message; and the name and context of a
+/// document by file reference, which the domain keeps as no document. Each is
+/// anchored at the message of `tail` holding it, from `from` on. Pieces count
+/// from `piece` by their place ([`set_anthropic_piece_text`] walks them alike).
+fn anthropic_pieces(message: &AnthropicMessage, item: usize, mut piece: usize, tail: &[DomainMessage], from: &mut usize) -> Vec<ScanMessage> {
+    let AnthropicContent::Blocks(blocks) = &message.content else {
+        return Vec::new();
+    };
+    let mut anchor = |holds: &BlockTest| {
+        let holding = |m: &DomainMessage| m.content.iter().any(holds);
+        // In order, so a result sent twice lands on each; a conversion places an
+        // item's tool messages first, so a block after one may sit before it.
+        let at = tail.iter().skip(*from).position(holding).map(|at| *from + at).or_else(|| tail.iter().position(holding));
+        if let Some(at) = at {
+            *from = at;
+        }
+        at.map_or(0, |at| tail.len() - 1 - at)
+    };
+    let mut out = Vec::new();
+    let mut result = |value: &Value, piece: &mut usize, anchor: &mut dyn FnMut(&BlockTest) -> usize| {
+        if !crate::api::is_server_run_result(value) {
+            return;
+        }
+        let reverse = anchor(&|b| matches!(b, DomainContentBlock::Unknown { value: v } if v == value));
+        if let Some(content) = crate::api::server_run_text(value) {
+            let call = crate::api::server_run_call_id(value);
+            out.push(ScanMessage {
+                item,
+                part: *piece,
+                reverse,
+                message: RhaiMessage { role: "tool".to_string(), content, tool_call_id: Some(call.clone()), tool_calls: Vec::new() },
+                held_call: (!call.is_empty()).then_some(call),
+            });
+        }
+        *piece += 1;
+    };
+    let mut files = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Unknown(value) => result(value, &mut piece, &mut anchor),
+            ContentBlock::ToolResult { content: Some(crate::api::messages::ToolResultContent::Blocks(inner)), .. } => {
+                for inner in inner {
+                    if let crate::api::messages::ToolResultBlock::Unknown(value) = inner {
+                        result(value, &mut piece, &mut anchor);
+                    }
+                }
+            }
+            ContentBlock::Document { source, title, context, .. } if source.r#type == "file" => {
+                let read: Vec<&str> = title.iter().chain(context).map(String::as_str).collect();
+                let id = source.file_id.clone();
+                let reverse = anchor(&|b| matches!(b, DomainContentBlock::File { file_id, .. } if *file_id == id));
+                if message.role != "assistant" && read.iter().any(|t| !t.trim().is_empty()) {
+                    files.push((piece, reverse, read.join("\n")));
+                }
+                piece += 1;
+            }
+            _ => {}
+        }
+    }
+    out.extend(files.into_iter().map(|(part, reverse, content)| ScanMessage {
+        item,
+        part,
+        reverse,
+        message: RhaiMessage { role: "user".to_string(), content, tool_call_id: None, tool_calls: Vec::new() },
+        held_call: None,
+    }));
+    out
 }
 
 /// The outputs of the built-in tools the client ran, among the Responses
@@ -988,10 +1125,20 @@ fn held_outputs(req: &ApiRequest, start: usize, tail: &[DomainMessage]) -> Vec<S
     let mut next = 0;
     let mut out = Vec::new();
     for (item, value) in items.iter().enumerate().skip(start) {
-        let Some(output) = crate::api::BuiltinOutput::of(value) else {
-            continue;
+        // A client-run tool's output, or the result of one the server ran.
+        let (call_id, read, role) = match crate::api::BuiltinOutput::of(value) {
+            Some(output) => {
+                let read = output.screen_text(value);
+                (output.call_id, read, "tool")
+            }
+            None if crate::api::is_server_run_result(value) => {
+                // An approval's reason is the user's own words.
+                let role = if value.get("type").and_then(Value::as_str) == Some("mcp_approval_response") { "user" } else { "tool" };
+                (crate::api::server_run_call_id(value), crate::api::server_run_text(value), role)
+            }
+            None => continue,
         };
-        let Some(content) = output.screen_text(value) else {
+        let Some(content) = read else {
             continue;
         };
         // One the conversion read as a message, by a `role` it carries, is
@@ -1012,12 +1159,12 @@ fn held_outputs(req: &ApiRequest, start: usize, tail: &[DomainMessage]) -> Vec<S
             part: DomainRequest::item_conversation(req, item).len(),
             reverse,
             message: RhaiMessage {
-                role: "tool".to_string(),
+                role: role.to_string(),
                 content,
-                tool_call_id: Some(output.call_id.clone()),
+                tool_call_id: Some(call_id.clone()),
                 tool_calls: Vec::new(),
             },
-            held_call: Some(output.call_id),
+            held_call: Some(call_id),
         });
     }
     out
@@ -1030,14 +1177,24 @@ fn held_outputs(req: &ApiRequest, start: usize, tail: &[DomainMessage]) -> Vec<S
 /// `an_edit_lands_on_its_message_alone`.
 pub fn set_item_text(req: &mut ApiRequest, item: usize, part: usize, text: &str) {
     let own = DomainRequest::item_conversation(req, item);
-    // The part past the item's messages is a built-in tool's output it holds
-    // ([`held_outputs`]), read whole and so written whole.
+    // The part past the item's messages is an output it holds ([`held_outputs`]),
+    // read whole and so written whole: a built-in tool's, or a server-run
+    // tool's result.
     if part == own.len()
         && let ApiRequest::Responses(r) = req
         && let crate::api::domain::ResponseInput::Raw(items) = &mut r.input
-        && let Some(output) = items.get_mut(item).filter(|o| crate::api::BuiltinOutput::of(o).is_some())
+        && let Some(output) = items.get_mut(item)
     {
-        crate::api::replace_builtin_output(output, text.to_string());
+        if crate::api::BuiltinOutput::of(output).is_some() {
+            crate::api::replace_builtin_output(output, text.to_string());
+        } else {
+            crate::api::set_server_run_text(output, text);
+        }
+        return;
+    }
+    // Past that, one of its pieces ([`scan_messages`]).
+    if part > own.len() {
+        set_item_piece_text(req, item, &own, part - own.len() - 1, text);
         return;
     }
     let Some(message) = own.get(part) else {
@@ -1109,6 +1266,204 @@ pub fn set_item_text(req: &mut ApiRequest, item: usize, part: usize, text: &str)
     }
 }
 
+/// Write `text` over the `piece`-th piece of an item: the documents of its
+/// scanned messages in order, then its results of tools the server ran.
+fn set_item_piece_text(req: &mut ApiRequest, item: usize, own: &[DomainMessage], piece: usize, text: &str) {
+    let mut left = piece;
+    for (part, m) in own.iter().enumerate().filter(|(_, m)| is_scanned(m)) {
+        let documents = m.content.iter().filter(|b| matches!(b, DomainContentBlock::Document { .. })).count();
+        if left < documents {
+            set_document_text(req, item, own, part, left, text);
+            return;
+        }
+        left -= documents;
+    }
+    if let ApiRequest::AnthropicMessages(r) = req {
+        set_anthropic_piece_text(&mut r.messages[item], left, text);
+    }
+}
+
+/// Write `text` over the `n`-th piece [`anthropic_pieces`] counts: a result's
+/// strings, or a file document's context, its name gone with what was read.
+fn set_anthropic_piece_text(message: &mut AnthropicMessage, mut n: usize, text: &str) {
+    let AnthropicContent::Blocks(blocks) = &mut message.content else {
+        return;
+    };
+    let mut take = || {
+        let hit = n == 0;
+        n = n.wrapping_sub(1);
+        hit
+    };
+    for block in blocks {
+        match block {
+            ContentBlock::Unknown(value) if crate::api::is_server_run_result(value) && take() => {
+                return crate::api::set_server_run_text(value, text);
+            }
+            ContentBlock::ToolResult { content: Some(crate::api::messages::ToolResultContent::Blocks(inner)), .. } => {
+                for inner in inner {
+                    if let crate::api::messages::ToolResultBlock::Unknown(value) = inner
+                        && crate::api::is_server_run_result(value)
+                        && take()
+                    {
+                        return crate::api::set_server_run_text(value, text);
+                    }
+                }
+            }
+            ContentBlock::Document { source, title, context, .. } if source.r#type == "file" && take() => {
+                *title = None;
+                *context = (!text.is_empty()).then(|| text.to_string());
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Write `text` over the `n`-th document of message `part` of an item, in the
+/// protocol's own shape: a document stays a document, its text in the channel it
+/// came in.
+fn set_document_text(req: &mut ApiRequest, item: usize, own: &[DomainMessage], part: usize, n: usize, text: &str) {
+    // A tool message is the k-th result of its item (as [`set_item_text`]).
+    let is_tool = matches!(own[part].role, DomainRole::Tool { .. });
+    let k = own[..part].iter().filter(|m| matches!(m.role, DomainRole::Tool { .. })).count();
+    match req {
+        ApiRequest::ChatCompletions(r) => {
+            if let Some(content) = &mut r.messages[item].content {
+                set_parts_document_text(content, n, text);
+            }
+        }
+        ApiRequest::AnthropicMessages(r) => {
+            let m = &mut r.messages[item];
+            let role_is_tool = m.role == "tool";
+            let AnthropicContent::Blocks(blocks) = &mut m.content else {
+                return;
+            };
+            if is_tool && !role_is_tool {
+                if let Some(ContentBlock::ToolResult { content: Some(crate::api::messages::ToolResultContent::Blocks(inner)), .. }) =
+                    blocks.iter_mut().filter(|b| matches!(b, ContentBlock::ToolResult { .. })).nth(k)
+                    && let Some(crate::api::messages::ToolResultBlock::Document { source, .. }) = inner
+                        .iter_mut()
+                        .filter(|b| matches!(b, crate::api::messages::ToolResultBlock::Document { source, .. } if source.r#type != "file"))
+                        .nth(n)
+                {
+                    set_source_text(source, text);
+                }
+            } else if let Some(ContentBlock::Document { source, title, context, .. }) =
+                // The domain reads a file reference as no document: counted as it counts.
+                blocks.iter_mut().filter(|b| matches!(b, ContentBlock::Document { source, .. } if source.r#type != "file")).nth(n)
+            {
+                // Read with the body, so gone with it. A body no text can land
+                // in keeps the text in the context the model reads beside it.
+                *title = None;
+                if set_source_text(source, text) {
+                    *context = None;
+                } else {
+                    *context = (!text.is_empty()).then(|| text.to_string());
+                }
+            }
+        }
+        ApiRequest::GoogleGemini(r) => {
+            let content = &mut r.contents[item];
+            if is_tool {
+                if let Some(GeminiPart::FunctionResponse { function_response }) =
+                    content.parts.iter_mut().filter(|p| matches!(p, GeminiPart::FunctionResponse { .. })).nth(k)
+                    && let Some(blob) = function_response
+                        .parts
+                        .iter_mut()
+                        .filter(|p| crate::api::domain_request::gemini_response_part_is_document(p))
+                        .nth(n)
+                {
+                    blob["inlineData"]["data"] = Value::String(crate::api::domain_request::gemini_text_data(text));
+                }
+            } else if let Some(GeminiPart::InlineData { inline_data, .. }) = content
+                .parts
+                .iter_mut()
+                .filter(|p| {
+                    matches!(p, GeminiPart::InlineData { inline_data, .. }
+                        if crate::api::domain_request::gemini_blob_is_document(&inline_data.mime_type, &inline_data.data))
+                })
+                .nth(n)
+            {
+                inline_data.data = crate::api::domain_request::gemini_text_data(text);
+            }
+        }
+        ApiRequest::Responses(r) => match &mut r.input {
+            crate::api::domain::ResponseInput::Text(_) => {}
+            crate::api::domain::ResponseInput::Messages(msgs) => set_parts_document_text(&mut msgs[item].content, n, text),
+            crate::api::domain::ResponseInput::Raw(items) => {
+                let key = if is_tool { "output" } else { "content" };
+                if let Some(Value::Array(parts)) = items[item].get_mut(key)
+                    && let Some(file) = parts.iter_mut().filter(|p| crate::api::domain_request::part_is_document(p)).nth(n)
+                {
+                    set_file_part_text(file, text);
+                }
+            }
+        },
+    }
+}
+
+/// Write `text` as an Anthropic document source's text, where
+/// [`document_screen_text`] read it: a content source's text blocks, its images
+/// kept, or a text body, which becomes the spec's text source whatever spelled
+/// it. `false` when the source holds bytes or a reference no text can land in.
+fn set_source_text(source: &mut crate::api::messages::ImageSource, text: &str) -> bool {
+    match source.r#type.as_str() {
+        "content" => {
+            let mut blocks = source.content.take().unwrap_or_default();
+            let mut written = false;
+            blocks.retain_mut(|block| {
+                let ContentBlock::Text { text: t, .. } = block else {
+                    return true;
+                };
+                if written {
+                    return false;
+                }
+                written = true;
+                *t = text.to_string();
+                true
+            });
+            if !written {
+                blocks.insert(0, ContentBlock::Text { text: text.to_string(), cache_control: None });
+            }
+            source.content = Some(blocks);
+        }
+        _ if source.r#type == "text" || source.media_type.starts_with("text/") => {
+            source.r#type = "text".to_string();
+            source.media_type = "text/plain".to_string();
+            source.data = text.to_string();
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn set_parts_document_text(content: &mut MessageContent, n: usize, text: &str) {
+    use crate::api::domain::ContentPart;
+    if let MessageContent::Parts(parts) = content
+        && let Some(file) = parts
+            .iter_mut()
+            .filter_map(|p| match p {
+                ContentPart::Unknown(v) if crate::api::domain_request::part_is_document(v) => Some(v),
+                _ => None,
+            })
+            .nth(n)
+    {
+        set_file_part_text(file, text);
+    }
+}
+
+/// Write `text` over a Chat `file` or a Responses `input_file` part's data URL,
+/// its media type and name kept.
+fn set_file_part_text(part: &mut Value, text: &str) {
+    let chat = part.get("type").and_then(Value::as_str) == Some("file");
+    let file = if chat { &mut part["file"] } else { part };
+    if let Some(url) = file.get("file_data").and_then(Value::as_str)
+        && let Some(written) = crate::api::domain_request::text_data_url(url, text)
+    {
+        file["file_data"] = Value::String(written);
+    }
+}
+
 /// A Gemini function response's `response` after a write of `text`: the text
 /// as JSON when it still is an object, and otherwise an object holding it (a
 /// placeholder) — the protocol's response is an object — except where the
@@ -1160,29 +1515,13 @@ fn set_message_content_text(content: &mut MessageContent, text: &str) {
         MessageContent::Parts(parts) => {
             // A text part is a typed one, or an untyped one the projection reads
             // as text (a Responses `input_text`).
-            let mut replaced = false;
-            parts.retain_mut(|part| {
-                let is_text = match part {
-                    ContentPart::Text { .. } => true,
-                    ContentPart::Unknown(v) => crate::api::domain_request::unknown_part_is_text(v),
-                    _ => false,
-                };
-                if !is_text {
-                    return true;
-                }
-                if replaced {
-                    return false;
-                }
-                replaced = true;
-                match part {
-                    ContentPart::Text { text: t } => *t = text.to_string(),
-                    ContentPart::Unknown(v) => v["text"] = Value::String(text.to_string()),
-                    _ => {}
-                }
-                true
+            let replaced = ContentPart::merge_text_parts(parts, text, |part| match part {
+                ContentPart::Text { .. } => true,
+                ContentPart::Unknown(v) => crate::api::domain_request::unknown_part_is_text(v),
+                _ => false,
             });
             if !replaced {
-                parts.push(crate::api::domain::ContentPart::Text { text: text.to_string() });
+                parts.push(crate::api::domain::ContentPart::text(text.to_string()));
             }
         }
         MessageContent::Text(t) => *t = text.to_string(),
@@ -1293,7 +1632,7 @@ fn chat_msg_text(msg: &Message) -> String {
         Some(MessageContent::Parts(parts)) => parts
             .iter()
             .filter_map(|p| match p {
-                crate::api::domain::ContentPart::Text { text } => Some(text.as_str()),
+                crate::api::domain::ContentPart::Text { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -1789,7 +2128,10 @@ fn gemini_content_text(content: &GeminiContent) -> String {
 }
 
 /// Expand a GeminiContent into one or more RhaiMessages (mirrors from_gemini domain expansion).
-/// Returns Vec<(RhaiMessage, is_func_response)>.
+/// Returns Vec<(RhaiMessage, is_func_response)>. A call and a response are keyed
+/// as the client wrote them — a call's own id (empty where it has none), a
+/// response's id, else its function's name — the key edits are written back by;
+/// not the pairing the request's parse reads (`GeminiCallIds`).
 fn gemini_to_rhai_expansion(content: &GeminiContent) -> Vec<(RhaiMessage, bool)> {
     let role_str = content.role.as_deref().unwrap_or("user");
     let rhai_role = if role_str == "model" { "assistant" } else { "user" };
@@ -2820,30 +3162,27 @@ pub fn apply_to_api_request(
         }
         ApiRequest::GoogleGemini(gemini) => {
             // System prompt
-            if changed.system_prompt && let Some(new_prompt) = &ctx.system_prompt {
-                let current = gemini
-                    .system_instruction
-                    .as_ref()
-                    .and_then(|si| {
-                        si.parts.iter().find_map(|p| match p {
-                            crate::api::gemini::GeminiPart::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                    });
-                if current.is_none_or(|c| c != new_prompt) {
-                    gemini.system_instruction = Some(crate::api::gemini::GeminiContent {
-                        role: None,
-                        parts: vec![crate::api::gemini::GeminiPart::Text {
-                            text: new_prompt.clone(),
-                        }],
-                    });
-                    changes.push("system_prompt".to_string());
-                }
-            } else if changed.system_prompt && ctx.system_prompt.is_none()
-                && gemini.system_instruction.is_some()
+            // A script's prompt is the whole instruction: its edit replaces
+            // every part with its text, and its removal drops the instruction.
+            // It is compared with the text it read (`GeminiContent::system_text`),
+            // so a prompt left as read is not written.
+            if changed.system_prompt
+                && gemini.system_instruction.as_ref().and_then(crate::api::gemini::GeminiContent::system_text)
+                    != ctx.system_prompt
             {
-                gemini.system_instruction = None;
-                changes.push("system_prompt_removed".to_string());
+                match &ctx.system_prompt {
+                    Some(prompt) => {
+                        gemini.system_instruction = Some(crate::api::gemini::GeminiContent {
+                            role: None,
+                            parts: vec![crate::api::gemini::GeminiPart::Text { text: prompt.clone() }],
+                        });
+                        changes.push("system_prompt".to_string());
+                    }
+                    None => {
+                        gemini.system_instruction = None;
+                        changes.push("system_prompt_removed".to_string());
+                    }
+                }
             }
 
             // Message sync
@@ -3041,6 +3380,40 @@ mod tests {
         let unchanged = ChangedFields { system_prompt: false, messages: false, tools: false };
         assert!(apply_to_api_request(&ctx, &mut req, unchanged).is_empty());
         assert_eq!(texts(&req), texts(&parse()));
+    }
+
+    /// A Gemini system instruction's text is what a script reads — every text
+    /// part, a `thought: false` one too — and its prompt is the whole
+    /// instruction: an edit replaces every part, a removal drops it, and a
+    /// prompt read back unchanged is not written, however many parts hold it.
+    #[test]
+    fn a_gemini_system_prompt_is_read_and_written_as_its_text() {
+        let body = r#"{"systemInstruction":{"parts":[{"text":"A"},{"inlineData":{"mimeType":"image/png","data":"iVBO"}},{"thought":false,"text":"B"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let parse = || ApiRequest::parse(crate::api::sse::ApiVersion::GoogleGemini, &Bytes::from(body)).unwrap();
+        let prompt = ChangedFields { system_prompt: true, messages: false, tools: false };
+
+        let mut req = parse();
+        let mut ctx = from_api_request(&req, &test_user(), None, None, None, false, &no_subs());
+        assert_eq!(ctx.system_prompt.as_deref(), Some("A\nB"));
+        assert!(apply_to_api_request(&ctx, &mut req, prompt).is_empty());
+        assert_eq!(req.wire_value(), parse().wire_value());
+
+        ctx.system_prompt = Some("C".to_string());
+        assert_eq!(apply_to_api_request(&ctx, &mut req, prompt), ["system_prompt"]);
+        assert_eq!(req.wire_value().unwrap()["systemInstruction"], serde_json::json!({"parts": [{"text": "C"}]}));
+
+        // A prompt cut to its first part is an edit too.
+        let mut req = parse();
+        ctx.system_prompt = Some("A".to_string());
+        assert_eq!(apply_to_api_request(&ctx, &mut req, prompt), ["system_prompt"]);
+        assert_eq!(req.wire_value().unwrap()["systemInstruction"], serde_json::json!({"parts": [{"text": "A"}]}));
+
+        for body in [body, r#"{"systemInstruction":{"parts":[{"text":""}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#] {
+            let mut req = ApiRequest::parse(crate::api::sse::ApiVersion::GoogleGemini, &Bytes::from(body)).unwrap();
+            ctx.system_prompt = None;
+            assert_eq!(apply_to_api_request(&ctx, &mut req, prompt), ["system_prompt_removed"], "{body}");
+            assert!(req.wire_value().unwrap().get("systemInstruction").is_none());
+        }
     }
 
     #[test]
@@ -3982,12 +4355,7 @@ mod tests {
                 role: Some("user".to_string()),
                 parts: vec![
                     GeminiPart::Text { text: "Hello".to_string() },
-                    GeminiPart::InlineData {
-                        inline_data: crate::api::gemini::GeminiInlineData {
-                            mime_type: "image/png".to_string(),
-                            data: "base64data".to_string(),
-                        },
-                    },
+                    GeminiPart::inline("image/png".to_string(), "base64data".to_string()),
                 ],
             },
             GeminiContent {
@@ -5211,6 +5579,324 @@ mod scan_messages_tests {
             writes(ApiVersion::Responses, responses)?;
             writes(ApiVersion::Responses, messages)?;
         }
+    }
+
+    proptest! {
+        /// A data URL's text reads the same with its base64 padded or not, as a
+        /// data URL's reader decodes it. Not a property: that any payload under
+        /// `;base64,` is base64 (prose under a false one is passed through).
+        #[test]
+        fn a_text_file_reads_the_same_padded_or_not(text in "\\PC{1,40}") {
+            use base64::Engine;
+            prop_assume!(!text.trim().is_empty());
+            let wrapped = |b64: String| b64.as_bytes().chunks(8).map(|c| std::str::from_utf8(c).unwrap_or("")).collect::<Vec<_>>().join("\n");
+            let standard = base64::engine::general_purpose::STANDARD.encode(&text);
+            for b64 in [standard.clone(), standard.trim_end_matches('=').to_string(), wrapped(standard)] {
+                let url = format!("data:text/plain;base64,{b64}");
+                let items = vec![json!({"type": "message", "role": "user", "content": [{"type": "input_file", "filename": "a.txt", "file_data": url}]})];
+                let read = scan_messages(&parse(ApiVersion::Responses, &body(ApiVersion::Responses, items)), 0).unwrap();
+                prop_assert!(read.iter().any(|m| m.message.content == text), "{text:?}");
+            }
+        }
+    }
+
+    /// One text the model reads, in each shape a provider's spec gives it, with
+    /// where the edit must land.
+    fn model_read_cases() -> Vec<(&'static str, ApiVersion, Value, &'static str)> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(SECRET);
+        let unpadded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(SECRET);
+        let url = format!("data:text/plain;base64,{b64}");
+        let text_doc = json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": SECRET}});
+        let result = |v: Value| vec![v, json!({"role": "user", "content": "go on"})];
+        vec![
+            ("anthropic document, text source", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [text_doc.clone()]}]), "/messages/0/content/0/source/data"),
+            ("anthropic document, content source as a string", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": SECRET}}]}]),
+             "/messages/0/content/0/source/content/0/text"),
+            ("anthropic document, content source as blocks", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": SECRET}]}}]}]),
+             "/messages/0/content/0/source/content/0/text"),
+            ("anthropic title of a pdf", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "title": SECRET, "source": {"type": "base64", "media_type": "application/pdf", "data": "AAAA"}}]}]),
+             "/messages/0/content/0/context"),
+            ("anthropic context", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "context": SECRET, "source": {"type": "text", "media_type": "text/plain", "data": "x"}}]}]),
+             "/messages/0/content/0/source/data"),
+            ("anthropic tool result's document", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [text_doc.clone()]}]}]),
+             "/messages/0/content/0/content/0/source/data"),
+            ("anthropic mcp_tool_result", ApiVersion::AnthropicMessages,
+             Value::Array(result(json!({"role": "assistant", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1", "content": [{"type": "text", "text": SECRET}]}]}))),
+             "/messages/0/content/0/content/0/text"),
+            ("anthropic mcp_tool_result as a string", ApiVersion::AnthropicMessages,
+             Value::Array(result(json!({"role": "assistant", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1", "content": SECRET}]}))),
+             "/messages/0/content/0/content"),
+            ("anthropic web_fetch_tool_result", ApiVersion::AnthropicMessages,
+             Value::Array(result(json!({"role": "assistant", "content": [{"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "content":
+                 {"type": "web_fetch_result", "url": "https://x.example", "content": text_doc.clone()}}]}))),
+             "/messages/0/content/0/content/content/source/data"),
+            ("anthropic code_execution_tool_result", ApiVersion::AnthropicMessages,
+             Value::Array(result(json!({"role": "assistant", "content": [{"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_1", "content":
+                 {"type": "code_execution_result", "stdout": SECRET, "stderr": "", "return_code": 0, "content": []}}]}))),
+             "/messages/0/content/0/content/stdout"),
+            ("anthropic content source beside a block of another kind", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": SECRET}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}}]}]),
+             "/messages/0/content/0/source/content/0/text"),
+            ("anthropic document behind a file reference", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "source": {"type": "file", "file_id": "f1"}}, text_doc.clone()]}]),
+             "/messages/0/content/1/source/data"),
+            ("anthropic tool result's document behind a file reference", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                 {"type": "document", "source": {"type": "file", "file_id": "f1"}}, text_doc.clone()]}]}]),
+             "/messages/0/content/0/content/1/source/data"),
+            ("anthropic file reference's context", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "context": SECRET, "source": {"type": "file", "file_id": "f1"}}]}]),
+             "/messages/0/content/0/context"),
+            ("anthropic text body spelled as base64", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": SECRET}}]}]),
+             "/messages/0/content/0/source/data"),
+            ("anthropic search_result", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "search_result", "source": "https://x.example", "title": "t", "content": [{"type": "text", "text": SECRET}]}]}]),
+             "/messages/0/content/0/content/0/text"),
+            ("anthropic search_result in a tool result", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                 {"type": "search_result", "source": "https://x.example", "title": "t", "content": [{"type": "text", "text": SECRET}]}]}]}]),
+             "/messages/0/content/0/content/0/content/0/text"),
+            ("responses input_file beside a stray file member", ApiVersion::Responses,
+             json!([{"type": "message", "role": "user", "content": [{"type": "input_file", "filename": "a.txt", "file_data": url, "file": {}}]}]), ""),
+            ("responses input_file", ApiVersion::Responses,
+             json!([{"type": "message", "role": "user", "content": [{"type": "input_file", "filename": "a.txt", "file_data": url}]}]), ""),
+            ("responses input_file, unpadded", ApiVersion::Responses,
+             json!([{"type": "message", "role": "user", "content": [{"type": "input_file", "filename": "a.txt", "file_data": format!("data:text/plain;base64,{unpadded}")}]}]), ""),
+            ("responses message without its optional type, among other items", ApiVersion::Responses,
+             json!([{"type": "function_call", "call_id": "c0", "name": "f", "arguments": "{}"}, {"role": "user", "content": [{"type": "input_file", "filename": "a.txt", "file_data": url}]}]), ""),
+            ("responses message list", ApiVersion::Responses,
+             json!([{"role": "user", "content": [{"type": "input_file", "filename": "a.txt", "file_data": url}]}]), ""),
+            ("responses tool output's input_file", ApiVersion::Responses,
+             json!([{"type": "function_call_output", "call_id": "c1", "output": [{"type": "input_file", "filename": "a.txt", "file_data": url}]}]), ""),
+            ("responses mcp_call output", ApiVersion::Responses,
+             json!([{"type": "mcp_call", "id": "m1", "name": "x", "server_label": "s", "arguments": "{}", "output": SECRET}]), "/input/0/output"),
+            ("responses mcp_call error", ApiVersion::Responses,
+             json!([{"type": "mcp_call", "id": "m1", "name": "x", "server_label": "s", "arguments": "{}", "error": {"type": "http_error", "code": 500, "message": SECRET}}]), "/input/0/error/message"),
+            ("responses code_interpreter logs", ApiVersion::Responses,
+             json!([{"type": "code_interpreter_call", "id": "ci1", "container_id": "c", "code": "x", "status": "completed", "outputs": [{"type": "logs", "logs": SECRET}]}]), "/input/0/outputs/0/logs"),
+            ("responses file_search result", ApiVersion::Responses,
+             json!([{"type": "file_search_call", "id": "fs1", "status": "completed", "queries": ["q"], "results": [{"text": SECRET, "filename": "a"}]}]), "/input/0/results/0/text"),
+            ("responses approval reason", ApiVersion::Responses,
+             json!([{"type": "mcp_approval_response", "approval_request_id": "a1", "approve": false, "reason": SECRET}]), "/input/0/reason"),
+            ("responses computer safety check message", ApiVersion::Responses,
+             json!([{"type": "computer_call_output", "call_id": "k1", "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AA"},
+                     "acknowledged_safety_checks": [{"id": "s", "code": "c", "message": SECRET}]}]), "/input/0/acknowledged_safety_checks/0/message"),
+            ("responses computer output off spec", ApiVersion::Responses,
+             json!([{"type": "computer_call_output", "call_id": "k1", "output": SECRET}]), "/input/0/output"),
+            ("chat file part", ApiVersion::ChatCompletions,
+             json!([{"role": "user", "content": [{"type": "file", "file": {"filename": "a.txt", "file_data": url}}]}]), ""),
+            ("gemini text blob", ApiVersion::GoogleGemini,
+             json!([{"role": "user", "parts": [{"inlineData": {"mimeType": "text/plain", "data": b64}}]}]), ""),
+            ("gemini function response's text blob", ApiVersion::GoogleGemini,
+             json!([{"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"ok": true}, "parts": [{"inlineData": {"mimeType": "text/plain", "data": b64}}]}}]}]), ""),
+        ]
+    }
+
+    const SECRET: &str = "THE-SECRET-TEXTS";
+
+    /// The bytes of a request's wire, text and the base64 of it alike, with what
+    /// a data URL or a blob holds decoded.
+    fn wire_holds(wire: &Value, needle: &str) -> bool {
+        use base64::Engine;
+        let decoded = |s: &str| {
+            let b64 = s.rsplit(";base64,").next().unwrap_or(s);
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(b64.trim_end_matches('='))
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .is_some_and(|t| t.contains(needle))
+        };
+        match wire {
+            Value::String(s) => s.contains(needle) || decoded(s),
+            Value::Array(a) => a.iter().any(|v| wire_holds(v, needle)),
+            Value::Object(o) => o.values().any(|v| wire_holds(v, needle)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn every_text_the_model_reads_is_read_and_written_in_place() {
+        for (name, version, items, landing) in model_read_cases() {
+            let Value::Array(items) = items else { panic!() };
+            let mut req = parse(version, &body(version, items));
+            let read = scan_messages(&req, 0).unwrap_or_else(|| panic!("{name}: pairs"));
+            let at: Vec<_> = read.iter().filter(|m| m.message.content.contains(SECRET)).collect();
+            assert_eq!(at.len(), 1, "{name}: read once, in {:?}", read.iter().map(|m| &m.message.content).collect::<Vec<_>>());
+            let (item, part) = (at[0].item, at[0].part);
+            set_item_text(&mut req, item, part, "[withheld]");
+            let wire: Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+            assert!(!wire_holds(&wire, SECRET), "{name}: nothing of the original stays: {wire}");
+            assert!(wire_holds(&wire, "[withheld]"), "{name}: the edit is on the wire: {wire}");
+            if !landing.is_empty() {
+                assert_eq!(wire.pointer(landing), Some(&json!("[withheld]")), "{name}: {wire}");
+            }
+            let again = scan_messages(&parse(version, &wire), 0).unwrap();
+            assert!(again.iter().any(|m| m.message.content.contains("[withheld]")), "{name}: reads as written");
+            assert_eq!(again.len(), read.len(), "{name}: the shape survives: {wire}");
+        }
+    }
+
+    /// What the guardrail does not read, and why: bytes no detector reads, the
+    /// ids that pair a result with its call, a file's name, what the call says
+    /// (the model's own). The positive control is the case above.
+    #[test]
+    fn what_is_deliberately_not_read_stays_unread_and_as_sent() {
+        let cases = vec![
+            (ApiVersion::AnthropicMessages, json!([{"role": "user", "content": [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": SECRET}}]}])),
+            (ApiVersion::AnthropicMessages, json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [{"type": "x", "text": SECRET}]}}]}])),
+            (ApiVersion::AnthropicMessages, json!([{"role": "assistant", "content": [{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [{"type": "web_search_result", "encrypted_content": SECRET, "title": "t", "url": "https://x.example"}]}]}, {"role": "user", "content": "go"}])),
+            (ApiVersion::AnthropicMessages, json!([{"role": "assistant", "content": [{"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "content": {"type": "web_fetch_result", "url": "https://x.example", "content": {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": SECRET}}}}]}, {"role": "user", "content": "go"}])),
+            (ApiVersion::Responses, json!([{"type": "message", "role": "user", "content": [{"type": "input_file", "filename": SECRET, "file_data": "data:text/plain;base64,aGVsbG8="}]}])),
+            (ApiVersion::Responses, json!([{"type": "mcp_call", "id": SECRET, "name": SECRET, "server_label": "s", "arguments": SECRET}])),
+            (ApiVersion::Responses, json!([{"type": "code_interpreter_call", "id": "c", "container_id": "c", "code": SECRET, "status": "completed", "outputs": [{"type": "image", "url": SECRET}]}])),
+            (ApiVersion::Responses, json!([{"type": "computer_call_output", "call_id": SECRET, "output": {"type": "computer_screenshot", "image_url": SECRET}}])),
+            (ApiVersion::Responses, json!([{"type": "web_search_call", "id": SECRET, "status": "completed", "action": {"type": "search", "query": SECRET}}])),
+        ];
+        for (version, items) in cases {
+            let Value::Array(items) = items.clone() else { panic!() };
+            let read = scan_messages(&parse(version, &body(version, items.clone())), 0).unwrap();
+            assert!(read.iter().all(|m| !m.message.content.contains(SECRET)), "{items:?}");
+        }
+    }
+
+    /// Pieces are counted by their place, whatever their text: a blank document,
+    /// read by nothing, still holds its place, and a verdict replayed in any
+    /// order lands the same.
+    #[test]
+    fn an_edit_of_one_piece_leaves_every_other_where_it_is() {
+        let doc = |t: &str| json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": t}});
+        let items = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "prose"},
+            doc("   "),
+            doc("first"),
+            {"type": "tool_result", "tool_use_id": "t1", "content": [doc("in result"), {"type": "text", "text": "beside"}]},
+            doc("second"),
+            {"type": "mcp_tool_result", "tool_use_id": "m1", "content": "from a server"},
+        ]})];
+        let mut req = parse(ApiVersion::AnthropicMessages, &body(ApiVersion::AnthropicMessages, items));
+        let read = scan_messages(&req, 0).unwrap();
+        let part_of = |text: &str| read.iter().find(|m| m.message.content == text).unwrap_or_else(|| panic!("{text}")).part;
+        let (first, second, in_result, server) = (part_of("first"), part_of("second"), part_of("in result"), part_of("from a server"));
+        set_item_text(&mut req, 0, server, "M");
+        set_item_text(&mut req, 0, second, "S");
+        set_item_text(&mut req, 0, first, "F");
+        set_item_text(&mut req, 0, in_result, "R");
+        let wire: Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+        let blocks = &wire["messages"][0]["content"];
+        assert_eq!(blocks[0]["text"], "prose");
+        assert_eq!(blocks[1]["source"]["data"], "   ");
+        assert_eq!(blocks[2]["source"]["data"], "F");
+        assert_eq!(blocks[3]["content"][0]["source"]["data"], "R");
+        assert_eq!(blocks[3]["content"][1]["text"], "beside");
+        assert_eq!(blocks[3]["tool_use_id"], "t1");
+        assert_eq!(blocks[4]["source"]["data"], "S");
+        assert_eq!(blocks[5]["content"], "M");
+        assert_eq!(blocks[5]["tool_use_id"], "m1");
+        // Nothing else changed its place in the read either.
+        let again = scan_messages(&parse(ApiVersion::AnthropicMessages, &wire), 0).unwrap();
+        assert_eq!(again.iter().find(|m| m.message.content == "S").map(|m| m.part), Some(second));
+    }
+
+    /// Several pieces across a conversation: each read once, under the call it
+    /// answers, anchored at its own message, counted past what is no piece, and
+    /// written alone. An empty string stays empty: no field gains a placeholder.
+    #[test]
+    fn pieces_across_messages_keep_their_calls_anchors_and_places() {
+        let result = |call: &str, text: &str| json!({"type": "mcp_tool_result", "tool_use_id": call, "content": text});
+        let items = vec![
+            json!({"role": "assistant", "content": [
+                result("m1", "first result"),
+                {"type": "a_block_of_no_kind", "text": "not a result"},
+                {"type": "bash_code_execution_tool_result", "tool_use_id": "b1", "content":
+                    {"type": "bash_code_execution_result", "stdout": "bash output", "stderr": "", "return_code": 0, "content": []}},
+                {"type": "document", "context": "the model's own", "source": {"type": "file", "file_id": "f1"}},
+                result("m2", "second result"),
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "document", "context": "a user's context", "source": {"type": "file", "file_id": "f2"}},
+                {"type": "text", "text": "go on"},
+            ]}),
+            json!({"role": "assistant", "content": [result("m3", "later result")]}),
+            json!({"role": "user", "content": "last"}),
+        ];
+        let mut req = parse(ApiVersion::AnthropicMessages, &body(ApiVersion::AnthropicMessages, items));
+        let read = scan_messages(&req, 0).unwrap();
+        let piece = |text: &str| read.iter().find(|m| m.message.content == text).unwrap_or_else(|| panic!("{text}"));
+        // Domain: assistant, user, assistant, user, so from the end 3, 2, 1, 0.
+        for (text, call, reverse) in [("first result", "m1", 3), ("bash output", "b1", 3), ("second result", "m2", 3), ("later result", "m3", 1)] {
+            let at = piece(text);
+            assert_eq!(at.message.role, "tool", "{text}");
+            assert_eq!(at.held_call.as_deref(), Some(call), "{text}");
+            assert_eq!(at.message.tool_call_id.as_deref(), Some(call), "{text}");
+            assert_eq!(at.reverse, reverse, "{text}");
+        }
+        let user = piece("a user's context");
+        assert_eq!((user.message.role.as_str(), user.reverse, user.held_call.as_deref()), ("user", 2, None));
+        assert!(read.iter().all(|m| m.message.content != "the model's own"), "an assistant's document is not read");
+        assert!(read.iter().all(|m| m.message.content != "not a result"));
+
+        let (item, part) = (piece("second result").item, piece("second result").part);
+        let (bash_item, bash_part) = (piece("bash output").item, piece("bash output").part);
+        set_item_text(&mut req, item, part, "S");
+        set_item_text(&mut req, bash_item, bash_part, "B");
+        let wire: Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+        let blocks = &wire["messages"][0]["content"];
+        assert_eq!(blocks[0]["content"], "first result");
+        assert_eq!(blocks[1]["text"], "not a result");
+        assert_eq!(blocks[2]["content"]["stdout"], "B");
+        assert_eq!(blocks[2]["content"]["stderr"], "", "an empty field stays empty");
+        assert_eq!(blocks[3]["context"], "the model's own");
+        assert_eq!(blocks[4]["content"], "S");
+        assert_eq!(wire["messages"][2]["content"][0]["content"], "later result");
+    }
+
+    /// An edit of a content source's text keeps the images beside it: nothing is
+    /// dropped without a marker.
+    #[test]
+    fn an_edit_of_a_content_source_keeps_its_images() {
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let items = vec![json!({"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [
+            image.clone(), {"type": "text", "text": SECRET}, {"type": "text", "text": "more"},
+        ]}}]})];
+        let mut req = parse(ApiVersion::AnthropicMessages, &body(ApiVersion::AnthropicMessages, items));
+        let read = scan_messages(&req, 0).unwrap();
+        let at = read.iter().find(|m| m.message.content.contains(SECRET)).unwrap();
+        let (item, part) = (at.item, at.part);
+        set_item_text(&mut req, item, part, "[withheld]");
+        let wire: Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+        let held = &wire["messages"][0]["content"][0]["source"]["content"];
+        assert_eq!(held[0]["type"], "image", "{held}");
+        assert_eq!(held[1]["text"], "[withheld]", "{held}");
+        assert_eq!(held.as_array().map(Vec::len), Some(2), "{held}");
+    }
+
+    /// A finding on a piece is anchored at the message holding it, so the
+    /// console pins it there; a document's role is its message's, which is what
+    /// keeps the PII pass off a tool's document and on a user's.
+    #[test]
+    fn a_piece_is_anchored_at_its_message_with_its_role() {
+        let doc = json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "body"}});
+        let items = vec![
+            json!({"role": "user", "content": [doc.clone()]}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [doc]}]}),
+            json!({"role": "assistant", "content": "ok"}),
+            json!({"role": "user", "content": "last"}),
+        ];
+        let read = scan_messages(&parse(ApiVersion::AnthropicMessages, &body(ApiVersion::AnthropicMessages, items)), 0).unwrap();
+        let docs: Vec<_> = read.iter().filter(|m| m.message.content == "body").collect();
+        assert_eq!(docs.len(), 2);
+        assert_eq!((docs[0].message.role.as_str(), docs[0].reverse), ("user", 4));
+        assert_eq!((docs[1].message.role.as_str(), docs[1].reverse), ("tool", 2));
+        assert_eq!(docs[1].message.tool_call_id.as_deref(), Some("t1"));
     }
 
     /// An edit keeps what the protocol requires of the item it lands on:

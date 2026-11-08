@@ -905,6 +905,9 @@ fn emit(chunks: Vec<bytes::Bytes>, bytes: &mut Vec<u8>) {
     chunks.iter().for_each(|c| bytes.extend_from_slice(c));
 }
 
+/// The request the property's streams answer.
+const REQUEST_ID: uuid::Uuid = uuid::Uuid::from_u128(0x5eed);
+
 /// Run `stream` into `client` as the streaming pipeline does — with a policy
 /// holding calls (`held`) or on the fast path — returning the audit and the
 /// client's bytes. A stream of several responses is an agent loop: every
@@ -913,7 +916,7 @@ fn emit(chunks: Vec<bytes::Bytes>, bytes: &mut Vec<u8>) {
 fn run(stream: &GenStream, client: ApiVersion, held: bool) -> (TransformState, String) {
     let upstream = stream.upstream;
     let mut audit = TransformState::new(upstream);
-    let mut parser = StreamParser::new(upstream);
+    let mut parser = StreamParser::new(upstream).identifying_calls(REQUEST_ID);
     let mut acc = held.then(|| policy(upstream));
     let facts = crate::api::domain_request::ClientToolFacts { freeform: [FREEFORM_TOOL.to_string()].into(), ..Default::default() };
     let mut out = EventEmitter::new(client, upstream, "m", "req-p", None, None, 0, 0).with_client_tools(&facts);
@@ -925,8 +928,9 @@ fn run(stream: &GenStream, client: ApiVersion, held: bool) -> (TransformState, S
         // An earlier round's output is the loop's: held, and never replayed to
         // the client.
         let to_client = r == last;
-        for Frame { event: frame, .. } in frames_of(upstream, round, base, r) {
+        for Frame { event: mut frame, .. } in frames_of(upstream, round, base, r) {
             let events = parser.parse(&frame);
+            crate::api::call_ids::give_call_ids(&mut frame, &parser.take_settled_ids());
             out.observe_upstream(&frame);
             match &mut acc {
                 Some(acc) => {
@@ -1397,9 +1401,18 @@ fn check(stream: &GenStream, client: ApiVersion, held: bool) -> Result<(), Strin
     if recorded.len() != expected.len() {
         return Err(format!("audit recorded {} calls, the stream carried {}: {recorded:?}", recorded.len(), expected.len()));
     }
+    // A Gemini call the upstream sent no id is recorded under the gateway's
+    // for its number (`call_ids`) — the one its client is given.
+    let id_of = |r: &crate::pipeline::response::AccumulatedToolCall, want: &Carried| {
+        if stream.upstream == ApiVersion::GoogleGemini && want.id.is_empty() {
+            crate::api::call_ids::gateway_call_id(REQUEST_ID, r.index)
+        } else {
+            want.id.clone()
+        }
+    };
     for (r, want) in recorded.iter().zip(&expected) {
         let args = if want.freeform { crate::api::domain_request::freeform_call_input(&want.text).to_string() } else { want.text.clone() };
-        if r.id != want.id
+        if r.id != id_of(r, want)
             || r.function_name != want.name
             || r.server_tool != want.server
             || args_of(want.freeform, &Value::String(r.arguments.clone())) != args_of(want.freeform, &Value::String(args))
@@ -1474,14 +1487,15 @@ fn check(stream: &GenStream, client: ApiVersion, held: bool) -> Result<(), Strin
     let mut withheld: Vec<usize> = Vec::new();
     let mut matched: Vec<usize> = Vec::new();
     for got in &calls {
-        let at = offered.iter().copied().find(|&i| !expected[i].id.is_empty() && expected[i].id == got.id).or_else(|| minted_for(&got.id));
+        let at = offered.iter().copied().find(|&i| !recorded[i].id.is_empty() && recorded[i].id == got.id).or_else(|| minted_for(&got.id));
         let at = match at {
             Some(at) => at,
             // A pass-through client reads the upstream's frames, and a Gemini
-            // call's id is optional: a call the upstream never identified is
-            // theirs without one.
+            // client's call id is optional: a call the row records without an
+            // id is theirs without one. A Gemini upstream's call never is —
+            // the gateway gives it the id the row records.
             None if got.id.is_empty() && (pass_through || client == ApiVersion::GoogleGemini) => {
-                match offered.iter().copied().find(|&i| expected[i].id.is_empty() && !matched.contains(&i) && expected[i].name == got.name) {
+                match offered.iter().copied().find(|&i| recorded[i].id.is_empty() && !matched.contains(&i) && expected[i].name == got.name) {
                     Some(at) => at,
                     None => return Err(format!("client call {got:?} is no call the stream carried\n{body}")),
                 }

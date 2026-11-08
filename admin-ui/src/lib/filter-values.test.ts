@@ -16,7 +16,7 @@ describe('oneOf', () => {
 describe('the filter sets', () => {
   it('list every value the API names, once', () => {
     expect([...SESSION_LINKAGE].sort()).toEqual(['has_children', 'has_parent', 'unlinked']);
-    expect([...TOOL_CALL_OUTCOMES].sort()).toEqual(['args_modified', 'blocked', 'ok', 'redacted']);
+    expect([...TOOL_CALL_OUTCOMES].sort()).toEqual(['args_modified', 'blocked', 'not_applied', 'ok', 'redacted']);
   });
 });
 

@@ -222,11 +222,13 @@ impl PendingInterceptedCall {
                     record.modifications.clear();
                     self.blocked = Some(description.clone());
                     record.blocked = Some(crate::proxy::content::BlockedToolInfo {
+                        not_applied: false,
                         name: record.name.clone(),
                         title,
                         description,
                         rule_id,
                         tool_use_id: self.tool_use_id.clone(),
+                        call_index: None,
                         arguments: Some(
                             serde_json::from_str(&self.arguments_json)
                                 .unwrap_or_else(|_| serde_json::Value::String(self.arguments_json.clone())),
@@ -1789,11 +1791,13 @@ impl BlockAccumulator {
                             .clone()
                             .unwrap_or_else(|| format!("Response tool blocked: {tool_name}"));
                         self.blocked_tool_infos.push(crate::proxy::content::BlockedToolInfo {
+                            not_applied: false,
                             name: tool_name.clone(),
                             title,
                             description: desc.clone(),
                             rule_id: rule_id.clone(),
                             tool_use_id: block.tool_call_id.clone(),
+                            call_index: None,
                             arguments: captured_args,
                         });
                         self.injection_blocks.push(crate::proxy::content::InjectionBlock {
@@ -2497,18 +2501,23 @@ pub fn apply_response_policy_json(
                 .get_mut("choices")
                 .and_then(|c| c.as_array_mut())
             {
-                for choice in choices.iter_mut() {
+                for (choice_at, choice) in choices.iter_mut().enumerate() {
                     if let Some(tool_calls) = choice
                         .get_mut("message")
                         .and_then(|m| m.get_mut("tool_calls"))
                         .and_then(|tc| tc.as_array_mut())
                     {
+                        // A call's place among the calls the row records: the
+                        // first choice's, before policy runs.
+                        let mut position: u32 = 0;
                         tool_calls.retain_mut(|tc| {
                             // A function call or a custom (freeform) one
                             // (`tool_call_item`).
                             let Some(call) = crate::api::domain::tool_call_item(tc) else {
                                 return true;
                             };
+                            let call_index = (choice_at == 0).then_some(position);
+                            position += 1;
                             let name = call.name.to_string();
                             let tool_use_id = call.call_id.map(str::to_string);
                             let args_str = call.arguments;
@@ -2539,11 +2548,13 @@ pub fn apply_response_policy_json(
                                     blocked_names.push(name.clone());
                                     blocked_notices.push(format!("[Tool call to `{name}` was blocked by policy: {description}]"));
                                     blocked_infos.push(crate::proxy::content::BlockedToolInfo {
+                                        not_applied: false,
                                         name: name.clone(),
                                         title,
                                         description,
                                         rule_id,
                                         tool_use_id,
+                                        call_index,
                                         arguments: args.clone().or_else(|| {
                                             if args_str.is_empty() {
                                                 None
@@ -2600,11 +2611,15 @@ pub fn apply_response_policy_json(
                 .get_mut("content")
                 .and_then(|c| c.as_array_mut())
             {
+                // A call's place among the answer's `tool_use` blocks.
+                let mut position: u32 = 0;
                 content.retain_mut(|block| {
                     let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if block_type != "tool_use" {
                         return true;
                     }
+                    let call_index = Some(position);
+                    position += 1;
                     let name = block
                         .get("name")
                         .and_then(|n| n.as_str())
@@ -2653,11 +2668,13 @@ pub fn apply_response_policy_json(
                             blocked_names.push(name.clone());
                             blocked_notices.push(format!("[Tool call to `{name}` was blocked by policy: {description}]"));
                             blocked_infos.push(crate::proxy::content::BlockedToolInfo {
+                                not_applied: false,
                                 name: name.clone(),
                                 title,
                                 description,
                                 rule_id,
                                 tool_use_id,
+                                call_index,
                                 arguments: args,
                             });
                             false
@@ -2689,20 +2706,22 @@ pub fn apply_response_policy_json(
                 .and_then(|c| c.get_mut("parts"))
                 .and_then(|p| p.as_array_mut())
             {
+                // A call's place among the candidate's `functionCall` parts.
+                let mut position: u32 = 0;
                 parts.retain_mut(|part| {
                     let Some(fc) = part.get("functionCall") else {
                         return true; // keep non-functionCall parts
                     };
+                    let call_index = Some(position);
+                    position += 1;
                     let name = fc
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("")
                         .to_string();
-                    // Gemini functionCall has no id field on the wire;
-                    // leave tool_use_id as None — the name-only fallback in
-                    // the admin event builder still attaches the banner for
-                    // single-occurrence turns, which is the common case.
-                    let tool_use_id: Option<String> = None;
+                    // A Gemini call's `id` is optional; without one its place
+                    // (`call_index`) is what tells it from a sibling.
+                    let tool_use_id = fc.get("id").and_then(|v| v.as_str()).map(str::to_string);
                     let gemini_args = fc.get("args").cloned();
                     let args_str = gemini_args
                         .as_ref()
@@ -2741,11 +2760,13 @@ pub fn apply_response_policy_json(
                             blocked_names.push(name.clone());
                             blocked_notices.push(format!("[Tool call to `{name}` was blocked by policy: {description}]"));
                             blocked_infos.push(crate::proxy::content::BlockedToolInfo {
+                                not_applied: false,
                                 name: name.clone(),
                                 title,
                                 description,
                                 rule_id,
                                 tool_use_id,
+                                call_index,
                                 arguments: gemini_args,
                             });
                             false
@@ -2768,6 +2789,9 @@ pub fn apply_response_policy_json(
                 .get_mut("output")
                 .and_then(|o| o.as_array_mut())
             {
+                // A call's place among the client calls the row records: a
+                // call the server ran is none.
+                let mut position: u32 = 0;
                 output.retain_mut(|item| {
                     // A built-in call goes on carrying only the payload read.
                     if let Some(builtin) = crate::api::domain::ClientBuiltin::of_item(item) {
@@ -2776,6 +2800,13 @@ pub fn apply_response_policy_json(
                     let Some(call) = crate::api::domain::tool_call_item(item) else {
                         return true;
                     };
+                    // As the row records a client call (`extract_upstream_response`).
+                    let recorded = item
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .is_some_and(crate::api::domain::is_client_call_item);
+                    let call_index = recorded.then_some(position);
+                    position += u32::from(recorded);
                     let name = call.name.to_string();
                     let tool_use_id = call.call_id.map(str::to_string);
                     let args_str = call.arguments;
@@ -2803,11 +2834,13 @@ pub fn apply_response_policy_json(
                             blocked_names.push(name.clone());
                             blocked_notices.push(format!("[Tool call to `{name}` was blocked by policy: {description}]"));
                             blocked_infos.push(crate::proxy::content::BlockedToolInfo {
+                                not_applied: false,
                                 name: name.clone(),
                                 title: format!("Response tool blocked: {name}"),
                                 description,
                                 rule_id: replace_rule_id,
                                 tool_use_id,
+                                call_index,
                                 arguments: args.clone(),
                             });
                             false
@@ -2816,11 +2849,13 @@ pub fn apply_response_policy_json(
                             blocked_names.push(name.clone());
                             blocked_notices.push(format!("[Tool call to `{name}` was blocked by policy: {description}]"));
                             blocked_infos.push(crate::proxy::content::BlockedToolInfo {
+                                not_applied: false,
                                 name: name.clone(),
                                 title,
                                 description,
                                 rule_id,
                                 tool_use_id,
+                                call_index,
                                 arguments: args.clone().or_else(|| {
                                     if args_str.is_empty() {
                                         None
@@ -3016,7 +3051,9 @@ pub fn extract_round_calls(
                         continue;
                     };
                     let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    // Gemini functionCall has no id field on the wire.
+                    // A Gemini call's id is optional; the gateway gives one to
+                    // a call with none before this reads it (`call_ids`).
+                    let tool_use_id = fc.get("id").and_then(|v| v.as_str()).filter(|id| !id.is_empty()).map(str::to_string);
                     let arguments_json = fc
                         .get("args")
                         .map(|v| serde_json::to_string(v).unwrap_or_default())
@@ -3033,7 +3070,7 @@ pub fn extract_round_calls(
                     };
                     pending.push(PendingInterceptedCall {
                         binding: binding.clone(),
-                        tool_use_id: None,
+                        tool_use_id,
                         tool_name: name.to_string(),
                         tool_call_index: idx,
                         arguments_json,
@@ -3123,6 +3160,11 @@ pub fn real_calls_the_policy_removes(
     if !extract_round_calls(&real_only, upstream_version, bindings).1.is_empty() {
         return None;
     }
+    // This round is not the answer the row keeps: a place in it names no call there.
+    let blocked_infos = blocked_infos
+        .into_iter()
+        .map(|info| crate::proxy::content::BlockedToolInfo { call_index: None, ..info })
+        .collect();
     Some(RealCallsRemoved { blocked_names, blocked_infos, healed })
 }
 
@@ -5274,14 +5316,105 @@ mod tests {
         )));
     }
 
+    /// A record's place (`call_index`) names its call among the calls a whole
+    /// answer's row records — read back the way the console reads them — on
+    /// every protocol: the row records every call before policy runs, and
+    /// neither the server's own calls nor an item it does not record as a call
+    /// count. A Gemini call's optional `id` is
+    /// read; a Chat choice past the first, which the row does not keep, gets
+    /// no place.
+    #[test]
+    fn a_removed_calls_place_names_it_in_the_stored_answer() {
+        use crate::api::sse::ApiVersion;
+        let withheld = [crate::proxy::content::BlockedToolInfo {
+            not_applied: false,
+            name: "search".into(),
+            title: "t".into(),
+            description: "search is withheld".into(),
+            rule_id: "R-S".into(),
+            tool_use_id: None,
+            call_index: None,
+            arguments: None,
+        }];
+        let chat_call = |id: &str, name: &str| json!({"type": "function", "id": id, "function": {"name": name, "arguments": "{}"}});
+        let cases = [
+            (ApiVersion::ChatCompletions, json!({"choices": [
+                {"index": 0, "message": {"role": "assistant", "tool_calls": [
+                    chat_call("s1", "search"), chat_call("r1", "read"), chat_call("s2", "search"),
+                ]}},
+                {"index": 1, "message": {"role": "assistant", "tool_calls": [chat_call("s3", "search")]}},
+            ]})),
+            (ApiVersion::AnthropicMessages, json!({"content": [
+                {"type": "text", "text": "looking"},
+                {"type": "server_tool_use", "id": "srv", "name": "web_search", "input": {}},
+                {"type": "tool_use", "id": "s1", "name": "search", "input": {}},
+                {"type": "tool_use", "id": "r1", "name": "read", "input": {}},
+                {"type": "tool_use", "id": "s2", "name": "search", "input": {}},
+            ]})),
+            (ApiVersion::GoogleGemini, json!({"candidates": [{"content": {"role": "model", "parts": [
+                {"text": "looking"},
+                {"functionCall": {"name": "search", "args": {}}},
+                {"functionCall": {"name": "read", "args": {}}},
+                {"functionCall": {"id": "s2", "name": "search", "args": {}}},
+            ]}}]})),
+            (ApiVersion::Responses, json!({"output": [
+                {"type": "mcp_call", "id": "m1", "name": "lookup", "arguments": "{}", "server_label": "x"},
+                {"type": "shell_call", "id": "h1", "call_id": "h1", "action": {"commands": ["ls"]}, "environment": {"type": "container_auto"}},
+                // Read as a call, but no item the row records as one.
+                {"type": "function", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call", "id": "f1", "call_id": "s1", "name": "search", "arguments": "{}"},
+                {"type": "function_call", "id": "f2", "call_id": "r1", "name": "read", "arguments": "{}"},
+                {"type": "function_call", "id": "f3", "call_id": "s2", "name": "search", "arguments": "{}"},
+            ]})),
+        ];
+        for (wire, answer) in cases {
+            let mut policed = answer.clone();
+            let (_, infos, _) = apply_response_policy_json(
+                &mut policed, wire, &[], &default_test_profiles(), None, None, &withheld,
+            );
+            let places: Vec<_> = infos.iter().map(|i| i.call_index).collect();
+            let mut row = crate::pipeline::response::TransformState::new(wire);
+            crate::pipeline::response_pipeline::read_whole_answer(&answer, wire, &mut row);
+            let stored = serde_json::to_value(&row.accumulated_tool_calls).unwrap();
+            let calls: Vec<(String, String)> =
+                crate::api::domain_request::domain_assistant_content_from_stored(wire, None, Some(&stored), None)
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        crate::api::domain_request::DomainContentBlock::ToolUse { id, name, .. } => Some((id, name)),
+                        _ => None,
+                    })
+                    .collect();
+            let expected: &[Option<u32>] =
+                if wire == ApiVersion::ChatCompletions { &[Some(0), Some(2), None] } else { &[Some(0), Some(2)] };
+            assert_eq!(places, expected, "{wire:?}");
+            for info in &infos {
+                let Some(place) = info.call_index else { continue };
+                let (id, name) = &calls[place as usize];
+                assert_eq!(name, &info.name, "{wire:?}: {calls:?}");
+                if let Some(call) = &info.tool_use_id {
+                    assert_eq!(id, call, "{wire:?}");
+                }
+            }
+            let ids: Vec<_> = infos.iter().map(|i| i.tool_use_id.as_deref()).collect();
+            let expected_ids: &[Option<&str>] = match wire {
+                ApiVersion::GoogleGemini => &[None, Some("s2")],
+                ApiVersion::ChatCompletions => &[Some("s1"), Some("s2"), Some("s3")],
+                _ => &[Some("s1"), Some("s2")],
+            };
+            assert_eq!(ids, expected_ids, "{wire:?}");
+        }
+    }
+
     /// WebFetch as a request withholds it, under rule `R-FETCH`.
     fn withheld_web_fetch() -> crate::proxy::content::BlockedToolInfo {
         crate::proxy::content::BlockedToolInfo {
+            not_applied: false,
             name: "WebFetch".into(),
             title: "Web fetch".into(),
             description: "WebFetch is withheld".into(),
             rule_id: "R-FETCH".into(),
             tool_use_id: None,
+            call_index: None,
             arguments: None,
         }
     }
@@ -8391,11 +8524,13 @@ mod tests {
         use crate::api::sse::ApiVersion;
         let bindings = vec![make_substitute_binding("web_search", "WS-SUB")];
         let withheld = |name: &str| crate::proxy::content::BlockedToolInfo {
+            not_applied: false,
             name: name.into(),
             title: "withheld".into(),
             description: "not here".into(),
             rule_id: "R".into(),
             tool_use_id: None,
+            call_index: None,
             arguments: None,
         };
         let decide = |response: &serde_json::Value, version, withheld: &[crate::proxy::content::BlockedToolInfo]| {
@@ -8412,6 +8547,9 @@ mod tests {
         assert_eq!(removed.blocked_names, ["Read", "Grep"]);
         let ids: Vec<_> = removed.blocked_infos.iter().map(|b| b.tool_use_id.as_deref()).collect();
         assert_eq!(ids, [Some("toolu_r"), Some("toolu_g")]);
+        // The round is continued: the row keeps a later answer, where these
+        // places name nothing.
+        assert!(removed.blocked_infos.iter().all(|b| b.call_index.is_none()));
         assert!(!removed.healed);
 
         assert!(decide(&anthropic, ApiVersion::AnthropicMessages, &[withheld("Read")]).is_none(), "Grep survives");

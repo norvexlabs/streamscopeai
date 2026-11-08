@@ -67,7 +67,7 @@ fn check_vision(request: &ApiRequest, caps: &ModelCapabilities) -> Result<(), Ap
         return Ok(());
     }
     if has_content_type(request, |part| {
-        matches!(part, ContentPart::ImageUrl { image_url } if !is_pdf_data_uri(&image_url.url))
+        matches!(part, ContentPart::ImageUrl { image_url, .. } if !is_pdf_data_uri(&image_url.url))
             // Responses spells it `input_image`, with `image_url` as a PLAIN
             // STRING rather than the Chat object — so it lands in the `Unknown`
             // arm and is invisible to the typed match above.
@@ -131,7 +131,7 @@ fn check_pdf_input(
         // smuggled through the image channel as a data URI — which arrives as a
         // well-formed `image_url` part, so it must be matched on the TYPED
         // variant, not only in the `Unknown` catch-all.
-        matches!(part, ContentPart::ImageUrl { image_url } if is_pdf_data_uri(&image_url.url))
+        matches!(part, ContentPart::ImageUrl { image_url, .. } if is_pdf_data_uri(&image_url.url))
             || matches!(part, ContentPart::Unknown(v) if {
                 let ct_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 // `input_file` / `input_image` are the Responses spellings of
@@ -189,8 +189,8 @@ fn check_unclassified_media(request: &ApiRequest, caps: &ModelCapabilities) -> R
     };
     let has_untyped_media = req.contents.iter().any(|c| {
         c.parts.iter().any(|part| match part {
-            crate::api::gemini::GeminiPart::InlineData { inline_data } => inline_data.mime_type.is_empty(),
-            crate::api::gemini::GeminiPart::FileData { file_data } => {
+            crate::api::gemini::GeminiPart::InlineData { inline_data, .. } => inline_data.mime_type.is_empty(),
+            crate::api::gemini::GeminiPart::FileData { file_data, .. } => {
                 file_data.mime_type.as_deref().is_none_or(str::is_empty)
             }
             crate::api::gemini::GeminiPart::FunctionResponse { function_response } => {
@@ -309,6 +309,7 @@ fn has_content_type(request: &ApiRequest, pred: impl Fn(&ContentPart) -> bool) -
                         url: String::new(),
                         detail: None,
                     },
+                    extra: Default::default(),
                 })
             };
             // Document block = PDF input (use Unknown with type=document),
@@ -345,10 +346,10 @@ fn has_content_type(request: &ApiRequest, pred: impl Fn(&ContentPart) -> bool) -
                 // `mimeType` is absent can't be classified here at all; that case
                 // belongs to `check_unclassified_media`.
                 let mime = match part {
-                    crate::api::gemini::GeminiPart::InlineData { inline_data } => {
+                    crate::api::gemini::GeminiPart::InlineData { inline_data, .. } => {
                         Some(inline_data.mime_type.as_str())
                     }
-                    crate::api::gemini::GeminiPart::FileData { file_data } => {
+                    crate::api::gemini::GeminiPart::FileData { file_data, .. } => {
                         file_data.mime_type.as_deref()
                     }
                     // A function response's media reaches the model too, on the
@@ -408,6 +409,7 @@ fn gemini_mime_matches(mime: &str, pred: &impl Fn(&ContentPart) -> bool) -> bool
                 url: String::new(),
                 detail: None,
             },
+            extra: Default::default(),
         })
     } else if mime.starts_with("audio/") {
         pred(&ContentPart::InputAudio {
@@ -415,6 +417,7 @@ fn gemini_mime_matches(mime: &str, pred: &impl Fn(&ContentPart) -> bool) -> bool
                 data: String::new(),
                 format: String::new(),
             },
+            extra: Default::default(),
         })
     } else if mime.starts_with("video/") {
         pred(&ContentPart::Unknown(serde_json::json!({"type": "video"})))

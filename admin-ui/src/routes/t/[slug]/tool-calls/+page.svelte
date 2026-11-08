@@ -128,7 +128,7 @@
     }
     pendingFocusRid = null;
     pendingFocusInv = null;
-    // `invocation_id` is `{request_id}:{tool_use_id}` — derive the turn's
+    // `invocation_id` is `{request_id}:{the call's place in the turn}` — derive the turn's
     // request_id so the LLM-side helper narrows to that one turn (matches
     // the audit page's request_id-narrowing pattern). MCP/Web rows aren't
     // affected because their request_ids never use that compound shape.
@@ -330,6 +330,7 @@
             <option value="blocked">Blocked</option>
             <option value="redacted">Redacted</option>
             <option value="args_modified">Args modified</option>
+            <option value="not_applied">Would block</option>
           </SelectInput>
         </FilterField>
       {/if}

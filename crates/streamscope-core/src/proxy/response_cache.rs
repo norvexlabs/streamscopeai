@@ -4,23 +4,19 @@
 //! ## Identity
 //!
 //! A cached answer belongs to exactly one `(alias, model, invocation preset,
-//! sampling params, conversation)` tuple. Serving one entry under a different
-//! model or a different system prompt is a correctness bug, so the key is split
-//! into two SHA-256 digests, both mandatory:
+//! response policy, client request)` tuple. Serving one entry under a
+//! different model or a different system prompt is a correctness bug, so the
+//! key is split into two SHA-256 digests, both mandatory:
 //!
-//! - **identity** — upstream model + the resolved invocation preset + every
-//!   sampling parameter that can change the answer. Editing the bound preset or
-//!   swapping the model therefore self-invalidates every entry it produced.
-//! - **content** — the *domain-normalized* conversation: system prompt, the full
-//!   message history in every role, tool definitions, response format. Hashing
-//!   the domain layer (not the wire bytes) is what makes the cache
-//!   translation-invariant: the same conversation sent on the OpenAI wire and on
-//!   the Anthropic wire lands on the same entry.
-//!
-//! Protocol-local decorations that do not change the answer are deliberately
-//! **excluded** from the content hash — `cache_control` markers (Anthropic-only)
-//! and `input_raw` (regenerated on cross-protocol emit). Including them would
-//! split the entry per client protocol and defeat the point.
+//! - **identity** — upstream model + the resolved invocation preset + the
+//!   response-shaping policy: nothing of the request. Editing the bound preset
+//!   or swapping the model therefore self-invalidates every entry it produced.
+//! - **content** — the client's own request: its protocol and its body as a
+//!   same-protocol forward sends it, without the members that change nothing
+//!   the model answers ([`UNKEYED`]). What the gateway models of a request is
+//!   lossy, so a key built from that reading would let two requests the model
+//!   reads differently share an answer; the cost is that the same conversation
+//!   sent on two protocols is two entries.
 //!
 //! ## Partitioning
 //!
@@ -48,10 +44,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::api::domain::{FinishReason, Usage};
-use crate::api::domain_request::{
-    DomainContentBlock, DomainMessage, DomainRequest, DomainRole, DomainSystemPrompt, DomainTool,
-    ReasoningEffort, ReasoningRequest,
-};
+use crate::api::ApiRequest;
+use crate::api::domain_request::{DomainContentBlock, DomainMessage, DomainRequest, DomainRole};
 use crate::api::sse::ApiVersion;
 
 // ---------------------------------------------------------------------------
@@ -322,9 +316,9 @@ pub struct CacheKey {
     pub partition_id: Uuid,
     /// The alias binding this answer was computed under. Also the flush grain.
     pub route_id: Uuid,
-    /// Model + preset + sampling params.
+    /// Upstream model + preset + response policy (`identity_hash`).
     pub identity: [u8; 32],
-    /// Domain-normalized conversation.
+    /// The client's request, as `content_hash` reads it.
     pub content: [u8; 32],
 }
 
@@ -340,7 +334,7 @@ pub struct SemanticBucket {
     pub partition_id: Uuid,
     pub route_id: Uuid,
     pub identity: [u8; 32],
-    /// See [`semantic_request`] — covers the embedding alias too.
+    /// See `semantic_of` — covers the embedding alias too.
     pub prefix: [u8; 32],
     /// The embedding model that produced every vector in this bucket.
     ///
@@ -443,236 +437,96 @@ fn hash_opt_str(h: &mut Sha256, s: Option<&str>) {
     }
 }
 
-/// Hash one content block, skipping the protocol-local decorations that do not
-/// change the model's answer (`cache_control`, `input_raw`). The variant tag is
-/// mixed in first so a `Text` and an `Image` carrying the same string differ.
-fn hash_block(h: &mut Sha256, block: &DomainContentBlock) {
-    match block {
-        DomainContentBlock::Text { text, .. } => {
-            h.update([1u8]);
-            hash_str(h, text);
-        }
-        DomainContentBlock::Image {
-            data, media_type, ..
-        } => {
-            h.update([2u8]);
-            hash_str(h, data);
-            hash_str(h, media_type);
-        }
-        DomainContentBlock::ToolUse {
-            id, name, input, thought_signature, ..
-        } => {
-            h.update([3u8]);
-            hash_str(h, id);
-            hash_str(h, name);
-            hash_json(h, input);
-            // Sent back to a Gemini target with the call. Only a signed call
-            // adds to the key, so an unsigned one keys as it always has (the
-            // message's block count keeps the extra bytes from reading as a
-            // following block).
-            if let Some(signature) = thought_signature {
-                h.update([0xFFu8]);
-                hash_str(h, signature);
-            }
-        }
-        DomainContentBlock::ToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => {
-            h.update([4u8]);
-            hash_str(h, tool_use_id);
-            h.update([u8::from(is_error.unwrap_or(false))]);
-            h.update((content.len() as u64).to_le_bytes());
-            for nested in content {
-                hash_block(h, nested);
-            }
-        }
-        DomainContentBlock::Document {
-            data,
-            media_type,
-            title,
-            context,
-            citations,
-            nested_content,
-            ..
-        } => {
-            h.update([5u8]);
-            hash_str(h, data);
-            hash_str(h, media_type);
-            hash_opt_str(h, title.as_deref());
-            hash_opt_str(h, context.as_deref());
-            hash_json(h, citations.as_ref().unwrap_or(&serde_json::Value::Null));
-            hash_json(
-                h,
-                nested_content.as_ref().unwrap_or(&serde_json::Value::Null),
-            );
-        }
-        DomainContentBlock::Thinking {
-            thinking,
-            signature,
-            signed_by,
-        } => {
-            h.update([6u8]);
-            hash_str(h, thinking);
-            hash_opt_str(h, signature.as_deref());
-            // Who signed it decides what a walk sends.
-            hash_opt_str(h, signed_by.map(|v| v.as_str()));
-        }
-        DomainContentBlock::Audio { data, format, .. } => {
-            h.update([7u8]);
-            hash_str(h, data);
-            hash_str(h, format);
-        }
-        DomainContentBlock::File {
-            file_id,
-            url,
-            media_type,
-            filename,
-            ..
-        } => {
-            h.update([8u8]);
-            hash_opt_str(h, file_id.as_deref());
-            hash_opt_str(h, url.as_deref());
-            hash_opt_str(h, media_type.as_deref());
-            hash_opt_str(h, filename.as_deref());
-        }
-        DomainContentBlock::BlobRef {
-            content_hash,
-            media_type,
-            size_bytes,
-            ..
-        } => {
-            h.update([9u8]);
-            hash_str(h, content_hash);
-            hash_str(h, media_type);
-            h.update(size_bytes.unwrap_or(0).to_le_bytes());
-        }
-        DomainContentBlock::Stripped {
-            media_type,
-            size_bytes,
-            reason,
-        } => {
-            h.update([10u8]);
-            hash_opt_str(h, media_type.as_deref());
-            h.update(size_bytes.unwrap_or(0).to_le_bytes());
-            hash_opt_str(h, reason.as_deref());
-        }
-        DomainContentBlock::Unknown { value } => {
-            h.update([11u8]);
-            hash_json(h, value);
-        }
-    }
+/// The members of a request body the key leaves out, each changing nothing
+/// the model answers: the model (the route keys it), whether and how the
+/// answer streams (a streamed and a whole answer are one answer, rendered
+/// differently), and the caller's identity and bookkeeping (`user`,
+/// `safety_identifier`, the provider prompt cache's key and retention,
+/// `metadata` — keying them would split every shared-scope cache per user).
+/// `store` keys: a Responses answer stored upstream has an id a later
+/// `previous_response_id` names, one not stored has none.
+const UNKEYED: &[&str] = &[
+    "model",
+    "stream",
+    "stream_options",
+    "user",
+    "safety_identifier",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "metadata",
+];
+
+/// The request as the key reads it: its protocol, the `anthropic-beta` header
+/// (forwarded to an Anthropic upstream, where it changes what the model does),
+/// and its body as a same-protocol forward sends it, without [`UNKEYED`].
+/// What the gateway models of a request is lossy — a member it does not model,
+/// where a message's text parts break — so the key reads the client's own
+/// request, and a difference anywhere in it is another request. The same
+/// request sent on two protocols is two entries.
+struct Keyed {
+    protocol: u8,
+    beta: Option<String>,
+    body: serde_json::Value,
 }
 
-fn hash_role(h: &mut Sha256, role: &DomainRole) {
-    match role {
-        DomainRole::User => h.update([1u8]),
-        DomainRole::Assistant => h.update([2u8]),
-        DomainRole::System => h.update([3u8]),
-        DomainRole::Tool {
-            tool_call_id,
-            is_error,
-            ..
-        } => {
-            h.update([4u8]);
-            hash_str(h, tool_call_id);
-            h.update([u8::from(is_error.unwrap_or(false))]);
-        }
-    }
-}
-
-fn hash_message(h: &mut Sha256, msg: &DomainMessage) {
-    hash_role(h, &msg.role);
-    h.update((msg.content.len() as u64).to_le_bytes());
-    for block in &msg.content {
-        hash_block(h, block);
-    }
-}
-
-fn hash_tools(h: &mut Sha256, tools: Option<&Vec<DomainTool>>) {
-    let Some(tools) = tools else {
-        h.update([0u8]);
-        return;
+/// `None` when the body cannot be serialized: the request is then not cached
+/// at all, never keyed by a placeholder two requests would share.
+fn keyed(request: &ApiRequest, headers: &axum::http::HeaderMap) -> Option<Keyed> {
+    let protocol = match request {
+        ApiRequest::ChatCompletions(_) => 1u8,
+        ApiRequest::Responses(_) => 2,
+        ApiRequest::AnthropicMessages(_) => 3,
+        ApiRequest::GoogleGemini(_) => 4,
     };
-    h.update([1u8]);
-    h.update((tools.len() as u64).to_le_bytes());
-    for t in tools {
-        hash_str(h, &t.name);
-        hash_opt_str(h, t.description.as_deref());
-        hash_json(h, t.parameters.as_ref().unwrap_or(&serde_json::Value::Null));
-        hash_opt_str(h, t.server_type.as_deref());
-        // What the tool is beyond its name: a hosted tool's configuration, a
-        // freeform tool's input format.
-        hash_opt_str(h, t.original_type.as_deref());
-        match &t.original_extra {
-            Some(extra) => {
-                h.update([1u8]);
-                hash_json(h, &serde_json::to_value(extra).unwrap_or(serde_json::Value::Null));
-            }
-            None => h.update([0u8]),
-        }
-        match &t.freeform {
-            Some(freeform) => {
-                h.update([1u8]);
-                hash_json(h, freeform.format.as_ref().unwrap_or(&serde_json::Value::Null));
-            }
-            None => h.update([0u8]),
-        }
-        h.update([match t.strict {
-            None => 0u8,
-            Some(false) => 1,
-            Some(true) => 2,
-        }]);
+    let mut body = request.wire_value()?;
+    let members = body.as_object_mut()?;
+    for key in UNKEYED {
+        members.remove(*key);
     }
+    let beta = headers.get("anthropic-beta").map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    Some(Keyed { protocol, beta, body })
 }
 
-fn hash_system(h: &mut Sha256, system: Option<&DomainSystemPrompt>) {
-    match system {
-        None => h.update([0u8]),
-        Some(DomainSystemPrompt::Text(t)) => {
-            h.update([1u8]);
-            hash_str(h, t);
-        }
-        Some(DomainSystemPrompt::Blocks(blocks)) => {
-            // Concatenated as one logical prompt: an Anthropic client sending two
-            // system blocks and an OpenAI client sending the joined string are the
-            // same instruction, so they must hash the same.
-            h.update([1u8]);
-            let joined: String = blocks
-                .iter()
-                .map(|b| b.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            hash_str(h, &joined);
-        }
-    }
+fn hash_keyed(h: &mut Sha256, keyed: &Keyed) {
+    h.update([keyed.protocol]);
+    hash_opt_str(h, keyed.beta.as_deref());
+    hash_json(h, &keyed.body);
 }
 
-/// Hash everything the model reads, over an explicit slice of the history.
-/// `content_hash` passes the whole conversation; `semantic_request` passes it
-/// short of the final user message.
-fn hash_conversation(h: &mut Sha256, req: &DomainRequest, messages: &[DomainMessage]) {
-    hash_system(h, req.system_prompt.as_ref());
-    h.update((messages.len() as u64).to_le_bytes());
-    for m in messages {
-        hash_message(h, m);
-    }
-    hash_tools(h, req.tools.as_ref());
-    hash_json(
-        h,
-        req.response_format
-            .as_ref()
-            .unwrap_or(&serde_json::Value::Null),
-    );
-}
-
-/// The content half of the key: everything the model reads.
-pub fn content_hash(req: &DomainRequest) -> [u8; 32] {
+fn content_of(keyed: &Keyed) -> [u8; 32] {
     let mut h = Sha256::new();
-    hash_conversation(&mut h, req, &req.messages);
+    hash_keyed(&mut h, keyed);
     h.finalize().into()
 }
+
+
+/// The final conversation item with its text blanked: what the semantic
+/// prefix keeps of it. Only the text the query reads is blanked — the item
+/// itself when it is a string (a Responses `input`), its `content` string, and
+/// the `text` of each part in its `content` or `parts` — so every other member
+/// (a `name`, a part's settings, how many parts) still has to match exactly.
+fn without_text(item: &mut serde_json::Value) {
+    match item {
+        serde_json::Value::String(text) => text.clear(),
+        serde_json::Value::Object(members) => {
+            for key in ["content", "parts"] {
+                match members.get_mut(key) {
+                    Some(serde_json::Value::String(text)) => text.clear(),
+                    Some(serde_json::Value::Array(parts)) => {
+                        for part in parts {
+                            if let Some(serde_json::Value::String(text)) = part.get_mut("text") {
+                                text.clear();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 
 /// The two halves semantic mode needs: the **prefix guard** and the text to
 /// embed.
@@ -702,13 +556,27 @@ pub fn content_hash(req: &DomainRequest) -> [u8; 32] {
 ///   bytes: a similarity of exactly 1.0, which no threshold rejects and the
 ///   prefix guard cannot catch, because the difference lives in the part that
 ///   was cut.
-pub fn semantic_request(req: &DomainRequest, embedding_alias: &str) -> Option<SemanticRequest> {
-    let (last, head) = req.messages.split_last()?;
-    if !matches!(last.role, DomainRole::User) {
+///
+/// Takes the request as the key read it, and blanks its body in place.
+fn semantic_of(request: &ApiRequest, mut keyed: Keyed, embedding_alias: &str) -> Option<SemanticRequest> {
+    let body = &mut keyed.body;
+    // The final conversation item, converted alone, is the one message
+    // matched by meaning: it must be exactly one user message of text. An item
+    // the gateway reads as more than one message (an Anthropic user turn
+    // holding tool results beside its text) is matched exactly.
+    let (items_key, _) = request.conversation_keys();
+    let last = match body.get(items_key)? {
+        serde_json::Value::Array(items) => items.len().checked_sub(1)?,
+        // A Responses `input` given as a string is its one user message.
+        serde_json::Value::String(_) => 0,
+        _ => return None,
+    };
+    let item = DomainRequest::item_conversation(request, last);
+    let [DomainMessage { role: DomainRole::User, content }] = item.as_slice() else {
         return None;
-    }
+    };
     let mut query = String::new();
-    for block in &last.content {
+    for block in content {
         match block {
             DomainContentBlock::Text { text, .. } => {
                 if !query.is_empty() {
@@ -723,9 +591,15 @@ pub fn semantic_request(req: &DomainRequest, embedding_alias: &str) -> Option<Se
         return None;
     }
 
+    // The prefix is the whole request but that item's text.
+    match body.get_mut(items_key) {
+        Some(serde_json::Value::Array(items)) => items.last_mut().into_iter().for_each(without_text),
+        Some(item) => without_text(item),
+        None => {}
+    }
     let mut h = Sha256::new();
     hash_str(&mut h, embedding_alias);
-    hash_conversation(&mut h, req, head);
+    hash_keyed(&mut h, &keyed);
     Some(SemanticRequest {
         prefix: h.finalize().into(),
         query,
@@ -743,7 +617,7 @@ pub struct SemanticRequest {
 /// Longest question the gateway will represent as a vector.
 ///
 /// The whole question must fit, because a vector built from part of it cannot
-/// distinguish requests that differ in the rest — see [`semantic_request`],
+/// distinguish requests that differ in the rest — see `semantic_of`,
 /// which declines rather than truncates. Deliberately conservative: it sits
 /// well under the context window of the embedding models a tenant is likely to
 /// name, since an upstream that truncates internally reintroduces exactly the
@@ -799,14 +673,14 @@ pub fn response_policy_hash(programs: &[crate::scripting::TransformProgram]) -> 
     h.finalize().into()
 }
 
-/// The identity half of the key: which model, invoked how, under which
-/// response-shaping policy.
+/// The identity half of the key: which model, under which invocation preset
+/// and response-shaping policy — what decides the answer beside the request,
+/// whose every member the content half reads ([`content_hash`]).
 ///
 /// `preset_settings` is the resolved preset for the target **actually**
 /// forwarded to — preset merge happens per-target inside the failover loop, so
 /// the route row alone is not enough.
 pub fn identity_hash(
-    req: &DomainRequest,
     upstream_model: &str,
     upstream_model_id: Option<&str>,
     preset_settings: &serde_json::Value,
@@ -817,66 +691,6 @@ pub fn identity_hash(
     hash_opt_str(&mut h, upstream_model_id);
     hash_json(&mut h, preset_settings);
     h.update(response_policy);
-    // Sampling parameters: anything the client can set that changes the answer.
-    // `stream` is deliberately absent — a streaming and a non-streaming request
-    // for the same conversation are the same answer, rendered differently.
-    h.update(req.max_output_tokens.unwrap_or(0).to_le_bytes());
-    h.update(req.temperature.unwrap_or(f32::NAN).to_bits().to_le_bytes());
-    h.update(req.top_p.unwrap_or(f32::NAN).to_bits().to_le_bytes());
-    match &req.stop_sequences {
-        Some(seqs) => {
-            h.update([1u8]);
-            h.update((seqs.len() as u64).to_le_bytes());
-            for s in seqs {
-                hash_str(&mut h, s);
-            }
-        }
-        None => h.update([0u8]),
-    }
-    // "Do not reason" is a request of its own, and whether the client asked
-    // to see the reasoning reaches the upstream too: both key apart from
-    // saying nothing.
-    match &req.reasoning {
-        Some(ReasoningRequest::On(r)) => {
-            h.update([1u8]);
-            h.update([match r.effort {
-                None => 0u8,
-                Some(ReasoningEffort::Low) => 1,
-                Some(ReasoningEffort::Medium) => 2,
-                Some(ReasoningEffort::High) => 3,
-            }]);
-            h.update(r.budget_tokens.unwrap_or(0).to_le_bytes());
-            h.update([match r.show {
-                None => 0u8,
-                Some(false) => 1,
-                Some(true) => 2,
-            }]);
-        }
-        Some(ReasoningRequest::Off) => h.update([2u8]),
-        None => h.update([0u8]),
-    }
-    // The choice's MEANING, not its spelling, so one choice keys alike whichever
-    // protocol expressed it; and the parallel switch, which changes the answer.
-    hash_json(
-        &mut h,
-        &req.tool_choice
-            .as_ref()
-            .map_or(serde_json::Value::Null, |c| c.identity()),
-    );
-    hash_json(&mut h, &req.parallel_tool_calls.map_or(serde_json::Value::Null, serde_json::Value::Bool));
-    // Unrecognized passthrough parameters can steer the upstream too, so they
-    // are part of the identity — an unknown knob costs a miss, never a wrong hit.
-    h.update((req.extra.len() as u64).to_le_bytes());
-    for (k, v) in &req.extra {
-        hash_str(&mut h, k);
-        hash_json(&mut h, v);
-    }
-    // What earlier non-user messages carried beside their text (another
-    // provider's reasoning, an image in a tool result) steers the answer too.
-    h.update((req.history_parts.len() as u64).to_le_bytes());
-    for part in &req.history_parts {
-        hash_json(&mut h, part);
-    }
     h.finalize().into()
 }
 
@@ -909,6 +723,9 @@ pub struct RequestCacheContext {
     /// the alias does semantic matching, the request's shape supports it, and
     /// the prompt was embedded successfully.
     pub semantic: Option<SemanticIndexEntry>,
+    /// The semantic stage's prefix and query, read with the key; `None` when
+    /// the alias does not match by meaning or the request's shape cannot be.
+    semantic_request: Option<SemanticRequest>,
     /// Why semantic matching could not run, when the alias asked for it. Purely
     /// operator-facing: an alias configured for semantic that silently degrades
     /// to exact is the failure mode nobody would otherwise notice.
@@ -1042,19 +859,23 @@ pub fn request_context(
     // A target with no alias binding (BYOK pass-through) has no cache identity.
     let route_id = target.route_id?;
 
-    let domain = DomainRequest::from_api_request(request);
+    let Some(keyed) = keyed(request, headers) else {
+        tracing::warn!(route_id = %route_id, "response cache skipped: the request body could not be serialized for its key");
+        return None;
+    };
+    let content = content_of(&keyed);
+    let multi_choice_request = asks_for_multiple_answers(&keyed.body);
     let key = CacheKey {
         tenant_id,
         partition_id: policy.share_scope.partition_id(Some(workspace_id), user_id),
         route_id,
         identity: identity_hash(
-            &domain,
             &target.model,
             target.upstream_model_id.as_deref(),
             &target.preset_settings,
             &response_policy_hash(response_programs),
         ),
-        content: content_hash(&domain),
+        content,
     };
 
     let bypass = client_requests_bypass(headers);
@@ -1069,7 +890,8 @@ pub fn request_context(
         semantic: None,
         semantic_skipped: None,
         bypass,
-        multi_choice_request: asks_for_multiple_answers(&domain),
+        multi_choice_request,
+        semantic_request: None,
         embed_elapsed: Duration::ZERO,
         embedding_cost: 0.0,
         embedding_priced: true,
@@ -1081,7 +903,17 @@ pub fn request_context(
 
     if let Some(entry) = cache.get(&ctx.key, policy.ttl()) {
         ctx.accept(entry, None, &target.pricing, config);
+        return Some(ctx);
     }
+    // An exact miss: the semantic stage's prefix and query, from the same
+    // reading of the request — the body is blanked in place, never copied
+    // again.
+    ctx.semantic_request = config
+        .cache
+        .embedding_alias
+        .as_deref()
+        .filter(|a| !a.is_empty() && matches_semantically(policy.mode))
+        .and_then(|alias| semantic_of(request, keyed, alias));
     Some(ctx)
 }
 
@@ -1120,13 +952,14 @@ impl RequestCacheContext {
 
 /// Did the client ask for more than one alternative answer?
 ///
-/// Read off the lifted wire params rather than the response, so it holds for a
+/// Read off the request body the key reads, not the response, so it holds for a
 /// streaming request that has no body yet.
-fn asks_for_multiple_answers(req: &DomainRequest) -> bool {
-    ["openai_n", "gemini_candidate_count"]
-        .iter()
-        .filter_map(|k| req.extra.get(*k))
-        .filter_map(|v| v.as_u64())
+fn asks_for_multiple_answers(body: &serde_json::Value) -> bool {
+    // Chat Completions `n`, Gemini `generationConfig.candidateCount`.
+    [body.get("n"), body.pointer("/generationConfig/candidateCount")]
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_u64)
         .any(|n| n > 1)
 }
 
@@ -1157,7 +990,6 @@ pub async fn semantic_lookup(
     user: &crate::auth::UserContext,
     config: &crate::config::TenantConfig,
     target: &super::routing::UpstreamTarget,
-    request: &crate::api::ApiRequest,
     ctx: &mut RequestCacheContext,
 ) {
     if ctx.bypass || ctx.served.is_some() || ctx.observed_age.is_some() {
@@ -1171,11 +1003,10 @@ pub async fn semantic_lookup(
         return;
     };
 
-    let domain = DomainRequest::from_api_request(request);
     // A request whose shape semantic matching cannot handle is served exactly,
     // which is complete and correct — there is nothing for an operator to fix,
     // so it is not badged.
-    let Some(parts) = semantic_request(&domain, alias) else {
+    let Some(parts) = ctx.semantic_request.take() else {
         return;
     };
 
@@ -1227,8 +1058,9 @@ pub async fn semantic_lookup(
 // ---------------------------------------------------------------------------
 
 /// One cached answer. Holds both the served wire body (for the same-protocol
-/// fast path and as the source for cross-protocol translation) and the
-/// accumulated summary (for re-rendering the answer as SSE).
+/// fast path, and as the source a stream-stored entry's Chat Completions body
+/// is translated from) and the accumulated summary (for re-rendering the
+/// answer as SSE).
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
     /// The client-facing JSON body exactly as it was served.
@@ -1828,9 +1660,20 @@ fn estimate_size(req: &StoreRequest) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::api::domain_request::DomainRequest;
+
+    /// The content half of the key for a request sent with no header the key
+    /// reads — the hot path keys its headers too (`request_context`).
+    pub(crate) fn content_hash(request: &ApiRequest) -> Option<[u8; 32]> {
+        Some(content_of(&keyed(request, &axum::http::HeaderMap::new())?))
+    }
+
+    /// The semantic stage's prefix and query for a request sent with no header
+    /// the key reads (see `semantic_of`).
+    pub(crate) fn semantic_request(request: &ApiRequest, embedding_alias: &str) -> Option<SemanticRequest> {
+        semantic_of(request, keyed(request, &axum::http::HeaderMap::new())?, embedding_alias)
+    }
 
     fn key(tenant: Uuid, partition: Uuid, route: Uuid, tag: u8) -> CacheKey {
         CacheKey {
@@ -1885,6 +1728,7 @@ mod tests {
             avoided_cost: 0.0,
             similarity: None,
             semantic: None,
+            semantic_request: None,
             semantic_skipped: None,
             bypass: false,
             embed_elapsed: Duration::ZERO,
@@ -2254,13 +2098,12 @@ mod tests {
 
     // ── key construction ──
 
-    fn domain_request(version: ApiVersion, body: serde_json::Value) -> DomainRequest {
+    fn domain_request(version: ApiVersion, body: serde_json::Value) -> ApiRequest {
         let bytes = bytes::Bytes::from(serde_json::to_vec(&body).unwrap());
-        let api = crate::api::ApiRequest::parse(version, &bytes).expect("valid request body");
-        DomainRequest::from_api_request(&api)
+        ApiRequest::parse(version, &bytes).expect("valid request body")
     }
 
-    fn chat_request(body: serde_json::Value) -> DomainRequest {
+    fn chat_request(body: serde_json::Value) -> ApiRequest {
         domain_request(ApiVersion::ChatCompletions, body)
     }
 
@@ -2397,116 +2240,68 @@ mod tests {
     }
 
     #[test]
-    fn identity_covers_model_preset_and_sampling() {
-        let req = chat_request(serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hello"}],
-            "temperature": 0.5,
-        }));
+    fn identity_covers_model_and_preset() {
         let none = response_policy_hash(&[]);
-        let base = identity_hash(&req, "gpt-4o", Some("mid"), &serde_json::json!({}), &none);
+        let base = identity_hash("gpt-4o", Some("mid"), &serde_json::json!({}), &none);
         assert_ne!(
             base,
-            identity_hash(&req, "gpt-4o-mini", Some("mid"), &serde_json::json!({}), &none),
+            identity_hash("gpt-4o-mini", Some("mid"), &serde_json::json!({}), &none),
             "a different upstream model is a different answer"
         );
         assert_ne!(
             base,
-            identity_hash(&req, "gpt-4o", Some("other"), &serde_json::json!({}), &none),
+            identity_hash("gpt-4o", Some("other"), &serde_json::json!({}), &none),
             "a different upstream model row is a different answer"
         );
         assert_ne!(
             base,
-            identity_hash(
-                &req,
-                "gpt-4o",
-                Some("mid"),
-                &serde_json::json!({"temperature": 0.1}),
-                &none,
-            ),
+            identity_hash("gpt-4o", Some("mid"), &serde_json::json!({"temperature": 0.1}), &none),
             "editing the bound preset must self-invalidate"
         );
-
-        let hotter = chat_request(serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hello"}],
-            "temperature": 0.9,
-        }));
-        assert_ne!(
-            base,
-            identity_hash(&hotter, "gpt-4o", Some("mid"), &serde_json::json!({}), &none)
-        );
+        // Positive control: the same model and preset key alike.
+        assert_eq!(base, identity_hash("gpt-4o", Some("mid"), &serde_json::json!({}), &none));
     }
 
-    /// A same-protocol forward sends the cap in the spelling the client used,
-    /// and a server reading only `max_tokens` treats the two differently.
+    /// Every sampling parameter the client sets is part of its request, and so
+    /// of the content half: the temperature, the cap in the spelling the client
+    /// used (a server reading only `max_tokens` treats the two differently),
+    /// how Anthropic thinking is displayed, and "do not reason" — a request of
+    /// its own, not the absence of one.
     #[test]
-    fn identity_covers_which_chat_cap_spelling_was_sent() {
-        let none = response_policy_hash(&[]);
-        let key = |cap: serde_json::Value| {
+    fn the_key_covers_every_sampling_parameter_the_client_set() {
+        let chat = |extra: serde_json::Value| {
             let mut body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hello"}]});
-            body.as_object_mut().unwrap().extend(cap.as_object().unwrap().clone());
-            identity_hash(&chat_request(body), "gpt-4o", Some("mid"), &serde_json::json!({}), &none)
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            content_hash(&chat_request(body))
         };
-        assert_ne!(key(serde_json::json!({"max_tokens": 50})), key(serde_json::json!({"max_completion_tokens": 50})));
+        assert_ne!(chat(serde_json::json!({"temperature": 0.5})), chat(serde_json::json!({"temperature": 0.9})));
+        assert_ne!(chat(serde_json::json!({"max_tokens": 50})), chat(serde_json::json!({"max_completion_tokens": 50})));
         assert_ne!(
-            key(serde_json::json!({"max_completion_tokens": 50, "max_tokens": 10})),
-            key(serde_json::json!({"max_completion_tokens": 50, "max_tokens": 4000}))
+            chat(serde_json::json!({"max_completion_tokens": 50, "max_tokens": 10})),
+            chat(serde_json::json!({"max_completion_tokens": 50, "max_tokens": 4000}))
         );
-        assert_eq!(key(serde_json::json!({"max_tokens": 50})), key(serde_json::json!({"max_tokens": 50})));
-
-        // A plain `max_tokens` keys like the same cap from another protocol:
-        // the identity is the conversation's, not its wire's.
-        let anthropic: crate::api::messages::MessagesRequest = serde_json::from_value(serde_json::json!({
-            "model": "m", "max_tokens": 50, "messages": [{"role": "user", "content": "hello"}],
-        }))
-        .unwrap();
+        let off = chat(serde_json::json!({"reasoning_effort": "none"}));
+        assert_ne!(off, chat(serde_json::json!({})));
+        assert_ne!(off, chat(serde_json::json!({"reasoning_effort": "low"})));
+        // Positive control: the same request, its members in another order,
+        // keys alike.
         assert_eq!(
-            key(serde_json::json!({"max_tokens": 50})),
-            identity_hash(&DomainRequest::from_anthropic(&anthropic), "gpt-4o", Some("mid"), &serde_json::json!({}), &none)
+            chat(serde_json::json!({"temperature": 0.5, "max_tokens": 50})),
+            chat(serde_json::json!({"max_tokens": 50, "temperature": 0.5}))
         );
-    }
-
-    /// `display` decides whether the answer carries thinking text at all, so
-    /// two requests differing only there are different answers.
-    #[test]
-    fn identity_covers_how_anthropic_thinking_is_displayed() {
         let anthropic = |display: Option<&str>| {
             let mut thinking = serde_json::json!({"type": "adaptive"});
             if let Some(d) = display {
                 thinking["display"] = serde_json::json!(d);
             }
-            let req: crate::api::messages::MessagesRequest = serde_json::from_value(serde_json::json!({
+            content_hash(&domain_request(ApiVersion::AnthropicMessages, serde_json::json!({
                 "model": "m", "max_tokens": 1024, "thinking": thinking,
                 "messages": [{"role": "user", "content": "hello"}],
-            }))
-            .unwrap();
-            DomainRequest::from_anthropic(&req)
+            })))
         };
-        let none = response_policy_hash(&[]);
-        let key = |r: &DomainRequest| identity_hash(r, "claude", Some("mid"), &serde_json::json!({}), &none);
-        assert_ne!(key(&anthropic(Some("summarized"))), key(&anthropic(Some("omitted"))));
-        assert_ne!(key(&anthropic(Some("omitted"))), key(&anthropic(None)));
-        // Positive control: the same request keys alike.
-        assert_eq!(key(&anthropic(Some("omitted"))), key(&anthropic(Some("omitted"))));
-    }
-
-    /// "Do not reason" is a request of its own, not the absence of one: a
-    /// same-protocol forward sends `reasoning_effort: "none"` verbatim, and a
-    /// model that reasons by default answers the two differently.
-    #[test]
-    fn identity_keeps_do_not_reason_apart_from_saying_nothing() {
-        let none = response_policy_hash(&[]);
-        let key = |extra: serde_json::Value| {
-            let mut body = serde_json::json!({"model": "m", "max_tokens": 50, "messages": [{"role": "user", "content": "hello"}]});
-            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            identity_hash(&chat_request(body), "gpt-5", Some("mid"), &serde_json::json!({}), &none)
-        };
-        let off = key(serde_json::json!({"reasoning_effort": "none"}));
-        assert_ne!(off, key(serde_json::json!({})));
-        assert_ne!(off, key(serde_json::json!({"reasoning_effort": "low"})));
-        // Positive control: the same request keys alike.
-        assert_eq!(off, key(serde_json::json!({"reasoning_effort": "none"})));
+        assert_ne!(anthropic(Some("summarized")), anthropic(Some("omitted")));
+        assert_ne!(anthropic(Some("omitted")), anthropic(None));
+        assert_eq!(anthropic(Some("omitted")), anthropic(Some("omitted")));
     }
 
     fn response_program(id: &str, version: &str, phase: &str) -> crate::scripting::TransformProgram {
@@ -2533,19 +2328,18 @@ mod tests {
             "model": "m",
             "messages": [{"role": "user", "content": "hello"}],
         }));
-        assert!(!asks_for_multiple_answers(&one));
+        assert!(!asks_for_multiple_answers(&keyed(&one, &axum::http::HeaderMap::new()).unwrap().body));
 
-        // `n` reaches the domain view only because `from_chat_completions` lifts
-        // it — the whole point of reading the request rather than the body is
-        // that a streaming store has no body yet.
+        // Read from the request, not the answer: a streaming store has no
+        // body yet.
         let many = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hello"}],
             "n": 2,
         }));
-        assert!(asks_for_multiple_answers(&many));
+        assert!(asks_for_multiple_answers(&keyed(&many, &axum::http::HeaderMap::new()).unwrap().body));
 
-        let gemini_many = DomainRequest::from_gemini(&crate::api::gemini::GeminiRequest {
+        let gemini_many = ApiRequest::GoogleGemini(crate::api::gemini::GeminiRequest {
             model: "m".into(),
             stream: None,
             contents: vec![],
@@ -2570,18 +2364,13 @@ mod tests {
             safety_settings: None,
             cached_content: None,
         });
-        assert!(asks_for_multiple_answers(&gemini_many));
+        assert!(asks_for_multiple_answers(&keyed(&gemini_many, &axum::http::HeaderMap::new()).unwrap().body));
     }
 
     #[test]
     fn identity_covers_the_response_shaping_policy() {
-        let req = chat_request(serde_json::json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "hello"}],
-        }));
         let id_with = |programs: &[crate::scripting::TransformProgram]| {
             identity_hash(
-                &req,
                 "gpt-4o",
                 Some("mid"),
                 &serde_json::json!({}),
@@ -2637,7 +2426,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_flag_is_not_part_of_identity() {
+    fn streaming_flag_is_not_part_of_the_key() {
         let non_stream = chat_request(serde_json::json!({
             "model": "m",
             "messages": [{"role": "user", "content": "hello"}],
@@ -2647,19 +2436,57 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true,
         }));
-        let none = response_policy_hash(&[]);
-        assert_eq!(
-            identity_hash(&non_stream, "gpt-4o", None, &serde_json::json!({}), &none),
-            identity_hash(&stream, "gpt-4o", None, &serde_json::json!({}), &none),
-            "a streaming request is the same answer, rendered differently"
-        );
+        // A streaming request is the same answer, rendered differently.
         assert_eq!(content_hash(&non_stream), content_hash(&stream));
     }
 
+    /// A caller's bookkeeping members split no shared cache. A client's
+    /// telemetry line in an Anthropic system text reaches the model on a
+    /// same-protocol forward, so it keys like any prompt text: what it says is
+    /// the client's to choose, and a stripped line would let one caller's
+    /// text shape an answer served to another.
     #[test]
-    fn cross_protocol_same_conversation_hashes_identically() {
-        // The whole point of hashing the domain layer: an OpenAI-wire and an
-        // Anthropic-wire rendering of one conversation share an entry.
+    fn caller_bookkeeping_does_not_key_and_a_telemetry_line_does() {
+        let anthropic = |system: serde_json::Value| {
+            content_hash(&domain_request(ApiVersion::AnthropicMessages, serde_json::json!({
+                "model": "m", "max_tokens": 9, "system": system, "messages": [{"role": "user", "content": "q"}],
+            })))
+        };
+        let billing = |cch: &str| format!("x-anthropic-billing-header: cc_version=1; cch={cch};\nYou are terse.");
+        assert_ne!(anthropic(serde_json::json!(billing("A"))), anthropic(serde_json::json!(billing("B"))));
+        assert_ne!(anthropic(serde_json::json!(billing("A"))), anthropic(serde_json::json!("You are terse.")));
+        assert_eq!(anthropic(serde_json::json!(billing("A"))), anthropic(serde_json::json!(billing("A"))));
+        let chat = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "q"}]});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            content_hash(&chat_request(body))
+        };
+        assert_eq!(
+            chat(serde_json::json!({"safety_identifier": "u1", "prompt_cache_key": "s1", "user": "a"})),
+            chat(serde_json::json!({"safety_identifier": "u2", "prompt_cache_key": "s2", "user": "b"}))
+        );
+        assert_ne!(chat(serde_json::json!({"seed": 1})), chat(serde_json::json!({"seed": 2})));
+        assert_ne!(chat(serde_json::json!({"store": true})), chat(serde_json::json!({"store": false})));
+        // The `anthropic-beta` header reaches an Anthropic upstream, so it keys.
+        let request = domain_request(ApiVersion::AnthropicMessages, serde_json::json!({
+            "model": "m", "max_tokens": 9, "messages": [{"role": "user", "content": "q"}],
+        }));
+        let with = |beta: Option<&str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(b) = beta {
+                headers.insert("anthropic-beta", b.parse().unwrap());
+            }
+            content_of(&keyed(&request, &headers).unwrap())
+        };
+        assert_ne!(with(Some("context-1m-2025-08-07")), with(None));
+        assert_ne!(with(Some("context-1m-2025-08-07")), with(Some("output-128k-2025-02-19")));
+        assert_eq!(with(None), content_hash(&request).unwrap());
+    }
+
+    /// The key reads the client's own request: the same conversation sent on
+    /// two protocols is two entries.
+    #[test]
+    fn the_same_conversation_on_two_protocols_is_two_entries() {
         let chat = chat_request(serde_json::json!({
             "model": "m",
             "messages": [
@@ -2676,7 +2503,95 @@ mod tests {
                 "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
             }),
         );
-        assert_eq!(content_hash(&chat), content_hash(&anthropic));
+        assert_ne!(content_hash(&chat), content_hash(&anthropic));
+        assert_ne!(semantic_request(&chat, "embed-1").map(|p| p.prefix), semantic_request(&anthropic, "embed-1").map(|p| p.prefix));
+    }
+
+    /// What the gateway does not model of a request is still part of it: the
+    /// same member at another place, a message's text split differently, a
+    /// setting on a part — each is another request, though the gateway's own
+    /// reading of the two is the same.
+    #[test]
+    fn a_difference_the_gateway_does_not_model_is_another_request() {
+        let chat = |messages: serde_json::Value| content_hash(&chat_request(serde_json::json!({"model": "m", "messages": messages})));
+        let anthropic = |messages: serde_json::Value| {
+            content_hash(&domain_request(ApiVersion::AnthropicMessages, serde_json::json!({"model": "m", "max_tokens": 9, "messages": messages})))
+        };
+        let image = |set: bool| {
+            let mut image = serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}});
+            if set {
+                image["transformations"] = serde_json::json!({"oversized_image": "error"});
+            }
+            image
+        };
+        let assistant = |set: bool| match set {
+            true => serde_json::json!({"role": "assistant", "content": "a", "reasoning_content": "r"}),
+            false => serde_json::json!({"role": "assistant", "content": "a"}),
+        };
+        let user_named = |set: bool| match set {
+            true => serde_json::json!({"role": "user", "content": "q", "name": "example_user"}),
+            false => serde_json::json!({"role": "user", "content": "q"}),
+        };
+        let text = |set: bool| match set {
+            true => serde_json::json!({"type": "text", "text": "q", "cache_control": {"type": "ephemeral"}}),
+            false => serde_json::json!({"type": "text", "text": "q"}),
+        };
+        let pic = serde_json::json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBO"}});
+        type Key<'a> = Box<dyn Fn(bool) -> Option<[u8; 32]> + 'a>;
+        let placed: Vec<Key> = vec![
+            // The same key on the other of two assistant messages.
+            Box::new(|first| chat(serde_json::json!([
+                {"role": "user", "content": "q"}, assistant(first), {"role": "user", "content": "q"}, assistant(!first),
+                {"role": "user", "content": "q"},
+            ]))),
+            // The same `name` on the other of two user messages.
+            Box::new(|first| chat(serde_json::json!([user_named(first), {"role": "assistant", "content": "a"}, user_named(!first)]))),
+            // The same text part setting on the other of two text parts.
+            Box::new(|first| chat(serde_json::json!([{"role": "user", "content": [text(first), text(!first)]}]))),
+            // A tool result's image between its text parts, or after them: the
+            // gateway joins the text either way.
+            Box::new(|first| {
+                let content = match first {
+                    true => serde_json::json!([{"type": "text", "text": "ab"}, pic]),
+                    false => serde_json::json!([{"type": "text", "text": "a"}, pic, {"type": "text", "text": "b"}]),
+                };
+                chat(serde_json::json!([
+                    {"role": "user", "content": "q"},
+                    {"role": "assistant", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{}"}}]},
+                    {"role": "tool", "tool_call_id": "c", "content": content},
+                ]))
+            }),
+            // Reasoning on a message the gateway keeps nothing of, or on the next.
+            Box::new(|first| match first {
+                true => chat(serde_json::json!([
+                    {"role": "user", "content": "q"}, {"role": "assistant", "content": null, "reasoning_content": "r"},
+                    {"role": "assistant", "content": "a"},
+                ])),
+                false => chat(serde_json::json!([
+                    {"role": "user", "content": "q"}, {"role": "assistant", "content": "a", "reasoning_content": "r"},
+                ])),
+            }),
+            // An image's detail.
+            Box::new(|first| {
+                let detail = if first { "low" } else { "high" };
+                chat(serde_json::json!([{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://x/i.png", "detail": detail}}, {"type": "text", "text": "q"},
+                ]}]))
+            }),
+            // The same setting on the other of two Anthropic images, at the top
+            // and inside a tool result.
+            Box::new(|first| anthropic(serde_json::json!([{"role": "user", "content": [image(first), image(!first)]}]))),
+            Box::new(|first| anthropic(serde_json::json!([
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "f", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": [image(first), image(!first)]}]},
+            ]))),
+        ];
+        for (case, key) in placed.iter().enumerate() {
+            assert_ne!(key(true), key(false), "case {case}");
+            // Positive control: the same request keys alike.
+            assert_eq!(key(true), key(true), "case {case}");
+        }
     }
 
     // ── semantic matching ──
@@ -3171,30 +3086,53 @@ mod tests {
         assert!(semantic_request(&at_limit, "embed-1").is_some());
     }
 
+    /// The bucket reads none of the last user message's text, and all of what
+    /// it carries beside; a final turn the gateway reads as more than one
+    /// message is matched exactly.
     #[test]
-    fn semantic_request_is_translation_invariant() {
-        // Same guarantee the exact key gives: one conversation, two wires, one
-        // bucket.
-        let chat = chat_request(serde_json::json!({
-            "model": "m",
-            "messages": [
-                {"role": "system", "content": "be terse"},
-                {"role": "user", "content": "hello"},
-            ],
-        }));
-        let anthropic = domain_request(
-            ApiVersion::AnthropicMessages,
-            serde_json::json!({
-                "model": "m",
-                "max_tokens": 100,
-                "system": "be terse",
-                "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
-            }),
-        );
-        assert_eq!(
-            semantic_request(&chat, "embed-1"),
-            semantic_request(&anthropic, "embed-1")
-        );
+    fn the_bucket_reads_all_of_the_last_user_message_but_its_text() {
+        let ask = |content: serde_json::Value, name: &str| {
+            semantic_request(
+                &chat_request(serde_json::json!({"model": "m", "messages": [
+                    {"role": "system", "content": "be terse"}, {"role": "user", "content": content, "name": name},
+                ]})),
+                "embed-1",
+            )
+            .expect("a text user turn is embeddable")
+        };
+        let part = |text: &str| serde_json::json!([{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]);
+        let a = ask(serde_json::json!("what is the capital of France"), "u");
+        assert_eq!(a.prefix, ask(serde_json::json!("capital of France?"), "u").prefix);
+        let b = ask(part("capital of France?"), "u");
+        assert_eq!(b.prefix, ask(part("what is the capital of France"), "u").prefix);
+        assert_eq!(b.query, "capital of France?");
+        // Everything beside the text still matches exactly: the message's
+        // `name`, a part's settings, its parts.
+        assert_ne!(a.prefix, ask(serde_json::json!("what is the capital of France"), "v").prefix);
+        assert_ne!(a.prefix, b.prefix);
+        // Only the text the query reads is blanked: a member nesting a `text`
+        // or `content` of its own still keys.
+        let member = |context: &str| {
+            semantic_request(
+                &chat_request(serde_json::json!({"model": "m", "messages": [
+                    {"role": "user", "content": "q", "context": {"content": context, "text": context}},
+                ]})),
+                "embed-1",
+            )
+            .expect("a text user turn is embeddable")
+            .prefix
+        };
+        assert_ne!(member("tenant A"), member("tenant B"));
+        // A Responses input string is its one user message.
+        let responses = domain_request(ApiVersion::Responses, serde_json::json!({"model": "m", "input": "hello"}));
+        assert_eq!(semantic_request(&responses, "embed-1").map(|p| p.query).as_deref(), Some("hello"));
+        // An Anthropic user turn carrying a tool result beside its question.
+        let tool_turn = domain_request(ApiVersion::AnthropicMessages, serde_json::json!({"model": "m", "max_tokens": 9, "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "f", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "r"}, {"type": "text", "text": "and?"}]},
+        ]}));
+        assert!(semantic_request(&tool_turn, "embed-1").is_none());
     }
 
     #[test]

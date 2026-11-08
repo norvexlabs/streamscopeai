@@ -21,7 +21,7 @@ function members<T extends string>(all: Record<T, true>): readonly T[] {
 
 export const SESSION_LINKAGE = members<SessionLinkage>({ has_children: true, has_parent: true, unlinked: true });
 export const ALERT_LEVELS = members<AlertLevel>({ major: true, minor: true, info: true });
-export const TOOL_CALL_OUTCOMES = members<ToolCallOutcome>({ ok: true, blocked: true, redacted: true, args_modified: true });
+export const TOOL_CALL_OUTCOMES = members<ToolCallOutcome>({ ok: true, blocked: true, not_applied: true, redacted: true, args_modified: true });
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 

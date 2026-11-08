@@ -235,11 +235,13 @@ pub async fn transform_request(
                 notice.push_str(&format!("\n- {name}: {desc}"));
                 badges.add_tool_blocked(Phase::Request, name.clone());
                 blocked_tools.push(crate::proxy::content::BlockedToolInfo {
+                    not_applied: false,
                     name: name.clone(),
                     title: title.to_string(),
                     description: desc.to_string(),
                     rule_id,
                     tool_use_id: None,
+                    call_index: None,
                     arguments: None,
                 });
             }
@@ -1421,10 +1423,10 @@ mod tests {
     }
 
     /// A client `priority` does not fragment the response cache: once removed,
-    /// the request's cache identity equals the same request sent without it.
+    /// the request's cache key equals the same request sent without it (the
+    /// identity half reads nothing of the request).
     #[tokio::test]
     async fn a_client_priority_does_not_change_the_cache_identity() {
-        use crate::api::domain_request::DomainRequest;
         let user = make_user_context_with_map(ModelMap::default());
         let (engine, programs) = empty_engine_and_programs();
         let mut identities = Vec::new();
@@ -1437,8 +1439,7 @@ mod tests {
             transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
-            let domain = DomainRequest::from_api_request(&request);
-            identities.push(crate::proxy::response_cache::identity_hash(&domain, "m", None, &serde_json::Value::Null, &[0u8; 32]));
+            identities.push(crate::proxy::response_cache::tests::content_hash(&request));
         }
         assert_eq!(identities[0], identities[2]);
         assert_eq!(identities[1], identities[2]);
@@ -2165,7 +2166,7 @@ mod tests {
     }
 
     /// A script's system-prompt edit is reported as one, on Gemini as on every
-    /// protocol.
+    /// protocol; it replaces the whole instruction.
     #[tokio::test]
     async fn a_gemini_system_prompt_edit_is_reported() {
         let user = make_user_context_with_map(ModelMap::default());
@@ -2174,7 +2175,7 @@ mod tests {
             "system_prompt",
             r#"fn transform(ctx) { ctx.system_prompt = "new"; ctx }"#,
         )];
-        let body = r#"{"systemInstruction":{"parts":[{"text":"old"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+        let body = r#"{"systemInstruction":{"parts":[{"text":"old"},{"inlineData":{"mimeType":"image/png","data":"iVBO"}},{"text":"rules"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
         let mut request =
             ApiRequest::parse(crate::api::sse::ApiVersion::GoogleGemini, &Bytes::from(body)).unwrap();
         let result = transform_request(
@@ -2184,6 +2185,7 @@ mod tests {
         .await
         .unwrap();
         assert!(result.flags.system_prompt_modified);
+        assert_eq!(request.wire_value().unwrap()["systemInstruction"]["parts"], serde_json::json!([{"text": "new"}]));
     }
 
     /// With no record of what was screened, the inbound scan reads every user

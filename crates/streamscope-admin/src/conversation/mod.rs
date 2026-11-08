@@ -122,6 +122,31 @@ pub struct ToolCallBlock {
     /// `response`-phase blocks attach to a `ToolCall` event — request-phase
     /// blocks surface only on the turn header.
     pub phase: String,
+    /// Policy would have blocked the call and it was not stopped: the console
+    /// shows it apart from a call that was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applied: bool,
+    /// The record this is, by its place in the turn's
+    /// `transform_diff.response_blocked_tools`, for a reader of the same row
+    /// that needs the whole record (the tool calls page). `None` for a record
+    /// of another kind (an agent call's finding).
+    #[serde(skip)]
+    pub record: Option<usize>,
+}
+
+impl ToolCallBlock {
+    /// The banner of a response-phase block record, entry `at` of the turn's
+    /// `transform_diff.response_blocked_tools`.
+    pub fn of_record(at: usize, info: &streamscope_core::proxy::content::BlockedToolInfo) -> Self {
+        Self {
+            rule_id: Some(info.rule_id.clone()),
+            rule_title: Some(info.title.clone()),
+            reason: info.description.clone(),
+            phase: "response".to_string(),
+            not_applied: info.not_applied,
+            record: Some(at),
+        }
+    }
 }
 
 /// Rule-identity payload attached to a `ConversationEvent::ToolCall` when a
@@ -594,4 +619,44 @@ pub struct A2aArtifactView {
     pub description: Option<String>,
     #[schema(value_type = Vec<streamscope_core::api::domain_request::DomainContentBlock>)]
     pub blocks: Vec<streamscope_core::api::domain_request::DomainContentBlock>,
+}
+
+/// The result the answering turn sent (`result_events`' new `ToolResult`s)
+/// for each of a turn's calls — `call_events`' new `ToolCall`s — by the call's
+/// index in `call_events`, each result paired once, by the call's id: calls
+/// repeating an id take its results in order. Only a call [`takes_a_result`]
+/// is paired.
+pub(crate) fn pair_results(call_events: &[ConversationEvent], result_events: &[ConversationEvent]) -> Vec<Option<ConversationEvent>> {
+    let mut results: Vec<Option<&ConversationEvent>> = result_events
+        .iter()
+        .filter(|e| matches!(e, ConversationEvent::ToolResult { is_new: true, .. }))
+        .map(Some)
+        .collect();
+    let mut paired = vec![None; call_events.len()];
+    for (at, event) in call_events.iter().enumerate() {
+        let ConversationEvent::ToolCall { id, .. } = event else {
+            continue;
+        };
+        if !takes_a_result(event) {
+            continue;
+        }
+        paired[at] = results
+            .iter()
+            .position(|r| matches!(r, Some(ConversationEvent::ToolResult { tool_call_id, .. }) if tool_call_id == id))
+            .and_then(|found| results[found].take().cloned());
+    }
+    paired
+}
+
+/// A call of this turn's answer the client received and can answer by its id:
+/// not one policy removed (a whole answer's row records it beside its
+/// siblings, which may share its id), not one the gateway ran (its result is
+/// the gateway's, never the client's), and not one recorded without an id:
+/// no id names its result.
+pub(crate) fn takes_a_result(event: &ConversationEvent) -> bool {
+    matches!(
+        event,
+        ConversationEvent::ToolCall { id, is_new: true, blocked, intercepted: None, .. }
+            if !id.is_empty() && !blocked.as_ref().is_some_and(|b| !b.not_applied)
+    )
 }
