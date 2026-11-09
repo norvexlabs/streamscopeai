@@ -777,6 +777,54 @@ mod tests {
         );
     }
 
+    /// Each Aider config file ships `~/.aider.model.metadata.json`, naming
+    /// the models the config selects (by the same provider-prefixed id): the
+    /// main model with the route's output cap and, when known, its window, and
+    /// a distinct weak model on its own. Aider looks a model up there before
+    /// anywhere else: with no entry it warns of an unknown window on every
+    /// start and downloads a public model list. Every key is named once (the
+    /// weak model is the main one until an admin fills the fast slot). A BYOK
+    /// render ships none — the gateway does not know the model the user names.
+    #[test]
+    fn every_aider_config_names_its_models_window_beside_it() {
+        let aider = seed("aider");
+        let configs: Vec<_> = aider.templates.iter().filter(|t| t.format == TemplateFormat::Yaml).collect();
+        assert_eq!(configs.len(), 2);
+        for t in configs {
+            // (fast slot, window known): a distinct fast model, the main model
+            // in both slots, and a route with no known window.
+            for (fast, window) in [("claude-haiku-4-5", true), ("qwen3:8b", true), ("claude-haiku-4-5", false)] {
+                let mut phs = validation_placeholders();
+                phs.insert("forward_auth".into(), Value::Bool(false));
+                phs.insert("model_alias".into(), Value::String("qwen3:8b".into()));
+                phs.insert("model_slot_fast".into(), Value::String(fast.into()));
+                if !window {
+                    phs.remove("context_window");
+                }
+                let config: yaml_serde::Value =
+                    yaml_serde::from_str(&crate::render::render(&t.body, t.format, &phs).unwrap()).unwrap();
+                let model = config["model"].as_str().unwrap().to_string();
+                let weak = config["weak-model"].as_str().unwrap().to_string();
+                let companions = crate::companions::companion_files(t, &phs).expect("renders");
+                let [meta] = companions.as_slice() else { panic!("{}: {companions:?}", t.title) };
+                assert_eq!(meta.path.as_deref(), Some("~/.aider.model.metadata.json"));
+                let doc: serde_json::Value = serde_json::from_str(&meta.body).expect("json");
+                let provider = model.split('/').next().unwrap();
+                assert_eq!(doc[&model]["litellm_provider"].as_str(), Some(provider), "{}", meta.body);
+                assert_eq!(doc[&model]["max_input_tokens"].as_i64(), window.then_some(200_000), "{}", meta.body);
+                assert_eq!(doc[&model]["max_output_tokens"].as_i64(), Some(200_000), "{}", meta.body);
+                assert_eq!(doc[&weak]["litellm_provider"].as_str(), Some(provider), "{}", meta.body);
+                // One entry per distinct model, each key written once.
+                let entries = doc.as_object().unwrap().len();
+                assert_eq!(entries, if weak == model { 1 } else { 2 }, "{}", meta.body);
+                assert_eq!(meta.body.matches("\"litellm_provider\"").count(), entries, "{}", meta.body);
+            }
+            let mut byok = validation_placeholders();
+            byok.insert("forward_auth".into(), Value::Bool(true));
+            assert!(crate::companions::companion_files(t, &byok).expect("renders").is_empty(), "{}", t.title);
+        }
+    }
+
     #[test]
     fn a_string_keyed_array_is_identified_by_the_name_before_its_equals_sign() {
         let check = |format, body: &str| keyed_array_error(format, body, "/e", "=");
@@ -873,8 +921,9 @@ mod tests {
                 .templates
                 .iter()
                 // A template that names no model (a shell export of the
-                // address and key) has no slot to name either.
-                .filter(|t| t.kind.needs_llm() && t.body.contains("{{model_alias}}"))
+                // address and key) has no slot to name either. A model may be
+                // spliced alone or joined to a prefix (`{{concat "openai/" model_alias}}`).
+                .filter(|t| t.kind.needs_llm() && t.body.contains("model_alias"))
                 .map(|t| {
                     let mut phs = validation_placeholders();
                     phs.insert("forward_auth".into(), Value::Bool(false));
@@ -907,16 +956,117 @@ mod tests {
             assert_eq!(agent["commit_message_model"]["model"], fast.as_str());
             assert_eq!(agent["thread_summary_model"]["model"], fast.as_str());
         }
+        let mut aider_shell = 0;
         for body in rendered("aider") {
-            let doc: yaml_serde::Value = yaml_serde::from_str(&body).unwrap();
-            let weak = doc["weak-model"].as_str().unwrap();
+            // The shell variant exports the weak model; the config files name it.
+            let weak = match body.lines().find_map(|l| l.strip_prefix("export AIDER_WEAK_MODEL=")) {
+                Some(weak) => {
+                    aider_shell += 1;
+                    weak.to_string()
+                }
+                None => {
+                    let doc: yaml_serde::Value = yaml_serde::from_str(&body).unwrap();
+                    doc["weak-model"].as_str().unwrap().to_string()
+                }
+            };
             assert!(weak.ends_with(&format!("/{fast}")), "{weak}");
         }
+        assert_eq!(aider_shell, 1, "aider's shell variant names its weak model");
         for body in rendered("goose") {
             let doc: yaml_serde::Value = yaml_serde::from_str(&body).unwrap();
             assert_eq!(doc["GOOSE_PLANNER_MODEL"].as_str(), Some(plan.as_str()));
             assert_eq!(doc["GOOSE_PLANNER_PROVIDER"], doc["GOOSE_PROVIDER"]);
         }
+    }
+
+    /// A model id reaches every shipped YAML config as the client must read
+    /// it, whatever characters it holds. The YAML escape quotes a value that
+    /// needs it (an Ollama tag `llama3.1:8b`, the BYOK `<your-model-name>`
+    /// sentinel) as a WHOLE scalar, so a template writing literal text beside a
+    /// placeholder (`openai/{{model_alias}}`) ships `openai/"llama3.1:8b"` — a
+    /// model no route serves. Such a value is built with `concat`. Every body
+    /// and companion, on every pass, is rendered with ids that force quoting,
+    /// top-level and per route.
+    #[test]
+    fn a_model_id_needing_quotes_reaches_every_yaml_config_unquoted() {
+        fn strings(v: &yaml_serde::Value, out: &mut Vec<String>) {
+            match v {
+                yaml_serde::Value::String(s) => out.push(s.clone()),
+                yaml_serde::Value::Sequence(items) => items.iter().for_each(|i| strings(i, out)),
+                yaml_serde::Value::Mapping(map) => map.iter().for_each(|(k, v)| {
+                    strings(k, out);
+                    strings(v, out);
+                }),
+                _ => {}
+            }
+        }
+        let mut phs = validation_placeholders();
+        let mut planted = Vec::new();
+        for (k, v) in [
+            ("model_alias", "alias:1"),
+            ("model_slot_default", "default:1"),
+            ("model_slot_fast", "fast:1"),
+            ("model_slot_plan", "plan:1"),
+            ("upstream_model", "upstream:1"),
+        ] {
+            phs.insert(k.into(), Value::String(v.into()));
+            planted.push(v.to_string());
+        }
+        if let Some(Value::List(routes)) = phs.get_mut("routes") {
+            for (n, route) in routes.iter_mut().enumerate() {
+                for k in ["model_alias", "upstream_model"] {
+                    let id = format!("route-{n}:{k}");
+                    route.insert(k.into(), Value::String(id.clone()));
+                    planted.push(id);
+                }
+            }
+        }
+        let mut checked = 0;
+        let mut aider_models = 0;
+        for (path, profile) in seed_profiles() {
+            for (forward_auth, project_scope) in [(false, false), (false, true), (true, false), (true, true)] {
+                phs.insert("forward_auth".into(), Value::Bool(forward_auth));
+                phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(project_scope));
+                for t in &profile.templates {
+                    let mut outputs = Vec::new();
+                    if t.format == TemplateFormat::Yaml {
+                        outputs.push(
+                            crate::render::render(&t.body, t.format, &phs)
+                                .unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+                        );
+                    }
+                    for c in crate::companions::companion_files(t, &phs)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                    {
+                        if c.format == TemplateFormat::Yaml {
+                            outputs.push(c.body);
+                        }
+                    }
+                    for body in outputs {
+                        let doc: yaml_serde::Value = yaml_serde::from_str(&body).unwrap();
+                        let mut values = Vec::new();
+                        strings(&doc, &mut values);
+                        for value in &values {
+                            assert!(
+                                !planted.iter().any(|id| value.contains(&format!("\"{id}\""))),
+                                "{}: `{value}` keeps the escape's quotes:\n{body}",
+                                path.display()
+                            );
+                        }
+                        if profile.id == "aider" && !forward_auth {
+                            assert!(values.iter().any(|v| v.ends_with("/alias:1")), "{body}");
+                            assert!(values.iter().any(|v| v.ends_with("/fast:1")), "{body}");
+                            aider_models += 1;
+                        }
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        // Positive control: the planted ids did reach Aider's two YAML configs
+        // (on both gateway passes), so the walk saw the values it judges.
+        assert_eq!(aider_models, 4, "aider ships two YAML configs");
+        assert!(checked > aider_models, "only {checked} YAML outputs checked");
     }
 
     /// OpenCode 2 resolves a model per agent, and a home-directory

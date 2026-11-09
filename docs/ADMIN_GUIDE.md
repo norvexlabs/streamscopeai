@@ -2438,7 +2438,7 @@ Identifies the **AI clients/apps** hitting the gateway and serves them per-app o
   app outright; otherwise its Referer, then its User-Agent, is matched against each app's patterns;
   and only when none of those matched is the opening of the request's system prompt matched against
   the app's **system prompt patterns**. That last signal is what recognises clients that send no
-  User-Agent (Goose) or a generic one (the Continue CLI). Patterns match ignoring the case of
+  User-Agent (Goose) or a generic one (the Continue CLI, Aider). Patterns match ignoring the case of
   plain (ASCII) letters; a system prompt pattern is one sentence per line, at least 12 characters (a shorter one would claim
   other clients' traffic), and should be a phrase only that client's prompt opens with — its name,
   typically. Add or edit an app with **+ Add App** / **Edit**; the new patterns name traffic from
@@ -2463,7 +2463,10 @@ Identifies the **AI clients/apps** hitting the gateway and serves them per-app o
   step is part of the profile too, so a client you add or copy carries it. A second file can name
   where it goes in a project, or exist only in a project (Claude Code's `.mcp.json`), and a file or
   step with nothing to say for a render (no MCP server selected) is left out. **Preview** renders a draft against sample
-  values before you save, and the placeholder reference lists everything you can use.
+  values before you save, and the placeholder reference lists everything you can use. In a YAML template, a
+  value that adds fixed text to a placeholder is written `{{concat "openai/" model_alias}}`, not
+  `openai/{{model_alias}}`: a model id YAML must quote (`llama3.1:8b`) would otherwise land with the quotes
+  inside the value.
 
   Saving is refused if a template would hand the user a config with no key in it — the commonest way
   to ship something that looks right and cannot connect. If a tool genuinely reads its key only from
@@ -2718,7 +2721,11 @@ place around your text. Zed reads the API key from a `STREAMSCOPE_API_KEY`
 environment variable (or the Agent Panel) rather than its `settings.json`, so export the minted key in your shell. Qwen Code
 gets the gateway in `~/.qwen/.env` with an output cap (the model alias's, else the model's, else 8 192 or its window if smaller), plus two keys merged into
 `~/.qwen/settings.json`: the OpenAI sign-in type (so a Qwen account you signed in with earlier does not
-take over) and, when the gateway knows the model, its context window. A config file that is not valid
+take over) and, when the gateway knows the model, its context window. Aider gets
+`~/.aider.model.metadata.json` beside `~/.aider.conf.yml`: its model with the output cap and, when the
+gateway knows it, the context window, and its weak model by name, so Aider neither warns of an unknown
+window nor downloads a public model list each time it starts. A BYOK provider gets none, since the gateway
+does not know the model you name. A config file that is not valid
 JSON even allowing comments and trailing commas, or one with comments that repeats a key, is not
 rewritten — `provision` stops before writing anything for that tool and names the file.
 

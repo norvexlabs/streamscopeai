@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.22]
+
+- **BREAKING** for an `ssai` older than this release, which cannot render the new Aider configs: `ssai update`
+  first. Aider works with every model alias. Its config named a model whose alias holds a character YAML must
+  quote (an Ollama tag such as `llama3.1:8b`, or the `<your-model-name>` a BYOK config leaves to fill in) as
+  `openai/"llama3.1:8b"`, a model the gateway does not serve; it is now written as one value. Re-run `ssai
+  provision` (or copy the Quickstart again) to rewrite an existing config. An Aider profile edited in the
+  console keeps its own templates: reset it, or write its model values as `{{concat "openai/" model_alias}}`
+  rather than `openai/{{model_alias}}`.
+- Aider's config file is set up with `~/.aider.model.metadata.json` beside it, giving its model the gateway's
+  output cap and, when known, context window, and naming its weak model: on a gateway provider it no longer warns
+  of an unknown window, or tries to download a public model list, on every start — under the Linux and macOS
+  sandbox (`ssai run --sandbox`), a download the egress guard refused and printed. The Quickstart's shell
+  variant, which writes no file, now names the model too (`AIDER_MODEL`, `AIDER_WEAK_MODEL`). Under that sandbox
+  Aider can also read its `~/.aider.model.settings.yml`.
+- Aider traffic is recognised as Aider. Aider calls models through generic SDK User-Agents, so its requests were
+  attributed to no app. The App Registry's Aider entry now matches the opening of Aider's system prompt in each of
+  its edit modes, and of its commit-message and chat-summary calls. An Aider entry edited in the console keeps
+  its own patterns: reset it to get these.
+
 ## [2026.11.21]
 
 - Inline AI documentation: the Admin Guide now covers both ways an inline gateway hands over intercepted traffic.

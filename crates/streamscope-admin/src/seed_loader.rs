@@ -1271,6 +1271,22 @@ let y = 2;
         ("You are Crush, a powerful AI Assistant that runs in the CLI. <critical_rules> These rules override everything else.", Some("crush")),
         ("You are Gemini CLI, an autonomous CLI agent specializing in software engineering tasks. You are currently operating in **YOLO** mode.", Some("gemini-cli")),
         ("You are Qwen Code, a non-interactive CLI agent developed by Alibaba Group, specializing in software engineering tasks.", Some("qwen-code")),
+        // Aider, one opening per edit format (whole, diff, udiff, editor-diff,
+        // editor-whole, architect, ask, context, help), then its weak-model calls.
+        ("Act as an expert software developer.\nTake requests for changes to the supplied code.\nIf the request is ambiguous, ask questions.", Some("aider")),
+        ("Act as an expert software developer.\nAlways use best practices when coding.\nRespect and use existing conventions, libraries, etc that are already present in the code base.\nReply in English.\n\nTake requests for changes to the supplied code.", Some("aider")),
+        ("Act as an expert software developer.\nReply in English.\n\nAlways use best practices when coding.\nRespect and use existing conventions, libraries, etc that are already present in the code base.\n\nTake requests for changes to the supplied code.", Some("aider")),
+        ("Act as an expert software developer who edits source code.\nReply in English.\n\nDescribe each change with a *SEARCH/REPLACE block* per the examples below.", Some("aider")),
+        ("Act as an expert software developer and make changes to source code.\nReply in English.\n\nOutput a copy of each file that needs changes.", Some("aider")),
+        ("Act as an expert architect engineer and provide direction to your editor engineer.\nStudy the change request and the current code.", Some("aider")),
+        ("Act as an expert code analyst.\nAnswer questions about the supplied code.\nAlways reply to the user in English.", Some("aider")),
+        ("Act as an expert code analyst.\nUnderstand the user's question or request, solely to determine ALL the existing sources files which will need to be modified.", Some("aider")),
+        ("You are an expert on the AI coding tool called Aider.\nAnswer the user's questions about how to use aider.", Some("aider")),
+        // Aider's weak-model calls: the commit message and the chat summary.
+        ("You are an expert software engineer that generates concise, one-line Git commit messages based on the provided diffs.\nReview the provided context and diffs which are about to be committed to a git repo.", Some("aider")),
+        ("*Briefly* summarize this partial conversation about programming.\nInclude less detail about older parts and more detail about the most recent messages.", Some("aider")),
+        // A neighbour's generic opening is not Aider's.
+        ("Act as an expert software developer.", None),
         ("You are opencode, an interactive CLI tool that helps users with software engineering tasks.", Some("opencode")),
         ("You are OpenCode, a coding agent that helps users with software engineering tasks.", Some("opencode")),
         ("You are OpenCode, an interactive general AI agent running on a user's computer.", Some("opencode")),

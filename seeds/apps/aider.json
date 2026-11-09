@@ -1,8 +1,21 @@
 {
   "id": "aider",
   "name": "Aider",
-  "description": "Terminal-based AI pair programming tool with git integration",
+  "description": "Terminal-based AI pair programming tool with git integration. Calls models with a generic SDK User-Agent, so it is recognised by its system prompt.",
   "url": "https://aider.chat",
-  "ua_patterns": ["aider/"],
-  "referer_patterns": ["aider.chat"]
+  "ua_patterns": [],
+  "referer_patterns": [
+    "aider.chat"
+  ],
+  "prompt_patterns": [
+    "take requests for changes to the supplied code",
+    "act as an expert software developer who edits source code",
+    "act as an expert software developer and make changes to source code",
+    "provide direction to your editor engineer",
+    "answer questions about the supplied code",
+    "solely to determine all the existing sources files",
+    "the ai coding tool called aider",
+    "one-line git commit messages based on the provided diffs",
+    "summarize this partial conversation about programming"
+  ]
 }

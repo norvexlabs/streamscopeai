@@ -13,9 +13,20 @@
       "filename": "~/.aider.conf.yml",
       "format": "yaml",
       "title": "Aider · .aider.conf.yml (Native Anthropic)",
-      "keyed_arrays": { "/set-env": "=" },
+      "keyed_arrays": {
+        "/set-env": "="
+      },
       "instructions": "Place at ~/.aider.conf.yml (or .aider.conf.yml in a project). Pick this variant for Claude models — it's the only Aider config that carries through extended thinking and `cache_control` (configure thinking budget per-model via `.aider.model.settings.yml`). It carries the gateway address and key itself (`set-env` and `anthropic-api-key`). `weak-model`, which Aider uses for commit messages and chat summaries, is the gateway's fast model (each the default model until an admin fills that slot on the route). Analytics and the update check are off (`analytics-disable`, `check-update`, `show-release-notes`); an admin who wants them back can edit this template.",
-      "body": "anthropic-api-key: {{api_key}}\nset-env:\n  - \"ANTHROPIC_API_BASE={{{base_url}}}\"\nmodel: anthropic/{{model_alias}}\nweak-model: anthropic/{{model_slot_fast}}\nanalytics-disable: true\ncheck-update: false\nshow-release-notes: false\n"
+      "body": "anthropic-api-key: {{api_key}}\nset-env:\n  - \"ANTHROPIC_API_BASE={{{base_url}}}\"\nmodel: {{concat \"anthropic/\" model_alias}}\nweak-model: {{concat \"anthropic/\" model_slot_fast}}\nanalytics-disable: true\ncheck-update: false\nshow-release-notes: false\n",
+      "companions": [
+        {
+          "path": "~/.aider.model.metadata.json",
+          "format": "json",
+          "title": "Aider · .aider.model.metadata.json",
+          "instructions": "Tells Aider the context window and output cap of the gateway model it runs, which it cannot look up for a gateway alias, and names its weak model: without it Aider warns that the window is unknown on every start and tries to download a public model list. Place it beside .aider.conf.yml (or merge its entries into your existing one). A BYOK config has none: the gateway does not know the model you name.",
+          "body": "{{#unless forward_auth}}{\n{{#unless (eq model_slot_fast model_alias)}}  \"{{concat \"anthropic/\" model_slot_fast}}\": { \"litellm_provider\": \"anthropic\", \"mode\": \"chat\" },\n{{/unless}}  \"{{concat \"anthropic/\" model_alias}}\": { \"litellm_provider\": \"anthropic\", \"mode\": \"chat\"{{#if context_window}}, \"max_input_tokens\": {{context_window}}{{/if}}{{#if max_output_tokens}}, \"max_output_tokens\": {{max_output_tokens}}{{/if}} }\n}\n{{/unless}}"
+        }
+      ]
     },
     {
       "kind": "llm",
@@ -23,8 +34,8 @@
       "filename": null,
       "format": "shell",
       "title": "Aider · shell env for Anthropic",
-      "instructions": "The same address and key as shell exports, for running aider without the config file. Analytics and the update check are off (`analytics-disable`, `check-update`, `show-release-notes`); an admin who wants them back can edit this template.",
-      "body": "export ANTHROPIC_API_BASE={{base_url}}\nexport ANTHROPIC_API_KEY={{api_key}}\nexport AIDER_ANALYTICS_DISABLE=true\nexport AIDER_CHECK_UPDATE=false\nexport AIDER_SHOW_RELEASE_NOTES=false\n"
+      "instructions": "The same address, key and models as shell exports, for running aider without the config file. Analytics and the update check are off (`analytics-disable`, `check-update`, `show-release-notes`); an admin who wants them back can edit this template.",
+      "body": "export ANTHROPIC_API_BASE={{base_url}}\nexport ANTHROPIC_API_KEY={{api_key}}\nexport AIDER_MODEL={{concat \"anthropic/\" model_alias}}\nexport AIDER_WEAK_MODEL={{concat \"anthropic/\" model_slot_fast}}\nexport AIDER_ANALYTICS_DISABLE=true\nexport AIDER_CHECK_UPDATE=false\nexport AIDER_SHOW_RELEASE_NOTES=false\n"
     },
     {
       "kind": "llm",
@@ -33,7 +44,16 @@
       "format": "yaml",
       "title": "Aider · .aider.conf.yml (OpenAI-compatible)",
       "instructions": "Place at ~/.aider.conf.yml (or .aider.conf.yml in a project). Works with every model the gateway serves. Aider's OpenAI path does not propagate thinking blocks (its `--reasoning-effort` flag only hints at server-side reasoning level). Aider treats Streamscope as an OpenAI-compatible endpoint via openai-api-base. For Claude models, the Native Anthropic variant keeps extended thinking and `cache_control` intact. `weak-model`, which Aider uses for commit messages and chat summaries, is the gateway's fast model (each the default model until an admin fills that slot on the route). Analytics and the update check are off (`analytics-disable`, `check-update`, `show-release-notes`); an admin who wants them back can edit this template.",
-      "body": "openai-api-base: {{base_url}}\nopenai-api-key: {{api_key}}\nmodel: openai/{{model_alias}}\nweak-model: openai/{{model_slot_fast}}\nanalytics-disable: true\ncheck-update: false\nshow-release-notes: false\n"
+      "body": "openai-api-base: {{base_url}}\nopenai-api-key: {{api_key}}\nmodel: {{concat \"openai/\" model_alias}}\nweak-model: {{concat \"openai/\" model_slot_fast}}\nanalytics-disable: true\ncheck-update: false\nshow-release-notes: false\n",
+      "companions": [
+        {
+          "path": "~/.aider.model.metadata.json",
+          "format": "json",
+          "title": "Aider · .aider.model.metadata.json",
+          "instructions": "Tells Aider the context window and output cap of the gateway model it runs, which it cannot look up for a gateway alias, and names its weak model: without it Aider warns that the window is unknown on every start and tries to download a public model list. Place it beside .aider.conf.yml (or merge its entries into your existing one). A BYOK config has none: the gateway does not know the model you name.",
+          "body": "{{#unless forward_auth}}{\n{{#unless (eq model_slot_fast model_alias)}}  \"{{concat \"openai/\" model_slot_fast}}\": { \"litellm_provider\": \"openai\", \"mode\": \"chat\" },\n{{/unless}}  \"{{concat \"openai/\" model_alias}}\": { \"litellm_provider\": \"openai\", \"mode\": \"chat\"{{#if context_window}}, \"max_input_tokens\": {{context_window}}{{/if}}{{#if max_output_tokens}}, \"max_output_tokens\": {{max_output_tokens}}{{/if}} }\n}\n{{/unless}}"
+        }
+      ]
     }
   ]
 }

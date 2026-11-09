@@ -113,8 +113,13 @@ RUN cargo test --workspace --all-features
 # RUSTSEC-2026-0387: crypto-bigint timing variability — 0.7 is on the fixed release; 0.5.5 comes
 #   only through openidconnect 4.0.1 (latest) → p256/p384 0.13, which verify an IdP's signatures over
 #   public keys and data, never a secret. Drop the ignore when openidconnect moves to p256 0.14.
+# RUSTSEC-2026-0459: bundled SQLite < 3.54 returns uninitialized page-cache memory for a crafted
+#   database + `-wal` pair. Only the proxy links SQLite, and it opens only the outbox files it writes
+#   in its own data directory: planting a pair there already takes the proxy's own write access.
+#   Fix bar is libsqlite3-sys >=0.39; sqlx-sqlite 0.9.0 (latest) pins <0.38 — drop the ignore when
+#   sqlx allows it.
 RUN cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0097 \
-    --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0387
+    --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0387 --ignore RUSTSEC-2026-0459
 
 # The gate marker: written only once every check above passed. Its content is
 # constant, so a rebuild whose checks re-ran and passed leaves the runtime image's

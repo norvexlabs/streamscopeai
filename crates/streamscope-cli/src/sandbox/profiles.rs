@@ -299,7 +299,7 @@ pub const AGENTS: &[AgentProfile] = &[
     },
     AgentProfile {
         names: &["aider"],
-        state_dirs: &["~/.aider", "~/.aider.conf.yml", "~/.config/aider", "~/.cache/aider"],
+        state_dirs: &["~/.aider", "~/.aider.conf.yml", "~/.aider.model.metadata.json", "~/.aider.model.settings.yml", "~/.config/aider", "~/.cache/aider"],
         env: &[],
         hub_dependent: false,
         engine: None,

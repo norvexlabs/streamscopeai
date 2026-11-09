@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use handlebars::{no_escape, Handlebars};
+use handlebars::{handlebars_helper, no_escape, Handlebars, JsonRender};
 use serde_json::Value as JsonValue;
 
 use crate::types::TemplateFormat;
@@ -150,9 +150,17 @@ pub enum RenderError {
     Template(String),
 }
 
+// `{{concat "openai/" model_alias}}` joins its arguments into ONE value, which
+// the format's escape then sees whole. A placeholder written after literal text
+// (`model: openai/{{model_alias}}`) is escaped alone: in YAML a value that needs
+// quoting (`qwen3:8b`, a `<…>` sentinel) becomes `openai/"qwen3:8b"`, a scalar
+// that keeps the quotes. Build any value with a fixed prefix or suffix with it.
+handlebars_helper!(concat: |*args| args.iter().map(|v| v.render()).collect::<String>());
+
 fn make_engine(escape: fn(&str) -> String) -> Handlebars<'static> {
     let mut h = Handlebars::new();
     h.register_escape_fn(escape);
+    h.register_helper("concat", Box::new(concat));
     h
 }
 
@@ -349,6 +357,29 @@ mod tests {
 
     fn ph<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value> {
         entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// A value built with `concat` reaches the client as exactly the joined
+    /// text, whatever the alias holds — the YAML escape quotes the WHOLE scalar.
+    /// The same text after a literal prefix keeps the escape's quotes inside the
+    /// value (the positive control: the shape `concat` exists to replace).
+    #[test]
+    fn a_concat_value_is_one_scalar_whatever_its_parts_hold() {
+        for alias in ["mock-model", "qwen3:8b", "<your-model-name>", "a\"b", "x #y", "null", "-lead", "a\\b", "42"] {
+            let phs = ph([("model_alias", alias.into())]);
+            let out = render("model: {{concat \"openai/\" model_alias}}\n", TemplateFormat::Yaml, &phs).unwrap();
+            let v: yaml_serde::Value = yaml_serde::from_str(&out).unwrap();
+            assert_eq!(v["model"].as_str(), Some(format!("openai/{alias}").as_str()), "{alias}: {out}");
+
+            // The JSON escape sees the joined value too (inside its quotes).
+            let out = render("{\"model\": \"{{concat \"openai/\" model_alias}}\"}", TemplateFormat::Json, &phs).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(v["model"].as_str(), Some(format!("openai/{alias}").as_str()), "{alias}: {out}");
+        }
+        let phs = ph([("model_alias", "qwen3:8b".into())]);
+        let out = render("model: openai/{{model_alias}}\n", TemplateFormat::Yaml, &phs).unwrap();
+        let v: yaml_serde::Value = yaml_serde::from_str(&out).unwrap();
+        assert_eq!(v["model"].as_str(), Some("openai/\"qwen3:8b\""), "{out}");
     }
 
     #[test]

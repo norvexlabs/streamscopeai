@@ -569,9 +569,10 @@ pub struct RenderResponse {
     pub template: RenderedTemplate,
     /// Files the client needs ALONGSIDE `template` — a credential the tool
     /// reads from its own env/secrets file rather than from the config the
-    /// profile templates. Same sentinel contract as `template.body`: the UI
-    /// substitutes the plaintext at copy-time. Empty for every client whose
-    /// template already carries its key.
+    /// profile templates, or what it reads about the models from a file of its
+    /// own (Aider's model metadata). Same sentinel contract as `template.body`:
+    /// the UI substitutes the plaintext at copy-time. Empty for a template that
+    /// declares none.
     pub companions: Vec<RenderedTemplate>,
     /// Keys created during this render. Empty when the render reused an
     /// existing key or minted nothing.

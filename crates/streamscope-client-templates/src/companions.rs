@@ -2,7 +2,8 @@
 //!
 //! Some tools read their credential from a file the profile's single template
 //! cannot express: Gemini CLI and Mistral Vibe take it from an auto-loaded
-//! `.env`, Goose from `secrets.yaml` beside its `config.yaml`. A companion with
+//! `.env`, Goose from `secrets.yaml` beside its `config.yaml`. Aider reads
+//! its models' window from `.aider.model.metadata.json` beside its config. A companion with
 //! no path is a step the user runs instead (Claude Code's `claude mcp add-json`
 //! commands: it keeps its MCP servers in a file holding its own state). The
 //! companion is therefore part of the config, not an extra — a render that
