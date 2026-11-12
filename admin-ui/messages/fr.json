@@ -560,7 +560,7 @@
   "portal_qs_cli_intro_pre": "L'outil",
   "portal_qs_cli_login_instructions": "Ouvre votre navigateur pour approuver cet appareil — fonctionne aussi bien avec les connexions par mot de passe que SSO.",
   "portal_qs_cli_provision_instructions": "Détecte vos outils installés, génère une clé de passerelle, et écrit chaque configuration. Relancez à tout moment ; `ssai sync --watch` maintient les configurations synchronisées.",
-  "portal_qs_cli_run_instructions": "`ssai run <client>` lance un outil provisionné dans un bac à sable natif : son système de fichiers est confiné au répertoire du projet courant et le trafic réseau sortant est restreint à cette passerelle. Utilisez `--sandbox off` pour exécuter un client sans confinement.",
+  "portal_qs_cli_run_instructions": "`ssai run <client>` lance un outil provisionné dans un bac à sable natif — `<client>` est son identifiant, tel que `ssai status` le liste, ou la commande qui le lance : son système de fichiers est confiné au répertoire du projet courant et le trafic réseau sortant est restreint à cette passerelle. Utilisez `--sandbox off` pour exécuter un client sans confinement.",
   "portal_qs_cli_step_ci": "CI / pipelines",
   "portal_qs_cli_step_install": "1. Installer",
   "portal_qs_cli_step_login": "2. Se connecter",

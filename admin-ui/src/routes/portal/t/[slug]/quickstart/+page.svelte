@@ -890,7 +890,7 @@
     <div class="space-y-2">
       <h2 class="text-sm font-semibold text-(--text-primary)">{m.portal_qs_cli_step_run()}</h2>
       <CodeSnippet
-        body={'ssai run claude'}
+        body={'ssai run <client>'}
         format="shell"
         instructions={m.portal_qs_cli_run_instructions()}
       />

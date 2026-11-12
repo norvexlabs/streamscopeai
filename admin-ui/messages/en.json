@@ -560,7 +560,7 @@
   "portal_qs_cli_intro_pre": "The",
   "portal_qs_cli_login_instructions": "Opens your browser to approve this device — works with password and SSO logins alike.",
   "portal_qs_cli_provision_instructions": "Detects your installed tools, mints one gateway key, and writes each config. Re-run any time; `ssai sync --watch` keeps configs converged.",
-  "portal_qs_cli_run_instructions": "`ssai run <client>` launches a provisioned tool inside a native sandbox: its filesystem is confined to the current project directory and network egress is pinned to this gateway. Pass `--sandbox off` to run a client without confinement.",
+  "portal_qs_cli_run_instructions": "`ssai run <client>` launches a provisioned tool inside a native sandbox — `<client>` is its id, as `ssai status` lists it, or the command that starts it: its filesystem is confined to the current project directory and network egress is pinned to this gateway. Pass `--sandbox off` to run a client without confinement.",
   "portal_qs_cli_step_ci": "CI / pipelines",
   "portal_qs_cli_step_install": "1. Install",
   "portal_qs_cli_step_login": "2. Log in",

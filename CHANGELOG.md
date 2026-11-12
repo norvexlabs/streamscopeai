@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.36]
+
+- **The portal's CLI steps name no particular client.** The Quickstart's run step reads
+  `ssai run <client>` and says what to put there: the client's id as `ssai status` lists it, or
+  the command that starts it.
+
 ## [2026.11.35]
 
 - **A more confined installation, on every shape.** The front that terminates TLS runs as an
