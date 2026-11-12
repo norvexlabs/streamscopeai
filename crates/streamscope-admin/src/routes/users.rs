@@ -544,10 +544,24 @@ pub async fn update_user(
 
     // Disable is REVERSIBLE: keys are kept but stop authenticating everywhere —
     // ak- lookups gate on `users.is_active` live, and the edge config body
-    // excludes inactive owners' keys. Only the per-user
-    // OAuth MCP credentials are dropped: they proxy a third-party grant that
-    // should be re-consented after a suspension, not silently resumed.
+    // excludes inactive owners' keys. Only the user's MCP connections are
+    // dropped — per-user OAuth credentials and filled header inputs: they
+    // proxy a third-party grant that should be re-consented after a
+    // suspension, not silently resumed.
     if req.is_active == Some(false) {
+        let inputs = sqlx::query("DELETE FROM mcp_user_inputs WHERE user_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("cascade delete mcp_user_inputs on user disable: {e}");
+                ApiError::internal("failed to drop user MCP inputs")
+            })?
+            .rows_affected();
+        if inputs > 0 {
+            tracing::info!(user_id = %id, dropped_inputs = inputs, "user disable cascade");
+        }
+
         let creds = sqlx::query(
             "DELETE FROM mcp_user_credentials WHERE user_id = $1",
         )

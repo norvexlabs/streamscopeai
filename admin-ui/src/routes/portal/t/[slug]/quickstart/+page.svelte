@@ -1,8 +1,12 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { portalApi } from '#lib/portal-client.js';
   import { extractError, extractErrorCode, fetchAllPages } from '#lib/api-helpers.js';
-  import { portalScope } from '#lib/scope.svelte.js';
+  import { portalScope, resolvePortalWorkspace } from '#lib/scope.svelte.js';
   import CodeSnippet from '#lib/components/CodeSnippet.svelte';
+  import Callout from '#lib/components/Callout.svelte';
+  import McpConnectBanner from '#lib/components/portal/McpConnectBanner.svelte';
+  import { serversNeedingConnection } from '#lib/mcp/connectionState.js';
   import SelectInput from '#lib/components/forms/SelectInput.svelte';
   import Tabs from '#lib/components/Tabs.svelte';
   import { getTabFromUrl } from '#lib/tabs.js';
@@ -16,6 +20,7 @@
     groupIndexFor,
     llmTemplateGroups as groupLlmTemplates,
     mcpAuthModeOf,
+    mcpOnlyTemplateIndex,
     offersOpenAiAndAnthropic,
     sameGroup,
     templateNeedsLlm,
@@ -26,9 +31,9 @@
 
   let slug = $derived(params.slug);
 
-  // ---------- Setup mode: web wizard vs the ssai CLI ----------
+  // ---------- Setup mode: the ssai CLI (offered first) vs the web wizard ----------
   type SetupTab = 'wizard' | 'cli';
-  let setupTab = $state<SetupTab>(getTabFromUrl(['wizard', 'cli'], 'wizard'));
+  let setupTab = $state<SetupTab>(getTabFromUrl(['cli', 'wizard'], 'cli'));
   let cliPortalUrl = $derived(`${page.url.origin}/portal/t/${slug}`);
   let cliInstallCmd = $derived(`curl -fsSL ${page.url.origin}/api/v1/cli/install.sh | sh`);
   let cliInstallPs = $derived(`irm ${page.url.origin}/api/v1/cli/install.ps1 | iex`);
@@ -46,8 +51,34 @@
   type PortalRoute = components['schemas']['PortalRoute'];
   type RenderResponse = components['schemas']['RenderResponse'];
   type PortalMcpVirtualServer = components['schemas']['PortalMcpVirtualServer'];
+  type PortalMcpLocalServer = components['schemas']['PortalMcpLocalServer'];
   type PortalWorkspace = components['schemas']['PortalWorkspaceInfo'];
   type QuickstartKey = components['schemas']['QuickstartKey'];
+  type McpServerWarning = components['schemas']['McpServerWarning'];
+
+  /** Why the render left a selected MCP server out, in the reader's language;
+   *  the server's own text for a reason this console does not know. */
+  function mcpWarningText(w: McpServerWarning): string {
+    const serverText = w.message;
+    switch (w.reason) {
+      case 'sign_in_cannot_reach_fwd':
+        return m.portal_qs_mcp_warning_sign_in_cannot_reach_fwd();
+      case 'pass_through_key_not_accepted':
+        return m.portal_qs_mcp_warning_pass_through_key_not_accepted();
+      case 'local_server_not_supported':
+        return m.portal_qs_mcp_warning_local_server_not_supported();
+      case 'local_server_project_only':
+        return m.portal_qs_mcp_warning_local_server_project_only();
+      default:
+        return serverText;
+    }
+  }
+
+  /** The variables the administrator left without a value: the rendered
+   *  config holds a paste-here placeholder for each. */
+  function localEnvToFill(l: PortalMcpLocalServer): string[] {
+    return (l.launch.env ?? []).filter((e) => e.value == null).map((e) => e.name);
+  }
 
   /** Wizard steps. `config` is shown only when the chosen client offers both
    *  an LLM-capable template and an MCP-only one; `llm` / `mcp` are shown
@@ -83,10 +114,17 @@
   // ---------- Initial data ----------
   let clients = $state<ClientProfileSummary[]>([]);
   let routes = $state<PortalRoute[]>([]);
-  let virtualServers = $state<PortalMcpVirtualServer[]>([]);
+  // Every virtual server any of the member's workspaces grants: the banner
+  // above both setups. The wizard offers `virtualServers`, its workspace's own.
+  let allVirtualServers = $state<PortalMcpVirtualServer[]>([]);
   let workspaces = $state<PortalWorkspace[]>([]);
-  // BYOK pass-through downstreams (empty by default → no routes), offered in the
-  // provider picker so a client can be provisioned host-only against them.
+  // What the wizard's workspace grants, read on entering it (`enterWorkspace`)
+  // and empty until then — never another workspace's: its MCP virtual servers,
+  // its providers (the route list spans every workspace the member is in, and
+  // a render draws on one) and, among those, its BYOK pass-through downstreams
+  // (no routes: provisioned host-only).
+  let virtualServers = $state<PortalMcpVirtualServer[]>([]);
+  let grantedProviderIds = $state<Set<string>>(new Set());
   let byokProviders = $state<{ id: string; name: string; upstreamProtocol: string | null }[]>([]);
   let loading = $state(true);
   let loadError = $state('');
@@ -97,6 +135,11 @@
   let renderErrorCode = $state<string | null>(null);
   let rendering = $state(false);
   let rendered = $state<RenderResponse | null>(null);
+  // What the last render sent: whether it carried local servers and nothing
+  // that needs a gateway key, and the variables of its local servers the
+  // member fills (each is a paste-here placeholder in the result).
+  let renderedLocalOnly = $state(false);
+  let renderedLocalFill = $state<string[]>([]);
 
   // Selected client + template
   let selectedClient = $state<ClientProfile | null>(null);
@@ -105,8 +148,9 @@
   // change never moves it.
   let variantPicked = $state(false);
 
-  // The workspace the key is pinned to, and the one unified key for the render.
-  let selectedWorkspaceId = $state<string>('');
+  // The workspace the wizard works in (see "The wizard's workspace" below) —
+  // the key is pinned to it — and the one unified key for the render.
+  let wizardWorkspaceId = $state<string>('');
   let keyCfg = $state<KeyConfig>(emptyKey());
 
   // LLM step — which provider the snippet defaults its model from.
@@ -117,38 +161,14 @@
 
   // MCP step — selection only; the unified key covers every ticked server.
   let mcpSelected = $state<Record<string, boolean>>({});
+  // The local MCP servers (run on the member's own machine) the wizard's
+  // workspace hands its members, read on entering it like its other grants,
+  // and which of them are ticked.
+  let localServers = $state<PortalMcpLocalServer[]>([]);
+  let localSelected = $state<Record<string, boolean>>({});
 
   $effect(() => {
     void loadInitial();
-  });
-
-  // Resolve the BYOK pass-through downstreams granted to the SELECTED workspace
-  // (the render binds/validates against it, so the unscoped union would offer a
-  // provider that then fails). Reads state only inside the async callback so the
-  // effect depends solely on `selectedWorkspaceId` (no reactive loop on the
-  // `byokProviders` it writes).
-  $effect(() => {
-    const ws = selectedWorkspaceId;
-    if (!ws) return;
-    let cancelled = false;
-    void portalApi
-      .GET('/api/v1/portal/auth/me', { params: { query: { workspace_id: ws } } })
-      .then(({ data, error }) => {
-        // Keep the current list on a transient failure — never wipe BYOK options
-        // to empty just because one scoped re-fetch errored.
-        if (cancelled || error || !data) return;
-        const next = (data.downstream_providers ?? [])
-          .filter((p) => p.byok)
-          .map((p) => ({ id: p.id, name: p.name, upstreamProtocol: p.upstream_protocol ?? null }));
-        const wasByok = byokProviders.some((p) => p.id === llmProviderId);
-        byokProviders = next;
-        // Clear a BYOK provider selection the new workspace no longer grants.
-        if (wasByok && !next.some((p) => p.id === llmProviderId)) llmProviderId = '';
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
   });
 
   // Whether the selected LLM provider is a BYOK pass-through downstream. A BYOK
@@ -183,12 +203,15 @@
     if (!selectedIsByok && keyCfg.forwardAuth) keyCfg.forwardAuth = false;
   });
 
+  /** The data every workspace shares, and the memberships that decide which
+   *  workspace the wizard works in. Without the memberships nothing can be
+   *  offered: a failed read is an error to retry, never "no workspace". */
   async function loadInitial() {
     loading = true;
     loadError = '';
+    membershipsLoaded = false;
     try {
-      const [clientsRes, routesList, vsList, meRes] = await Promise.all([
-        portalApi.GET('/api/v1/portal/quickstart/clients'),
+      const [routesList, vsList, meRes] = await Promise.all([
         // A failed list leaves its picker empty rather than blocking the
         // other client kinds the wizard can still set up.
         fetchAllPages<PortalRoute>((offset, limit) =>
@@ -199,26 +222,151 @@
           .catch((): PortalMcpVirtualServer[] => []),
         portalApi.GET('/api/v1/portal/auth/me'),
       ]);
-      if (clientsRes.error) {
-        loadError = extractError(clientsRes.error, m.portal_qs_err_load_clients());
+      if (meRes.error || !meRes.data) {
+        loadError = extractError(meRes.error, m.portal_qs_err_load_workspaces());
         return;
       }
-      clients = clientsRes.data?.clients ?? [];
       routes = routesList;
-      virtualServers = vsList;
-      workspaces = meRes.data?.workspaces ?? [];
-      // `byokProviders` is resolved per selected workspace by the effect below —
-      // the unscoped `me` union would offer a provider the chosen workspace
-      // doesn't grant (rejected at render). Default to the portal's active
-      // workspace when the user is a member;
-      // else fall back to the first membership. Overridable in the wizard.
-      const active = portalScope.activeWorkspace;
-      selectedWorkspaceId =
-        (active && workspaces.some((w) => w.id === active) ? active : workspaces[0]?.id) ?? '';
-      mcpSelected = Object.fromEntries(virtualServers.map((v) => [v.id, false]));
+      allVirtualServers = vsList;
+      workspaces = meRes.data.workspaces ?? [];
+      membershipsLoaded = true;
+      // Enter the header's workspace — as it stands now, whatever it was when
+      // the load began — before the wizard shows, so it never paints empty.
+      followHeader();
     } finally {
       loading = false;
     }
+  }
+
+  // ---------- The wizard's workspace ----------
+  // INVARIANT: the wizard works in ONE workspace, `wizardWorkspaceId`, and
+  // `enterWorkspace` is the only code that assigns it. Its source is the header
+  // workspace (`headerWorkspaceId`), reached through `followHeader` alone,
+  // which never moves the wizard while a configuration is being rendered or is
+  // on screen: a minted key is shown once, so the result stays as it is, under
+  // a notice naming both workspaces, until the member starts over. Entering a
+  // workspace starts the wizard over — nothing chosen before carries — and
+  // reads, once, everything the steps offer for it: its clients, what it
+  // grants, its keys. Each entry takes the next `entry` number; a read issued
+  // under an earlier one (another workspace's, or this workspace's before a
+  // restart) is dropped when it lands. What a workspace grants fails CLOSED: a
+  // failed read is an error to retry, never the grants of every membership.
+  let membershipsLoaded = $state(false);
+  let clientsLoading = $state(false);
+  // Not reactive: only compared by the reads they number. `picks` numbers the
+  // client picks of one entry: the latest one wins.
+  let entry = 0;
+  let picks = 0;
+
+  /** The header's workspace by the header's own rule (the remembered choice
+   *  while still a membership, else the first one); `''` for a member of none. */
+  const headerWorkspaceId = $derived(resolvePortalWorkspace(workspaces, portalScope.activeWorkspace) ?? '');
+
+  function workspaceName(id: string): string {
+    return workspaces.find((w) => w.id === id)?.name ?? '';
+  }
+
+  /** A configuration is on screen for a workspace the header has since left. */
+  const switchedAway = $derived(!!rendered && membershipsLoaded && headerWorkspaceId !== wizardWorkspaceId);
+
+  /** Move the wizard to the header's workspace, unless a render is in flight
+   *  or its result is on screen. */
+  function followHeader() {
+    if (!membershipsLoaded || rendering || rendered) return;
+    if (headerWorkspaceId !== wizardWorkspaceId) void enterWorkspace(headerWorkspaceId);
+  }
+
+  // Runs on a header switch and when the initial load ends (so a switch made
+  // while it ran is honoured); everything else `followHeader` reads is
+  // untracked.
+  $effect(() => {
+    void headerWorkspaceId;
+    void membershipsLoaded;
+    untrack(followHeader);
+  });
+
+  /** Start the wizard over in workspace `id`: clear every choice and result,
+   *  then read what the steps offer for it. */
+  async function enterWorkspace(id: string) {
+    const mine = ++entry;
+    wizardWorkspaceId = id;
+    selectedClient = null;
+    selectedTemplateIndex = 0;
+    variantPicked = false;
+    rendered = null;
+    renderedLocalOnly = false;
+    renderedLocalFill = [];
+    renderError = '';
+    renderErrorCode = null;
+    llmProviderId = '';
+    keyCfg = emptyKey();
+    expiryChoice = 'never';
+    expiresInDaysCustom = 30;
+    step = 'client';
+    clients = [];
+    virtualServers = [];
+    localServers = [];
+    grantedProviderIds = new Set();
+    byokProviders = [];
+    mcpSelected = {};
+    localSelected = {};
+    loadError = '';
+    // A member of no workspace: nothing to read, and no earlier entry's read
+    // will clear the flag (it is dropped when it lands).
+    clientsLoading = false;
+    if (!id) return;
+    clientsLoading = true;
+    const [offered, grants, servers, locals, keys] = await Promise.all([
+      portalApi.GET('/api/v1/portal/quickstart/clients', { params: { query: { workspace_id: id } } }),
+      portalApi.GET('/api/v1/portal/auth/me', { params: { query: { workspace_id: id } } }),
+      fetchAllPages<PortalMcpVirtualServer>((offset, limit) =>
+        portalApi.GET('/api/v1/portal/mcp/virtual-servers', { params: { query: { workspace_id: id, offset, limit } } }))
+        .catch(() => null),
+      fetchAllPages<PortalMcpLocalServer>((offset, limit) =>
+        portalApi.GET('/api/v1/portal/mcp/local-servers', { params: { query: { workspace_id: id, offset, limit } } }))
+        .catch(() => null),
+      // A failed key list offers no key to reuse; a new one can still be minted.
+      fetchAllPages<QuickstartKey>((offset, limit) =>
+        portalApi.GET('/api/v1/portal/quickstart/keys', { params: { query: { workspace_id: id, offset, limit } } }))
+        .catch((): QuickstartKey[] => []),
+    ]);
+    // A newer entry owns the wizard: this answer is not its.
+    if (mine !== entry) return;
+    clientsLoading = false;
+    if (offered.error) {
+      loadError = extractError(offered.error, m.portal_qs_err_load_clients());
+      return;
+    }
+    if (grants.error || !grants.data || servers === null || locals === null) {
+      loadError = extractError(grants.error, m.portal_qs_err_load_grants());
+      return;
+    }
+    const providers = grants.data.downstream_providers ?? [];
+    clients = offered.data?.clients ?? [];
+    grantedProviderIds = new Set(providers.map((p) => p.id));
+    byokProviders = providers
+      .filter((p) => p.byok)
+      .map((p) => ({ id: p.id, name: p.name, upstreamProtocol: p.upstream_protocol ?? null }));
+    virtualServers = servers;
+    mcpSelected = Object.fromEntries(servers.map((v) => [v.id, false]));
+    localServers = locals;
+    localSelected = Object.fromEntries(locals.map((l) => [l.id, false]));
+    keyCfg.keys = keys;
+    keyCfg.mode = keys.length > 0 ? 'reuse' : 'mint';
+    keyCfg.reuseKeyId = keys[0]?.id ?? '';
+    // Name left blank — the input shows the suggested name as a placeholder;
+    // an empty submit lets the backend pick the next free suffix.
+  }
+
+  /** The member's own restart: the header's workspace, whatever is on screen. */
+  function startOver() {
+    void enterWorkspace(headerWorkspaceId);
+  }
+
+  /** Retry what failed: the memberships, else the wizard's workspace. */
+  function retryLoad() {
+    if (membershipsLoaded) void enterWorkspace(headerWorkspaceId);
+    else void loadInitial();
   }
 
   // ---------- Derived state ----------
@@ -260,6 +408,21 @@
     return selectedClient?.templates[selectedTemplateIndex] ?? null;
   }
 
+  /** Where the chosen template writes a local MCP server: into the config
+   *  this page renders (`config`), only into a project's own file, which
+   *  `ssai provision` writes (`project`), or nowhere (`none`). */
+  const localMcp = $derived(chosenTemplate()?.local_mcp ?? 'none');
+  /** The ticked gateway servers. */
+  const gatewayPicked = $derived(virtualServers.filter((v) => mcpSelected[v.id]));
+  /** The ticked local servers the chosen template can write here. */
+  const localPicked = $derived(localMcp === 'config' ? localServers.filter((l) => localSelected[l.id]) : []);
+  /** Only local servers are ticked, on a template with no LLM section:
+   *  nothing in the render reaches the gateway, so it needs no key. */
+  const localOnlySelection = $derived.by(() => {
+    const t = chosenTemplate();
+    return !!t && !templateNeedsLlm(t) && templateNeedsMcp(t) && gatewayPicked.length === 0 && localPicked.length > 0;
+  });
+
   function templateNeedsMcp(t: ClientProfileTemplate | null): boolean {
     return !!t && (t.kind === 'mcp' || t.kind === 'combined');
   }
@@ -274,6 +437,16 @@
   function clientHasMcpOnly(): boolean {
     return !!selectedClient && selectedClient.templates.some((t) => t.kind === 'mcp');
   }
+  /** `true` when an MCP-only template of the selected client writes local
+   *  servers into the config this page renders. */
+  function mcpOnlyWritesLocal(): boolean {
+    return !!selectedClient && mcpOnlyTemplateIndex(selectedClient.templates, { gateway: false, local: true }) >= 0;
+  }
+  /** `true` when the MCP-only setup has a server to offer: a gateway one, or
+   *  a local one its template writes into the config this page renders. */
+  function mcpOnlyHasServers(): boolean {
+    return virtualServers.length > 0 || (localServers.length > 0 && mcpOnlyWritesLocal());
+  }
   /** Show the `config` step only when the client supports both shapes. */
   function clientNeedsConfigChoice(): boolean {
     return clientHasFull() && clientHasMcpOnly();
@@ -284,12 +457,14 @@
     return mcpAuthModeOf(chosenTemplate() ?? {});
   }
 
-  /** `true` when the render needs a key minted/reused — every path except a
-   *  pure spec-OAuth MCP template (OAuth mints no key). */
+  /** `true` when the render needs a key minted/reused: a template with an
+   *  LLM section always, an MCP-only one when a gateway server is ticked and
+   *  it authenticates with a key (OAuth mints none). Local servers alone
+   *  need no key. */
   function renderNeedsKey(): boolean {
     const t = chosenTemplate();
     if (templateNeedsLlm(t)) return true;
-    if (t && templateNeedsMcp(t) && mcpAuthModeOf(t) === 'static') return true;
+    if (t && templateNeedsMcp(t) && mcpAuthModeOf(t) === 'static') return gatewayPicked.length > 0;
     return false;
   }
 
@@ -331,12 +506,18 @@
   function compatibleProviders(): { id: string; name: string; routeCount: number }[] {
     const grouped = new Map<string, { name: string; count: number }>();
     for (const r of routes) {
+      if (!grantedProviderIds.has(r.provider_id)) continue;
       const e = grouped.get(r.provider_id);
       if (e) e.count += 1;
       else grouped.set(r.provider_id, { name: r.provider_name, count: 1 });
     }
     return [...grouped.entries()].map(([id, v]) => ({ id, name: v.name, routeCount: v.count }));
   }
+
+  /** Whether the wizard's workspace grants a provider an LLM configuration can
+   *  use — one with routes, or a BYOK pass-through. The route list alone spans
+   *  every workspace the member is in. */
+  const workspaceGrantsLlm = $derived(compatibleProviders().length > 0 || byokProviders.length > 0);
 
   /** Virtual servers for the Step-`mcp` checkbox list — built-in first, then
    *  alphabetical by name. */
@@ -347,31 +528,6 @@
     });
   }
 
-  // ---------- Key reuse / mint loading ----------
-  /** Load the keys already minted in the selected workspace so the user can
-   *  reuse one instead of minting another. */
-  async function loadWorkspaceKeys() {
-    keyCfg.keys = [];
-    if (!selectedWorkspaceId) return;
-    const workspaceId = selectedWorkspaceId;
-    const keys = await fetchAllPages<QuickstartKey>((offset, limit) =>
-      portalApi.GET('/api/v1/portal/quickstart/keys', {
-        params: { query: { workspace_id: workspaceId, offset, limit } },
-      })).catch(() => []);
-    // The user may have picked another workspace while this one loaded.
-    if (selectedWorkspaceId !== workspaceId) return;
-    keyCfg.keys = keys;
-    keyCfg.mode = keyCfg.keys.length > 0 ? 'reuse' : 'mint';
-    keyCfg.reuseKeyId = keyCfg.keys[0]?.id ?? '';
-    // Name left blank — the input shows the suggested name as a placeholder;
-    // an empty submit lets the backend pick the next free suffix.
-  }
-
-  async function selectWorkspace(id: string) {
-    selectedWorkspaceId = id;
-    await loadWorkspaceKeys();
-  }
-
   // ---------- Navigation ----------
   async function pickClient(c: ClientProfileSummary) {
     renderError = '';
@@ -379,16 +535,25 @@
     rendered = null;
     selectedTemplateIndex = 0;
     variantPicked = false;
+    const mine = entry;
+    const pick = ++picks;
     const { data, error: err } = await portalApi.GET(
       '/api/v1/portal/quickstart/clients/{id}',
-      { params: { path: { id: c.id } } },
+      { params: { path: { id: c.id }, query: { workspace_id: wizardWorkspaceId } } },
     );
+    // The wizard started over meanwhile (another workspace, or this one
+    // again), or the member picked another client: this answer is not the
+    // wizard's.
+    if (mine !== entry || pick !== picks) return;
     if (err || !data) {
-      renderError = extractError(err, m.portal_qs_err_load_client_profile());
+      // The administrator switched the client off after the list was read.
+      renderError =
+        extractErrorCode(err) === 'client_disabled'
+          ? m.portal_qs_err_client_not_offered()
+          : extractError(err, m.portal_qs_err_load_client_profile());
       return;
     }
     selectedClient = data;
-    await loadWorkspaceKeys();
     if (clientNeedsConfigChoice()) {
       // Default the index to a valid template so `chosenTemplate()` (and the
       // step indicator) resolve while on the `config` step; the user's
@@ -413,12 +578,16 @@
     step = 'llm';
   }
 
-  /** Enter the MCP-only path: select the first `kind = "mcp"` template and
-   *  open the MCP step, skipping the LLM model entirely. */
+  /** Enter the MCP-only path: select the MCP template that can write what
+   *  the workspace offers (`mcpOnlyTemplateIndex`) and open the MCP step,
+   *  skipping the LLM model entirely. */
   function enterMcpOnly() {
     if (!selectedClient) return;
-    const firstMcp = selectedClient.templates.findIndex((t) => t.kind === 'mcp');
-    selectedTemplateIndex = firstMcp >= 0 ? firstMcp : 0;
+    const fits = mcpOnlyTemplateIndex(selectedClient.templates, {
+      gateway: virtualServers.length > 0,
+      local: localServers.length > 0,
+    });
+    selectedTemplateIndex = fits >= 0 ? fits : 0;
     step = 'mcp';
   }
 
@@ -444,7 +613,7 @@
 
   function validateKey(): string | null {
     if (renderNeedsKey()) {
-      if (!selectedWorkspaceId) return m.portal_qs_err_pick_workspace();
+      if (!wizardWorkspaceId) return m.portal_qs_err_pick_workspace();
       if (keyCfg.mode === 'reuse' && !keyCfg.reuseKeyId) {
         return m.portal_qs_err_pick_existing_key();
       }
@@ -473,8 +642,10 @@
   async function nextFromMcp() {
     renderError = '';
     const tmpl = chosenTemplate();
-    const selected = virtualServers.filter((v) => mcpSelected[v.id]);
-    if (tmpl?.kind === 'mcp' && selected.length === 0) {
+    // Only what the template can write counts: a local server it has no
+    // form for is not a selection.
+    const selectedCount = gatewayPicked.length + localPicked.length;
+    if (tmpl?.kind === 'mcp' && selectedCount === 0) {
       renderError = m.portal_qs_err_select_mcp();
       return;
     }
@@ -488,9 +659,12 @@
 
   function buildMcpServers(tmpl: ClientProfileTemplate): components['schemas']['McpServerSelection'][] {
     if (!templateNeedsMcp(tmpl)) return [];
-    return virtualServers
-      .filter((v) => mcpSelected[v.id])
-      .map((v) => ({ virtual_server_id: v.id }));
+    return gatewayPicked.map((v) => ({ virtual_server_id: v.id }));
+  }
+
+  function buildMcpLocalServers(tmpl: ClientProfileTemplate): components['schemas']['McpLocalServerSelection'][] {
+    if (!templateNeedsMcp(tmpl)) return [];
+    return localPicked.map((l) => ({ local_server_id: l.id }));
   }
 
   function buildKeySpec(): components['schemas']['KeySpec'] | undefined {
@@ -518,13 +692,18 @@
         renderError = m.portal_qs_err_no_template();
         return;
       }
+      const key = buildKeySpec();
+      const gatewaySent = buildMcpServers(tmpl);
+      const localSent = templateNeedsMcp(tmpl) ? localPicked : [];
       const body: components['schemas']['RenderRequest'] = {
         client_id: selectedClient.id,
         template_index: selectedTemplateIndex,
-        workspace_id: selectedWorkspaceId,
-        key: buildKeySpec(),
+        workspace_id: wizardWorkspaceId,
+        // Absent when nothing rendered reaches the gateway with a key.
+        key,
         llm_provider_id: templateNeedsLlm(tmpl) ? llmProviderId : undefined,
-        mcp_servers: buildMcpServers(tmpl),
+        mcp_servers: gatewaySent,
+        mcp_local_servers: buildMcpLocalServers(tmpl),
       };
       const { data, error: err } = await portalApi.POST(
         '/api/v1/portal/quickstart/actions/render',
@@ -535,10 +714,18 @@
         renderErrorCode = extractErrorCode(err);
         return;
       }
+      const leftOut = new Set(data.warnings.map((w) => w.local_server_id).filter((id) => id != null));
+      renderedLocalFill = [
+        ...new Set(localSent.filter((l) => !leftOut.has(l.id)).flatMap((l) => localEnvToFill(l))),
+      ];
+      renderedLocalOnly = key === undefined && gatewaySent.length === 0 && localSent.length > 0;
       rendered = data;
       step = 'render';
     } finally {
       rendering = false;
+      // A header switch made while the render was in flight: a result stays on
+      // screen under its notice, a failed render lets the wizard follow.
+      followHeader();
     }
   }
 
@@ -547,21 +734,6 @@
     const idx = shownSteps.indexOf(step);
     const prev = idx > 0 ? shownSteps[idx - 1] : undefined;
     if (prev) step = prev;
-  }
-
-  function reset() {
-    selectedClient = null;
-    selectedTemplateIndex = 0;
-    variantPicked = false;
-    rendered = null;
-    renderError = '';
-    renderErrorCode = null;
-    llmProviderId = '';
-    keyCfg = emptyKey();
-    expiryChoice = 'never';
-    expiresInDaysCustom = 30;
-    mcpSelected = Object.fromEntries(virtualServers.map((v) => [v.id, false]));
-    step = 'client';
   }
 
   const API_KEY_SENTINEL = '<paste-your-api-key-here>';
@@ -588,22 +760,15 @@
   );
 </script>
 
-{#snippet workspacePicker()}
-  <label class="block text-xs text-(--text-secondary)">
-    {m.portal_qs_workspace_label()}
-    <SelectInput
-      value={selectedWorkspaceId}
-      onchange={(e) => selectWorkspace((e.target as HTMLSelectElement).value)}
-      class="mt-1"
-    >
-      {#each workspaces as w (w.id)}
-        <option value={w.id}>{w.name}</option>
-      {/each}
-    </SelectInput>
+{#snippet workspaceLine()}
+  <div class="text-xs text-(--text-secondary)" data-testid="qs-workspace">
+    <span class="block">{m.portal_qs_workspace_label()}</span>
+    <span class="block mt-1 text-sm font-semibold text-(--text-primary)">{workspaceName(wizardWorkspaceId)}</span>
     <span class="block mt-1 opacity-70">
-      {m.portal_qs_workspace_help()}
+      {localOnlySelection ? m.portal_qs_workspace_help_local() : m.portal_qs_workspace_help()}
+      {#if workspaces.length > 1}{m.portal_qs_workspace_change()}{/if}
     </span>
-  </label>
+  </div>
 {/snippet}
 
 {#snippet keyPicker(prefix: string, allowFwd: boolean, fwdLabel: string, fwdHelp: string)}
@@ -672,12 +837,17 @@
 <Tabs
   class="mt-4"
   tabs={[
-    { id: 'wizard', label: m.portal_qs_tab_wizard() },
     { id: 'cli', label: m.portal_qs_tab_cli() },
+    { id: 'wizard', label: m.portal_qs_tab_wizard() },
   ]}
   active={setupTab}
   onchange={(t) => (setupTab = t as SetupTab)}
 />
+
+<!-- Both setups write the same MCP servers, so the banner is above both. -->
+{#if !loading && !loadError && serversNeedingConnection(allVirtualServers).length > 0}
+  <div class="mt-6"><McpConnectBanner {slug} servers={serversNeedingConnection(allVirtualServers)} /></div>
+{/if}
 
 {#if setupTab === 'cli'}
   <div class="mt-6 space-y-6 max-w-3xl" data-testid="cli-setup-panel">
@@ -739,7 +909,12 @@
 {#if loading}
   <div class="mt-6 text-sm text-(--text-secondary)">{m.portal_qs_loading()}</div>
 {:else if loadError}
-  <div class="mt-6 text-sm text-(--error)">{loadError}</div>
+  <div class="mt-6 flex items-center gap-3 text-sm text-(--error)" role="alert">
+    <span>{loadError}</span>
+    <button type="button" onclick={retryLoad} class="underline text-(--text-primary)">{m.portal_qs_retry()}</button>
+  </div>
+{:else if !wizardWorkspaceId}
+  <div class="mt-6 text-sm text-(--text-secondary)">{m.portal_qs_no_workspace()}</div>
 {:else}
   <!-- Step indicator -->
   <div class="mt-6 mb-4 flex items-center gap-3 text-xs text-(--text-secondary)">
@@ -764,8 +939,12 @@
   {/if}
 
   <!-- Step: pick client -->
-  {#if step === 'client'}
-    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+  {#if step === 'client' && clientsLoading}
+    <div class="text-sm text-(--text-secondary)">{m.portal_qs_loading()}</div>
+  {:else if step === 'client' && clients.length === 0}
+    <div class="text-sm text-(--text-secondary)" data-testid="qs-no-clients">{m.portal_qs_no_clients()}</div>
+  {:else if step === 'client'}
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3" data-testid="qs-client-grid">
       {#each clients as c (c.id)}
         <button
           type="button"
@@ -805,8 +984,8 @@
           type="button"
           data-testid="config-type-full"
           class="rounded-lg border border-(--border) bg-(--bg-card) hover:border-(--accent) p-4 text-left transition disabled:opacity-50 disabled:cursor-not-allowed"
-          disabled={routes.length === 0}
-          title={routes.length === 0 ? m.portal_qs_no_llm_provider() : ''}
+          disabled={!workspaceGrantsLlm}
+          title={workspaceGrantsLlm ? '' : m.portal_qs_no_llm_provider()}
           onclick={() => pickConfigType('full')}
         >
           <div class="text-sm font-semibold text-(--text-primary)">{m.portal_qs_full_setup()}</div>
@@ -818,8 +997,8 @@
           type="button"
           data-testid="config-type-mcp"
           class="rounded-lg border border-(--border) bg-(--bg-card) hover:border-(--accent) p-4 text-left transition disabled:opacity-50 disabled:cursor-not-allowed"
-          disabled={virtualServers.length === 0}
-          title={virtualServers.length === 0 ? m.portal_qs_no_mcp_servers() : ''}
+          disabled={!mcpOnlyHasServers()}
+          title={mcpOnlyHasServers() ? '' : m.portal_qs_no_mcp_servers()}
           onclick={() => pickConfigType('mcp')}
         >
           <div class="text-sm font-semibold text-(--text-primary)">{m.portal_qs_mcp_only()}</div>
@@ -860,7 +1039,7 @@
           {/if}
         {/if}
 
-        {@render workspacePicker()}
+        {@render workspaceLine()}
 
         <label class="block text-xs text-(--text-secondary)">
           {m.portal_qs_downstream_provider()}
@@ -993,7 +1172,20 @@
               <span class="px-1 py-0.5 rounded-sm bg-(--bg-card) text-[10px] text-(--text-secondary)">{m.portal_qs_built_in()}</span>
             {/if}
             {#if v.connection_status === 'needs_connection'}
-              <span class="px-1 py-0.5 rounded-sm bg-(--warning-bg) text-[10px] text-(--warning-text)">{m.portal_qs_connect_first()}</span>
+              <a
+                href={pthref(slug, '/portal/mcp/connections')}
+                data-testid="qs-connect-first"
+                class="px-1 py-0.5 rounded-sm bg-(--warning-bg) text-[10px] text-(--warning-text) underline hover:no-underline"
+              >{m.portal_qs_connect_first_action()}</a>
+            {/if}
+            {#if v.fwd_mount}
+              <span
+                class="px-1 py-0.5 rounded-sm bg-(--bg-card) text-[10px] text-(--text-secondary)"
+                title={chosenMcpAuthMode() === 'spec_oauth' ? m.portal_qs_fwd_mount_oauth() : m.portal_qs_fwd_mount_note({ slug: v.slug })}
+                data-testid="qs-fwd-mount">{m.portal_qs_fwd_mount()}</span>
+            {/if}
+            {#if v.client_headers.length > 0}
+              <span class="text-[10px] text-(--text-tertiary) font-mono" data-testid="qs-client-headers">{m.portal_qs_client_headers({ headers: v.client_headers.join(', ') })}</span>
             {/if}
           </label>
         {/each}
@@ -1005,19 +1197,77 @@
           </p>
         {/if}
 
+        {#if localServers.length > 0 && localMcp === 'none'}
+          <p class="text-[11px] text-(--text-tertiary)" data-testid="qs-local-not-offered">{m.portal_qs_local_not_offered()}</p>
+        {:else if localServers.length > 0}
+          {@const projectOnly = localMcp === 'project'}
+          <div class="space-y-2 pt-1" data-testid="qs-local-servers">
+            <div class="text-xs font-semibold text-(--text-secondary)">{m.portal_qs_local_title()}</div>
+            <p class="text-[11px] text-(--text-tertiary)">{m.portal_qs_local_help()}</p>
+            {#if projectOnly}
+              <p class="text-[11px] text-(--warning-text)" data-testid="qs-local-project-only">{m.portal_qs_local_project_only()}</p>
+            {:else}
+              <p class="text-[11px] text-(--text-tertiary)" data-testid="qs-local-runner">{m.portal_qs_local_runner()}</p>
+            {/if}
+            {#each localServers as l (l.id)}
+              {@const toFill = localEnvToFill(l)}
+              <label
+                class="block space-y-1 text-sm text-(--text-primary) rounded-sm border border-(--border) bg-(--bg-secondary) p-3 {projectOnly ? 'opacity-60' : ''}"
+                data-testid="qs-local-server"
+              >
+                <span class="flex flex-wrap items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={!projectOnly && (localSelected[l.id] ?? false)}
+                    disabled={projectOnly}
+                    onchange={(e) => (localSelected[l.id] = (e.target as HTMLInputElement).checked)}
+                  />
+                  <span class="font-semibold">{l.name}</span>
+                  <span class="text-xs text-(--text-tertiary)">{m.portal_qs_slug_label({ slug: l.slug })}</span>
+                  <span class="px-1 py-0.5 rounded-sm bg-(--bg-card) text-[10px] text-(--text-secondary)">{m.portal_qs_local_badge()}</span>
+                </span>
+                {#if l.description}
+                  <span class="block text-xs text-(--text-secondary)">{l.description}</span>
+                {/if}
+                <span class="block text-[11px] text-(--text-tertiary)">
+                  {m.portal_qs_local_command()}
+                  <code class="font-mono break-all text-(--text-secondary)" data-testid="qs-local-command">{l.command_line}</code>
+                </span>
+                {#if toFill.length > 0 && !projectOnly}
+                  <span class="block text-[11px] text-(--warning-text)" data-testid="qs-local-fill">
+                    {m.portal_qs_local_fill_hint({ names: toFill.join(', ') })}
+                  </span>
+                {/if}
+              </label>
+            {/each}
+          </div>
+        {/if}
+
         {#if chosenMcpAuthMode() === 'spec_oauth'}
           <div class="text-[11px] text-(--text-tertiary)">
             {m.portal_qs_oauth_note()}
           </div>
+          {#if sortedVirtualServers().some((v) => v.fwd_mount && mcpSelected[v.id])}
+            <div class="text-[11px] text-(--warning-text)">{m.portal_qs_fwd_mount_oauth()}</div>
+          {/if}
         {:else if !templateNeedsLlm(chosenTemplate())}
           <!-- MCP-only static path: the unified key is configured here. -->
-          {@render workspacePicker()}
-          {@render keyPicker(
-            selectedClient.id,
-            true,
-            m.portal_qs_byok_fwd_label(),
-            m.portal_qs_byok_fwd_help_mcp(),
-          )}
+          {@render workspaceLine()}
+          {#if localOnlySelection}
+            <!-- Only local servers are ticked: nothing reaches the gateway,
+                 so no key is chosen or minted. -->
+            <p class="text-xs text-(--text-secondary)" data-testid="qs-local-no-key">{m.portal_qs_local_no_key()}</p>
+          {:else}
+            <!-- No BYOK toggle here: whether an MCP server is reached through
+                 /fwd is decided per server from the headers its client sends,
+                 not by the key. -->
+            {@render keyPicker(
+              selectedClient.id,
+              false,
+              m.portal_qs_byok_fwd_label(),
+              m.portal_qs_byok_fwd_help_mcp(),
+            )}
+          {/if}
         {/if}
       </div>
 
@@ -1036,21 +1286,58 @@
   {#if step === 'render'}
     <div class="space-y-4">
       <div class="flex items-center justify-between">
-        <button class="text-xs text-(--text-secondary) hover:text-(--text-primary)" onclick={reset}>{m.portal_qs_start_over()}</button>
+        <button class="text-xs text-(--text-secondary) hover:text-(--text-primary)" onclick={startOver}>{m.portal_qs_start_over()}</button>
         <div class="text-xs text-(--text-secondary)">{selectedClient?.label}</div>
       </div>
 
+      {#if switchedAway}
+        <div
+          role="status"
+          data-testid="qs-switched-notice"
+          class="flex items-center justify-between gap-3 rounded-sm border border-(--warning-border) bg-(--warning-bg) px-3 py-2 text-xs text-(--warning)"
+        >
+          <span>{m.portal_qs_switched_notice({ from: workspaceName(wizardWorkspaceId), to: workspaceName(headerWorkspaceId) })}</span>
+          <button type="button" onclick={startOver} class="shrink-0 underline" data-testid="qs-start-over-for">
+            {m.portal_qs_start_over_for({ workspace: workspaceName(headerWorkspaceId) })}
+          </button>
+        </div>
+      {/if}
+
       {#if rendered}
+        {#if rendered.warnings.length > 0}
+          <Callout severity="warning" title={m.portal_qs_mcp_warnings_title()}>
+            <ul class="space-y-1" data-testid="qs-mcp-warnings">
+              {#each rendered.warnings as w (w.virtual_server_id ?? w.local_server_id ?? w.slug)}
+                <li data-testid="qs-mcp-warning" data-reason={w.reason}>
+                  <code class="font-mono">{w.local_server_id ? w.slug : `/mcp/${w.slug}`}</code> — {mcpWarningText(w)}
+                </li>
+              {/each}
+            </ul>
+          </Callout>
+        {/if}
         {#if rendered.minted_keys.length > 0}
           <div class="rounded-sm border border-(--success-border) bg-(--success-bg) px-3 py-2 text-xs text-(--success-text)">
             {m.portal_qs_minted_pre({ count: rendered.minted_keys.length, names: rendered.minted_keys.map((k) => k.name).join(', ') })}
             {m.portal_qs_minted_clipboard_pre()} <strong>{m.portal_qs_copy_with_key()}</strong>{m.portal_qs_minted_clipboard_post()}
           </div>
-        {:else}
+          {#if renderedLocalFill.length > 0}
+            <div class="rounded-sm border border-(--border) bg-(--bg-secondary) px-3 py-2 text-xs text-(--text-secondary)" data-testid="qs-own-values">
+              {m.portal_qs_placeholder_own_values_also({ names: renderedLocalFill.join(', ') })}
+            </div>
+          {/if}
+        {:else if !renderedLocalOnly}
           <div class="rounded-sm border border-(--border) bg-(--bg-secondary) px-3 py-2 text-xs text-(--text-secondary)">
             {m.portal_qs_placeholder_pre()}
             <code class="font-mono">&lt;paste-…&gt;</code>
             {m.portal_qs_placeholder_post()}
+            {#if renderedLocalFill.length > 0}
+              <span data-testid="qs-own-values">{m.portal_qs_placeholder_own_values_also({ names: renderedLocalFill.join(', ') })}</span>
+            {/if}
+          </div>
+        {:else if renderedLocalFill.length > 0}
+          <!-- No key in this config: every placeholder is the member's own value. -->
+          <div class="rounded-sm border border-(--border) bg-(--bg-secondary) px-3 py-2 text-xs text-(--text-secondary)" data-testid="qs-own-values">
+            {m.portal_qs_placeholder_own_values({ names: renderedLocalFill.join(', ') })}
           </div>
         {/if}
 
@@ -1096,7 +1383,7 @@
           </a>
           <button
             type="button"
-            onclick={reset}
+            onclick={startOver}
             class="px-3 py-1.5 rounded-sm bg-(--accent) hover:bg-(--accent-hover) text-(--accent-fg) text-sm"
           >
             {m.portal_qs_build_another()}

@@ -1,6 +1,6 @@
 //! Built-in (gateway-internal) MCP upstreams.
 //!
-//! When `mcp::handler::call_cached` and `mcp::upstream::call_with_bearer_for_streaming`
+//! When `mcp::handler::call_cached` and `mcp::upstream::call_with_auth_for_streaming`
 //! see an upstream whose `upstream_url` starts with the `internal://` scheme,
 //! they short-circuit the outbound HTTP call and dispatch here instead. The
 //! returned [`super::jsonrpc::JsonRpcResponse`] flows through the rest of the
@@ -20,7 +20,7 @@ use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse, RpcId};
 use super::upstream::UpstreamError;
 
 /// `true` when this upstream is a gateway-internal sentinel (handled by
-/// [`dispatch`] rather than by `mcp::upstream::call_with_bearer*`). Thin
+/// [`dispatch`] rather than by `mcp::upstream::call_with_auth*`). Thin
 /// wrapper around [`is_internal_upstream_url`] so callers with an
 /// `McpUpstreamServer` in hand don't reach into the URL field directly.
 pub fn is_internal(upstream: &McpUpstreamServer) -> bool {

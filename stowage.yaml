@@ -132,7 +132,7 @@ data:
   volumes:
     postgres: { uid: 70 }
     proxy:    { uid: 65532 }
-    cli-ca:   { uid: 0, keep_on_reset: true }
+    cli-ca:   { uid: 65532, keep_on_reset: true }
   reset: [postgres, proxy]
 
 secrets:

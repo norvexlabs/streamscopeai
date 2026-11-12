@@ -248,6 +248,22 @@ export function formatDate(dateStr: string | null | undefined): string {
   });
 }
 
+/** A day bucket that starts at 00:00 UTC, by its short weekday ("Mon"): the
+ *  UTC day, whatever the viewer's time zone. */
+export function formatUtcWeekday(dateStr: string): string {
+  return new Date(dateStr).toLocaleDateString(localeTag(), { weekday: 'short', timeZone: 'UTC' });
+}
+
+/** A day bucket that starts at 00:00 UTC, as "Mon, Nov 9" in the UI locale. */
+export function formatUtcDay(dateStr: string): string {
+  return new Date(dateStr).toLocaleDateString(localeTag(), {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+    timeZone: 'UTC',
+  });
+}
+
 /** Format a datetime to a locale string: Feb 27, 2:34 PM (en); 27 févr., 14:34 (fr) */
 export function formatDateTime(dateStr: string | null | undefined): string {
   if (!dateStr) return '--';

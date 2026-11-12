@@ -1,5 +1,9 @@
 <script lang="ts">
   import type { LayoutProps } from './$types';
+  import { onMount } from 'svelte';
+  import { invalidateAll } from '$app/navigation';
+  import { refreshCycle } from '#lib/refreshCycle.svelte.js';
+  import { hiddenPages, pageHidden, type PortalPage } from '#lib/portalPages.svelte.js';
   import SourceLink from '#lib/components/SourceLink.svelte';
   import RefreshButton from '#lib/components/RefreshButton.svelte';
   import { portalScope, reconcilePortalWorkspace } from '#lib/scope.svelte.js';
@@ -36,16 +40,19 @@
   }
 
   // Portal sidebar — same component, different nav tree. Of the visibility
-  // flags only `managerOnly` applies (the portal has no system tenant and no
+  // flags `managerOnly` applies (the portal has no system tenant and no
   // super-admin): shown to a manager of ANY of their workspaces, read from the
   // server-loaded memberships so the server render already has it (the Team
-  // page itself follows the header workspace). Hrefs scoped to /portal/t/<slug>.
+  // page itself follows the header workspace) — and the pages hidden for the
+  // viewer's workspaces are left out. Hrefs scoped to /portal/t/<slug>.
+  const PAGES: PortalPage[] = ['sessions', 'requests'];
   let filteredPortalNav = $derived(
     scopeNav(
       filterNavForViewer(buildPortalNav(), {
         isSystemTenant: false,
         isSuperAdmin: false,
         isManager: (data?.portalWorkspaces ?? []).some((w) => w.role === 'manager'),
+        hiddenPages: PAGES.filter((p) => pageHidden(p, data ?? {})),
       }),
       (href) => pthref(slug, href)
     )
@@ -68,6 +75,19 @@
   // said when it was written, which this setting can no longer restate.
   $effect(() => {
     setAccountingCurrency(data?.accountingCurrency);
+  });
+
+  // The identity this layout loaded — the memberships, what is hidden — is a
+  // copy of the gateway's answer. It is re-read when the gateway refuses a
+  // route as hidden (`hiddenPages`) and on every Refresh, so the sidebar and
+  // the pages follow an administrator's change without a reload.
+  onMount(() => {
+    const withdraw = hiddenPages.rereadWith(invalidateAll);
+    const unlisten = refreshCycle.listen(() => void hiddenPages.recheck());
+    return () => {
+      withdraw();
+      unlisten();
+    };
   });
 
 </script>

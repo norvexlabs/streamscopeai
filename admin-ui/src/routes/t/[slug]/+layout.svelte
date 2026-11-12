@@ -100,7 +100,8 @@
 
   // Each kind's profiles back its pickers: Tool-policy, Guardrail and
   // Transform on the workspace (Transform also the programs scope selector),
-  // Experts on the workspace and the experts-page membership editor.
+  // Experts on the workspace and the experts-page membership editor, Portal &
+  // clients on the workspace.
   function loadTenantContext() {
     loadSyncStatus();
     loadWorkspaces();

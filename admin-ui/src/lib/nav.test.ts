@@ -106,6 +106,22 @@ describe('portal nav', () => {
 		expect(member).toEqual(hrefs(true).filter((h) => h !== '/portal/team'));
 	});
 
+	const shown = (hiddenPages: ('sessions' | 'requests')[]) =>
+		filterNavForViewer(buildPortalNav(), { isSystemTenant: false, isSuperAdmin: false, hiddenPages });
+
+	it('leaves_out_a_page_hidden_for_the_viewers_workspaces_and_only_that_one', () => {
+		const paths = (hidden: ('sessions' | 'requests')[]) => shown(hidden).flatMap((c) => c.items).map((i) => i.href);
+		expect(paths([])).toEqual(hrefs(false));
+		expect(paths(['sessions'])).toEqual(hrefs(false).filter((h) => h !== '/portal/sessions'));
+		expect(paths(['requests'])).toEqual(hrefs(false).filter((h) => h !== '/portal/audit'));
+	});
+
+	it('drops_the_activity_cluster_when_both_its_pages_are_hidden', () => {
+		const labels = (hidden: ('sessions' | 'requests')[]) => shown(hidden).map((c) => c.label);
+		expect(labels(['sessions', 'requests']).length).toBe(labels([]).length - 1);
+		expect(shown(['sessions', 'requests']).flatMap((c) => c.items).map((i) => i.href)).not.toContain('/portal/audit');
+	});
+
 	it('gives each page its own icon', () => {
 		const icons = buildPortalNav().flatMap((c) => c.items).map((i) => i.icon);
 		expect(new Set(icons).size).toBe(icons.length);

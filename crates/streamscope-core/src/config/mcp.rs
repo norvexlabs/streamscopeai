@@ -13,10 +13,14 @@
 //! the MCP handler walks each route in turn (capability merge, namespace
 //! strip-and-stamp, JSON-RPC dispatch).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::mcp::header_inputs;
 
 /// Transport currently spoken to the upstream MCP server. Only
 /// `streamable_http` is honored; `sse` rejects with
@@ -30,14 +34,37 @@ pub enum McpTransport {
 }
 
 /// Authentication mode at the upstream.
+///
+/// - `Headers`: only the headers the remote declares (none = no auth), each
+///   filled by the admin, the user or the client
+///   ([`crate::mcp::header_inputs`]).
+/// - `PerUserOauth`: the same declared headers, plus the user's OAuth token as
+///   `Authorization: Bearer`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpAuthMode {
     #[default]
-    NoAuth,
-    ServiceAccount,
+    Headers,
     PerUserOauth,
-    Byot,
+}
+
+impl McpAuthMode {
+    /// Parse the stored value. `None` for anything else: the caller disables
+    /// the upstream rather than guess (fail closed).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "headers" => Some(Self::Headers),
+            "per_user_oauth" => Some(Self::PerUserOauth),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Headers => "headers",
+            Self::PerUserOauth => "per_user_oauth",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,12 +82,17 @@ pub struct McpUpstreamServer {
     #[serde(default)]
     pub cred_version: i64,
     /// AES-256-GCM ciphertext, base64-encoded (matches `crypto::encrypt`
-    /// output). Populated when `auth_mode = ServiceAccount`; NULL otherwise.
-    /// Decrypt with `streamscope_core::crypto::decrypt` to obtain the bearer
-    /// token. The DB column is BYTEA — admin stores the base64 UTF-8 bytes
-    /// and reads them back as a `String` here for the snapshot push.
+    /// output). Set only on the built-in web upstream, where it holds the
+    /// search backend's API key; it is never upstream auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_credential: Option<String>,
+    /// The adopted `server.json` remote: its declared headers and, in its
+    /// `_meta`, each input's filler. `upstream_url` is its finished URL.
+    #[serde(default)]
+    pub remote: header_inputs::Remote,
+    /// Admin-filled input id → AES-256-GCM ciphertext (base64), one per input.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub encrypted_admin_inputs: HashMap<String, String>,
 
     // ── Per-user OAuth client config ──
     // Populated when `auth_mode = PerUserOauth`. The portal initiates the
@@ -97,6 +129,66 @@ pub struct McpUpstreamServer {
     pub connect_timeout_ms: i32,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_ms: i32,
+    /// The validated declaration of `remote` under `auth_mode`, filled on
+    /// first use. Built with `Default::default()`; read only through
+    /// [`McpUpstreamServer::input_specs`].
+    #[serde(skip)]
+    pub input_specs_cache: InputSpecsCache,
+}
+
+/// What [`header_inputs::validate_fillers`] returned for an upstream's
+/// `remote` and `auth_mode`, kept beside the copy of both it was computed
+/// from. The cell is shared by every clone — filled or not — so every request
+/// cloning an upstream out of one config snapshot fills and reads the same
+/// validation.
+#[derive(Clone, Default)]
+pub struct InputSpecsCache(Arc<OnceLock<CachedInputSpecs>>);
+
+struct CachedInputSpecs {
+    auth_mode: McpAuthMode,
+    remote: header_inputs::Remote,
+    specs: Result<Vec<header_inputs::InputSpec>, header_inputs::RemoteError>,
+}
+
+impl std::fmt::Debug for InputSpecsCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() { "InputSpecsCache(filled)" } else { "InputSpecsCache(empty)" })
+    }
+}
+
+impl McpUpstreamServer {
+    /// The upstream's input specs: [`header_inputs::validate_fillers`] over
+    /// its `remote`, with `Authorization` reserved when `auth_mode` is
+    /// `per_user_oauth`. Validated once and kept; an entry computed from a
+    /// `remote` or `auth_mode` the struct no longer holds is never returned —
+    /// the specs are then validated afresh (and not kept), so a mutated
+    /// struct can never read a stale declaration.
+    pub fn input_specs(
+        &self,
+    ) -> Cow<'_, Result<Vec<header_inputs::InputSpec>, header_inputs::RemoteError>> {
+        let oauth = self.auth_mode == McpAuthMode::PerUserOauth;
+        let cached = self.input_specs_cache.0.get_or_init(|| CachedInputSpecs {
+            auth_mode: self.auth_mode,
+            remote: self.remote.clone(),
+            specs: header_inputs::validate_fillers(&self.remote, oauth),
+        });
+        if cached.auth_mode == self.auth_mode && cached.remote == self.remote {
+            Cow::Borrowed(&cached.specs)
+        } else {
+            Cow::Owned(header_inputs::validate_fillers(&self.remote, oauth))
+        }
+    }
+
+    /// [`header_inputs::resolve`] for this upstream, over its kept specs.
+    pub fn resolve_inputs(
+        &self,
+        values: header_inputs::InputValues<'_>,
+    ) -> Result<header_inputs::UpstreamAuth, header_inputs::ResolveError> {
+        match &*self.input_specs() {
+            Ok(specs) => header_inputs::resolve_validated(&self.remote, specs, values),
+            Err(e) => Err(header_inputs::ResolveError::Declaration(e.clone())),
+        }
+    }
 }
 
 /// Per-user OAuth credential — one ciphertext blob per (tenant, user, upstream)
@@ -118,6 +210,17 @@ pub struct McpUserCredential {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+/// One user's filled inputs for one upstream: input id → AES-256-GCM
+/// ciphertext (base64). Only the user-filled ids of the upstream's
+/// declaration are read from it ([`crate::mcp::header_inputs::resolve`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpUserInputs {
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+    pub upstream_server_id: Uuid,
+    pub encrypted_values: HashMap<String, String>,
 }
 
 fn default_true() -> bool { true }
@@ -235,6 +338,9 @@ pub struct McpConfig {
     /// OAuth dispatcher. Disabled upstreams are dropped on entry
     /// (mirrors `routes_by_virtual_server`'s "drop dependent rows" semantics).
     pub user_credentials: HashMap<(Uuid, Uuid), McpUserCredential>,
+    /// `(user_id, upstream_server_id) -> filled inputs`. Like
+    /// `user_credentials`, rows of disabled upstreams are dropped.
+    pub user_inputs: HashMap<(Uuid, Uuid), McpUserInputs>,
     /// Set of revoked or expired-but-recently-issued JWT `jti`s.
     /// The MCP handler rejects requests with a JWT bearer whose `jti` lives
     /// in this set. Populated by config sync from MCP-surface
@@ -437,6 +543,7 @@ impl McpConfig {
             virtual_server_by_slug,
             routes_by_virtual_server,
             user_credentials,
+            user_inputs: HashMap::new(),
             revoked_jtis: std::collections::HashSet::new(),
             jwks: Vec::new(),
             virtual_prefix_index,
@@ -475,6 +582,20 @@ impl McpConfig {
         self.user_credentials.get(&(user_id, upstream_id))
     }
 
+    /// Index the users' filled inputs, keeping only rows of indexed upstreams.
+    pub fn set_user_inputs(&mut self, rows: Vec<McpUserInputs>) {
+        self.user_inputs = rows
+            .into_iter()
+            .filter(|r| self.upstream_servers.contains_key(&r.upstream_server_id))
+            .map(|r| ((r.user_id, r.upstream_server_id), r))
+            .collect();
+    }
+
+    /// A user's filled inputs for an upstream.
+    pub fn user_inputs(&self, user_id: Uuid, upstream_id: Uuid) -> Option<&McpUserInputs> {
+        self.user_inputs.get(&(user_id, upstream_id))
+    }
+
     /// Resolve `/mcp/<slug>` to `(virtual_server, routes)`.
     pub fn lookup_by_slug(&self, slug: &str) -> Option<(&McpVirtualServer, &[McpVirtualRoute])> {
         let id = self.virtual_server_by_slug.get(slug)?;
@@ -493,6 +614,56 @@ mod tests {
     use super::*;
 
     fn id() -> Uuid { Uuid::new_v4() }
+
+    /// An upstream read the way a snapshot reads one, declaring one
+    /// `Authorization` header filled by `filler`.
+    fn declaring_authorization(auth_mode: &str, filler: &str) -> McpUpstreamServer {
+        serde_json::from_value(serde_json::json!({
+            "id": id(), "tenant_id": id(), "name": "u", "upstream_url": "https://up.example/mcp",
+            "auth_mode": auth_mode,
+            "remote": {
+                "type": "streamable-http", "url": "https://up.example/mcp",
+                "headers": [{ "name": "Authorization", "isRequired": true, "isSecret": true }],
+                "_meta": { "ai.streamscope/inputs": { "fillers": { "Authorization": filler } } },
+            },
+        }))
+        .unwrap()
+    }
+
+    /// The specs are validated once and shared by every clone; an entry is
+    /// never read for a `remote` or `auth_mode` the struct no longer holds.
+    #[test]
+    fn kept_input_specs_always_match_the_remote_and_auth_mode() {
+        use std::borrow::Cow;
+        let up = declaring_authorization("headers", "admin");
+        // A clone taken BEFORE the first read shares the cell too: the proxy
+        // clones upstreams out of the snapshot per request.
+        let early = up.clone();
+        let first = up.input_specs();
+        let Cow::Borrowed(first) = first else { panic!("a filled entry is borrowed") };
+        assert_eq!(first, &header_inputs::validate_fillers(&up.remote, false));
+        assert!(first.is_ok());
+        let again = up.input_specs();
+        assert!(matches!(again, Cow::Borrowed(r) if std::ptr::eq(r, first)), "validated once");
+        let copy = up.clone();
+        assert!(matches!(copy.input_specs(), Cow::Borrowed(r) if std::ptr::eq(r, first)), "a clone shares it");
+        assert!(matches!(early.input_specs(), Cow::Borrowed(r) if std::ptr::eq(r, first)), "an earlier clone shares it");
+
+        // `Authorization` is the token's on an OAuth upstream: the same remote
+        // under the other mode validates differently, and is read so.
+        let mut oauth = up.clone();
+        oauth.auth_mode = McpAuthMode::PerUserOauth;
+        assert_eq!(
+            *oauth.input_specs(),
+            Err(header_inputs::RemoteError::ReservedForOauth)
+        );
+        let mut client = up.clone();
+        client.remote = declaring_authorization("headers", "client").remote;
+        let specs = client.input_specs();
+        assert_eq!(specs.as_deref().unwrap()[0].filler, header_inputs::Filler::Client);
+        // The original still reads its own entry.
+        assert_eq!(up.input_specs().as_deref().unwrap()[0].filler, header_inputs::Filler::Admin);
+    }
 
     #[test]
     fn permits_with_allow_wins() {
@@ -524,13 +695,15 @@ mod tests {
             vec![McpUpstreamServer {
                 id: up_id, tenant_id, name: "u".into(), description: None,
                 upstream_url: "http://u".into(), transport: McpTransport::StreamableHttp,
-                auth_mode: McpAuthMode::NoAuth, cred_version: 1,
-                encrypted_credential: None,
+                auth_mode: McpAuthMode::Headers, cred_version: 1,
+                encrypted_credential: None, remote: Default::default(),
+                encrypted_admin_inputs: HashMap::new(),
                 oauth_issuer_url: None, oauth_authorization_url: None,
                 oauth_token_url: None, oauth_revocation_url: None,
                 oauth_client_id: None, encrypted_oauth_client_secret: None,
                 oauth_default_scopes: vec![],
                 enabled: true, connect_timeout_ms: 10000, request_timeout_ms: 60000,
+                input_specs_cache: Default::default(),
             }],
             vec![McpVirtualServer {
                 id: vs_id, tenant_id, slug: "alpha".into(), name: "Alpha".into(),
@@ -559,13 +732,15 @@ mod tests {
             vec![McpUpstreamServer {
                 id: up_id, tenant_id, name: "u".into(), description: None,
                 upstream_url: "http://u".into(), transport: McpTransport::StreamableHttp,
-                auth_mode: McpAuthMode::NoAuth, cred_version: 1,
-                encrypted_credential: None,
+                auth_mode: McpAuthMode::Headers, cred_version: 1,
+                encrypted_credential: None, remote: Default::default(),
+                encrypted_admin_inputs: HashMap::new(),
                 oauth_issuer_url: None, oauth_authorization_url: None,
                 oauth_token_url: None, oauth_revocation_url: None,
                 oauth_client_id: None, encrypted_oauth_client_secret: None,
                 oauth_default_scopes: vec![],
                 enabled: false, connect_timeout_ms: 10000, request_timeout_ms: 60000,
+                input_specs_cache: Default::default(),
             }],
             vec![McpVirtualServer {
                 id: vs_id, tenant_id, slug: "alpha".into(), name: "Alpha".into(),

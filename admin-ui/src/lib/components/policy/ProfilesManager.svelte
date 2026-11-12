@@ -13,6 +13,9 @@
   import EmptyState from '#lib/components/EmptyState.svelte';
   import { page } from '$app/state';
   import { scopeHref } from '#lib/tenant.js';
+  import { fetchAllPages } from '#lib/api-helpers.js';
+  import { profileUsage, usedByLabel } from '#lib/profileUsage.js';
+  import { PROFILE_KINDS, profileCount } from '#lib/profileKinds.js';
 
   type Profile = components['schemas']['Profile'];
 
@@ -25,35 +28,41 @@
 
   let { kind, activate = true }: Props = $props();
 
+  /** What this kind is called and does (`PROFILE_KINDS`: one entry per kind). */
+  const info = $derived(PROFILE_KINDS[kind]);
   /** Base route of this kind's drill-down editor — the single, uniform path
    *  every profile card (and the shared-baseline card) links into. */
-  const basePath = $derived(
-    kind === 'tools'
-      ? '/policy/profiles'
-      : kind === 'transform'
-        ? '/transforms/profiles'
-        : kind === 'expert'
-          ? '/experts/profiles'
-          : '/guardrail/profiles'
-  );
+  const basePath = $derived(`${info.root}/profiles`);
   let profiles = $state<Profile[]>([]);
   let loading = $state(true);
   let loaded = $state(false);
   let loadError = $state('');
 
-  const isTools = $derived(kind === 'tools');
-  const isTransform = $derived(kind === 'transform');
-  const isExpert = $derived(kind === 'expert');
-  const isGuardrail = $derived(kind === 'guardrail');
-  const noun = $derived(
-    kind === 'tools'
-      ? 'tool profile'
-      : kind === 'transform'
-        ? 'transform profile'
-        : kind === 'expert'
-          ? 'expert profile'
-          : 'guardrail profile'
-  );
+  // A kind whose profiles each own their whole content (Portal & clients):
+  // always Standalone, a copy of another or the seed, never Off for a workspace.
+  const isClientAccess = $derived(info.standaloneOnly);
+  const noun = $derived(info.noun);
+
+  // The workspaces each profile applies to — shown for Portal & clients, whose
+  // Default switch reaches developers at their next provision, sync or run. `null` until read (and when the
+  // read failed): the line is then left out, never shown as "no workspace".
+  let usage = $state<Map<string, string[]> | null>(null);
+  // Only the latest read lands: a slower one never overwrites it.
+  let usageRead = 0;
+
+  /** Read in the background: the list and its actions never wait for it. */
+  async function loadUsage(list: Profile[]) {
+    const read = ++usageRead;
+    let next: Map<string, string[]> | null = null;
+    try {
+      const workspaces = await fetchAllPages((offset, limit) =>
+        adminApi.GET('/api/v1/admin/workspaces', { params: { query: { offset, limit } } }));
+      next = profileUsage(kind, list, workspaces);
+    } catch {
+      next = null;
+    }
+    if (read === usageRead) usage = next;
+  }
 
   async function load() {
     loading = true;
@@ -68,6 +77,7 @@
       profiles = data?.items ?? [];
       // Keep the shared profile list (drives the workspace pickers) in sync.
       profileLists.land(read, profiles.map((p) => ({ id: p.id, name: p.name, is_default: p.is_default })));
+      if (isClientAccess) void loadUsage(profiles);
     }
     loading = false;
     loaded = true;
@@ -95,7 +105,14 @@
   });
 
   function openCreate() {
-    newName = ''; newDescription = ''; newMode = 'layered'; startSource = 'blank';
+    newName = ''; newDescription = '';
+    if (isClientAccess) {
+      // A copy of the Default unless the admin picks another start.
+      newMode = 'standalone';
+      startSource = profiles.find((p) => p.is_default)?.id ?? 'seed';
+    } else {
+      newMode = 'layered'; startSource = 'blank';
+    }
     showCreate = true;
   }
 
@@ -126,7 +143,7 @@
       if (code === 'profile_name_taken') {
         toast.error('Name already in use', { body: 'Pick a different name for this profile.' });
       } else {
-        toast.error('Failed to create profile', { body: extractError(error) });
+        toast.error('Failed to create profile', { body: extractError(error), code: code ?? undefined });
       }
       return;
     }
@@ -159,7 +176,15 @@
   }
 
   // ── Set as default ──
+  // Portal & clients asks first: the switch reaches every developer of the
+  // workspaces on the Default at their next provision, sync or run.
+  let confirmDefault = $state<Profile | null>(null);
+  function askDefault(p: Profile) {
+    if (isClientAccess) confirmDefault = p;
+    else void setDefault(p);
+  }
   async function setDefault(p: Profile) {
+    confirmDefault = null;
     const { error } = await adminApi.POST('/api/v1/admin/profiles/{id}/actions/set-default', {
       params: { path: { id: p.id } },
     });
@@ -198,19 +223,21 @@
 </script>
 
 <div class="flex items-start justify-between mb-4 gap-4">
+  {#if isClientAccess}
+  <p class="text-sm text-(--text-secondary) max-w-2xl">
+    The <strong>Default</strong> applies to every workspace with no profile of its own. Another
+    profile is an independent copy: assign it to a workspace (Workspaces → Access) to give that team
+    its own clients and sandbox rules. An edit to the Default does not reach it.
+    {info.openHint}
+  </p>
+  {:else}
   <p class="text-sm text-(--text-secondary) max-w-2xl">
     The <strong>Default</strong> is the shared base. <strong>Layered</strong> profiles build on it
     (no duplication); <strong>Standalone</strong> profiles are independent (forked from the built-in
-    defaults, or blank). A workspace assigned <strong>Off</strong> runs
-    {#if isTools}no tool policy{:else if isTransform}no transforms{:else if isExpert}no expert{:else}no guardrail{/if}.
-    {#if isExpert}
-      Open a profile to choose its experts.
-    {:else if isGuardrail}
-      Open a profile to edit its posture; the shared classifier backend lives under Settings → Guardrail.
-    {:else}
-      Open a profile to edit its {isTools ? 'rules' : 'programs'}.
-    {/if}
+    defaults, or blank). A workspace assigned <strong>Off</strong> runs {info.offRuns}.
+    {info.openHint}
   </p>
+  {/if}
   <button onclick={openCreate} class="px-3 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) shrink-0">+ New profile</button>
 </div>
 
@@ -220,16 +247,18 @@
   <div class="px-3 py-2 rounded-lg bg-(--error-bg) border border-(--error-border) text-sm text-(--error-text)">{loadError}</div>
 {:else}
   {#if profiles.length === 0}
-    <EmptyState title={`No ${noun}s`} body={`Create one to apply a distinct ${isTools ? 'tool policy' : isTransform ? 'set of transforms' : isExpert ? 'set of experts' : 'guardrail posture'} to a workspace.`} />
+    <EmptyState title={`No ${noun}s`} body={`Create one to apply a distinct ${info.distinct} to a workspace.`} />
   {:else}
     <div class="bg-(--bg-card) rounded-xl border border-(--border) divide-y divide-(--border)">
       {#each profiles as p (p.id)}
-        <div class="px-5 py-3 flex items-center justify-between gap-4">
+        <div class="px-5 py-3 flex items-center justify-between gap-4" data-testid="profile-row" data-profile={p.name}>
           <a href={manageLink(p.id)} class="min-w-0 group">
             <div class="flex items-center gap-2">
               <span class="text-sm text-(--text-primary) group-hover:text-(--accent) truncate">{p.name}</span>
               {#if p.is_default}
                 <span class="px-2 py-0.5 text-[10px] rounded-full bg-(--accent)/10 text-(--accent)">Default</span>
+              {:else if isClientAccess}
+                <!-- Every profile of the kind is an independent copy: no mode to tell apart. -->
               {:else if p.standalone}
                 <span class="px-2 py-0.5 text-[10px] rounded-full bg-(--bg-secondary) text-(--text-secondary)">Standalone</span>
               {:else}
@@ -237,17 +266,19 @@
               {/if}
             </div>
             {#if p.description}<p class="text-xs text-(--text-secondary) truncate">{p.description}</p>{/if}
+            {#if isClientAccess && usage}
+              <p class="text-xs text-(--text-secondary) truncate" data-testid="profile-used-by" title={(usage.get(p.id) ?? []).join(', ')}>{usedByLabel(usage.get(p.id) ?? [])}</p>
+            {/if}
           </a>
           <div class="flex items-center gap-4 shrink-0">
-            {#if isTools || isTransform}
-              <span class="text-xs font-mono text-(--text-secondary)" title={p.is_default || p.standalone ? 'Items in this profile' : 'Its own items (on top of the Default)'}>{p.is_default || p.standalone ? `${p.rule_count} ${p.rule_count === 1 ? 'item' : 'items'}` : `+${p.rule_count} of its own`}</span>
-            {:else if isExpert}
-              <span class="text-xs font-mono text-(--text-secondary)" title="Experts enabled on this profile">{p.rule_count} {p.rule_count === 1 ? 'expert' : 'experts'}</span>
+            {#if profileCount(info, p)}
+              {@const count = profileCount(info, p)}
+              <span class="text-xs font-mono text-(--text-secondary)" title={count?.title}>{count?.text}</span>
             {/if}
             <a href={manageLink(p.id)} class="text-xs text-(--accent) hover:underline">Edit →</a>
             <button onclick={() => openEdit(p)} class="text-xs text-(--text-secondary) hover:text-(--text-primary)">Rename</button>
             {#if !p.is_default}
-              <button onclick={() => setDefault(p)} class="text-xs text-(--text-secondary) hover:text-(--text-primary)">Set as default</button>
+              <button onclick={() => askDefault(p)} class="text-xs text-(--text-secondary) hover:text-(--text-primary)">Set as default</button>
               <button onclick={() => askDelete(p)} class="text-xs text-(--error) hover:underline">Delete</button>
             {/if}
           </div>
@@ -260,8 +291,18 @@
 <!-- Create -->
 <Modal open={showCreate} title={`New ${noun}`} onclose={() => (showCreate = false)} maxWidth="max-w-md">
   <div class="space-y-4">
-    <FormField label="Name"><TextInput bind:value={newName} placeholder={isTools ? 'Engineering-strict' : isTransform ? 'Redaction-heavy' : isExpert ? 'Security-only' : 'Strict'} /></FormField>
+    <FormField label="Name"><TextInput bind:value={newName} placeholder={info.placeholder} /></FormField>
     <FormField label="Description"><TextInput bind:value={newDescription} placeholder="Optional" /></FormField>
+    {#if isClientAccess}
+    <FormField label="Start from" help="The new profile is an independent copy: later edits to its source do not reach it.">
+      <SelectInput bind:value={startSource}>
+        {#each profiles as p (p.id)}
+          <option value={p.id}>Copy {p.name}{p.is_default ? ' (default)' : ''}</option>
+        {/each}
+        <option value="seed">{info.seedOption}</option>
+      </SelectInput>
+    </FormField>
+    {:else}
     <FormField label="Relationship to the Default" help={newMode === 'layered'
       ? 'Builds on the Default and adds only its own — no duplication; tracks Default edits.'
       : 'Independent of the Default — owns its full content.'}>
@@ -273,14 +314,15 @@
     <FormField label="Start from">
       <SelectInput bind:value={startSource}>
         {#if newMode === 'standalone'}
-          <option value="seed">{isExpert ? 'Seed — all experts' : isGuardrail ? 'Seed — default posture' : 'Seed — built-in defaults'}</option>
+          <option value="seed">{info.seedOption}</option>
         {/if}
-        <option value="blank">{isExpert ? 'Blank — no experts' : isGuardrail ? 'Blank — default posture' : newMode === 'layered' ? 'Blank — just the Default' : 'Blank — empty'}</option>
+        <option value="blank">{info.blankOption ?? (newMode === 'layered' ? 'Blank — just the Default' : 'Blank — empty')}</option>
         {#each profiles as p (p.id)}
           <option value={p.id}>Copy {p.name}{p.is_default ? ' (default)' : ''}</option>
         {/each}
       </SelectInput>
     </FormField>
+    {/if}
     <div class="flex justify-end gap-2">
       <button onclick={() => (showCreate = false)} class="px-4 py-1.5 text-sm rounded-lg text-(--text-secondary) hover:text-(--text-primary)">Cancel</button>
       <button onclick={create} disabled={creating || !newName.trim()} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{creating ? 'Creating…' : 'Create'}</button>
@@ -308,4 +350,13 @@
   destructive
   onconfirm={doDelete}
   oncancel={() => (confirmId = '')}
+/>
+
+<ConfirmDialog
+  open={!!confirmDefault}
+  title="Set as default"
+  message={`Make ${confirmDefault?.name ?? 'this profile'} the Default? Every workspace with no profile of its own, and the Agent and Inline AI workspaces, follow its clients and sandbox rules at their developers' next provision, sync or run; the portal Quickstart follows on its next load.`}
+  confirmLabel="Set as default"
+  onconfirm={() => confirmDefault && setDefault(confirmDefault)}
+  oncancel={() => (confirmDefault = null)}
 />

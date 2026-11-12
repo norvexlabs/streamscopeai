@@ -4,8 +4,17 @@
   import Icon from '#lib/components/Icon.svelte';
   import { page } from '$app/state';
   import { thref } from '#lib/tenant.js';
+  import { declaredInputs, missingAdminValues, remoteFillers } from '#lib/mcp/headerInputs.js';
+  import { FILLER_HELP, FILLER_NAME, inputRoster } from '#lib/mcp/fillers.js';
+  import { adminApi } from '#lib/api-client.js';
+  import { extractError } from '#lib/api-helpers.js';
+  import FormError from '#lib/components/forms/FormError.svelte';
+  import UpstreamTestResult from '#lib/components/mcp/UpstreamTestResult.svelte';
+  import type { UpstreamTestResult as TestResult } from '#lib/mcp/upstreamTest.js';
 
   let slug = $derived(page.params.slug ?? '');
+  // The test is a POST, which the server refuses a read-only account.
+  const canTest = $derived(page.data.user?.role !== 'read_only');
 
   type UpstreamRow = components['schemas']['McpUpstreamServerRow'];
   type VirtualRouteRow = components['schemas']['McpVirtualRouteRow'];
@@ -41,6 +50,27 @@
     expandedIds = { ...expandedIds, [id]: !expandedIds[id] };
   }
 
+  // The last Test result of each upstream, and the ones in flight.
+  let testResults = $state<Record<string, TestResult>>({});
+  let testErrors = $state<Record<string, string>>({});
+  let testing = $state<Record<string, boolean>>({});
+
+  async function runTest(u: UpstreamRow) {
+    testing = { ...testing, [u.id]: true };
+    const results = { ...testResults };
+    const errors = { ...testErrors };
+    delete results[u.id];
+    delete errors[u.id];
+    testResults = results;
+    testErrors = errors;
+    const { data, error } = await adminApi.POST('/api/v1/admin/mcp/upstream-servers/{id}/actions/test', {
+      params: { path: { id: u.id } },
+    });
+    if (error || !data) testErrors = { ...testErrors, [u.id]: extractError(error, 'The test could not run.') };
+    else testResults = { ...testResults, [u.id]: data };
+    testing = { ...testing, [u.id]: false };
+  }
+
   function usedBy(upstreamId: string): VirtualServerRow[] {
     const vsIds = new Set(routes.filter((r) => r.upstream_server_id === upstreamId).map((r) => r.virtual_server_id));
     return virtualServers.filter((v) => vsIds.has(v.id));
@@ -60,19 +90,21 @@
     );
   }
 
-  function authPillClass(mode: string, hasCredential: boolean, incompleteOauth: boolean): string {
-    if (mode === 'service_account') {
-      return hasCredential
-        ? 'bg-(--success-bg) text-(--success-text)'
-        : 'bg-(--warning-bg) text-(--warning-text)';
-    }
-    if (mode === 'per_user_oauth') {
-      return incompleteOauth
-        ? 'bg-(--warning-bg) text-(--warning-text)'
-        : 'bg-(--info-bg) text-(--info-text)';
-    }
-    if (mode === 'byot') return 'bg-(--tag-violet-bg) text-(--tag-violet-text)';
-    return 'bg-(--bg-primary) border border-(--border) text-(--text-secondary)';
+  /** Who fills the upstream's inputs, and which admin values are missing. */
+  function inputSummary(u: UpstreamRow): { admin: number; user: number; client: string[]; missing: string[] } {
+    const inputs = declaredInputs(u.remote);
+    const fillers = remoteFillers(u.remote);
+    const count = (f: string) => inputs.filter((d) => fillers[d.id] === f).length;
+    const missing = missingAdminValues(
+      inputs,
+      fillers,
+      (id) => id in u.inputs || u.secret_input_ids.includes(id),
+    );
+    return { admin: count('admin'), user: count('user'), client: u.client_headers, missing };
+  }
+
+  function authLabel(u: UpstreamRow): string {
+    return u.auth_mode === 'per_user_oauth' ? 'per-user OAuth' : 'headers';
   }
 </script>
 
@@ -117,7 +149,8 @@
         {@const usingVses = usedBy(u.id)}
         {@const isBuiltIn = u.built_in === true}
         {@const oauthBad = oauthIncomplete(u)}
-        <div class="px-6 py-4">
+        {@const summary = inputSummary(u)}
+        <div class="px-6 py-4" data-testid="upstream-row" data-upstream-id={u.id}>
           <div class="flex items-center justify-between gap-3">
             <div class="flex items-center gap-3 min-w-0 flex-1">
               <button
@@ -140,15 +173,26 @@
               </div>
               <div class="flex items-center gap-2 shrink-0 flex-wrap">
                 <span
-                  class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm font-medium {authPillClass(u.auth_mode, u.has_credential, oauthBad)}"
-                  title={u.auth_mode === 'service_account' && !u.has_credential
-                    ? 'Service-account upstream is missing its credential — every call returns JSON-RPC -32500'
+                  data-testid="upstream-auth-pill"
+                  class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm font-medium {oauthBad || summary.missing.length > 0
+                    ? 'bg-(--warning-bg) text-(--warning-text)'
+                    : u.auth_mode === 'per_user_oauth'
+                      ? 'bg-(--info-bg) text-(--info-text)'
+                      : 'bg-(--bg-primary) border border-(--border) text-(--text-secondary)'}"
+                  title={summary.missing.length > 0
+                    ? `Missing administrator value: ${summary.missing.join(', ')} — every call fails until it is set`
                     : oauthBad
                       ? 'OAuth client incomplete — set the Client ID and Secret (Edit) before granting this endpoint or connecting from the portal'
                       : ''}
                 >
-                  {u.auth_mode}{#if u.auth_mode === 'service_account'} {u.has_credential ? '✓' : '⚠'}{:else if oauthBad} ⚠{/if}
+                  {authLabel(u)}{#if oauthBad || summary.missing.length > 0} ⚠{/if}
                 </span>
+                {#if summary.user > 0}
+                  <span class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm bg-(--tag-violet-bg) text-(--tag-violet-text)" title="Inputs each user fills in the portal">user inputs: {summary.user}</span>
+                {/if}
+                {#if summary.client.length > 0}
+                  <span class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm font-mono bg-(--bg-primary) border border-(--border) text-(--text-secondary)" title="Headers the client sends on every request">client: {summary.client.join(', ')}</span>
+                {/if}
                 {#if usingVses.length > 0}
                   <span class="text-[10px] text-(--text-secondary)">used by:</span>
                   {#each usingVses.slice(0, 3) as vs}
@@ -164,6 +208,16 @@
               </div>
             </div>
             <div class="flex items-center gap-3 shrink-0">
+              {#if canTest}
+                <button
+                  type="button"
+                  data-testid="upstream-test"
+                  class="text-xs font-medium text-(--accent) hover:text-(--accent-hover) disabled:opacity-50"
+                  disabled={testing[u.id] === true}
+                  title="Call the upstream with the administrator's values and list what it serves"
+                  onclick={() => void runTest(u)}
+                >{testing[u.id] ? 'Testing…' : 'Test'}</button>
+              {/if}
               <button
                 type="button"
                 class="w-7 h-3.5 rounded-full relative transition-colors {u.enabled ? 'bg-(--success)' : 'bg-(--toggle-off)'}"
@@ -190,6 +244,21 @@
               >Delete</button>
             </div>
           </div>
+
+          {#if summary.missing.length > 0}
+            <div class="mt-2 ml-7 flex items-center gap-2 text-xs text-(--warning-text)" data-testid="upstream-missing-admin">
+              <span>Administrator value not set: <code class="font-mono">{summary.missing.join(', ')}</code> — calls fail until set.</span>
+              {#if !isBuiltIn}
+                <button type="button" class="font-medium text-(--accent) hover:text-(--accent-hover) underline" onclick={() => onOpenEdit(u)}>Set it</button>
+              {/if}
+            </div>
+          {/if}
+
+          {#if testErrors[u.id]}
+            <div class="mt-3 ml-7"><FormError message={testErrors[u.id]} /></div>
+          {:else if testResults[u.id]}
+            <div class="mt-3 ml-7"><UpstreamTestResult result={testResults[u.id]} onedit={isBuiltIn ? undefined : () => onOpenEdit(u)} /></div>
+          {/if}
 
           {#if isExpanded}
             <div class="mt-4 ml-7 bg-(--bg-primary) rounded-lg p-4 space-y-2">
@@ -237,12 +306,35 @@
                   {/if}
                 </div>
               {/if}
-              {#if u.auth_mode === 'byot'}
+              {#if u.remote.headers && u.remote.headers.length > 0}
                 <div class="pt-2 border-t border-(--border)">
-                  <p class="text-[10px] text-(--text-secondary) uppercase tracking-wider">BYOT</p>
-                  <p class="text-xs text-(--text-secondary) mt-1">
-                    Agents forward their own bearer via <code class="font-mono">vk-*</code> keys. Single-route binding required.
-                  </p>
+                  <p class="text-[10px] text-(--text-secondary) uppercase tracking-wider">Headers</p>
+                  <ul class="mt-1 space-y-0.5 text-xs">
+                    {#each inputRoster(u.remote, u.inputs, u.secret_input_ids) as r (r.id)}
+                      <li class="flex items-center gap-2 flex-wrap" data-testid="upstream-input" data-input-id={r.id} data-state={r.state}>
+                        <code class="font-mono text-(--text-primary)">{r.id}</code>
+                        <span class="text-(--text-secondary)" title={r.filler ? FILLER_HELP[r.filler] : ''}>{r.filler ? FILLER_NAME[r.filler] : '—'}</span>
+                        {#if r.state === 'set'}
+                          {#if r.value !== null}
+                            <code class="font-mono text-(--text-secondary)">· {r.value}</code>
+                          {:else}
+                            <span class="text-(--success-text)">· set</span>
+                          {/if}
+                        {:else if r.state === 'missing'}
+                          <span class="text-(--warning-text)">· not set — calls fail until set</span>
+                        {:else if r.state === 'unset'}
+                          <span class="text-(--text-secondary)">· not set (optional)</span>
+                        {:else if r.filler === 'user'}
+                          <span class="text-(--text-secondary)">· in the portal's MCP Sign-ins page</span>
+                        {:else if r.filler === 'client'}
+                          <span class="text-(--text-secondary)">· on each request</span>
+                        {/if}
+                      </li>
+                    {/each}
+                  </ul>
+                  {#if summary.admin === 0 && summary.user === 0 && summary.client.length === 0}
+                    <p class="text-xs text-(--text-secondary) mt-1">Fixed headers only.</p>
+                  {/if}
                 </div>
               {/if}
             </div>

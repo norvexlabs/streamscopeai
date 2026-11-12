@@ -12,6 +12,7 @@
 import createClient from 'openapi-fetch';
 import type { paths } from './generated/api-types';
 import { networkErrorMiddleware } from './network-error';
+import { pageHiddenMiddleware } from './portalPages.svelte.js';
 
 export const portalApi = createClient<paths>({
   baseUrl: '',
@@ -63,6 +64,11 @@ portalApi.use({
     });
   },
 });
+
+// A route hidden for the viewer's workspaces answers 403 `portal_page_hidden`:
+// the page it belongs to shows that it is not available, and the identity the
+// layout holds is re-read (`portalPages.svelte.ts`).
+portalApi.use(pageHiddenMiddleware);
 
 // Redirect to portal login on 401 so the user can re-authenticate.
 portalApi.use({

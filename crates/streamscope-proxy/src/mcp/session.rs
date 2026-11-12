@@ -82,7 +82,11 @@ pub struct McpSessionMap {
     /// one holds a session and a live stream, the other holds nothing at all.
     /// Sharing one slot would make whichever client arrived second replace the
     /// other's connection state on every alternating request.
-    upstream_handshakes: DashMap<(Uuid, Uuid, Uuid, bool), UpstreamHandshake>,
+    /// Each entry holds the inputs fingerprint it was opened under: a lookup
+    /// under another one misses, and the next handshake replaces the entry —
+    /// one entry per `(tenant, user, upstream, era)`, never a caller riding a
+    /// session another credential opened.
+    upstream_handshakes: DashMap<(Uuid, Uuid, Uuid, bool), (UpstreamHandshake, u64)>,
     /// Which protocol eras each upstream implements. Key is `(tenant_id,
     /// upstream_server_id)` — **not** the user.
     ///
@@ -391,7 +395,7 @@ impl McpSessionMap {
         // above cannot reach them. Missing this is a pure leak — one entry
         // per user per upstream, held for the process's lifetime.
         self.upstream_handshakes
-            .retain(|_, v| v.established_at >= cutoff);
+            .retain(|_, v| v.0.established_at >= cutoff);
         // Same reasoning for the era map, on the same clock: it is keyed by
         // `(tenant, upstream)` and never appears in `map` either. Expiring it
         // is also what lets an upstream upgraded in place be re-probed
@@ -476,18 +480,22 @@ impl McpSessionMap {
         tenant_id: Uuid,
         user_id: Uuid,
         upstream_id: Uuid,
+        inputs: u64,
         era: UpstreamEra,
     ) -> Option<UpstreamHandshake> {
         let key = (tenant_id, user_id, upstream_id, era.is_modern());
-        let stale = {
+        let (stale, same_inputs) = {
             let entry = self.upstream_handshakes.get(&key)?;
-            entry.established_at.elapsed() > idle_ttl()
+            (entry.0.established_at.elapsed() > idle_ttl(), entry.1 == inputs)
         };
         if stale {
             self.upstream_handshakes.remove(&key);
             return None;
         }
-        self.upstream_handshakes.get(&key).map(|e| e.clone())
+        if !same_inputs {
+            return None;
+        }
+        self.upstream_handshakes.get(&key).map(|e| e.0.clone())
     }
 
     /// Record a completed gateway-owned handshake.
@@ -499,6 +507,7 @@ impl McpSessionMap {
         tenant_id: Uuid,
         user_id: Uuid,
         upstream_id: Uuid,
+        inputs: u64,
         handshake: UpstreamHandshake,
     ) -> UpstreamHandshake {
         let cap = max_entries();
@@ -517,7 +526,7 @@ impl McpSessionMap {
             );
             return handshake;
         }
-        self.upstream_handshakes.insert(key, handshake.clone());
+        self.upstream_handshakes.insert(key, (handshake.clone(), inputs));
         handshake
     }
 
@@ -564,6 +573,7 @@ mod tests {
             tenant,
             alice,
             upstream,
+            0,
             UpstreamHandshake::legacy(
                 Some("up-sid-1".into()),
                 serde_json::json!({"tools": {}}),
@@ -572,15 +582,15 @@ mod tests {
             ),
         );
 
-        let got = m.handshake(tenant, alice, upstream, UpstreamEra::Legacy).unwrap();
+        let got = m.handshake(tenant, alice, upstream, 0, UpstreamEra::Legacy).unwrap();
         assert_eq!(got.session_id.as_deref(), Some("up-sid-1"));
         assert_eq!(got.protocol_version, "2025-11-25");
 
         // The key includes the authenticated user, so a tenant-mate cannot
         // reach Alice's upstream session context.
-        assert!(m.handshake(tenant, bob, upstream, UpstreamEra::Legacy).is_none());
+        assert!(m.handshake(tenant, bob, upstream, 0, UpstreamEra::Legacy).is_none());
         // Nor can another tenant.
-        assert!(m.handshake(Uuid::new_v4(), alice, upstream, UpstreamEra::Legacy).is_none());
+        assert!(m.handshake(Uuid::new_v4(), alice, upstream, 0, UpstreamEra::Legacy).is_none());
     }
 
     #[test]
@@ -596,10 +606,35 @@ mod tests {
             tenant,
             user,
             upstream,
+            0,
             UpstreamHandshake::legacy(None, serde_json::json!({}), "2025-11-25".into(), None),
         );
-        let got = m.handshake(tenant, user, upstream, UpstreamEra::Legacy).unwrap();
+        let got = m.handshake(tenant, user, upstream, 0, UpstreamEra::Legacy).unwrap();
         assert!(got.session_id.is_none());
+    }
+
+    /// A handshake is found only under the inputs it was opened with; one
+    /// opened under other inputs replaces it, so the map holds one entry per
+    /// (tenant, user, upstream, era) and no caller rides another's session.
+    #[test]
+    fn a_handshake_is_found_only_under_the_inputs_it_was_opened_with() {
+        let m = McpSessionMap::new();
+        let (tenant, user, upstream) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let handshake =
+            |sid: &str| UpstreamHandshake::legacy(Some(sid.into()), serde_json::json!({}), "x".into(), None);
+        m.set_handshake(tenant, user, upstream, 1, handshake("a"));
+        assert_eq!(
+            m.handshake(tenant, user, upstream, 1, UpstreamEra::Legacy).unwrap().session_id.as_deref(),
+            Some("a")
+        );
+        assert!(m.handshake(tenant, user, upstream, 2, UpstreamEra::Legacy).is_none());
+        m.set_handshake(tenant, user, upstream, 2, handshake("b"));
+        assert!(m.handshake(tenant, user, upstream, 1, UpstreamEra::Legacy).is_none());
+        assert_eq!(
+            m.handshake(tenant, user, upstream, 2, UpstreamEra::Legacy).unwrap().session_id.as_deref(),
+            Some("b")
+        );
+        assert_eq!(m.handshake_len(), 1);
     }
 
     #[test]
@@ -612,11 +647,12 @@ mod tests {
             tenant,
             user,
             upstream,
+            0,
             UpstreamHandshake::legacy(Some("s".into()), serde_json::json!({}), "x".into(), None),
         );
-        assert!(m.handshake(tenant, user, upstream, UpstreamEra::Legacy).is_some());
+        assert!(m.handshake(tenant, user, upstream, 0, UpstreamEra::Legacy).is_some());
         m.forget_handshake(tenant, user, upstream, UpstreamEra::Legacy);
-        assert!(m.handshake(tenant, user, upstream, UpstreamEra::Legacy).is_none());
+        assert!(m.handshake(tenant, user, upstream, 0, UpstreamEra::Legacy).is_none());
         assert_eq!(m.handshake_len(), 0);
     }
 

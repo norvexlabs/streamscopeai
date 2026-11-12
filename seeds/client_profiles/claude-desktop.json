@@ -13,7 +13,8 @@
       "format": "json",
       "title": "Claude Desktop · claude_desktop_config.json",
       "instructions": "macOS: ~/Library/Application Support/Claude/claude_desktop_config.json — Windows: %APPDATA%\\Claude\\claude_desktop_config.json. Claude Desktop only speaks stdio MCP, so the snippet uses the `mcp-remote` bridge (https://github.com/geelen/mcp-remote). Restart Claude Desktop after editing.",
-      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"command\": \"npx\",\n      \"args\": [\n        \"-y\",\n        \"mcp-remote\",\n        \"{{url}}\",\n        \"--header\",\n        \"Authorization:Bearer {{api_key}}\"\n      ]\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+      "local_mcp": "config",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {{#if local}}{\n      \"command\": \"{{command}}\",\n      \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}},\n      \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{else}}{\n      \"command\": \"npx\",\n      \"args\": [\n        \"-y\",\n        \"mcp-remote\",\n        \"{{url}}\"{{#each headers}},\n        \"--header\",\n        \"{{name}}:{{value}}\"{{/each}}\n      ]\n    }{{/if}}{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
     }
   ]
 }

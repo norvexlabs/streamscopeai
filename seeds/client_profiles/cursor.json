@@ -14,7 +14,8 @@
       "title": "Cursor · MCP server (static key)",
       "instructions": "Place at ~/.cursor/mcp.json (global) or .cursor/mcp.json (project). Reload Cursor after editing.",
       "mcp_auth_mode": "static",
-      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"http\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"Bearer {{api_key}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+      "local_mcp": "config",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {{#if local}}{\n      \"type\": \"stdio\",\n      \"command\": \"{{command}}\",\n      \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}},\n      \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{else}}{\n      \"type\": \"http\",\n      \"url\": \"{{url}}\"{{#if headers}},\n      \"headers\": { {{#each headers}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{/if}}{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
     },
     {
       "kind": "mcp",
@@ -24,7 +25,8 @@
       "title": "Cursor · MCP server (OAuth)",
       "instructions": "Place at ~/.cursor/mcp.json. On first MCP tool use Cursor will open a browser tab to authorize against the Streamscope gateway.",
       "mcp_auth_mode": "spec_oauth",
-      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"http\",\n      \"url\": \"{{url}}\"\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+      "local_mcp": "config",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {{#if local}}{\n      \"type\": \"stdio\",\n      \"command\": \"{{command}}\",\n      \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}},\n      \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{else}}{\n      \"type\": \"http\",\n      \"url\": \"{{url}}\"{{#if headers}},\n      \"headers\": { {{#each headers}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{/if}}{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
     },
     {
       "kind": "instructions",

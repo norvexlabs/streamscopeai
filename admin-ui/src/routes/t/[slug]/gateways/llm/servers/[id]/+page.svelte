@@ -993,9 +993,10 @@
                     The automatic target is <strong>{formatDuration(autoItlTarget)}</strong> now (the slowest engine's; each
                     engine is held to its own). A target keeps paused agent sessions' history cached and turns fast.
                   {:else}
-                    The automatic target is still learning: no engine has yet run one or two requests long enough to teach
-                    its time per token (since it, or the gateway, last started), and an engine that does not publish its
-                    time between tokens (vLLM does) never will. Until then it holds nothing.
+                    The automatic target is still learning: some gateway replica has not yet seen an engine run one or two
+                    requests long enough to learn its time per token (since the engine, or that replica, last started), and
+                    an engine that does not publish its time between tokens (vLLM does) never teaches one. A replica still
+                    learning holds nothing.
                   {/if}
                 </p>
                 {/if}

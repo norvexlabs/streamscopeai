@@ -1,13 +1,13 @@
 <script lang="ts">
   // Destination lists: named sets of network destinations that a consumer
   // attaches as allow or block — the developers' sandbox (Governance →
-  // Client access) and the built-in Web tool (Gateways → MCP → Web).
+  // Portal & clients) and the built-in Web tool (Gateways → MCP → Web).
   import { onMount } from 'svelte';
   import { adminApi } from '#lib/api-client.js';
   import { extractError, extractErrorCode } from '#lib/api-helpers.js';
   import { toast } from '#lib/toast.svelte.js';
   import { useDirtyForm } from '#lib/hooks.svelte.js';
-  import { entriesFromText } from '#lib/destinationAttachments.js';
+  import { entriesFromText, useLabel } from '#lib/destinationAttachments.js';
   import Page from '#lib/components/page/Page.svelte';
   import Skeleton from '#lib/components/Skeleton.svelte';
   import EmptyState from '#lib/components/EmptyState.svelte';
@@ -18,9 +18,11 @@
   import type { components } from '#lib/generated/api-types.js';
 
   type DestinationList = components['schemas']['DestinationList'];
-  type ListUse = components['schemas']['DestinationListUse'];
 
   let lists = $state<DestinationList[]>([]);
+  // The Portal & clients profiles by id, to name the profile behind a sandbox
+  // use. Empty until read, and when the read fails: the chips then go unnamed.
+  let profileNames = $state<Map<string, string>>(new Map());
   let loading = $state(true);
 
   const form = useDirtyForm();
@@ -40,11 +42,8 @@
       return;
     }
     lists = data?.items ?? [];
-  }
-
-  function useLabel(u: ListUse): string {
-    const who = u.consumer === 'web' ? 'Web' : 'Sandbox';
-    return `${who} ${u.mode}`;
+    const profiles = await adminApi.GET('/api/v1/admin/profiles', { params: { query: { kind: 'client_access', limit: 200 } } });
+    if (profiles.data) profileNames = new Map(profiles.data.items.map((p) => [p.id, p.name]));
   }
 
   function openCreate() {
@@ -161,7 +160,7 @@
                 {/if}
                 <span class="text-xs text-(--text-tertiary)">{l.entries.length} entr{l.entries.length === 1 ? 'y' : 'ies'}</span>
                 {#each l.used_by as u, i (i)}
-                  <span class="px-1.5 py-0.5 text-[10px] rounded-sm bg-(--bg-primary) text-(--text-secondary) border border-(--border)">{useLabel(u)}</span>
+                  <span class="px-1.5 py-0.5 text-[10px] rounded-sm bg-(--bg-primary) text-(--text-secondary) border border-(--border)">{useLabel(u, profileNames)}</span>
                 {/each}
               </div>
               {#if l.description}

@@ -129,8 +129,8 @@ pub(crate) struct PortalUsage {
 /// The portal's totals for one scope. `gateway_audit.workspace_id` is the issuing key's
 /// workspace, so it confines an `ak-` key's totals.
 ///
-/// The portal's three usage figures — these totals, [`portal_per_key`] and
-/// [`workspace_member_usage`] — count one population: LLM requests (the ones
+/// The portal's usage figures — these totals, [`portal_daily`],
+/// [`portal_per_key`] and [`workspace_member_usage`] — count one population: LLM requests (the ones
 /// that carry tokens and cost), attributed to the workspace stamped on the
 /// row. Keep them in step: the per-key rows sum to the part of these totals
 /// made with the scope's live keys.
@@ -156,6 +156,53 @@ pub(crate) async fn portal_totals(
     .bind(end_ts)
     .bind(scope.workspace_id())
     .fetch_one(&mut *conn)
+    .await
+}
+
+/// One UTC day of a scope's traffic, or (`day` = `None`) the whole window.
+#[derive(sqlx::FromRow)]
+pub(crate) struct PortalDayUsage {
+    /// 00:00 UTC of the day; `None` on the window's total.
+    pub day: Option<DateTime<Utc>>,
+    pub requests: i64,
+    pub amount: f64,
+    pub currency_count: i64,
+    pub currency: Option<String>,
+}
+
+/// The scope's LLM requests and spend per UTC day over the window, plus one
+/// row (`day` = `None`) for the whole window — the same population as
+/// [`portal_totals`], so the days sum to the total and the total's currency
+/// count is exact (it is not derivable from the days' counts). Days without
+/// traffic have no row.
+///
+/// Cost: the portal Home reads it with the caller's own scope over 7 days, so
+/// it walks the caller's rows of that week on `gateway_audit (tenant_id,
+/// user_id, timestamp)` and their `llm_audit` rows by key — one aggregate, no
+/// other user's rows.
+pub(crate) async fn portal_daily(
+    conn: &mut Scoped,
+    scope: &PortalDataScope,
+    (start_ts, end_ts): Window,
+) -> sqlx::Result<Vec<PortalDayUsage>> {
+    let sql = format!(
+        r#"SELECT date_trunc('day', g.timestamp, 'UTC') AS day,
+                  COUNT(*)::bigint AS requests,
+                  COALESCE(SUM(cost), 0.0)::float8 AS amount,
+                  COUNT(DISTINCT a.cost_currency)::bigint AS currency_count,
+                  MIN(a.cost_currency) AS currency
+           FROM {AUDIT_LOG_JOIN}
+           WHERE ($1::uuid IS NULL OR g.user_id = $1){window}
+             AND ($4::uuid IS NULL OR g.workspace_id = $4)
+           GROUP BY GROUPING SETS ((date_trunc('day', g.timestamp, 'UTC')), ())"#,
+        window = window_sql(AUDIT_LOG_WINDOW, 2, 3),
+    );
+    sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+    .bind(scope.user_id())
+    .bind(start_ts)
+    .bind(end_ts)
+    .bind(scope.workspace_id())
+    .fetch_all(&mut *conn)
     .await
 }
 

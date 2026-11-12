@@ -494,6 +494,11 @@ pub struct PlaceholderReference {
 pub async fn placeholders() -> Json<PlaceholderReference> {
     use streamscope_client_templates::Value;
     let mut phs = streamscope_client_templates::fixture::validation_placeholders();
+    // A template that declares a local form is also handed local MCP servers,
+    // after the gateway's: list their keys beside a gateway item's.
+    if let Some(Value::List(servers)) = phs.get_mut("mcp_servers") {
+        servers.push(streamscope_client_templates::fixture::mcp_local_item("localfs"));
+    }
     // `forward_auth` is a real placeholder — the seeds branch on it — but it is
     // deliberately absent from the base dictionary because `validate_profile`
     // supplies it per pass, rendering each body under both values. Name it here
@@ -524,10 +529,14 @@ pub async fn placeholders() -> Json<PlaceholderReference> {
                 name,
                 kind: "list".into(),
                 sample: None,
+                // Every key an item may carry: a list's items differ in kind
+                // (a gateway MCP server and a local one).
                 item_keys: items
-                    .first()
-                    .map(|i| i.keys().cloned().collect())
-                    .unwrap_or_default(),
+                    .iter()
+                    .flat_map(|i| i.keys().cloned())
+                    .collect::<std::collections::BTreeSet<String>>()
+                    .into_iter()
+                    .collect(),
             },
             Value::None => PlaceholderRef {
                 name,
@@ -588,11 +597,6 @@ pub async fn preview(
     use streamscope_client_templates::{fixture, render, TemplateFormat};
     validate_templates(&body)?;
 
-    let mut phs = fixture::validation_placeholders();
-    phs.insert(
-        "forward_auth".into(),
-        streamscope_client_templates::Value::Bool(false),
-    );
     // Validation above already proved every one of these renders, so a failure
     // here is not reachable; map it rather than unwrap.
     let render_err = |e: streamscope_client_templates::RenderError| {
@@ -602,6 +606,13 @@ pub async fn preview(
 
     let mut templates = Vec::with_capacity(body.templates.len());
     for t in &body.templates {
+        // What save-time validation renders the template with: a local MCP
+        // server after the gateway's for a template that declares a form.
+        let mut phs = fixture::validation_placeholders_for(t);
+        phs.insert(
+            "forward_auth".into(),
+            streamscope_client_templates::Value::Bool(false),
+        );
         let instructions = match t.instructions.as_deref() {
             Some(text) => render(text, TemplateFormat::Text, &phs).map_err(render_err)?,
             None => String::new(),
@@ -765,9 +776,11 @@ fn validate_templates(profile: &ClientProfile) -> Result<(), ApiError> {
     use streamscope_client_templates::fixture::ProfileInvalid;
     streamscope_client_templates::fixture::validate_profile(profile).map_err(|e| {
         let code = match e {
-            ProfileInvalid::Render { .. } | ProfileInvalid::KeyedArrayInvalid { .. } => {
-                ApiErrorCode::ClientProfileTemplateInvalid
-            }
+            ProfileInvalid::Render { .. }
+            | ProfileInvalid::KeyedArrayInvalid { .. }
+            | ProfileInvalid::LocalMcpUnwritten { .. }
+            | ProfileInvalid::LocalMcpValueRetyped { .. }
+            | ProfileInvalid::LocalMcpOutsideProject { .. } => ApiErrorCode::ClientProfileTemplateInvalid,
             ProfileInvalid::KeyUnreachable { .. }
             | ProfileInvalid::CompanionOutOfScope { .. }
             | ProfileInvalid::CompanionPathInvalid { .. } => {

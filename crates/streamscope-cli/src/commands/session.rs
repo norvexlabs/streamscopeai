@@ -191,11 +191,18 @@ fn confirm_with_default(question: &str, default: bool) -> Result<bool> {
 /// Both keep asking until at least `min` are chosen; the numbered form also
 /// reprompts on any out-of-range or unparseable entry.
 pub fn pick_many(question: &str, items: &[Choice], min: usize) -> Result<Vec<usize>> {
+    pick_many_ticked(question, items, min, &(0..items.len()).collect::<Vec<_>>())
+}
+
+/// [`pick_many`] with only `ticked` (indices into `items`) ticked to start:
+/// they are also what empty input and end of input choose in the numbered
+/// form, where `all` still selects everything.
+pub fn pick_many_ticked(question: &str, items: &[Choice], min: usize, ticked: &[usize]) -> Result<Vec<usize>> {
     if crate::ui::styled_prompts() {
         let options = items
             .iter()
             .enumerate()
-            .map(|(i, c)| c.option(i).selected(true))
+            .map(|(i, c)| c.option(i).selected(ticked.contains(&i)))
             .collect();
         let mut chosen = crate::ui::prompt(|| {
             demand::MultiSelect::new(question)
@@ -212,13 +219,20 @@ pub fn pick_many(question: &str, items: &[Choice], min: usize) -> Result<Vec<usi
     for (i, item) in items.iter().enumerate() {
         println!("  {}) {}", i + 1, item.plain());
     }
+    let default = default_selection_label(ticked, items.len());
     loop {
-        print!("Enter numbers to provision (e.g. 1,3,5 / all / none) [all]: ");
+        print!("Enter numbers to provision (e.g. 1,3,5 / all / none) [{default}]: ");
         std::io::stdout().flush()?;
         let mut line = String::new();
-        // EOF (piped/non-TTY with nothing to read) defaults to "all".
-        if std::io::stdin().read_line(&mut line)? == 0 {
-            return Ok((0..items.len()).collect());
+        let eof = std::io::stdin().read_line(&mut line)? == 0;
+        if eof || line.trim().is_empty() {
+            match default_answer(ticked, min, eof) {
+                Some(chosen) => return chosen,
+                None => {
+                    println!("pick at least {min}");
+                    continue;
+                }
+            }
         }
         match parse_selection(&line, items.len()) {
             Some(mut chosen) if chosen.len() >= min => {
@@ -231,6 +245,32 @@ pub fn pick_many(question: &str, items: &[Choice], min: usize) -> Result<Vec<usi
                 items.len()
             ),
         }
+    }
+}
+
+/// What an empty answer (Enter), or the end of input (`eof`: piped / non-TTY
+/// with nothing to read), chooses in the numbered multi-select: the ticked
+/// items, when they are at least `min`. Fewer on Enter asks again (`None`);
+/// fewer at the end of input is an error, since asking again would never end.
+fn default_answer(ticked: &[usize], min: usize, eof: bool) -> Option<Result<Vec<usize>>> {
+    if ticked.len() >= min {
+        Some(Ok(ticked.to_vec()))
+    } else if eof {
+        Some(Err(anyhow::anyhow!("no answer, and fewer than {min} are selected by default (end of input)")))
+    } else {
+        None
+    }
+}
+
+/// How the numbered multi-select names its default: `all`, `none`, or the
+/// 1-based numbers of the ticked items.
+fn default_selection_label(ticked: &[usize], n: usize) -> String {
+    if ticked.len() == n {
+        "all".to_string()
+    } else if ticked.is_empty() {
+        "none".to_string()
+    } else {
+        ticked.iter().map(|i| (i + 1).to_string()).collect::<Vec<_>>().join(",")
     }
 }
 
@@ -334,7 +374,20 @@ pub fn ask_text(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_selection;
+    use super::{default_answer, parse_selection};
+
+    /// An empty answer takes the ticked items only when they are enough:
+    /// fewer asks again on Enter and fails at the end of input.
+    #[test]
+    fn a_default_answer_honours_the_minimum() {
+        assert_eq!(default_answer(&[0, 2], 1, false).unwrap().unwrap(), vec![0, 2]);
+        assert_eq!(default_answer(&[0, 2], 2, true).unwrap().unwrap(), vec![0, 2]);
+        assert_eq!(default_answer(&[], 0, true).unwrap().unwrap(), Vec::<usize>::new());
+        assert!(default_answer(&[], 1, false).is_none());
+        assert!(default_answer(&[0], 2, false).is_none());
+        assert!(default_answer(&[], 1, true).unwrap().is_err());
+        assert!(default_answer(&[0], 2, true).unwrap().is_err());
+    }
 
     #[test]
     fn empty_and_all_select_everything() {

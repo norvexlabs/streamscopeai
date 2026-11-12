@@ -712,7 +712,9 @@ On the VM (over SSH):
 
 | Command | Does |
 |---|---|
-| `ssai-stow status [--json]` | The release and channel, the install's state, each route's URL, the advanced settings in effect, the system booted (active / passive / recovery), the last failed boot, the disk and its pressure, the services |
+| `ssai-stow --version` | The release this installer carries, and the Stowage release that built it |
+| `ssai-stow describe [--json]` | What that release offers, read with no install: its default registry and its routes |
+| `ssai-stow status [--json]` | The release and channel, the install's state, each route's URL, the advanced settings in effect, the system booted (active / passive / recovery), the last failed boot, the disk and its pressure, the services; `--json` also lists every setting the install records |
 | `ssai-stow health [--json]` | Ready, or why not — the health gate's check, from inside the VM, even when the public URLs are down |
 | `ssai-stow ps [--json]` | The services, their state and health; a service that is down is named with its exit code, the signal, whether its memory limit killed it, and that limit (`status` says the same) |
 | `ssai-stow logs <service> [--tail N]` | A service's last lines (default 200, at most 5000) |
@@ -1183,7 +1185,10 @@ identical to the VM appliance; only the install and lifecycle differ.
 - **Docker** on the machine you install from, to fetch the installer (§ A).
 - A **managed Postgres** reachable from the cluster (Amazon RDS, Google Cloud SQL, AlloyDB, or any
   PostgreSQL 18+). In-cluster Postgres is supported too — **CloudNativePG** for high availability, or a
-  single-pod database for evaluation only.
+  single-pod database for evaluation only. Expert analysis reads only what was written before the
+  oldest transaction still open **anywhere on that PostgreSQL server**, so a transaction another
+  application leaves open (an `idle in transaction` session) pauses expert analysis until it ends.
+  On a server you share, set `idle_in_transaction_session_timeout` for the other applications' roles.
 - An **Ingress controller** (e.g. ingress-nginx) and **cert-manager** with a configured issuer
   (e.g. a Let's Encrypt `ClusterIssuer`).
 - **DNS** records for your two public hostnames — the admin console and the gateway.
@@ -1453,6 +1458,7 @@ is safe to inspect.
 
 ```bash
 ssai-stow k8s status                                                       # what the release runs, helm status
+ssai-stow --version                                                        # the release this installer carries
 kubectl -n <ns> get pods -l app.kubernetes.io/instance=<release>         # who is unhealthy
 kubectl -n <ns> logs deploy/<release>-streamscopeai-admin-api --tail=100   # control-plane / migration logs
 kubectl -n <ns> logs deploy/<release>-streamscopeai-proxy --tail=100       # gateway logs
@@ -1773,6 +1779,8 @@ and runs provisioning:
 
 ```bash
 streamscopeai/ssai-stow status --dir ./streamscopeai                  # release, URLs, settings, services
+streamscopeai/ssai-stow --version                                     # the release it carries
+streamscopeai/ssai-stow describe                                      # what that release offers, no install needed
 streamscopeai/ssai-stow --dir ./streamscopeai --set API_DOCS_PUBLIC=false
 streamscopeai/ssai-stow --dir ./streamscopeai --ports gateway=8180
 streamscopeai/ssai-stow --dir ./streamscopeai --tls byo --cert cert.pem --key key.pem

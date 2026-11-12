@@ -9,15 +9,17 @@ use serde_json::{Map, Value};
 use streamscope_client_templates::{keyed_entry_identity, STRING_ENTRIES};
 
 use super::{
-    escape_token, is_keyed_record, keyed_jobs, merge_entries, unescape_token, KeyedEntry, MergeOutcome,
+    escape_token, is_keyed_record, is_what_we_wrote, keyed_jobs, merge_entries, unescape_token, withdraw_from,
+    KeyedEntry, MergeOutcome,
 };
-use crate::state::{sha256_hex, OwnedLeaf};
+use crate::state::{sha256_hex, EntryRoot, OwnedLeaf};
 
 pub fn merge(
     existing: Option<&str>,
     rendered: &str,
     prev_owned: &[OwnedLeaf],
     keyed_arrays: &BTreeMap<String, String>,
+    withdraw: &[EntryRoot],
 ) -> Result<MergeOutcome> {
     let mut rendered_v: Value =
         serde_json::from_str(rendered).context("rendered config is not valid JSON")?;
@@ -41,6 +43,9 @@ pub fn merge(
         bail!("the existing config file is not a JSON object");
     }
     let before = jsonc.map(|_| doc.clone());
+    let (prev_owned, withdrawn) =
+        withdraw_from(streamscope_client_templates::TemplateFormat::Json, &mut doc, prev_owned, withdraw, remove_root);
+    let prev_owned = prev_owned.as_slice();
 
     // A keyed array leaves the render before the leaf merge: its entries are
     // merged one by one below, never replaced as one leaf.
@@ -66,7 +71,7 @@ pub fn merge(
     let mut owned: Vec<OwnedLeaf> = Vec::new();
     collect_leaves("", &rendered_v, &mut owned);
 
-    merge_value(&mut doc, &rendered_v);
+    merge_value(&mut doc, &rendered_v, "", prev_owned);
 
     // Remove leaves we owned that left the render — only when unedited.
     let mut kept_edited = Vec::new();
@@ -122,7 +127,35 @@ pub fn merge(
         contents,
         owned,
         kept_edited,
+        withdrawn,
     })
+}
+
+/// Take the entry at `root` out of `doc`; `false` when nothing stood there.
+/// A keyed array emptied by it goes too, as one emptied by a re-render does.
+fn remove_root(doc: &mut Value, root: &EntryRoot) -> bool {
+    let Some(entry) = &root.entry else {
+        if doc.pointer(&root.path).is_none() {
+            return false;
+        }
+        remove_pointer(doc, &root.path);
+        return true;
+    };
+    let Some(Value::Array(entries)) = doc.pointer_mut(&root.path) else { return false };
+    let Some(i) = entries.iter().position(|e| e.identity(&entry.key).as_deref() == Some(entry.id.as_str())) else {
+        return false;
+    };
+    entries.remove(i);
+    if entries.is_empty() {
+        remove_pointer(doc, &root.path);
+    }
+    true
+}
+
+/// Whether something stands at `root` in the file `existing`.
+pub(super) fn holds(existing: &str, root: &EntryRoot) -> Result<bool> {
+    let mut doc = parse_jsonc(existing).context("the existing config file is not valid JSON")?;
+    Ok(remove_root(&mut doc, root))
 }
 
 impl KeyedEntry for Value {
@@ -134,9 +167,11 @@ impl KeyedEntry for Value {
         value_hash(self)
     }
 
-    fn replace_with(&mut self, rendered: &Self) {
+    fn replace_with(&mut self, rendered: &Self, keep_filled: bool) {
         let live = std::mem::replace(self, rendered.clone());
-        keep_filled_sentinels(self, &live);
+        if keep_filled {
+            keep_filled_sentinels(self, &live);
+        }
     }
 }
 
@@ -179,7 +214,9 @@ fn collect_leaves(prefix: &str, v: &Value, out: &mut Vec<OwnedLeaf>) {
 
 /// Objects merge recursively; everything else (scalars, arrays, null)
 /// replaces the existing value wholesale — EXCEPT a paste-me sentinel, which
-/// never overwrites a value the user already filled in.
+/// never overwrites a value the user already filled in: it replaces only the
+/// value `prev_owned` records the last run wrote at that path (`prefix` is
+/// the pointer of `dst`).
 ///
 /// A render that contributes an EMPTY object under a key the target doesn't
 /// already have (e.g. `{"mcpServers": {}}` from a client provisioned with zero
@@ -189,15 +226,17 @@ fn collect_leaves(prefix: &str, v: &Value, out: &mut Vec<OwnedLeaf>) {
 /// keeps the writers' "fully-unprovisioned block doesn't linger" contract; an
 /// empty object under a key that already exists still recurses below (merging
 /// nothing, preserving the user's value).
-fn merge_value(dst: &mut Value, src: &Value) {
+fn merge_value(dst: &mut Value, src: &Value, prefix: &str, prev_owned: &[OwnedLeaf]) {
     match (dst, src) {
         (Value::Object(d), Value::Object(s)) => {
             for (k, sv) in s {
+                let path = format!("{prefix}/{}", escape_token(k));
                 match d.get_mut(k) {
-                    Some(dv) if dv.is_object() && sv.is_object() => merge_value(dv, sv),
+                    Some(dv) if dv.is_object() && sv.is_object() => merge_value(dv, sv, &path, prev_owned),
                     Some(dv)
                         if matches!(sv, Value::String(s) if super::is_paste_sentinel(s))
-                            && dv != sv => {}
+                            && dv != sv
+                            && !is_what_we_wrote(prev_owned, &path, &value_hash(dv)) => {}
                     None if matches!(sv, Value::Object(m) if m.is_empty()) => {}
                     _ => {
                         d.insert(k.clone(), sv.clone());

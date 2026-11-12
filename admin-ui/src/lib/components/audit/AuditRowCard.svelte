@@ -6,7 +6,9 @@
   // chronological sort isn't broken by per-kind table headers.
   //
   // Expansion is owned by the parent — AuditRowCard signals via onToggle
-  // and lets the page mount the appropriate detail component below.
+  // and lets the page mount the appropriate detail component below. Without
+  // an onToggle the row has no detail to open: it is a plain line, not a
+  // button.
 
   import type { AuditLogRow } from '#lib/api-types.js';
   import { formatDuration, formatTokens, formatCost, formatDateTime, formatFinishReason, finishReasonColor, formatErrorCategory, errorCategoryColor, formatTaskState } from '#lib/formatters.js';
@@ -21,7 +23,8 @@
   interface Props {
     row: AuditLogRow;
     expanded: boolean;
-    onToggle: () => void;
+    /** Opens or closes the row's detail; omitted when the row has none. */
+    onToggle?: () => void;
     /**
      * Cross-user pivot — filter the list to this user. Omitted in the portal
      * member plane (the row is always the caller), where the user identity
@@ -48,17 +51,10 @@
   );
 </script>
 
-<div
-  class="border-b border-(--border) hover:bg-(--bg-elevated) transition-colors cursor-pointer"
-  onclick={onToggle}
-  role="button"
-  tabindex="0"
-  aria-expanded={expanded}
-  onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); onToggle(); } }}
->
+{#snippet line()}
   <!-- Header strip: chevron + kind chip + time + user + latency + status -->
   <div class="flex items-center gap-3 px-4 py-2.5 text-sm">
-    <span class="text-(--text-secondary) w-4 inline-block transition-transform {expanded ? 'rotate-90' : ''}">&#9654;</span>
+    <span class="text-(--text-secondary) w-4 inline-block transition-transform {expanded ? 'rotate-90' : ''}">{#if onToggle}&#9654;{/if}</span>
     {#if showKindChip}
       <TagBadge color={auditKindColor[kind]} class="uppercase tracking-wider">
         {auditKindLabel(kind)}
@@ -190,4 +186,22 @@
       {/if}
     {/if}
   </div>
-</div>
+{/snippet}
+
+{#if onToggle}
+  <div
+    class="border-b border-(--border) hover:bg-(--bg-elevated) transition-colors cursor-pointer"
+    data-testid="audit-row"
+    onclick={onToggle}
+    role="button"
+    tabindex="0"
+    aria-expanded={expanded}
+    onkeydown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) { e.preventDefault(); onToggle(); } }}
+  >
+    {@render line()}
+  </div>
+{:else}
+  <div class="border-b border-(--border)" data-testid="audit-row">
+    {@render line()}
+  </div>
+{/if}

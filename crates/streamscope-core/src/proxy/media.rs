@@ -1436,17 +1436,20 @@ async fn media_handler_inner(
     // --- Resolve upstream target ---
     // Session-pin upstream selection (preserves the provider prompt cache across
     // a session's turns for multi-target LB-group aliases; no session id → RR).
-    let all_targets = match super::routing::resolve_all_upstreams_by_model(
-        &model_requested,
-        &ctx.user,
-        &ctx.config.credentials,
-        &state.lb_counters,
-        attr.session_id.as_deref(),
-        crate::api::sse::ApiVersion::from_path(&path),
-        headers.get("x-origin-host").and_then(|v| v.to_str().ok()),
-        &ctx.config.endpoints,
-        true,
-    ) {
+    let resolved = super::routing::origin_host(&headers, &ctx.user).and_then(|origin_host| {
+        super::routing::resolve_all_upstreams_by_model(
+            &model_requested,
+            &ctx.user,
+            &ctx.config.credentials,
+            &state.lb_counters,
+            attr.session_id.as_deref(),
+            crate::api::sse::ApiVersion::from_path(&path),
+            origin_host,
+            &ctx.config.endpoints,
+            true,
+        )
+    });
+    let all_targets = match resolved {
         Ok(t) => super::order_by_health(&state, t),
         Err(e) => {
             let e = e.for_model(err_ctx.model_requested);
@@ -2157,7 +2160,14 @@ async fn catchall_handler_inner(
     // another. Without one, the first matching provider in grant order serves,
     // unless its target would hand the client's credential to a different
     // pass-through provider (`routing::CredentialScope`).
-    let origin_host = headers.get("x-origin-host").and_then(|v| v.to_str().ok());
+    let origin_host = match super::routing::origin_host(&headers, &ctx.user) {
+        Ok(h) => h,
+        Err(e) => {
+            send_catchall_error_audit(&state, &err_ctx, &e).await;
+            state.proxy_stats.inc_errors();
+            return Err(e);
+        }
+    };
     let path_matches: Vec<(uuid::Uuid, &crate::config::RoutePolicy)> = ctx
         .user
         .allowed_provider_ids

@@ -31,7 +31,8 @@
       "format": "json",
       "title": "Cline · MCP server",
       "instructions": "Cline UI → MCP Servers → Edit Configuration. Or place at the cline_mcp_settings.json path shown by Cline.",
-      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"streamableHttp\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"Authorization\": \"Bearer {{api_key}}\" }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+      "local_mcp": "config",
+      "body": "{\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {{#if local}}{\n      \"command\": \"{{command}}\",\n      \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}},\n      \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{else}}{\n      \"type\": \"streamableHttp\",\n      \"url\": \"{{url}}\"{{#if headers}},\n      \"headers\": { {{#each headers}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{/if}}{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
     }
   ]
 }

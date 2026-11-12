@@ -1118,10 +1118,15 @@ fn build_app(
                 .get(mcp::mcp_get_handler)
                 .delete(mcp::mcp_delete_handler),
         )
-        // BYOK (`vk-*`) keys forward the client's bearer to the
-        // single byot upstream bound to the slug. Same handler shape as
-        // `/mcp/{slug}` after auth resolution; capability cache is bypassed.
-        .route("/fwd/{key}/mcp/{slug}", post(mcp::mcp_fwd_handler))
+        // The gateway key in the path (any gateway key), so the request's own
+        // `Authorization` can be a client-filled upstream input. Same handler
+        // as `/mcp/{slug}` after auth resolution.
+        .route(
+            "/fwd/{key}/mcp/{slug}",
+            post(mcp::mcp_fwd_handler)
+                .get(mcp::mcp_fwd_get_handler)
+                .delete(mcp::mcp_fwd_delete_handler),
+        )
         .route_layer(deadline(core.request_body_deadline))
         .with_state(mcp_state);
 

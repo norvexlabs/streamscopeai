@@ -1,6 +1,6 @@
 <script lang="ts">
   // The destination lists one consumer attaches, each once, as allow or
-  // block. Shared by the Client access Sandbox tab and the Web settings tab;
+  // block. Shared by a Portal & clients profile's Sandbox tab and the Web settings tab;
   // the host owns saving (`onchange` hands it the whole new set).
   import SelectInput from '#lib/components/forms/SelectInput.svelte';
   import { attach, detach, unattached, type Attachment, type DestinationMode } from '#lib/destinationAttachments.js';

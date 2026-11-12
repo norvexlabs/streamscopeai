@@ -21,14 +21,15 @@ pub struct NotificationItem {
     /// `budget_breach` | `budget_approaching` | `session_major_alert` |
     /// `credential_expiring` | `guardrail_detection` | `upstream_unhealthy` |
     /// `upstream_recovered` | `appliance_upgrade_available` |
-    /// `agent_analysis_failing` | `edge_sync_rows_dropped`.
+    /// `agent_analysis_failing` | `edge_sync_rows_dropped` |
+    /// `mcp_upstream_unusable`.
     pub kind: String,
     /// 0 info, 1 warning, 2 critical.
     pub severity: i16,
     pub title: String,
     pub summary: String,
     /// `workspace` | `user` | `session` | `api_key` | `guardrail` |
-    /// `upstream_server` — drives the UI deep-link.
+    /// `upstream_server` | `mcp_upstream_server` — drives the UI deep-link.
     pub target_kind: Option<String>,
     pub target_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,

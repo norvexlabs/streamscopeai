@@ -30,9 +30,10 @@ pub mod session;
 pub mod spec_oauth;
 pub mod sse_seq;
 pub mod upstream;
+pub mod upstream_auth;
 pub mod upstream_listen;
 pub mod virtual_servers;
 pub mod virtualize;
 
 pub use handler::{McpAppState, McpRouterState, mcp_fwd_handler, mcp_handler};
-pub use handler::{mcp_delete_handler, mcp_get_handler};
+pub use handler::{mcp_delete_handler, mcp_fwd_delete_handler, mcp_fwd_get_handler, mcp_get_handler};

@@ -172,8 +172,8 @@ pub struct AdaptiveLive {
     /// What an automatic token-latency target holds this engine to:
     /// `AUTO_ITL_TARGET_RATIO` times `low_load_itl_ms` — the figure each
     /// replica applies is its own, and this one the slowest. `null` until
-    /// learned: an automatic target holds nothing until then. Reported
-    /// whatever the server's setting.
+    /// EVERY replica reporting the engine has learned its own: a replica still
+    /// learning holds nothing. Reported whatever the server's setting.
     pub auto_itl_target_ms: Option<f64>,
 }
 
@@ -560,6 +560,9 @@ fn refusal_counts(counts: HashMap<String, i64>) -> Vec<RefusalCount> {
 /// beat per replica ([`latest_load`]).
 pub(crate) fn summarize_live(rows: &[LoadRow]) -> (HashMap<Uuid, ServerLive>, HashMap<Uuid, EndpointLive>) {
     let mut endpoints: HashMap<Uuid, (EndpointLive, Option<DateTime<Utc>>)> = HashMap::new();
+    // Endpoints with a replica whose learned limit has no low-load figure yet:
+    // that replica applies no automatic target, so the engine has none to show.
+    let mut still_learning: HashSet<Uuid> = HashSet::new();
     for r in rows {
         let entry = endpoints.entry(r.endpoint_id).or_insert_with(|| {
             (
@@ -597,6 +600,9 @@ pub(crate) fn summarize_live(rows: &[LoadRow]) -> (HashMap<Uuid, ServerLive>, Ha
         };
         if let Some(state) = adaptive {
             let itl = r.adaptive_low_load_itl_us.map(|us| f64::from(us) / 1000.0);
+            if itl.is_none() {
+                still_learning.insert(r.endpoint_id);
+            }
             live.adaptive = Some(match live.adaptive.take() {
                 None => AdaptiveLive {
                     limit: r.adaptive_limit.map(i64::from),
@@ -634,10 +640,17 @@ pub(crate) fn summarize_live(rows: &[LoadRow]) -> (HashMap<Uuid, ServerLive>, Ha
         }
     }
 
-    // Each engine's automatic target, from its slowest replica's figure.
-    for (live, _) in endpoints.values_mut() {
+    // Each engine's automatic target, from its slowest replica's figure — once
+    // every replica reporting it has learned its own: each applies only its
+    // own, so one still learning holds nothing, and a target shown then would
+    // claim a hold part of the fleet does not apply.
+    for (endpoint_id, (live, _)) in endpoints.iter_mut() {
         if let Some(a) = live.adaptive.as_mut() {
-            a.auto_itl_target_ms = a.low_load_itl_ms.and_then(auto_itl_target);
+            a.auto_itl_target_ms = if still_learning.contains(endpoint_id) {
+                None
+            } else {
+                a.low_load_itl_ms.and_then(auto_itl_target)
+            };
         }
     }
     let server_of: HashMap<Uuid, Uuid> = rows.iter().map(|r| (r.endpoint_id, r.server_id)).collect();
@@ -1864,6 +1877,10 @@ mod tests {
             learned(1, 101, 10, Some(25_000)),
             // An engine still learning has no target.
             learned(1, 102, 10, None),
+            // Nor one any of whose replicas is still learning — slower than
+            // every other engine here, so the server's figure shows it left out.
+            learned(1, 103, 10, Some(30_000)),
+            learned(1, 103, 11, None),
             // A server whose engines taught nothing has none.
             learned(2, 200, 10, None),
         ]);
@@ -1871,7 +1888,13 @@ mod tests {
         assert_eq!(auto(100), Some(60.0), "3 × 20 ms, its own slowest replica");
         assert_eq!(auto(101), Some(76.2), "3 × 25.4 ms, to a tenth of a millisecond");
         assert_eq!(auto(102), None, "learning");
-        // The server's is its slowest engine's.
+        assert_eq!(auto(103), None, "one replica learned, the other still learning: no target");
+        assert_eq!(
+            endpoints[&Uuid::from_u128(103)].adaptive.as_ref().and_then(|a| a.low_load_itl_ms),
+            Some(30.0),
+            "the figure a replica learned is still shown"
+        );
+        // The server's is its slowest engine's that has one: not 103's 90 ms.
         assert_eq!(servers[&Uuid::from_u128(1)].auto_itl_target_ms, Some(76.2));
         assert_eq!(servers[&Uuid::from_u128(2)].auto_itl_target_ms, None);
     }

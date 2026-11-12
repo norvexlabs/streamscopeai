@@ -28,11 +28,11 @@
 //! ## Safety
 //!
 //! Cached responses are stored as raw `JsonRpcResponse` values *without* any
-//! per-user filtering. This is correct for `auth_mode = NoAuth` and
-//! `auth_mode = ServiceAccount` because every agent sees the same upstream.
-//! Per-user OAuth (`auth_mode = PerUserOauth`) MUST NOT cache —
-//! callers are expected to bypass the cache for those upstreams. The
-//! [`is_cacheable`] helper enforces this at the edge.
+//! per-user filtering. This is correct only for an upstream every caller
+//! reaches with the same headers: `auth_mode = headers` with every declared
+//! input admin-filled. A user- or client-filled input, or a per-user OAuth
+//! token, makes the catalog per-caller, and such an upstream MUST NOT cache.
+//! The [`is_cacheable`] helper enforces this at the edge.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -170,16 +170,16 @@ impl CapabilityCache {
     }
 }
 
-/// Cacheability gate: NoAuth and ServiceAccount upstreams share one identity
-/// across all agents — safe to cache. PerUserOauth and Byot are per-user;
-/// caching would leak one user's catalog to another. Disabled upstreams
+/// Cacheability gate: an upstream every caller reaches with the same headers
+/// — `headers` mode, every declared input admin-filled (none declared
+/// included) — shares one identity across all agents and is safe to cache.
+/// A user- or client-filled input or a per-user OAuth token is per-caller;
+/// caching would leak one caller's catalog to another. Disabled upstreams
 /// shouldn't be reached at all but we double-gate here.
 pub fn is_cacheable(upstream: &McpUpstreamServer) -> bool {
     upstream.enabled
-        && matches!(
-            upstream.auth_mode,
-            McpAuthMode::NoAuth | McpAuthMode::ServiceAccount
-        )
+        && upstream.auth_mode == McpAuthMode::Headers
+        && super::upstream_auth::every_input_is_admin(upstream)
 }
 
 /// Cacheability gate by method — only idempotent *list* methods are
@@ -205,28 +205,22 @@ mod tests {
     use super::*;
     use crate::mcp::jsonrpc::{JsonRpcResponse, RpcId};
 
-    fn upstream(auth: McpAuthMode, enabled: bool) -> McpUpstreamServer {
-        McpUpstreamServer {
-            id: Uuid::new_v4(),
-            tenant_id: Uuid::new_v4(),
-            name: "u".into(),
-            description: None,
-            upstream_url: "http://up".into(),
-            transport: streamscope_core::config::mcp::McpTransport::StreamableHttp,
-            auth_mode: auth,
-            cred_version: 1,
-            encrypted_credential: None,
-            oauth_issuer_url: None,
-            oauth_authorization_url: None,
-            oauth_token_url: None,
-            oauth_revocation_url: None,
-            oauth_client_id: None,
-            encrypted_oauth_client_secret: None,
-            oauth_default_scopes: vec![],
-            enabled,
-            connect_timeout_ms: 10_000,
-            request_timeout_ms: 60_000,
-        }
+    fn upstream(auth: McpAuthMode, fillers: &[&str], enabled: bool) -> McpUpstreamServer {
+        let headers: Vec<serde_json::Value> = (0..fillers.len())
+            .map(|i| serde_json::json!({ "name": format!("X-In-{i}"), "isRequired": true }))
+            .collect();
+        let filler_map: serde_json::Map<String, serde_json::Value> = fillers
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (format!("X-In-{i}"), serde_json::json!(f)))
+            .collect();
+        let mut u = crate::mcp::upstream_auth::test_support::upstream(
+            auth,
+            serde_json::Value::Array(headers),
+            serde_json::Value::Object(filler_map),
+        );
+        u.enabled = enabled;
+        u
     }
 
     fn key(upstream_id: Uuid, cred_version: i64, method: &str) -> CacheKey {
@@ -340,13 +334,22 @@ mod tests {
         assert!(cache.get(&k).is_none());
     }
 
+    /// Cacheable only when every caller sends the same headers: `headers`
+    /// mode with every input admin-filled (none at all included). One user-
+    /// or client-filled input, or a per-user OAuth token, makes it per-caller.
     #[test]
-    fn cacheability_gate_by_auth_mode() {
-        assert!(is_cacheable(&upstream(McpAuthMode::NoAuth, true)));
-        assert!(is_cacheable(&upstream(McpAuthMode::ServiceAccount, true)));
-        assert!(!is_cacheable(&upstream(McpAuthMode::PerUserOauth, true)));
-        assert!(!is_cacheable(&upstream(McpAuthMode::Byot, true)));
-        assert!(!is_cacheable(&upstream(McpAuthMode::NoAuth, false)));
+    fn cacheability_gate_by_who_fills_the_inputs() {
+        assert!(is_cacheable(&upstream(McpAuthMode::Headers, &[], true)));
+        assert!(is_cacheable(&upstream(McpAuthMode::Headers, &["admin", "admin"], true)));
+        assert!(!is_cacheable(&upstream(McpAuthMode::Headers, &["admin", "user"], true)));
+        assert!(!is_cacheable(&upstream(McpAuthMode::Headers, &["admin", "client"], true)));
+        assert!(!is_cacheable(&upstream(McpAuthMode::PerUserOauth, &[], true)));
+        assert!(!is_cacheable(&upstream(McpAuthMode::PerUserOauth, &["admin"], true)));
+        assert!(!is_cacheable(&upstream(McpAuthMode::Headers, &[], false)));
+        // An input with no filler is an invalid declaration: never cached.
+        let mut no_filler = upstream(McpAuthMode::Headers, &["admin"], true);
+        no_filler.remote.meta = None;
+        assert!(!is_cacheable(&no_filler));
     }
 
     #[test]

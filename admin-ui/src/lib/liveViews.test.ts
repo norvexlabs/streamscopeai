@@ -35,7 +35,7 @@ describe('isLiveView', () => {
 			'/portal/t/[slug]/home',
 			'/portal/t/[slug]/sessions',
 			'/portal/t/[slug]/audit',
-			'/portal/t/[slug]/usage',
+			'/portal/t/[slug]/keys',
 		]) {
 			expect(isLiveView(id), id).toBe(false);
 		}

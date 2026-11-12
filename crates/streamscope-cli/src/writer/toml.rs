@@ -6,16 +6,20 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
+use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, TableLike};
 
-use super::{is_keyed_record, keyed_jobs, merge_entries, unescape_token, KeyedEntry, MergeOutcome};
-use crate::state::{sha256_hex, OwnedLeaf};
+use super::{
+    is_keyed_record, is_what_we_wrote, keyed_jobs, merge_entries, unescape_token, withdraw_from, KeyedEntry,
+    MergeOutcome,
+};
+use crate::state::{sha256_hex, EntryRoot, OwnedLeaf};
 
 pub fn merge(
     existing: Option<&str>,
     rendered: &str,
     prev_owned: &[OwnedLeaf],
     keyed_arrays: &BTreeMap<String, String>,
+    withdraw: &[EntryRoot],
 ) -> Result<MergeOutcome> {
     let mut rendered_doc: DocumentMut = rendered
         .parse()
@@ -26,6 +30,9 @@ pub fn merge(
         )?,
         _ => DocumentMut::new(),
     };
+    let (prev_owned, withdrawn) =
+        withdraw_from(streamscope_client_templates::TemplateFormat::Toml, &mut doc, prev_owned, withdraw, remove_root);
+    let prev_owned = prev_owned.as_slice();
 
     // A keyed array of tables leaves the render before the leaf merge: its
     // entries are merged one by one below. Declared as a JSON pointer, it is
@@ -53,7 +60,7 @@ pub fn merge(
     let mut owned: Vec<OwnedLeaf> = Vec::new();
     collect_leaves("", rendered_doc.as_table(), &mut owned);
 
-    merge_table(doc.as_table_mut(), rendered_doc.as_table());
+    merge_table(doc.as_table_mut(), rendered_doc.as_table(), "", prev_owned, false);
 
     let mut kept_edited = Vec::new();
     for prev in prev_owned {
@@ -135,7 +142,46 @@ pub fn merge(
         contents: doc.to_string(),
         owned,
         kept_edited,
+        withdrawn,
     })
+}
+
+/// Take the entry at `root` out of `doc`; `false` when nothing stood there.
+/// An array of tables emptied by it goes too, as one emptied by a re-render
+/// does.
+fn remove_root(doc: &mut DocumentMut, root: &EntryRoot) -> bool {
+    let segments: Vec<&str> = root.path.split('.').collect();
+    let Some(entry) = &root.entry else {
+        if lookup(doc.as_table(), &segments).is_none() {
+            return false;
+        }
+        remove_path(doc.as_table_mut(), &segments);
+        return true;
+    };
+    let Some(Ok(tables)) = lookup(doc.as_table(), &segments).map(tables_of) else { return false };
+    let Some(i) = tables.iter().position(|t| t.identity(&entry.key).as_deref() == Some(entry.id.as_str())) else {
+        return false;
+    };
+    if tables.len() == 1 {
+        remove_path(doc.as_table_mut(), &segments);
+        return true;
+    }
+    match lookup_mut(doc.as_table_mut(), &segments) {
+        Some(Item::ArrayOfTables(array)) => {
+            array.remove(i);
+        }
+        Some(Item::Value(toml_edit::Value::Array(array))) => {
+            array.remove(i);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Whether something stands at `root` in the file `existing`.
+pub(super) fn holds(existing: &str, root: &EntryRoot) -> Result<bool> {
+    let mut doc: DocumentMut = existing.parse().context("the existing config file is not valid TOML")?;
+    Ok(remove_root(&mut doc, root))
 }
 
 impl KeyedEntry for Table {
@@ -149,17 +195,27 @@ impl KeyedEntry for Table {
         })
     }
 
+    /// A table printed as an item shows its own keys only, so one holding
+    /// tables is hashed with them: an edit inside `[servers.env]` is an edit
+    /// of the entry.
     fn entry_hash(&self) -> String {
-        item_hash(&Item::Table(self.clone()))
+        if !self.iter().any(|(_, item)| item.is_table() || item.is_array_of_tables()) {
+            return item_hash(&Item::Table(self.clone()));
+        }
+        let mut text = String::new();
+        nested_text(self, &mut text);
+        sha256_hex(text.as_bytes())
     }
 
     /// Keeps the live table's place in the document and the comment above its
     /// header; the body is the render's.
-    fn replace_with(&mut self, rendered: &Self) {
+    fn replace_with(&mut self, rendered: &Self, keep_filled: bool) {
         let position = self.position();
         let decor = self.decor().clone();
         let live = std::mem::replace(self, rendered.clone());
-        keep_filled_sentinels(self, &live);
+        if keep_filled {
+            keep_filled_sentinels(self, &live);
+        }
         if let Some(position) = position {
             self.set_position(Some(position));
         }
@@ -167,16 +223,53 @@ impl KeyedEntry for Table {
     }
 }
 
+/// `table` as text, the tables inside it included, each value printed
+/// decor-stripped as [`item_hash`] reads it.
+fn nested_text(table: &Table, out: &mut String) {
+    for (key, item) in table.iter() {
+        out.push_str(key);
+        match item {
+            Item::Table(child) => {
+                out.push('{');
+                nested_text(child, out);
+                out.push('}');
+            }
+            Item::ArrayOfTables(array) => {
+                out.push('[');
+                for child in array.iter() {
+                    out.push('{');
+                    nested_text(child, out);
+                    out.push('}');
+                }
+                out.push(']');
+            }
+            value => {
+                out.push('=');
+                out.push_str(value.to_string().trim());
+                out.push('\n');
+            }
+        }
+    }
+}
+
 /// Put back, under `new`, every value the user filled in over a paste sentinel
-/// that `new` still carries — the leaf rule of [`merge_table`].
-fn keep_filled_sentinels(new: &mut Table, live: &Table) {
+/// that `new` still carries — the leaf rule of [`merge_table`], through
+/// sub-tables and inline tables alike: the user may hold as `env = { … }`
+/// what the render writes as a table of its own.
+fn keep_filled_sentinels(new: &mut dyn TableLike, live: &dyn TableLike) {
     for (key, item) in new.iter_mut() {
         let Some(live_item) = live.get(key.get()) else { continue };
         if item.as_str().is_some_and(super::is_paste_sentinel) {
-            if live_item.as_str() != item.as_str() {
-                *item = live_item.clone();
+            if live_item.as_str() != item.as_str()
+                && let Some(theirs) = live_item.as_value()
+            {
+                // The value alone: the spacing around it belongs to the form
+                // it was written in.
+                let mut theirs = theirs.clone();
+                theirs.decor_mut().clear();
+                *item = Item::Value(theirs);
             }
-        } else if let (Item::Table(new_child), Item::Table(live_child)) = (item, live_item) {
+        } else if let (Some(new_child), Some(live_child)) = (item.as_table_like_mut(), live_item.as_table_like()) {
             keep_filled_sentinels(new_child, live_child);
         }
     }
@@ -259,47 +352,96 @@ fn collect_leaves(prefix: &str, table: &Table, out: &mut Vec<OwnedLeaf>) {
     }
 }
 
-fn merge_table(dst: &mut Table, src: &Table) {
+/// `prefix` is the dotted path of `dst`, the grammar `prev_owned` records in.
+///
+/// A sub-table and an inline table hold the same data, and which one a file
+/// uses is its author's choice: where the render and the file disagree on the
+/// form (`[x.env]` against `env = { … }`, either way round) the two merge
+/// leaf by leaf, into the form the file has. Only an inline table rendered
+/// over an inline table is one value, replaced whole.
+///
+/// `inline`: `dst` is an inline table, or sits inside one. Everything
+/// written under it is then a value — a rendered table goes in as an inline
+/// table — because a `[table]` inside an inline table has no spelling and is
+/// not printed.
+fn merge_table(dst: &mut dyn TableLike, src: &dyn TableLike, prefix: &str, prev_owned: &[OwnedLeaf], inline: bool) {
     for (key, item) in src.iter() {
-        match (dst.get_mut(key), item) {
-            (Some(Item::Table(d)), Item::Table(s)) => merge_table(d, s),
+        let path = if prefix.is_empty() { key.to_string() } else { format!("{prefix}.{key}") };
+        let live = dst.get(key);
+        let leaf_by_leaf = (item.is_table() && live.is_some_and(Item::is_table_like))
+            || (item.is_inline_table() && live.is_some_and(Item::is_table));
+        if leaf_by_leaf {
+            let inline = inline || live.is_some_and(Item::is_inline_table);
+            if let (Some(d), Some(s)) = (dst.get_mut(key).and_then(Item::as_table_like_mut), item.as_table_like()) {
+                merge_table(d, s, &path, prev_owned, inline);
+            }
+            continue;
+        }
+        match dst.get_mut(key) {
             // A paste-me sentinel never overwrites a value the user already
-            // filled in (BYOK upstream keys).
-            (Some(existing), leaf)
-                if leaf.as_str().is_some_and(super::is_paste_sentinel)
-                    && existing.as_str() != leaf.as_str() => {}
+            // filled in (BYOK upstream keys): it replaces only the value the
+            // last run wrote there.
+            Some(existing)
+                if item.as_str().is_some_and(super::is_paste_sentinel)
+                    && existing.as_str() != item.as_str()
+                    && !is_what_we_wrote(prev_owned, &path, &item_hash(existing)) => {}
             // In-place assignment keeps the existing key's decor (the user's
             // comment above the line); `insert` would drop it.
-            (Some(existing), _) => *existing = item.clone(),
-            (None, _) => {
-                dst.insert(key, item.clone());
+            Some(existing) => *existing = held_by(item, inline),
+            None => {
+                dst.insert(key, held_by(item, inline));
             }
         }
     }
 }
 
-fn lookup<'a>(table: &'a Table, segments: &[&str]) -> Option<&'a Item> {
+/// `item` in the form its parent can hold: as it is under a table, as a value
+/// (a table as an inline table, an array of tables as an array of them) under
+/// an inline one.
+fn held_by(item: &Item, inline_parent: bool) -> Item {
+    if !inline_parent {
+        return item.clone();
+    }
+    match item.clone().into_value() {
+        Ok(mut value) => {
+            // The spacing of a `[table]` header is not a value's.
+            value.decor_mut().clear();
+            Item::Value(value)
+        }
+        Err(original) => original,
+    }
+}
+
+fn lookup_mut<'a>(table: &'a mut dyn TableLike, segments: &[&str]) -> Option<&'a mut Item> {
+    let (head, rest) = segments.split_first()?;
+    let item = table.get_mut(head)?;
+    if rest.is_empty() {
+        Some(item)
+    } else {
+        lookup_mut(item.as_table_like_mut()?, rest)
+    }
+}
+
+/// The item at `segments`, through sub-tables and inline tables alike.
+fn lookup<'a>(table: &'a dyn TableLike, segments: &[&str]) -> Option<&'a Item> {
     let (head, rest) = segments.split_first()?;
     let item = table.get(head)?;
     if rest.is_empty() {
         Some(item)
     } else {
-        match item {
-            Item::Table(t) => lookup(t, rest),
-            _ => None,
-        }
+        lookup(item.as_table_like()?, rest)
     }
 }
 
 /// Remove the leaf, pruning ancestor tables emptied by the removal. Returns
 /// `true` when the table became empty.
-fn remove_path(table: &mut Table, segments: &[&str]) -> bool {
+fn remove_path(table: &mut dyn TableLike, segments: &[&str]) -> bool {
     let Some((head, rest)) = segments.split_first() else {
         return false;
     };
     if rest.is_empty() {
         table.remove(head);
-    } else if let Some(Item::Table(child)) = table.get_mut(head)
+    } else if let Some(child) = table.get_mut(head).and_then(Item::as_table_like_mut)
         && remove_path(child, rest)
     {
         table.remove(head);

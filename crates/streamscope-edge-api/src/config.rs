@@ -25,6 +25,8 @@ pub struct ConfigResponse {
     pub mcp_virtual_routes: Vec<EdgeMcpVirtualRoute>,
     /// Per-user OAuth credentials, encrypted at rest.
     pub mcp_user_credentials: Vec<EdgeMcpUserCredential>,
+    /// Users' filled header inputs (`mcp_user_inputs`), encrypted at rest.
+    pub mcp_user_inputs: Vec<EdgeMcpUserInputs>,
     /// Revoked spec-OAuth JWT `jti`s. Set by the proxy on every
     /// inbound JWT bearer; tokens whose `jti` is here are rejected.
     pub mcp_revoked_jtis: Vec<uuid::Uuid>,
@@ -127,11 +129,16 @@ pub struct EdgeMcpUpstreamServer {
     pub transport: String,
     pub auth_mode: String,
     pub cred_version: i64,
-    /// AES-256-GCM ciphertext (base64 string).
+    /// AES-256-GCM ciphertext (base64 string) of the built-in web upstream's
+    /// search key; `None` on every other upstream.
     /// The DB column is BYTEA; admin stores the base64 ciphertext as UTF-8 bytes.
     /// Read back here as `String` for the tenant body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_credential: Option<String>,
+    /// The adopted `server.json` remote (JSONB), fillers in its `_meta`.
+    pub remote: serde_json::Value,
+    /// Admin input id → AES-256-GCM ciphertext (base64), a JSONB object.
+    pub encrypted_admin_inputs: serde_json::Value,
     // ── Per-user OAuth client config ──
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_issuer_url: Option<String>,
@@ -199,6 +206,17 @@ pub struct EdgeMcpUserCredential {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+}
+
+/// One user's filled header inputs for one upstream (`mcp_user_inputs`).
+#[derive(Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "sqlx", derive(sqlx::FromRow))]
+pub struct EdgeMcpUserInputs {
+    pub tenant_id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub upstream_server_id: uuid::Uuid,
+    /// Input id → AES-256-GCM ciphertext (base64), a JSONB object.
+    pub encrypted_values: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -429,6 +447,9 @@ impl ConfigResponse {
         self.mcp_user_credentials.sort_by(|a, b| {
             (a.user_id, a.upstream_server_id).cmp(&(b.user_id, b.upstream_server_id))
         });
+        self.mcp_user_inputs.sort_by(|a, b| {
+            (a.user_id, a.upstream_server_id).cmp(&(b.user_id, b.upstream_server_id))
+        });
         self.mcp_revoked_jtis.sort();
         self.mcp_revoked_jtis.dedup();
         self.mcp_jwks.sort_by(|a, b| a.kid.cmp(&b.kid));
@@ -511,6 +532,7 @@ mod tests {
             "mcp_upstream_servers": [],
             "mcp_virtual_servers": [],
             "mcp_user_credentials": [],
+            "mcp_user_inputs": [],
             "a2a_agents": [],
             "workspace_rate_limits": {},
             "workspaces_outside_tenant_budget": [],

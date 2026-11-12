@@ -698,6 +698,40 @@ pub struct ManagedFile {
     pub file_hash: String,
 }
 
+/// Where one config entry stands in a file, in the writer's own path grammar
+/// for that file's format: the subtree at `path`, or — with `entry` — the one
+/// entry of the keyed array at `path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryRoot {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<OwnedEntry>,
+}
+
+/// The entry a local MCP server was written as in one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalMcpEntry {
+    /// The file, as its [`ManagedFile`] names it.
+    pub file: String,
+    #[serde(flatten)]
+    pub root: EntryRoot,
+    /// Whether nothing stood at `root` when the server was first written
+    /// there: the entry is then ours whole, and goes whole — with whatever
+    /// the developer pasted into it — when the server is withdrawn. An entry
+    /// the file already held is the developer's: only the leaves we wrote and
+    /// they left unchanged ever leave it.
+    pub created: bool,
+}
+
+/// A local MCP server selected for a client, and the entries it was written
+/// as (none where the client's config does not carry it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedLocalMcp {
+    pub id: uuid::Uuid,
+    pub slug: String,
+    pub entries: Vec<LocalMcpEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedClient {
     pub client_id: String,
@@ -718,6 +752,16 @@ pub struct ManagedClient {
     /// template index: a run naming other clients chooses for those and leaves
     /// this one's alone.
     pub mcp_server_ids: Vec<uuid::Uuid>,
+    /// The local MCP servers (started by this machine) selected for THIS
+    /// client, as a set — `sync` re-requests the ones the workspace is still
+    /// handed, and names by its slug one it no longer is.
+    pub mcp_local_servers: Vec<ManagedLocalMcp>,
+    /// The whole launch each local MCP server was last written with, by slug
+    /// (the administrator's environment values, the command, its arguments):
+    /// what `sync` compares the gateway's answer to, so a launch an
+    /// administrator changed is printed when it is applied. Empty for a client
+    /// whose config carries none.
+    pub mcp_local_commands: BTreeMap<String, String>,
     pub files: Vec<ManagedFile>,
     pub last_provisioned: chrono::DateTime<chrono::Utc>,
     /// The command that launches this client (e.g. `claude`) — persisted so
@@ -1540,6 +1584,8 @@ mod manifest_tests {
         // and `provision` moves nothing.
         let mut fixed = client;
         fixed["mcp_server_ids"] = serde_json::json!([]);
+        fixed["mcp_local_servers"] = serde_json::json!([]);
+        fixed["mcp_local_commands"] = serde_json::json!({});
         std::fs::write(&path, ws(fixed).to_string()).unwrap();
         let manifest = Manifest::load(&paths_in(&dir)).unwrap();
         assert_eq!(manifest.hosts["https://gw#acme"].clients[0].client_id, "cursor");

@@ -73,10 +73,11 @@ pub enum ProfileKind {
     /// Which agent experts analyze a workspace's conversations
     /// (`expert_profile_members`). Admin-side only — no proxy hot-path resolution.
     Expert,
-    /// Which client profiles a workspace is offered and what its developers'
-    /// sandboxes may reach (`client_access_members`,
-    /// `client_access_destinations`, `client_access_sandbox`). Admin-side
-    /// only, and never in a config body ([`Self::on_edge`]).
+    /// Which client profiles a workspace is offered, what its developers'
+    /// sandboxes may reach, and what the portal hides from its members — four
+    /// sections (`client_access_members`, `client_access_destinations`,
+    /// `client_access_sandbox`, `client_access_portal`). Admin-side only, and
+    /// never in a config body ([`Self::on_edge`]).
     ClientAccess,
 }
 

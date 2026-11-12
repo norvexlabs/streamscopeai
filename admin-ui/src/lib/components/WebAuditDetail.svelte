@@ -13,6 +13,7 @@
   import { auditHref } from '#lib/deeplinks.js';
   import { m } from '#lib/paraglide/messages.js';
   import { portalWorkspace } from '#lib/selfScoped.js';
+  import { pageHidden } from '#lib/portalPages.svelte.js';
 
   type WebAuditLogEntry = components['schemas']['WebAuditLogEntry'];
 
@@ -62,14 +63,18 @@
       <DetailField label={m.browse_detail_orchestrator()} colSpan={2} flex>
         <!-- A full load: from the audit page itself the link is a fresh deep
              link (the page reads its filters and focus once, on load). -->
-        <a
-          class="text-(--accent) hover:text-(--accent-hover) font-mono text-[11px]"
-          data-sveltekit-reload
-          href={scopeHref(page.params.slug ?? '', page.url.pathname, auditHref({ kind: 'llm', request_id: row.parent_request_id, workspace_id: viewedWorkspace() }))}
-          title={m.browse_detail_orchestrator_title()}
-        >
-          {row.parent_request_id.slice(-8)}
-        </a>
+        {#if pageHidden('requests', page.data)}
+          <span class="font-mono text-[11px] text-(--text-primary)">{row.parent_request_id.slice(-8)}</span>
+        {:else}
+          <a
+            class="text-(--accent) hover:text-(--accent-hover) font-mono text-[11px]"
+            data-sveltekit-reload
+            href={scopeHref(page.params.slug ?? '', page.url.pathname, auditHref({ kind: 'llm', request_id: row.parent_request_id, workspace_id: viewedWorkspace() }))}
+            title={m.browse_detail_orchestrator_title()}
+          >
+            {row.parent_request_id.slice(-8)}
+          </a>
+        {/if}
         <CopyButton text={row.parent_request_id} />
       </DetailField>
     {/if}

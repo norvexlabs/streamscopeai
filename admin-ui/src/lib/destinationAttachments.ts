@@ -8,6 +8,20 @@ import type { components } from '#lib/generated/api-types.js';
 export type DestinationMode = components['schemas']['DestinationMode'];
 export type Attachment = components['schemas']['DestinationAttachment'];
 
+export type ListUse = components['schemas']['DestinationListUse'];
+
+/**
+ * One place a list is attached, as its chip reads: the Web tool, or the sandbox
+ * of a Portal & clients profile — named, so a list several profiles attach
+ * shows which ones. A profile not in `profileNames` (not read yet) is left
+ * unnamed rather than shown by its id.
+ */
+export function useLabel(use: ListUse, profileNames: ReadonlyMap<string, string>): string {
+  if (use.consumer === 'web') return `Web ${use.mode}`;
+  const profile = use.profile_id ? profileNames.get(use.profile_id) : undefined;
+  return profile ? `Sandbox ${use.mode} · ${profile}` : `Sandbox ${use.mode}`;
+}
+
 /** Attach `listId` in `mode`; a list already attached takes the new mode. */
 export function attach(current: readonly Attachment[], listId: string, mode: DestinationMode): Attachment[] {
   const others = current.filter((a) => a.list_id !== listId);

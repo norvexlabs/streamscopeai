@@ -50,12 +50,14 @@ pub fn merge(
     };
 
     // Update in place / append. A paste-me sentinel never overwrites a value
-    // the user already filled in.
+    // the user already filled in: it replaces only the value the last run
+    // wrote for that variable.
     for (k, v) in &pairs {
         match lines.iter_mut().find(|l| key_of(l).as_deref() == Some(k)) {
             Some(line) => {
                 let current = value_of(line).unwrap_or_default();
-                if !(super::is_paste_sentinel(v) && current != *v) {
+                let theirs = current != *v && !super::is_what_we_wrote(prev_owned, k, &sha256_hex(current.as_bytes()));
+                if !(super::is_paste_sentinel(v) && theirs) {
                     *line = format!("{k}={v}");
                 }
             }
@@ -91,5 +93,6 @@ pub fn merge(
         contents,
         owned,
         kept_edited,
+        withdrawn: Vec::new(),
     })
 }

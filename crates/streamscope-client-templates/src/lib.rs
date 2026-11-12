@@ -17,10 +17,10 @@ pub mod types;
 
 pub use companions::{companion_files, CompanionFile};
 pub use render::{
-    render, upstream_mcp_bearer_placeholder, RenderError, Value, API_KEY_PLACEHOLDER, PROJECT_SCOPE,
+    local_command_line, mcp_client_header_placeholder, mcp_header_item, mcp_local_server_item, render, RenderError, Value, API_KEY_PLACEHOLDER, PROJECT_SCOPE, YAML_STRING_HELPER,
     UPSTREAM_API_KEY_PLACEHOLDER,
 };
 pub use types::{
     default_llm_template_index, composite_identity, keyed_entry_identity, scalar_identity, string_entry_identity, ClientProfile, ClientProfileTemplate, CompanionTemplate, companion_project_path,
-    KeyDelivery, McpAuthMode, TemplateFormat, TemplateKind, STRING_ENTRIES,
+    KeyDelivery, LocalMcpForm, McpAuthMode, TemplateFormat, TemplateKind, STRING_ENTRIES,
 };

@@ -1262,7 +1262,10 @@ async fn proxy_handler_inner(
 
     // 7a. Resolve upstream targets for LB/failover (primary + fallbacks),
     //     session-pinned via `affinity` (only multi-target aliases are affected).
-    let mut all_targets = match routing::resolve_all_upstreams(&api_request, &ctx.user, &ctx.config.credentials, &state.lb_counters, affinity, client_api_version, headers.get("x-origin-host").and_then(|v| v.to_str().ok()), &ctx.config.endpoints) {
+    let resolved = routing::origin_host(&headers, &ctx.user).and_then(|origin_host| {
+        routing::resolve_all_upstreams(&api_request, &ctx.user, &ctx.config.credentials, &state.lb_counters, affinity, client_api_version, origin_host, &ctx.config.endpoints)
+    });
+    let mut all_targets = match resolved {
         Ok(t) => t,
         Err(e) => {
             let e = e.for_model(err_ctx.model_requested);
@@ -2665,7 +2668,7 @@ pub async fn models_handler(
         ApiVersion::AnthropicMessages => &[ApiVersion::AnthropicMessages],
         _ => &[ApiVersion::ChatCompletions, ApiVersion::Responses],
     };
-    let entries = resolved_entries(&ctx.user, callers, &headers);
+    let entries = resolved_entries(&ctx.user, callers, &headers)?;
 
     if grammar == ApiVersion::AnthropicMessages {
         let response = serde_json::json!({
@@ -2708,7 +2711,7 @@ pub async fn gemini_models_handler(
     let bearer = auth::extract_api_token_with_query(&headers, req.uri().query())?;
     let ctx = auth::authenticate(&bearer, &state.tenant_registry.load())?;
 
-    let entries = resolved_entries(&ctx.user, &[ApiVersion::GoogleGemini], &headers);
+    let entries = resolved_entries(&ctx.user, &[ApiVersion::GoogleGemini], &headers)?;
 
     // `nextPageToken` is omitted, not empty: Gemini's own contract is that its
     // absence ends the listing, and the whole catalog is served in one page.
@@ -2747,7 +2750,7 @@ pub async fn gemini_model_get_handler(
     // Resolve against the caller's OWN map, so this is not an existence oracle
     // for aliases the key cannot reach — an alias another workspace can use is
     // absent here exactly as an alias nobody has is.
-    let entry = resolved_entries(&ctx.user, &[ApiVersion::GoogleGemini], &headers)
+    let entry = resolved_entries(&ctx.user, &[ApiVersion::GoogleGemini], &headers)?
         .into_iter()
         .find(|e| e.alias == alias)
         .ok_or_else(|| AppError::ModelNotFound(alias.to_string()))?;
@@ -2890,8 +2893,8 @@ fn resolved_entries(
     user: &auth::UserContext,
     callers: &[ApiVersion],
     headers: &axum::http::HeaderMap,
-) -> Vec<ResolvedModelEntry> {
-    let origin_host = headers.get("x-origin-host").and_then(|v| v.to_str().ok());
+) -> Result<Vec<ResolvedModelEntry>, AppError> {
+    let origin_host = routing::origin_host(headers, user)?;
     let scopes: Vec<_> = callers.iter().map(|p| routing::CredentialScope::of(user, Some(*p), origin_host)).collect();
     let mut entries: Vec<ResolvedModelEntry> = user
         .model_map
@@ -2904,7 +2907,7 @@ fn resolved_entries(
         })
         .collect();
     entries.sort_by(|a, b| a.alias.cmp(&b.alias));
-    entries
+    Ok(entries)
 }
 
 impl ResolvedModelEntry {

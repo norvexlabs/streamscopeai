@@ -317,7 +317,217 @@ pub(crate) async fn conversation_session(
     .await
 }
 
-/// Core session list logic — callable from both HTTP handler and agent code.
+/// A list row's columns: the summary's, and those [`MODEL_REQUESTED_JOIN`] and
+/// [`WORKSPACE_JOIN`] supply. List rows don't anchor a child card; the anchor is
+/// read with the linked-children query on the parent's session page. The linked
+/// sessions a row names are confined by the view, bound ahead of the read's own
+/// filters.
+fn session_cols(linked: LinkedView) -> String {
+    format!(
+        "{summary}, \
+         mr.model_requested, {child_count} AS child_count, \
+         ws.name AS workspace_name, mr.provider AS provider, \
+         ak.name AS key_name, ak.key_prefix, \
+         NULL::text AS linkage_spawn_tool_call_id",
+        summary = summary_columns(),
+        child_count = linked.child_count(),
+    )
+}
+
+/// Lateral subquery to get model_requested + provider from the most recent
+/// llm_audit entry via conversation_turns (LLM-only cols → no need to JOIN
+/// gateway_audit on this hot path).
+const MODEL_REQUESTED_JOIN: &str = "LEFT JOIN LATERAL ( \
+     SELECT a.model_requested, a.provider FROM conversation_turns ct2 \
+     JOIN llm_audit a ON a.request_id = ct2.request_id AND a.timestamp = ct2.timestamp \
+     WHERE ct2.session_id = s.session_id \
+     ORDER BY ct2.timestamp DESC LIMIT 1 \
+ ) mr ON true";
+
+/// `ak` supplies the issuing key's name/prefix, which only a key-authenticated
+/// session has. The workspace badge comes from the session's own column, so it
+/// still resolves for a session whose `key_id` is a spec-OAuth token's jti.
+const WORKSPACE_JOIN: &str = "LEFT JOIN api_keys ak ON ak.id = s.key_id \
+     LEFT JOIN workspaces ws ON ws.id = s.workspace_id";
+
+/// Where a session stands in the order its turns landed: the id of the ingest
+/// transaction that last added a turn to it (`sessions.landed_xid`), then the
+/// session id. A session landed later stands after every position a scan has
+/// passed, whatever time a gateway stamped on its turns.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) struct LandedKey {
+    pub xid: i64,
+    pub session_id: Uuid,
+}
+
+impl LandedKey {
+    /// A position as its two columns store it: set only when both are.
+    pub(crate) fn from_columns(xid: Option<i64>, session_id: Option<Uuid>) -> Option<Self> {
+        Some(Self { xid: xid?, session_id: session_id? })
+    }
+
+    /// Before every session landed by transaction `xid` or a later one, after
+    /// every session landed by an earlier one.
+    pub(crate) fn before(xid: i64) -> Self {
+        Self { xid, session_id: Uuid::nil() }
+    }
+}
+
+/// `<xid>.<session id>`: the one spelling of a position, in a log line, a
+/// notification key or an audit row.
+impl std::fmt::Display for LandedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.xid, self.session_id)
+    }
+}
+
+/// One page of [`list_sessions_landed`].
+pub(crate) struct LandedPage {
+    /// The page, in landing order, each session with its key.
+    pub rows: Vec<(SessionSummary, LandedKey)>,
+    /// The scan listed `limit` keys: more may follow the last one. (A session
+    /// deleted between the scan's two reads is not in `rows`.)
+    pub full: bool,
+    /// Every transaction with a smaller id had ended when the page was read, so
+    /// no session lands before `LandedKey::before(bound)` after it.
+    pub bound: i64,
+}
+
+/// The oldest transaction id still running on the server. Every turn landed by
+/// a smaller one is committed (or rolled back); every stamp still to commit is
+/// at least this. Within one database cluster it never moves back, so a stored
+/// position past it was taken in another cluster (a backup restored into a new
+/// one, whose ids start over).
+pub(crate) async fn landing_bound(conn: &mut Scoped) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
+        .fetch_one(&mut *conn)
+        .await?)
+}
+
+/// The position from which every session active after `active_after` (and up
+/// to `active_until`, when given) is read: before each such session's stamp, and
+/// before every transaction still running. Sessions active at or before it may
+/// stand after it too; a reader that must skip them filters on their activity.
+pub(crate) async fn landing_start(
+    conn: &mut Scoped,
+    active_after: chrono::DateTime<chrono::Utc>,
+    active_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> anyhow::Result<LandedKey> {
+    let bound = landing_bound(conn).await?;
+    let first: Option<i64> = sqlx::query_scalar(
+        "SELECT MIN(landed_xid) FROM sessions \
+         WHERE updated_at > $1 AND ($2::timestamptz IS NULL OR updated_at <= $2)",
+    )
+    .bind(active_after)
+    .bind(active_until)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(LandedKey::before(first.map_or(bound, |f| f.min(bound))))
+}
+
+/// Clear every stamp at or past the next transaction id: no transaction of this
+/// cluster has written one, so the cluster restored them from another (a backup
+/// restored into a new one, whose ids start over). A session that loses its
+/// stamp is read again once a turn reaches it. Returns how many were cleared.
+///
+/// Two statements, so an ingest committing in between is never mistaken for one:
+/// the read sees only committed stamps, each below its snapshot's next id, and the
+/// clear applies only where the stamp is still the one read — an ingest's new
+/// stamp makes the re-checked row differ.
+pub(crate) async fn forget_foreign_stamps(conn: &mut Scoped) -> anyhow::Result<u64> {
+    let foreign: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT session_id, landed_xid FROM sessions \
+         WHERE landed_xid >= pg_snapshot_xmax(pg_current_snapshot())::text::bigint",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    if foreign.is_empty() {
+        return Ok(0);
+    }
+    let (ids, stamps): (Vec<Uuid>, Vec<i64>) = foreign.into_iter().unzip();
+    Ok(sqlx::query(
+        "UPDATE sessions s SET landed_xid = NULL \
+         FROM unnest($1::uuid[], $2::bigint[]) AS f(sid, xid) \
+         WHERE s.session_id = f.sid AND s.landed_xid = f.xid",
+    )
+    .bind(ids)
+    .bind(stamps)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected())
+}
+
+/// The expert agent's scan: up to `limit` sessions of the scope in the order
+/// their turns landed, after `after` (from the first stamped session when
+/// `None`), each active after `active_after` when one is given and not the user
+/// `exclude_email`'s. Only sessions landed by a transaction that had ended when
+/// the scan began are listed ([`LandedPage::bound`]). A session no turn has
+/// landed on since landing order was recorded (`landed_xid` NULL) is never listed.
+pub(crate) async fn list_sessions_landed(
+    conn: &mut Scoped,
+    after: Option<LandedKey>,
+    active_after: Option<chrono::DateTime<chrono::Utc>>,
+    exclude_email: &str,
+    limit: i64,
+    scope: &AuditScope,
+) -> anyhow::Result<LandedPage> {
+    let bound = landing_bound(conn).await?;
+    // The list's own filters: `updated_since` is exclusive.
+    let mut query = SessionListQuery::default();
+    query.updated_since = active_after;
+    query.exclude_user = Some(exclude_email.to_string());
+
+    // The bound at `$1`, the position (when there is one) at `$2` / `$3`, the
+    // filters after it. The position is a condition only when it is set, so the
+    // index range starts there under a generic plan too. No linkage filter is
+    // set, so the view the filters are handed binds nothing.
+    let mut sql = "SELECT s.session_id, s.landed_xid FROM sessions s WHERE s.landed_xid < $1".to_string();
+    let first_filter = if after.is_some() {
+        sql.push_str(" AND (s.landed_xid, s.session_id) > ($2, $3)");
+        4
+    } else {
+        2
+    };
+    let (limit_idx, _) = push_session_filters(&mut sql, &query, scope, LINKED_AT_2, first_filter);
+    sql.push_str(&format!(" ORDER BY s.landed_xid, s.session_id LIMIT ${limit_idx}"));
+    let mut first = sqlx::query_as::<_, (Uuid, i64)>(sqlx::AssertSqlSafe(&*sql)).bind(bound);
+    if let Some(after) = after {
+        first = first.bind(after.xid).bind(after.session_id);
+    }
+    let keys: Vec<(Uuid, i64)> = bind_session_filters(first, &query, scope)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+    let full = i64::try_from(keys.len()).unwrap_or(i64::MAX) >= limit;
+    if keys.is_empty() {
+        return Ok(LandedPage { rows: Vec::new(), full, bound });
+    }
+
+    // The rows of those keys, through a tenant-wide view: the scope chose them.
+    let sql = format!(
+        "SELECT {cols} FROM unnest($1::uuid[]) AS k(sid) \
+         JOIN sessions s ON s.session_id = k.sid {join} {MODEL_REQUESTED_JOIN} {WORKSPACE_JOIN}",
+        cols = session_cols(LINKED_AT_2),
+        join = LINKED_AT_2.join(),
+    );
+    let ids: Vec<Uuid> = keys.iter().map(|k| k.0).collect();
+    let rows: Vec<SessionSummaryRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
+        .bind(ids)
+        .bind(None::<Uuid>)
+        .bind(None::<Vec<Uuid>>)
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut by_id: std::collections::HashMap<Uuid, SessionSummary> =
+        into_summaries(conn, rows).await.into_iter().map(|s| (s.session_id, s)).collect();
+    // A session deleted between the two reads is left out.
+    let rows = keys
+        .into_iter()
+        .filter_map(|(session_id, xid)| by_id.remove(&session_id).map(|s| (s, LandedKey { xid, session_id })))
+        .collect();
+    Ok(LandedPage { rows, full, bound })
+}
+
+/// Core session list logic — the console's and the portal's.
 /// Callers are responsible for clamping `query.limit` to an acceptable maximum
 /// before invoking — this function trusts the passed-through value so handlers
 /// can overfetch by +1 without the clamp silently stripping it — and for
@@ -346,38 +556,9 @@ pub(crate) async fn list_sessions_impl(
     let search = search_pattern(query.search.as_deref());
     let sort = query.sort.unwrap_or_default();
 
-    // List rows don't anchor a child card; the anchor is read with the
-    // linked-children query on the parent's session page.
-    // The linked sessions a row names are confined by the scope's view, bound
-    // ahead of the list's own filters.
-    let session_cols = |linked: LinkedView| {
-        format!(
-            "{summary}, \
-             mr.model_requested, {child_count} AS child_count, \
-             ws.name AS workspace_name, mr.provider AS provider, \
-             ak.name AS key_name, ak.key_prefix, \
-             NULL::text AS linkage_spawn_tool_call_id",
-            summary = summary_columns(),
-            child_count = linked.child_count(),
-        )
-    };
     let (view_user, view_workspaces) = scope.linked_view();
-
-    // Lateral subquery to get model_requested + provider from the most recent
-    // llm_audit entry via conversation_turns (LLM-only cols → no need to JOIN
-    // gateway_audit on this hot path).
-    let model_req_join = "LEFT JOIN LATERAL ( \
-         SELECT a.model_requested, a.provider FROM conversation_turns ct2 \
-         JOIN llm_audit a ON a.request_id = ct2.request_id AND a.timestamp = ct2.timestamp \
-         WHERE ct2.session_id = s.session_id \
-         ORDER BY ct2.timestamp DESC LIMIT 1 \
-     ) mr ON true";
-
-    // `ak` supplies the issuing key's name/prefix, which only a key-authenticated
-    // session has. The workspace badge comes from the session's own column, so it
-    // still resolves for a session whose `key_id` is a spec-OAuth token's jti.
-    let workspace_join = "LEFT JOIN api_keys ak ON ak.id = s.key_id \
-         LEFT JOIN workspaces ws ON ws.id = s.workspace_id";
+    let model_req_join = MODEL_REQUESTED_JOIN;
+    let workspace_join = WORKSPACE_JOIN;
 
     let Some(pattern) = search else {
         // The view at `$1` / `$2`, the filters after it.
@@ -596,11 +777,11 @@ fn push_session_filters(
 }
 
 /// Bind [`push_session_filters`]' parameters, in its order.
-fn bind_session_filters<'q>(
-    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, SessionSummaryRow, sqlx::postgres::PgArguments>,
+fn bind_session_filters<'q, O>(
+    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments>,
     query: &SessionListQuery,
     scope: &'q AuditScope,
-) -> sqlx::query::QueryAs<'q, sqlx::Postgres, SessionSummaryRow, sqlx::postgres::PgArguments> {
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, O, sqlx::postgres::PgArguments> {
     if let Some(user_id) = scope.user_id() {
         q = q.bind(user_id);
     }

@@ -41,6 +41,13 @@ pub struct PortalMeResponse {
     /// endpoint it is not allowed to call.
     #[schema(value_type = String, example = "USD")]
     pub accounting_currency: streamscope_core::pricing::Currency,
+    /// What the portal hides for the caller — what every workspace they
+    /// belong to hides (a member of none: the Default profile's). `sessions`:
+    /// the Sessions page and every conversation's content (its routes answer
+    /// 403 `portal_page_hidden`, and `GET /portal/audit` rows carry metadata
+    /// only). `requests`: the Requests page (`GET /portal/audit` answers that
+    /// 403). Held by the API whatever the portal shows.
+    pub hidden_pages: Vec<super::portal_pages::PortalPage>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -220,6 +227,7 @@ pub struct MeQuery {
 pub async fn me(
     mut db: TenantConn,
     Extension(user): Extension<PortalUser>,
+    Extension(hidden): Extension<HiddenPages>,
     Query(q): Query<MeQuery>,
 ) -> Result<Json<PortalMeResponse>, ApiError> {
     let user_id = user.user_id;
@@ -272,9 +280,11 @@ pub async fn me(
     let provider_scope = user.key_workspace_id.or(q.workspace_id);
     let providers = accessible_providers(db.conn(), user_id, provider_scope).await?;
     let accounting_currency = crate::routes::pricing::accounting_currency(db.conn()).await;
+    let hidden_pages = hidden.into_vec();
 
     Ok(Json(PortalMeResponse {
         accounting_currency,
+        hidden_pages,
         user: PortalUserDetail {
             id: user_id,
             email: detail.0,
@@ -788,7 +798,8 @@ use super::audit::{
 };
 use crate::audit_store::AuditScope;
 use crate::audit_store::logs::list_audit_rows;
-use super::portal_view::MemberView;
+use super::portal_pages::HiddenPages;
+use super::portal_view::{MemberView, WithoutContent};
 use crate::audit_store::ownership::{
     assert_media_owned, assert_request_owned, assert_session_owned, assert_tool_definition_owned,
 };
@@ -1005,6 +1016,7 @@ fn teammate_filter(scope: &PortalDataScope, user_email: Option<String>) -> Optio
         (status = 200, description = "The session summaries the caller may read", body = OffsetPage<SessionSummary>),
         (status = 400, description = "`start` is not before `end`, or a search term under 3 characters", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -1064,6 +1076,7 @@ pub async fn my_sessions(
         (status = 200, description = "Full conversation for the caller's own session", body = ConversationResponse),
         (status = 404, description = "Session not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1091,6 +1104,7 @@ pub async fn my_session_conversation(
         (status = 200, description = "Parent/child sessions linked to the caller's own session", body = LinkedSessions),
         (status = 404, description = "Session not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1117,17 +1131,31 @@ pub async fn my_session_linked(
         (status = 200, description = "The audit rows the caller may read, kind-discriminated", body = OffsetPage<AuditLogRow>),
         (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or a `kind=all` page is too deep", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "The Requests page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
+/// The caller's requests. While conversation content is hidden for the caller
+/// (`sessions` in `hidden_pages`) each row carries its metadata only — the
+/// content fields are absent or null — and `search`, `resource_uri` and
+/// `media_type` are accepted and not applied.
 pub async fn my_audit(
     mut db: TenantConn,
     Extension(user): Extension<PortalUser>,
+    Extension(hidden): Extension<HiddenPages>,
     Query(q): Query<PortalAuditQuery>,
 ) -> Result<Json<OffsetPage<AuditLogRow>>, ApiError> {
     super::check_bounds(q.start, q.end)?;
-    super::check_search(q.search.as_deref())?;
+    // Conversation content is withheld from this caller (`portal_view`): the
+    // text search and the filters on a withheld field — the resource a call
+    // read, the media a request carried — are accepted and NOT applied, or
+    // the rows returned would reveal what the fields no longer do. Dropped
+    // before the checks, so a short term is ignored rather than refused.
+    let content_hidden = hidden.content_hidden();
+    let shown = |filter: Option<String>| filter.filter(|_| !content_hidden);
+    let search = shown(q.search);
+    super::check_search(search.as_deref())?;
     let limit = q
         .limit
         .unwrap_or(PORTAL_AUDIT_DEFAULT_LIMIT)
@@ -1140,7 +1168,7 @@ pub async fn my_audit(
     let scope = AuditScope::portal(&data_scope);
     let mut query = AuditQuery::default();
     query.kind = q.kind;
-    query.search = q.search;
+    query.search = search;
     query.start = q.start;
     query.end = q.end;
     query.request_id = q.request_id;
@@ -1152,12 +1180,12 @@ pub async fn my_audit(
     query.finish_reason = q.finish_reason;
     query.upstream_server = q.upstream_server;
     query.api_version = q.api_version;
-    query.media_type = q.media_type;
+    query.media_type = shown(q.media_type);
     query.has_blocked = q.has_blocked;
     query.surface = q.surface;
     query.operation = q.operation;
     query.tool_id = q.tool_id;
-    query.resource_uri = q.resource_uri;
+    query.resource_uri = shown(q.resource_uri);
     query.prompt_id = q.prompt_id;
     query.virtual_server_id = q.virtual_server_id;
     query.upstream_server_id = q.upstream_server_id;
@@ -1167,6 +1195,9 @@ pub async fn my_audit(
 
     let mut page = list_audit_rows(db.conn(), &query, &scope, limit, offset).await?;
     page.items = page.items.for_member();
+    if content_hidden {
+        page.items = page.items.without_content();
+    }
     Ok(Json(page))
 }
 
@@ -1202,6 +1233,7 @@ pub struct PortalAuditFilterOptions {
     responses(
         (status = 200, description = "The audit filter options the caller may pick from", body = PortalAuditFilterOptions),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Both the Sessions and the Requests page are hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -1274,6 +1306,7 @@ pub async fn my_audit_filter_options(
         (status = 200, description = "Full trace for the caller's own request", body = TraceResponse),
         (status = 404, description = "Request not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`)", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1303,6 +1336,7 @@ pub async fn my_trace(
         (status = 200, description = "Paginated web child calls", body = OffsetPage<super::audit::WebAuditLogEntry>),
         (status = 404, description = "Request not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -1361,6 +1395,7 @@ pub struct PortalMediaQuery {
         (status = 200, description = "Binary blob data", content_type = "application/octet-stream"),
         (status = 404, description = "Blob not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`)", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1416,6 +1451,7 @@ pub async fn my_media(
         (status = 200, description = "Tool-definition JSON blob", body = ToolDefinitionBlobResponse),
         (status = 404, description = "Hash not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))

@@ -79,6 +79,7 @@ pub struct CreateProfileRequest {
     pub description: Option<String>,
     /// How the new profile relates to the Default and what it starts from
     /// (defaults to Layered + Blank — inherits the Default with no own content).
+    /// A `client_access` profile takes Standalone with `seed` or `copy` only.
     #[serde(default)]
     pub start_from: ProfileStartChoice,
 }
@@ -133,17 +134,31 @@ pub struct UpdateProfileRequest {
     pub model: Option<Option<String>>,
 }
 
-/// Client access has only its tenant Default: no other profile of the kind is
-/// created, promoted or assigned to a workspace.
-pub(crate) fn refuse_default_only(kind: ProfileKind) -> Result<(), ApiError> {
-    if kind == ProfileKind::ClientAccess {
-        return Err(default_only());
+/// The refusal for a choice a profile kind does not take.
+pub(crate) fn choice_unsupported(message: &'static str) -> ApiError {
+    ApiError::bad_request(message).code(ApiErrorCode::ProfileChoiceUnsupported)
+}
+
+/// What a new profile of `kind` may start as. A client-access profile owns its
+/// whole content — the clients offered, the sandbox's destinations and
+/// settings — so it is Standalone, and starts from a copy of another or from
+/// the seed: there is no Default beneath it to layer on, and an empty one would
+/// offer its workspaces no client.
+fn start_choice_allowed(kind: ProfileKind, standalone: bool, content: &StartContent) -> Result<(), ApiError> {
+    if kind != ProfileKind::ClientAccess {
+        return Ok(());
+    }
+    if !standalone {
+        return Err(choice_unsupported("a client-access profile is Standalone: it cannot layer on the Default"));
+    }
+    if matches!(content, StartContent::Blank) {
+        return Err(choice_unsupported("a client-access profile starts from a copy of another or from the seed"));
     }
     Ok(())
 }
 
-fn default_only() -> ApiError {
-    ApiError::bad_request("client access has only its Default profile").code(ApiErrorCode::ProfileKindDefaultOnly)
+fn default_protected() -> ApiError {
+    ApiError::conflict("the default profile cannot be deleted", ApiErrorCode::ProfileDefaultProtected)
 }
 
 fn parse_kind(s: &str) -> Result<ProfileKind, ApiError> {
@@ -282,7 +297,8 @@ pub(crate) async fn apply_profile_seed(
 
 /// Deep-copy a source profile's **own** content onto `dest_id` (the per-kind copy
 /// adapter for create-from-copy). Tool rules / transform programs are cloned with
-/// fresh ids/names; guardrail copies the policy row; expert copies membership.
+/// fresh ids/names; guardrail copies the policy row; expert copies membership;
+/// client access copies its clients, destinations and sandbox settings.
 /// Returns the count.
 async fn copy_profile_content(
     tx: &mut Scoped,
@@ -349,8 +365,22 @@ async fn copy_profile_content(
         ProfileKind::Expert => {
             super::expert_profiles::copy_members(tx, tenant_id, source_id, dest_id).await
         }
-        // Refused before any copy (`refuse_default_only`).
-        ProfileKind::ClientAccess => Err(default_only()),
+        ProfileKind::ClientAccess => {
+            super::client_access_profiles::copy_content(tx, tenant_id, source_id, dest_id).await
+        }
+    }
+}
+
+/// A failed absorb write onto the profile being promoted. A foreign-key
+/// violation there means that profile was deleted meanwhile: the 404 the
+/// promotion's own row count would have given.
+fn absorb_failed(what: &'static str) -> impl Fn(sqlx::Error) -> ApiError {
+    move |e| {
+        if super::is_foreign_key_violation(&e) {
+            return ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound);
+        }
+        tracing::error!("absorb base ({what}): {e}");
+        ApiError::internal("failed to set default profile")
     }
 }
 
@@ -360,7 +390,8 @@ async fn copy_profile_content(
 /// `rule_id`s / names and `is_builtin` flags — that keeps the "builtins live on
 /// the Default" invariant, so seed-sync continues to refresh builtins on (and
 /// land new builtins on) whatever profile is currently the Default. For
-/// guardrail/expert there is no rule-id-keyed builtin set, so it copies. The
+/// guardrail/expert there is no rule-id-keyed builtin set, so it copies; client
+/// access absorbs nothing. The
 /// outgoing Default is left holding only what the new Default already overrode
 /// (typically nothing) and is demoted to a Standalone by the caller.
 async fn absorb_base_into(
@@ -410,10 +441,7 @@ async fn absorb_base_into(
             .bind(dest_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                tracing::error!("absorb base (move tool rules): {e}");
-                ApiError::internal("failed to set default profile")
-            })?;
+            .map_err(absorb_failed("move tool rules"))?;
             sqlx::query(
                 "UPDATE tool_policy_rules SET forked_from = NULL \
                  WHERE tenant_id = $1 AND profile_id = $3 AND forked_from IS NOT NULL",
@@ -439,10 +467,7 @@ async fn absorb_base_into(
             .bind(dest_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                tracing::error!("absorb base (move transform programs): {e}");
-                ApiError::internal("failed to set default profile")
-            })?;
+            .map_err(absorb_failed("move transform programs"))?;
         }
         ProfileKind::Expert => {
             sqlx::query(
@@ -455,13 +480,13 @@ async fn absorb_base_into(
             .bind(base_id)
             .execute(&mut *tx)
             .await
-            .map_err(|e| {
-                tracing::error!("absorb base expert members: {e}");
-                ApiError::internal("failed to set default profile")
-            })?;
+            .map_err(absorb_failed("copy expert members"))?;
         }
-        // Refused before any promotion (`refuse_default_only`).
-        ProfileKind::ClientAccess => return Err(default_only()),
+        // Nothing is absorbed: a client-access profile owns its whole content, so
+        // the promoted one becomes the Default as it stands. Merging the outgoing
+        // Default's clients or destinations into it would offer what its admin
+        // had trimmed.
+        ProfileKind::ClientAccess => {}
         ProfileKind::Guardrail => {
             // Only when the promoted profile carries no own policy — else its own
             // posture wins and there is nothing to inherit.
@@ -599,7 +624,7 @@ pub async fn list_profiles(
     request_body = CreateProfileRequest,
     responses(
         (status = 201, description = "Profile created", body = Profile),
-        (status = 400, description = "Validation failed", body = ApiErrorResponse),
+        (status = 400, description = "Validation failed, or a start the kind does not take", body = ApiErrorResponse),
         (status = 409, description = "Name taken", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -610,7 +635,6 @@ pub async fn create_profile(
     Json(req): Json<CreateProfileRequest>,
 ) -> Result<(StatusCode, Json<Profile>), ApiError> {
     let kind = parse_kind(&req.kind)?;
-    refuse_default_only(kind)?;
     let name = req.name.trim();
     if name.is_empty() {
         return Err(ApiError::bad_request("name is required")
@@ -623,6 +647,7 @@ pub async fn create_profile(
         ProfileStartChoice::Layered { content } => (false, content),
         ProfileStartChoice::Standalone { content } => (true, content),
     };
+    start_choice_allowed(kind, standalone, content)?;
 
     // One transaction: insert the row and seed its content so a mid-sequence
     // failure leaves neither a row without its content nor orphaned content
@@ -837,7 +862,7 @@ pub async fn delete_profile(
         return Err(ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound));
     };
     if is_default {
-        return Err(ApiError::conflict("the default profile cannot be deleted", ApiErrorCode::ProfileDefaultProtected));
+        return Err(default_protected());
     }
     let kind = parse_kind(&kind_str)?;
 
@@ -872,14 +897,35 @@ pub async fn delete_profile(
             // `profile_id` FKs (ON DELETE CASCADE) when the row is deleted below.
         }
     }
-    sqlx::query("DELETE FROM profiles WHERE id = $1")
+    // `is_default` was read before this transaction, so the delete states the
+    // rule itself: a profile promoted since then is not removed (Postgres
+    // re-checks the predicate against the row the promotion committed), which
+    // would leave the kind with no Default. Nothing deleted: the profile is the
+    // Default now, or gone — and returning here commits nothing.
+    let deleted = sqlx::query("DELETE FROM profiles WHERE id = $1 AND NOT is_default")
         .bind(id)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
             tracing::error!("delete profile: {e}");
             ApiError::internal("failed to delete profile")
-        })?;
+        })?
+        .rows_affected();
+    if deleted == 0 {
+        let still_there: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                tracing::error!("delete profile (recheck): {e}");
+                ApiError::internal("failed to delete profile")
+            })?;
+        return Err(if still_there {
+            default_protected()
+        } else {
+            ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound)
+        });
+    }
     tx.commit().await.map_err(|e| {
         tracing::error!("delete profile (commit): {e}");
         ApiError::internal("failed to delete profile")
@@ -896,6 +942,7 @@ pub async fn delete_profile(
     responses(
         (status = 200, description = "Default set", body = ActionResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 409, description = "Another profile was set as default at the same time", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -918,7 +965,6 @@ pub async fn set_default_profile(
         return Err(ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound));
     };
     let kind = parse_kind(&kind_str)?;
-    refuse_default_only(kind)?;
 
     // Clear the current default for this (tenant, kind) then set the new one, in
     // one transaction — the one-default partial-unique index forbids two defaults
@@ -932,8 +978,9 @@ pub async fn set_default_profile(
     // complete, self-contained base. For tools/transform this MOVES the rows
     // (keeping the canonical `rule_id`s / `is_builtin` so seed-sync keeps
     // refreshing builtins on the Default — the "builtins live on the Default"
-    // invariant); for guardrail/expert it copies. Runs for any target (Layered or
-    // Standalone) so the builtin home always follows the Default.
+    // invariant); for guardrail/expert it copies; client access absorbs nothing.
+    // Runs for any target (Layered or Standalone) so the builtin home always
+    // follows the Default.
     let old_default = default_profile_id(&mut tx, tenant_id, kind).await?;
     if let Some(base_id) = old_default
         && base_id != id
@@ -955,16 +1002,35 @@ pub async fn set_default_profile(
         ApiError::internal("failed to set default profile")
     })?;
     // Promote: the new Default is always standalone (it is the base).
-    sqlx::query(
+    let promoted = sqlx::query(
         "UPDATE profiles SET is_default = true, standalone = true, updated_at = now() WHERE id = $1",
     )
     .bind(id)
     .execute(&mut *tx)
     .await
     .map_err(|e| {
+        // The one-default index: another profile of the kind was promoted at
+        // the same time and committed first.
+        if super::is_unique_violation(&e) {
+            return ApiError::conflict(
+                "another profile was set as default at the same time; reload and try again",
+                ApiErrorCode::ProfileDefaultChanged,
+            );
+        }
         tracing::error!("set default profile: {e}");
         ApiError::internal("failed to set default profile")
-    })?;
+    })?
+    .rows_affected();
+    // The target was deleted since it was read: returning here commits nothing,
+    // so the clear above is undone and the kind keeps its Default.
+    if promoted == 0 {
+        return Err(ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound));
+    }
+    // The workspaces assigned the promoted profile now inherit it (no
+    // assignment row names the Default — `is_default_for_assignment`).
+    if kind == ProfileKind::ClientAccess {
+        super::client_access_profiles::release_assignments(&mut tx, tenant_id, id).await?;
+    }
     tx.commit().await.map_err(|e| {
         tracing::error!("set default profile (commit): {e}");
         ApiError::internal("failed to set default profile")
@@ -1082,4 +1148,47 @@ pub fn profiles_router() -> axum::Router<Arc<AdminState>> {
             "/{id}/actions/attach-developer-defaults",
             post(super::client_access_profiles::attach_developer_defaults),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn starts() -> [StartContent; 3] {
+        [StartContent::Blank, StartContent::Seed, StartContent::Copy { id: Uuid::nil() }]
+    }
+
+    fn refused(kind: ProfileKind, standalone: bool, content: &StartContent) -> bool {
+        match start_choice_allowed(kind, standalone, content) {
+            Ok(()) => false,
+            Err(e) => {
+                assert_eq!(e.code, ApiErrorCode::ProfileChoiceUnsupported);
+                assert_eq!(e.status, StatusCode::BAD_REQUEST);
+                true
+            }
+        }
+    }
+
+    #[test]
+    fn a_client_access_profile_is_standalone_and_never_blank() {
+        // The two starts it takes.
+        assert!(!refused(ProfileKind::ClientAccess, true, &StartContent::Seed));
+        assert!(!refused(ProfileKind::ClientAccess, true, &StartContent::Copy { id: Uuid::nil() }));
+        // Layered, whatever its content; and Standalone with nothing in it.
+        for content in starts() {
+            assert!(refused(ProfileKind::ClientAccess, false, &content));
+        }
+        assert!(refused(ProfileKind::ClientAccess, true, &StartContent::Blank));
+    }
+
+    #[test]
+    fn every_other_kind_takes_every_start() {
+        for kind in [ProfileKind::Tools, ProfileKind::Guardrail, ProfileKind::Transform, ProfileKind::Expert] {
+            for standalone in [false, true] {
+                for content in starts() {
+                    assert!(!refused(kind, standalone, &content), "{} standalone={standalone}", kind.as_str());
+                }
+            }
+        }
+    }
 }

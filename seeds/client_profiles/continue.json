@@ -18,7 +18,8 @@
         "/models": "name",
         "/mcpServers": "name"
       },
-      "body": "name: streamscope\nversion: 0.0.1\nschema: v1\nmodels:\n{{#each routes}}  - name: {{model_alias}}\n    provider: anthropic\n    model: {{model_alias}}\n    apiBase: {{{base_url}}}/v1/\n    apiKey: {{{../api_key}}}\n    roles:\n      - chat\n      - edit\n      - apply\n{{#if supports_vision}}    capabilities:\n      - image_input\n{{#if supports_function_calling}}      - tool_use\n{{/if}}{{else}}{{#if supports_function_calling}}    capabilities:\n      - tool_use\n{{/if}}{{/if}}{{#if context_window}}    contextLength: {{context_window}}\n{{/if}}{{#if max_output_tokens}}    defaultCompletionOptions:\n      maxTokens: {{max_output_tokens}}\n{{/if}}{{/each}}{{#if mcp_servers}}mcpServers:\n{{#each mcp_servers}}  - name: {{slug}}\n    type: streamable-http\n    url: {{url}}\n    requestOptions:\n      headers:\n        Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}{{/if}}"
+      "local_mcp": "config",
+      "body": "name: streamscope\nversion: 0.0.1\nschema: v1\nmodels:\n{{#each routes}}  - name: {{model_alias}}\n    provider: anthropic\n    model: {{model_alias}}\n    apiBase: {{{base_url}}}/v1/\n    apiKey: {{{../api_key}}}\n    roles:\n      - chat\n      - edit\n      - apply\n{{#if supports_vision}}    capabilities:\n      - image_input\n{{#if supports_function_calling}}      - tool_use\n{{/if}}{{else}}{{#if supports_function_calling}}    capabilities:\n      - tool_use\n{{/if}}{{/if}}{{#if context_window}}    contextLength: {{context_window}}\n{{/if}}{{#if max_output_tokens}}    defaultCompletionOptions:\n      maxTokens: {{max_output_tokens}}\n{{/if}}{{/each}}{{#if mcp_servers}}mcpServers:\n{{#each mcp_servers}}  - name: {{quoted slug}}\n{{#if local}}    type: stdio\n    command: {{quoted command}}\n{{#if args}}    args:\n{{#each args}}      - {{quoted value}}\n{{/each}}{{/if}}{{#if env}}    env:\n{{#each env}}      {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{else}}    type: streamable-http\n    url: {{quoted url}}\n{{#if headers}}    requestOptions:\n      headers:\n{{#each headers}}        {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{/if}}{{/each}}{{/if}}"
     },
     {
       "kind": "combined",
@@ -31,7 +32,8 @@
         "/models": "name",
         "/mcpServers": "name"
       },
-      "body": "name: streamscope\nversion: 0.0.1\nschema: v1\nmodels:\n{{#each routes}}  - name: {{model_alias}}\n    provider: openai\n    model: {{model_alias}}\n    apiBase: {{{base_url}}}/\n    apiKey: {{{../api_key}}}\n    roles:\n      - chat\n      - edit\n      - apply\n{{#if supports_vision}}    capabilities:\n      - image_input\n{{#if supports_function_calling}}      - tool_use\n{{/if}}{{else}}{{#if supports_function_calling}}    capabilities:\n      - tool_use\n{{/if}}{{/if}}{{#if context_window}}    contextLength: {{context_window}}\n{{/if}}{{#if max_output_tokens}}    defaultCompletionOptions:\n      maxTokens: {{max_output_tokens}}\n{{/if}}{{/each}}{{#if mcp_servers}}mcpServers:\n{{#each mcp_servers}}  - name: {{slug}}\n    type: streamable-http\n    url: {{url}}\n    requestOptions:\n      headers:\n        Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}{{/if}}"
+      "local_mcp": "config",
+      "body": "name: streamscope\nversion: 0.0.1\nschema: v1\nmodels:\n{{#each routes}}  - name: {{model_alias}}\n    provider: openai\n    model: {{model_alias}}\n    apiBase: {{{base_url}}}/\n    apiKey: {{{../api_key}}}\n    roles:\n      - chat\n      - edit\n      - apply\n{{#if supports_vision}}    capabilities:\n      - image_input\n{{#if supports_function_calling}}      - tool_use\n{{/if}}{{else}}{{#if supports_function_calling}}    capabilities:\n      - tool_use\n{{/if}}{{/if}}{{#if context_window}}    contextLength: {{context_window}}\n{{/if}}{{#if max_output_tokens}}    defaultCompletionOptions:\n      maxTokens: {{max_output_tokens}}\n{{/if}}{{/each}}{{#if mcp_servers}}mcpServers:\n{{#each mcp_servers}}  - name: {{quoted slug}}\n{{#if local}}    type: stdio\n    command: {{quoted command}}\n{{#if args}}    args:\n{{#each args}}      - {{quoted value}}\n{{/each}}{{/if}}{{#if env}}    env:\n{{#each env}}      {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{else}}    type: streamable-http\n    url: {{quoted url}}\n{{#if headers}}    requestOptions:\n      headers:\n{{#each headers}}        {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{/if}}{{/each}}{{/if}}"
     },
     {
       "kind": "mcp",
@@ -43,7 +45,8 @@
       "keyed_arrays": {
         "/mcpServers": "name"
       },
-      "body": "mcpServers:\n{{#each mcp_servers}}  - name: {{slug}}\n    type: streamable-http\n    url: {{url}}\n    requestOptions:\n      headers:\n        Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}"
+      "local_mcp": "config",
+      "body": "mcpServers:\n{{#each mcp_servers}}  - name: {{quoted slug}}\n{{#if local}}    type: stdio\n    command: {{quoted command}}\n{{#if args}}    args:\n{{#each args}}      - {{quoted value}}\n{{/each}}{{/if}}{{#if env}}    env:\n{{#each env}}      {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{else}}    type: streamable-http\n    url: {{quoted url}}\n{{#if headers}}    requestOptions:\n      headers:\n{{#each headers}}        {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{/if}}{{/each}}"
     }
   ]
 }

@@ -29,7 +29,8 @@
         "/models": "name",
         "/mcp_servers": "name"
       },
-      "body": "active_model = \"{{model_alias}}\"\nenable_telemetry = false\nenable_update_checks = false\nenable_auto_update = false\n\n[[providers]]\nname = \"streamscope\"\napi_base = \"{{base_url}}\"\napi_key_env_var = \"STREAMSCOPE_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n\n[[models]]\nname = \"{{model_alias}}\"\nprovider = \"streamscope\"\nalias = \"{{model_alias}}\"\n{{#each mcp_servers}}\n[[mcp_servers]]\nname = \"{{slug}}\"\ntransport = \"streamable-http\"\nurl = \"{{url}}\"\nauth = { type = \"static\", headers = { \"Authorization\" = \"Bearer {{api_key}}\" } }\n{{/each}}"
+      "local_mcp": "config",
+      "body": "active_model = \"{{model_alias}}\"\nenable_telemetry = false\nenable_update_checks = false\nenable_auto_update = false\n\n[[providers]]\nname = \"streamscope\"\napi_base = \"{{base_url}}\"\napi_key_env_var = \"STREAMSCOPE_API_KEY\"\napi_style = \"openai\"\nbackend = \"generic\"\n\n[[models]]\nname = \"{{model_alias}}\"\nprovider = \"streamscope\"\nalias = \"{{model_alias}}\"\n{{#each mcp_servers}}\n[[mcp_servers]]\nname = \"{{slug}}\"\n{{#if local}}transport = \"stdio\"\ncommand = \"{{command}}\"\nargs = [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]\n{{#if env}}\n[mcp_servers.env]\n{{#each env}}\"{{name}}\" = \"{{value}}\"\n{{/each}}{{/if}}{{else}}transport = \"streamable-http\"\nurl = \"{{url}}\"\n{{#if headers}}auth = { type = \"static\", headers = { {{#each headers}}\"{{name}}\" = \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} } }\n{{/if}}{{/if}}{{/each}}"
     }
   ]
 }

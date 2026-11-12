@@ -1,8 +1,11 @@
 //! MCP gateway CRUD — upstream servers + virtual servers + virtual routes.
 //!
-//! All four upstream auth modes (`no_auth`, `service_account`, `per_user_oauth`,
-//! `byot`) are honored end-to-end by the proxy. The admin surface persists
-//! the row shape; the proxy resolves the bearer per request.
+//! An upstream is an adopted `server.json` remote: the headers it declares,
+//! each filled by the administrator (stored encrypted here), the user (in the
+//! portal) or the calling client (per request, never stored), plus the user's
+//! own OAuth token when `auth_mode = per_user_oauth`. The admin surface
+//! persists the row shape; the proxy resolves the headers per request
+//! ([`streamscope_core::mcp::header_inputs::resolve`]).
 
 
 use streamscope_mcp_auth::ssrf::Egress;
@@ -15,6 +18,12 @@ use streamscope_core::config::mcp::is_valid_route_prefix;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use std::collections::{BTreeMap, HashMap};
+
+use streamscope_core::config::mcp::McpAuthMode;
+use streamscope_core::mcp::header_inputs::{self as hi, Filler, Remote};
+
+use super::mcp_inputs;
 use super::{ActionResponse, ApiError, ApiErrorCode, ApiErrorResponse, OffsetPage, PageQuery, TotalPage};
 use crate::db::tenant::TenantConn;
 
@@ -23,8 +32,6 @@ use crate::db::tenant::TenantConn;
 // one synced to proxies.
 // ---------------------------------------------------------------------------
 
-const VALID_TRANSPORTS: &[&str] = &["streamable_http", "sse"];
-const VALID_AUTH_MODES: &[&str] = &["no_auth", "service_account", "per_user_oauth", "byot"];
 
 /// Slug pattern: `^[a-z][a-z0-9-]{0,30}$` — bookmark-stable, URL-safe.
 pub(crate) fn is_valid_slug(s: &str) -> bool {
@@ -60,21 +67,79 @@ const PREFIX_RULE: &str = "prefix must be empty, or up to 16 lowercase letters, 
 // MCP UPSTREAM SERVERS
 // ===========================================================================
 
-#[derive(Serialize, sqlx::FromRow, ToSchema)]
+/// Every column an upstream read returns, in [`UpstreamDbRow`]'s shape.
+const UPSTREAM_COLS: &str = r#"id, name, description, upstream_url, transport, auth_mode, enabled,
+    connect_timeout_ms, request_timeout_ms, cred_version,
+    remote, encrypted_admin_inputs, required_user_input_ids, url_variables, catalog_entry_id,
+    oauth_issuer_url, oauth_authorization_url, oauth_token_url,
+    oauth_revocation_url, oauth_client_id,
+    (encrypted_oauth_client_secret IS NOT NULL) AS has_oauth_client_secret,
+    COALESCE(oauth_default_scopes, ARRAY[]::TEXT[]) AS oauth_default_scopes,
+    built_in, created_at, updated_at"#;
+
+#[derive(sqlx::FromRow)]
+struct UpstreamDbRow {
+    id: Uuid,
+    name: String,
+    description: Option<String>,
+    upstream_url: String,
+    transport: String,
+    auth_mode: String,
+    enabled: bool,
+    connect_timeout_ms: i32,
+    request_timeout_ms: i32,
+    cred_version: i64,
+    remote: sqlx::types::Json<Remote>,
+    encrypted_admin_inputs: sqlx::types::Json<HashMap<String, String>>,
+    required_user_input_ids: Vec<String>,
+    url_variables: sqlx::types::Json<BTreeMap<String, String>>,
+    catalog_entry_id: Option<Uuid>,
+    oauth_issuer_url: Option<String>,
+    oauth_authorization_url: Option<String>,
+    oauth_token_url: Option<String>,
+    oauth_revocation_url: Option<String>,
+    oauth_client_id: Option<String>,
+    has_oauth_client_secret: bool,
+    oauth_default_scopes: Vec<String>,
+    built_in: bool,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize, ToSchema)]
 pub struct McpUpstreamServerRow {
     pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
+    /// The finished URL: the remote's URL template with its variables filled.
     pub upstream_url: String,
+    /// Derived from `remote.type`.
     pub transport: String,
+    /// `headers` | `per_user_oauth`.
     pub auth_mode: String,
     pub enabled: bool,
     pub connect_timeout_ms: i32,
     pub request_timeout_ms: i32,
     pub cred_version: i64,
-    /// Presence-only signal. `true` iff `encrypted_credential`
-    /// IS NOT NULL on the underlying row. The plaintext is never echoed.
-    pub has_credential: bool,
+    /// The adopted `server.json` remote: its declared headers and, in
+    /// `_meta["ai.streamscope/inputs"].fillers`, who fills each input.
+    /// Its keys are the MCP Registry schema's own camelCase (`isRequired`,
+    /// `_meta`), unlike the rest of this body: it is that canonical document.
+    pub remote: Remote,
+    /// The NON-secret admin-filled values, input id → value.
+    pub inputs: BTreeMap<String, String>,
+    /// The secret admin-filled inputs that have a value (never the value).
+    pub secret_input_ids: Vec<String>,
+    /// The user-filled inputs a user must fill before the upstream is usable.
+    pub required_user_input_ids: Vec<String>,
+    /// The headers a client must send for this upstream, lowercased.
+    pub client_headers: Vec<String>,
+    /// The values `upstream_url` was finished with: variable name → value
+    /// (a default counts as its value). Never secret.
+    pub url_variables: BTreeMap<String, String>,
+    /// The catalog entry the upstream was adopted from; `None` for one created
+    /// by hand, or once that entry is deleted.
+    pub catalog_entry_id: Option<Uuid>,
     // ── Per-user OAuth client config ──
     pub oauth_issuer_url: Option<String>,
     pub oauth_authorization_url: Option<String>,
@@ -95,21 +160,70 @@ pub struct McpUpstreamServerRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+impl From<UpstreamDbRow> for McpUpstreamServerRow {
+    fn from(r: UpstreamDbRow) -> Self {
+        let remote = r.remote.0;
+        let specs = mcp_inputs::stored_specs(r.id, &remote, &r.auth_mode);
+        let (inputs, secret_input_ids) =
+            mcp_inputs::admin_values_view(&remote, specs.as_deref(), &r.encrypted_admin_inputs.0);
+        let client_headers = specs.as_deref().map(mcp_inputs::client_headers).unwrap_or_default();
+        Self {
+            id: r.id,
+            name: r.name,
+            description: r.description,
+            upstream_url: r.upstream_url,
+            transport: r.transport,
+            auth_mode: r.auth_mode,
+            enabled: r.enabled,
+            connect_timeout_ms: r.connect_timeout_ms,
+            request_timeout_ms: r.request_timeout_ms,
+            cred_version: r.cred_version,
+            remote,
+            inputs,
+            secret_input_ids,
+            required_user_input_ids: r.required_user_input_ids,
+            client_headers,
+            url_variables: r.url_variables.0,
+            catalog_entry_id: r.catalog_entry_id,
+            oauth_issuer_url: r.oauth_issuer_url,
+            oauth_authorization_url: r.oauth_authorization_url,
+            oauth_token_url: r.oauth_token_url,
+            oauth_revocation_url: r.oauth_revocation_url,
+            oauth_client_id: r.oauth_client_id,
+            has_oauth_client_secret: r.has_oauth_client_secret,
+            oauth_default_scopes: r.oauth_default_scopes,
+            built_in: r.built_in,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct CreateMcpUpstreamServer {
     pub name: String,
     pub description: Option<String>,
-    pub upstream_url: String,
-    /// Defaults to `"streamable_http"`.
-    pub transport: Option<String>,
-    /// Defaults to `"no_auth"`. All four modes (`"no_auth"`,
-    /// `"service_account"`, `"per_user_oauth"`, `"byot"`) are honored.
+    /// The `server.json` remote, with each declared input's filler in
+    /// `_meta["ai.streamscope/inputs"].fillers`. `{"type": "streamable-http",
+    /// "url": "…"}` declares no header (no auth).
+    /// Its keys are the MCP Registry schema's own camelCase (`isRequired`,
+    /// `_meta`), unlike the rest of this body: it is that canonical document.
+    pub remote: Remote,
+    /// Values of the remote URL's `{variables}` (a variable's default fills an
+    /// absent one). Never secret. Stored, with the defaults used, as the row's
+    /// `url_variables`.
+    #[serde(default)]
+    pub url_variables: HashMap<String, String>,
+    /// `headers` (default) or `per_user_oauth` (the declared headers plus the
+    /// user's OAuth token as `Authorization: Bearer`).
     pub auth_mode: Option<String>,
-    /// Bearer token plaintext. Required when `auth_mode =
-    /// "service_account"`; rejected when any other auth_mode is set. Encrypted
-    /// at rest with AES-256-GCM (`ENCRYPTION_KEY` HKDF-derived). Never echoed
-    /// in responses — `has_credential: bool` surfaces presence.
-    pub credential: Option<String>,
+    /// Values of the NON-secret admin-filled inputs: input id → value.
+    #[serde(default)]
+    pub inputs: HashMap<String, String>,
+    /// Values of the secret admin-filled inputs: input id → value. Encrypted
+    /// at rest, never echoed.
+    #[serde(default)]
+    pub secret_inputs: HashMap<String, String>,
     // ── Per-user OAuth client config ──
     /// Required when `auth_mode = "per_user_oauth"`. Forbidden otherwise.
     pub oauth_issuer_url: Option<String>,
@@ -132,18 +246,30 @@ pub struct UpdateMcpUpstreamServer {
     /// `null` or `""` clears it; absent leaves it.
     #[serde(default, deserialize_with = "super::double_option::null_as_blank")]
     pub description: Option<String>,
-    pub upstream_url: Option<String>,
-    pub transport: Option<String>,
+    /// Replace the remote (declaration and fillers). A filler moved away from
+    /// `user` drops that input from every user's values; one moved away from
+    /// `admin` drops the stored admin value; a change of the client-filled
+    /// headers re-checks every virtual server the upstream is routed on.
+    /// Its keys are the MCP Registry schema's own camelCase (`isRequired`,
+    /// `_meta`), unlike the rest of this body: it is that canonical document.
+    pub remote: Option<Remote>,
+    /// Re-finish the URL with these variable values, merged onto the stored
+    /// ones: a variable left out keeps its stored value; one the template
+    /// uses with neither a stored nor a sent value is refused (a default fills
+    /// one only at create and adopt). The URL is recomputed when this is present
+    /// or `remote.url` changes; a stored value of a variable the remote no
+    /// longer declares is dropped.
+    pub url_variables: Option<HashMap<String, String>>,
     /// Locked post-create — only accepted when equal to the existing value
     /// (idempotent passthrough). Any other value rejects with
-    /// `McpUpstreamAuthModeLocked`. Each mode carries a distinct credential
-    /// shape; flips would silently strand or drop credentials.
+    /// `McpUpstreamAuthModeLocked`.
     pub auth_mode: Option<String>,
-    /// Rotate the service-account bearer token. Empty string rejects with
-    /// `McpUpstreamCredentialRequired`; supplying any value on a
-    /// non-`service_account` row rejects with `McpUpstreamCredentialNotAllowed`.
-    /// Absent preserves the existing ciphertext.
-    pub credential: Option<String>,
+    /// NON-secret admin values: a value sets, `null` clears.
+    #[serde(default)]
+    pub inputs: HashMap<String, Option<String>>,
+    /// Secret admin values: a value sets, `""` clears, `null` keeps.
+    #[serde(default)]
+    pub secret_inputs: HashMap<String, Option<String>>,
     // ── Per-user OAuth client config ──
     pub oauth_issuer_url: Option<String>,
     pub oauth_authorization_url: Option<String>,
@@ -190,7 +316,7 @@ fn nonempty_vec<T>(v: Option<&Vec<T>>) -> Option<&Vec<T>> {
 /// at write time so the proxy and admin-api callers never fan out to them.
 /// Hostnames pass — DNS-rebinding is a separate concern and the trust
 /// boundary here is "an admin typed it", not "anyone can register one".
-fn validate_outbound_urls(
+pub(crate) fn validate_outbound_urls(
     upstream_url: Option<&str>,
     oauth_issuer_url: Option<&str>,
     oauth_authorization_url: Option<&str>,
@@ -240,86 +366,10 @@ fn validate_outbound_urls(
 /// discovery alike — a deployment-level decision, never a per-tenant one.
 pub(crate) const MCP_EGRESS: Egress = Egress::Surface(Surface::Mcp);
 
-fn validate_upstream_create(body: &CreateMcpUpstreamServer, egress: Egress) -> Result<(), ApiError> {
-    if body.name.trim().is_empty() {
-        return Err(ApiError::bad_request("name must not be empty"));
-    }
-    if !body.upstream_url.starts_with("http://") && !body.upstream_url.starts_with("https://") {
-        return Err(ApiError::bad_request("upstream_url must be http(s)://..."));
-    }
-    if let Some(t) = &body.transport
-        && !VALID_TRANSPORTS.contains(&t.as_str())
-    {
-        return Err(ApiError::bad_request("transport must be one of: streamable_http, sse"));
-    }
-    if let Some(a) = &body.auth_mode
-        && !VALID_AUTH_MODES.contains(&a.as_str())
-    {
-        return Err(ApiError::bad_request(
-            "auth_mode must be one of: no_auth, service_account, per_user_oauth, byot",
-        ));
-    }
-    validate_outbound_urls(
-        Some(body.upstream_url.as_str()),
-        body.oauth_issuer_url.as_deref(),
-        body.oauth_authorization_url.as_deref(),
-        body.oauth_token_url.as_deref(),
-        body.oauth_revocation_url.as_deref(),
-        egress,
-    )?;
-    Ok(())
-}
-
-/// Validate the `(auth_mode, credential)` shape on create/update.
-///
-/// Rules:
-/// - `auth_mode = service_account` + credential missing/empty on **create** →
-///   `McpUpstreamCredentialRequired` (you can't ship a service-account row
-///   without a token; the proxy would 503 every request).
-/// - `auth_mode = service_account` + empty-string credential (any op) →
-///   `McpUpstreamCredentialRequired` (use `auth_mode = no_auth` to clear).
-/// - `auth_mode != service_account` + credential set → `McpUpstreamCredentialNotAllowed`
-///   (the field is meaningless outside service_account; surface the
-///   contradiction rather than silently dropping).
-/// - `auth_mode = None` (PATCH not changing auth_mode) + credential set → allow
-///   (rotation case — caller is rotating the token without changing mode).
-///   Caller is responsible for the row's resulting shape.
-fn validate_credential_shape(
-    auth_mode: Option<&str>,
-    credential: Option<&str>,
-    is_create: bool,
-) -> Result<(), ApiError> {
-    let auth_mode = auth_mode.map(str::trim);
-    let credential = credential.map(str::trim);
-
-    // On create, omitted auth_mode defaults to "no_auth" downstream — fold
-    // that defaulting into validation so a credential supplied alongside an
-    // omitted auth_mode is rejected with `McpUpstreamCredentialNotAllowed`
-    // rather than silently encrypted into a no_auth row.
-    let effective_auth_mode = if is_create { auth_mode.or(Some("no_auth")) } else { auth_mode };
-
-    match (effective_auth_mode, credential, is_create) {
-        // service_account on create — credential required.
-        (Some("service_account"), None, true) | (Some("service_account"), Some(""), true) => {
-            Err(ApiError::bad_request(
-                "credential is required when auth_mode = service_account",
-            )
-            .code(ApiErrorCode::McpUpstreamCredentialRequired))
-        }
-        // Empty-string credential while in service_account mode (any op).
-        (Some("service_account"), Some(""), false) => Err(ApiError::bad_request(
-            "credential must be a non-empty bearer token; to clear, set auth_mode = no_auth",
-        )
-        .code(ApiErrorCode::McpUpstreamCredentialRequired)),
-        // Credential supplied with non-service-account auth_mode.
-        (Some(other), Some(c), _) if other != "service_account" && !c.is_empty() => {
-            Err(ApiError::bad_request(
-                "credential is only valid when auth_mode = service_account",
-            )
-            .code(ApiErrorCode::McpUpstreamCredentialNotAllowed))
-        }
-        _ => Ok(()),
-    }
+/// The stored `auth_mode` a request names: `headers` or `per_user_oauth`.
+fn parse_auth_mode(mode: &str) -> Result<McpAuthMode, ApiError> {
+    McpAuthMode::parse(mode)
+        .ok_or_else(|| ApiError::bad_request("auth_mode must be one of: headers, per_user_oauth"))
 }
 
 /// Validate the OAuth client config shape.
@@ -421,76 +471,6 @@ fn validate_oauth_client_resulting_shape(
     }
 }
 
-/// Enforce the BYOT single-route invariant on
-/// `mcp_virtual_routes`. A virtual server may host either:
-///   * exactly one route bound to a `byot` upstream, OR
-///   * any number of routes bound to non-`byot` upstreams.
-///
-/// Mixing the two modes breaks the forward-auth contract (a `vk-*`
-/// agent's bearer can't be split across upstreams). `excluded_route_id`
-/// lets the PATCH path ignore the row being updated when counting
-/// siblings.
-async fn validate_byot_route_invariant(
-    db: &mut TenantConn,
-    virtual_server_id: Uuid,
-    upstream_server_id: Uuid,
-    excluded_route_id: Option<Uuid>,
-) -> Result<(), ApiError> {
-    let new_auth_mode: String = sqlx::query_scalar(
-        "SELECT auth_mode FROM mcp_upstream_servers WHERE id = $1",
-    )
-    .bind(upstream_server_id)
-    .fetch_one(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("validate byot route lookup upstream: {e}");
-        ApiError::internal("failed to validate route")
-    })?;
-
-    // Pull every other route on this virtual server with its upstream's mode.
-    let sibling_modes: Vec<(Uuid, String)> = if let Some(excl) = excluded_route_id {
-        sqlx::query_as::<_, (Uuid, String)>(
-            r#"SELECT r.id, u.auth_mode
-               FROM mcp_virtual_routes r
-               JOIN mcp_upstream_servers u ON u.id = r.upstream_server_id
-               WHERE r.virtual_server_id = $1 AND r.id <> $2"#,
-        )
-        .bind(virtual_server_id)
-        .bind(excl)
-    } else {
-        sqlx::query_as::<_, (Uuid, String)>(
-            r#"SELECT r.id, u.auth_mode
-               FROM mcp_virtual_routes r
-               JOIN mcp_upstream_servers u ON u.id = r.upstream_server_id
-               WHERE r.virtual_server_id = $1"#,
-        )
-        .bind(virtual_server_id)
-    }
-    .fetch_all(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("validate byot route count siblings: {e}");
-        ApiError::internal("failed to validate route")
-    })?;
-
-    let any_sibling_is_byot = sibling_modes.iter().any(|(_, m)| m == "byot");
-    let new_is_byot = new_auth_mode == "byot";
-
-    if new_is_byot && !sibling_modes.is_empty() {
-        return Err(ApiError::bad_request(
-            "byot upstream can only be routed to a virtual server with no other routes",
-        )
-        .code(ApiErrorCode::McpKeyMultiUpstream));
-    }
-    if !new_is_byot && any_sibling_is_byot {
-        return Err(ApiError::bad_request(
-            "this virtual server already has a byot route; byot requires exclusive single-route binding",
-        )
-        .code(ApiErrorCode::McpKeyMultiUpstream));
-    }
-    Ok(())
-}
-
 /// The OAuth-client fields a `per_user_oauth` upstream must carry before its
 /// endpoint can be granted to a workspace or connected by a portal user. This
 /// is the single source of truth for "is the OAuth client complete?" — the
@@ -579,15 +559,7 @@ pub(crate) async fn ensure_endpoint_oauth_grantable(
 pub(crate) fn encrypt_mcp_credential(credential: Option<&str>) -> Result<Option<Vec<u8>>, ApiError> {
     match credential {
         Some(plain) if !plain.is_empty() => {
-            let key = streamscope_core::crypto::get_encryption_key().ok_or_else(|| {
-                tracing::error!("ENCRYPTION_KEY not set — refusing to store mcp upstream credential");
-                ApiError::server_misconfigured("ENCRYPTION_KEY not configured")
-            })?;
-            let encrypted = streamscope_core::crypto::encrypt(plain, &key).map_err(|e| {
-                tracing::error!("encrypt mcp upstream credential: {e}");
-                ApiError::internal("failed to encrypt credential")
-            })?;
-            Ok(Some(encrypted.into_bytes()))
+            Ok(Some(super::mcp_inputs::encrypt_value(plain)?.into_bytes()))
         }
         _ => Ok(None),
     }
@@ -617,18 +589,9 @@ pub async fn list_mcp_upstream_servers(
             tracing::error!("count mcp_upstream_servers: {e}");
             ApiError::internal("failed to list mcp upstream servers")
         })?;
-    let rows = sqlx::query_as::<_, McpUpstreamServerRow>(
-        r#"SELECT id, name, description, upstream_url, transport, auth_mode, enabled,
-                  connect_timeout_ms, request_timeout_ms, cred_version,
-                  (encrypted_credential IS NOT NULL) AS has_credential,
-                  oauth_issuer_url, oauth_authorization_url, oauth_token_url,
-                  oauth_revocation_url, oauth_client_id,
-                  (encrypted_oauth_client_secret IS NOT NULL) AS has_oauth_client_secret,
-                  COALESCE(oauth_default_scopes, ARRAY[]::TEXT[]) AS oauth_default_scopes,
-                  built_in, created_at, updated_at
-           FROM mcp_upstream_servers
-           ORDER BY name LIMIT $1 OFFSET $2"#,
-    )
+    let rows = sqlx::query_as::<_, UpstreamDbRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPSTREAM_COLS} FROM mcp_upstream_servers ORDER BY name LIMIT $1 OFFSET $2"
+    )))
     .bind(limit)
     .bind(offset)
     .fetch_all(db.conn())
@@ -637,6 +600,7 @@ pub async fn list_mcp_upstream_servers(
         tracing::error!("list mcp_upstream_servers: {e}");
         ApiError::internal("failed to list mcp upstream servers")
     })?;
+    let rows = rows.into_iter().map(McpUpstreamServerRow::from).collect();
     Ok(Json(TotalPage::new(rows, limit, offset, total)))
 }
 
@@ -655,18 +619,9 @@ pub async fn get_mcp_upstream_server(
     mut db: TenantConn,
     Path(id): Path<Uuid>,
 ) -> Result<Json<McpUpstreamServerRow>, ApiError> {
-    let row = sqlx::query_as::<_, McpUpstreamServerRow>(
-        r#"SELECT id, name, description, upstream_url, transport, auth_mode, enabled,
-                  connect_timeout_ms, request_timeout_ms, cred_version,
-                  (encrypted_credential IS NOT NULL) AS has_credential,
-                  oauth_issuer_url, oauth_authorization_url, oauth_token_url,
-                  oauth_revocation_url, oauth_client_id,
-                  (encrypted_oauth_client_secret IS NOT NULL) AS has_oauth_client_secret,
-                  COALESCE(oauth_default_scopes, ARRAY[]::TEXT[]) AS oauth_default_scopes,
-                  built_in, created_at, updated_at
-           FROM mcp_upstream_servers
-           WHERE id = $1"#,
-    )
+    let row = sqlx::query_as::<_, UpstreamDbRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT {UPSTREAM_COLS} FROM mcp_upstream_servers WHERE id = $1"
+    )))
     .bind(id)
     .fetch_optional(db.conn())
     .await
@@ -675,7 +630,7 @@ pub async fn get_mcp_upstream_server(
         ApiError::internal("failed to fetch mcp upstream server")
     })?
     .ok_or_else(|| ApiError::not_found("mcp upstream server not found", ApiErrorCode::McpUpstreamServerNotFound))?;
-    Ok(Json(row))
+    Ok(Json(row.into()))
 }
 
 #[utoipa::path(
@@ -694,10 +649,17 @@ pub async fn create_mcp_upstream_server(
     mut db: TenantConn,
     Json(body): Json<CreateMcpUpstreamServer>,
 ) -> Result<(StatusCode, Json<McpUpstreamServerRow>), ApiError> {
-    let egress = MCP_EGRESS;
-    validate_upstream_create(&body, egress)?;
-    validate_credential_shape(body.auth_mode.as_deref(), body.credential.as_deref(), true)?;
-    let effective_auth_mode_for_oauth = body.auth_mode.as_deref().or(Some("no_auth"));
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+    let auth_mode = match body.auth_mode.as_deref() {
+        Some(m) => parse_auth_mode(m)?,
+        None => McpAuthMode::Headers,
+    };
+    let specs = mcp_inputs::specs_of(&body.remote, auth_mode.as_str())?;
+    let upstream_url =
+        hi::finish_url(&body.remote, &body.url_variables).map_err(|e| mcp_inputs::remote_error(&e))?;
+    let url_variables = mcp_inputs::url_values_used(&body.remote, &body.url_variables);
     // Empty oauth_* strings/arrays are normalised to "absent" so the canonical
     // row shape never carries `""` or `[]` in a column that should be NULL.
     // Mirrors the `description` empty→NULL pattern below.
@@ -708,8 +670,16 @@ pub async fn create_mcp_upstream_server(
     let oauth_client_id = nonempty_str(body.oauth_client_id.as_deref());
     let oauth_client_secret = nonempty_str(body.oauth_client_secret.as_deref());
     let oauth_default_scopes = nonempty_vec(body.oauth_default_scopes.as_ref());
+    validate_outbound_urls(
+        Some(&upstream_url),
+        oauth_issuer_url,
+        oauth_authorization_url,
+        oauth_token_url,
+        oauth_revocation_url,
+        MCP_EGRESS,
+    )?;
     validate_oauth_client_shape(
-        effective_auth_mode_for_oauth,
+        Some(auth_mode.as_str()),
         oauth_issuer_url,
         oauth_authorization_url,
         oauth_token_url,
@@ -719,12 +689,23 @@ pub async fn create_mcp_upstream_server(
         oauth_default_scopes,
         true,
     )?;
-    let transport = body.transport.unwrap_or_else(|| "streamable_http".into());
-    let auth_mode = body.auth_mode.unwrap_or_else(|| "no_auth".into());
+
+    // The admin's values: only admin-filled ids, every required one present.
+    let ops = mcp_inputs::plan_value_patch(
+        &body.remote,
+        &specs,
+        Filler::Admin,
+        &mcp_inputs::as_patch(&body.inputs),
+        &mcp_inputs::as_patch(&body.secret_inputs),
+    )
+    .map_err(mcp_inputs::PatchRefusal::into_api)?;
+    let (admin_values, _) = mcp_inputs::encrypt_ops(&ops)?;
+    mcp_inputs::require_filled(&specs, Filler::Admin, &admin_values)?;
+    let required_user_input_ids = hi::required_user_input_ids(&specs);
+
     let enabled = body.enabled.unwrap_or(true);
     let connect_timeout_ms = body.connect_timeout_ms.unwrap_or(10_000);
     let request_timeout_ms = body.request_timeout_ms.unwrap_or(60_000);
-    let encrypted_credential = encrypt_mcp_credential(body.credential.as_deref())?;
     let encrypted_oauth_client_secret = encrypt_mcp_credential(oauth_client_secret)?;
     // Normalize description so create + patch agree on the "empty means NULL"
     // semantics — keeps a single canonical row shape regardless of which
@@ -735,34 +716,30 @@ pub async fn create_mcp_upstream_server(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let row = sqlx::query_as::<_, McpUpstreamServerRow>(
+    let row = sqlx::query_as::<_, UpstreamDbRow>(sqlx::AssertSqlSafe(format!(
         r#"INSERT INTO mcp_upstream_servers
                (tenant_id, name, description, upstream_url, transport, auth_mode,
-                enabled, connect_timeout_ms, request_timeout_ms, encrypted_credential,
+                enabled, connect_timeout_ms, request_timeout_ms,
+                remote, encrypted_admin_inputs, required_user_input_ids,
                 oauth_issuer_url, oauth_authorization_url, oauth_token_url,
                 oauth_revocation_url, oauth_client_id, encrypted_oauth_client_secret,
-                oauth_default_scopes)
+                oauth_default_scopes, url_variables)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                   $11, $12, $13, $14, $15, $16, $17)
-           RETURNING id, name, description, upstream_url, transport, auth_mode, enabled,
-                     connect_timeout_ms, request_timeout_ms, cred_version,
-                     (encrypted_credential IS NOT NULL) AS has_credential,
-                     oauth_issuer_url, oauth_authorization_url, oauth_token_url,
-                     oauth_revocation_url, oauth_client_id,
-                     (encrypted_oauth_client_secret IS NOT NULL) AS has_oauth_client_secret,
-                     COALESCE(oauth_default_scopes, ARRAY[]::TEXT[]) AS oauth_default_scopes,
-                     built_in, created_at, updated_at"#,
-    )
+                   $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+           RETURNING {UPSTREAM_COLS}"#
+    )))
     .bind(db.tenant_uuid())
     .bind(&body.name)
     .bind(description)
-    .bind(&body.upstream_url)
-    .bind(&transport)
-    .bind(&auth_mode)
+    .bind(&upstream_url)
+    .bind(body.remote.kind.transport_str())
+    .bind(auth_mode.as_str())
     .bind(enabled)
     .bind(connect_timeout_ms)
     .bind(request_timeout_ms)
-    .bind(encrypted_credential)
+    .bind(sqlx::types::Json(&body.remote))
+    .bind(sqlx::types::Json(&admin_values))
+    .bind(&required_user_input_ids)
     .bind(oauth_issuer_url)
     .bind(oauth_authorization_url)
     .bind(oauth_token_url)
@@ -770,6 +747,7 @@ pub async fn create_mcp_upstream_server(
     .bind(oauth_client_id)
     .bind(encrypted_oauth_client_secret)
     .bind(oauth_default_scopes)
+    .bind(sqlx::types::Json(&url_variables))
     .fetch_one(db.conn())
     .await
     .map_err(|e| {
@@ -781,7 +759,7 @@ pub async fn create_mcp_upstream_server(
         }
     })?;
 
-    Ok((StatusCode::CREATED, Json(row)))
+    Ok((StatusCode::CREATED, Json(row.into())))
 }
 
 #[utoipa::path(
@@ -794,6 +772,7 @@ pub async fn create_mcp_upstream_server(
         (status = 200, description = "Updated", body = McpUpstreamServerRow),
         (status = 400, description = "Invalid", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 409, description = "Built-in; a client header another upstream on a shared virtual server reads; or a client-filled Authorization on an upstream routed on an OAuth sign-in virtual server", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -802,23 +781,8 @@ pub async fn update_mcp_upstream_server(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateMcpUpstreamServer>,
 ) -> Result<Json<McpUpstreamServerRow>, ApiError> {
-    if let Some(t) = &body.transport
-        && !VALID_TRANSPORTS.contains(&t.as_str())
-    {
-        return Err(ApiError::bad_request("transport must be one of: streamable_http, sse"));
-    }
-    if let Some(a) = &body.auth_mode
-        && !VALID_AUTH_MODES.contains(&a.as_str())
-    {
-        return Err(ApiError::bad_request(
-            "auth_mode must be one of: no_auth, service_account, per_user_oauth, byot",
-        ));
-    }
-    if let Some(url) = &body.upstream_url
-        && !url.starts_with("http://")
-        && !url.starts_with("https://")
-    {
-        return Err(ApiError::bad_request("upstream_url must be http(s)://..."));
+    if let Some(a) = &body.auth_mode {
+        parse_auth_mode(a)?;
     }
     // Empty oauth_* strings/arrays are normalised to "absent" so a PATCH like
     // `{oauth_token_url: ""}` on a non-`per_user_oauth` row never lands `""` in
@@ -832,54 +796,65 @@ pub async fn update_mcp_upstream_server(
     let oauth_client_secret = nonempty_str(body.oauth_client_secret.as_deref());
     let oauth_default_scopes = nonempty_vec(body.oauth_default_scopes.as_ref().and_then(Option::as_ref));
 
-    let egress = MCP_EGRESS;
     validate_outbound_urls(
-        body.upstream_url.as_deref(),
+        None,
         oauth_issuer_url,
         oauth_authorization_url,
         oauth_token_url,
         oauth_revocation_url,
-        egress,
+        MCP_EGRESS,
     )?;
 
-    // Pull built_in + every column we need for shape validation in one round
-    // trip. The PATCH gates on five facts about the existing row: is it
-    // built-in (reject), what auth_mode is locked in (matches body when
-    // supplied), are the per-user-OAuth columns already populated (required
-    // for `per_user_oauth` resulting-shape check), and is the OAuth client
-    // secret already on file.
+    let fail = |e: sqlx::Error| {
+        tracing::error!("update mcp_upstream_server: {e}");
+        ApiError::internal("failed to update mcp upstream server")
+    };
+    // One transaction: the row, the admin values, the users' values and the
+    // collision check commit together. Lock order is shared with the route
+    // insert (`mcp_inputs::lock_and_check_route_binding`): the virtual servers
+    // this upstream is routed on first, then this row.
+    let mut tx = db.conn().begin().await.map_err(fail)?;
+    let locked_vs = mcp_inputs::lock_upstream_virtual_servers(&mut tx, id).await?;
+
     #[derive(sqlx::FromRow)]
     struct ExistingRow {
         built_in: bool,
+        name: String,
         auth_mode: String,
+        upstream_url: String,
+        transport: String,
+        remote: sqlx::types::Json<Remote>,
+        url_variables: sqlx::types::Json<BTreeMap<String, String>>,
+        encrypted_admin_inputs: sqlx::types::Json<HashMap<String, String>>,
         oauth_issuer_url: Option<String>,
         oauth_authorization_url: Option<String>,
         oauth_token_url: Option<String>,
         oauth_client_id: Option<String>,
         has_oauth_client_secret: bool,
     }
+    // `FOR NO KEY UPDATE`: a concurrent route insert's foreign-key check
+    // (`FOR KEY SHARE`) on this row must not wait on it.
     let existing: ExistingRow = sqlx::query_as::<_, ExistingRow>(
-        r#"SELECT built_in, auth_mode, oauth_issuer_url, oauth_authorization_url,
-                  oauth_token_url, oauth_client_id,
+        r#"SELECT built_in, name, auth_mode, upstream_url, transport, remote, url_variables,
+                  encrypted_admin_inputs,
+                  oauth_issuer_url, oauth_authorization_url, oauth_token_url, oauth_client_id,
                   (encrypted_oauth_client_secret IS NOT NULL) AS has_oauth_client_secret
            FROM mcp_upstream_servers
-           WHERE id = $1"#,
+           WHERE id = $1
+           FOR NO KEY UPDATE"#,
     )
     .bind(id)
-    .fetch_optional(db.conn())
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("fetch existing upstream: {e}");
-        ApiError::internal("failed to fetch existing upstream")
-    })?
+    .map_err(fail)?
     .ok_or_else(|| {
         ApiError::not_found("mcp upstream server not found", ApiErrorCode::McpUpstreamServerNotFound)
     })?;
 
     // Refuse mutation on built-in (gateway-managed) rows. The synthetic
     // `internal://*` upstreams (e.g. `builtin-web` for `/mcp/web`) are
-    // configured through the dedicated web admin endpoints (phase 2); the
-    // generic upstream PATCH must not let an operator repoint or rename them.
+    // configured through the dedicated web admin endpoints; the generic
+    // upstream PATCH must not let an operator repoint or rename them.
     if existing.built_in {
         return Err(ApiError::conflict(
             "built-in upstream is gateway-managed; configure via the web admin endpoints",
@@ -887,10 +862,9 @@ pub async fn update_mcp_upstream_server(
         ));
     }
 
-    // auth_mode is locked post-create. Each mode carries a distinct credential
-    // shape (service_account ↔ bearer, per_user_oauth ↔ client + token store,
-    // byot ↔ no server-side credential); flipping silently strands or drops
-    // credentials, so we surface a typed 400 here and require delete+recreate.
+    // auth_mode is locked post-create: `per_user_oauth` carries an OAuth
+    // client and every user's token store, and reserves `Authorization`;
+    // flipping silently strands or drops them, so re-adopt to switch.
     if let Some(new_mode) = body.auth_mode.as_deref()
         && new_mode != existing.auth_mode
     {
@@ -900,12 +874,8 @@ pub async fn update_mcp_upstream_server(
         .code(ApiErrorCode::McpUpstreamAuthModeLocked));
     }
 
-    // Validate credential + oauth shape against the locked-in auth_mode.
-    // `body.auth_mode` is either absent (no_op) or equals existing.auth_mode
-    // (passthrough), so we always validate against the existing row.
+    // Validate the oauth shape against the locked-in auth_mode.
     let effective_auth_mode = existing.auth_mode.as_str();
-    validate_credential_shape(Some(effective_auth_mode), body.credential.as_deref(), false)?;
-
     if effective_auth_mode == "per_user_oauth" {
         // Compose (patch ∪ existing) and reject when any required field is
         // empty/missing after the merge. Feed the **raw** `body.oauth_*` values
@@ -1007,17 +977,134 @@ pub async fn update_mcp_upstream_server(
         )?;
     }
 
-    // Credential + secret rotation: encrypt fresh ciphertext when supplied,
-    // otherwise leave the existing column untouched. `auth_mode` is locked, so
-    // no nullification CASE is needed — `service_account` rows always carry a
-    // credential (validated above), `per_user_oauth` rows always carry the
-    // client_secret (resulting-shape check), and the other two modes never had
-    // either column populated to begin with.
-    let encrypted_credential = match body.credential.as_deref() {
-        Some(plain) if !plain.is_empty() => Some(encrypt_mcp_credential(Some(plain))?),
-        _ => None,
+    // The declaration: the new remote (or the stored one), its fillers
+    // validated, the URL re-finished when its template or variables change.
+    let stored_remote = &existing.remote.0;
+    let remote_changed = body.remote.as_ref().is_some_and(|r| r != stored_remote);
+    let remote = body.remote.clone().unwrap_or_else(|| stored_remote.clone());
+    let specs = mcp_inputs::specs_of(&remote, effective_auth_mode)?;
+    let stored_specs =
+        mcp_inputs::stored_specs(id, stored_remote, effective_auth_mode).unwrap_or_default();
+    // The URL is finished again when its template or a variable changes,
+    // from the stored values merged with the body's — a default never fills
+    // a variable here (see `merged_url_variables`).
+    let stored_vars = &existing.url_variables.0;
+    let (upstream_url, url_variables) = if body.url_variables.is_some() || remote.url != stored_remote.url {
+        let vars = mcp_inputs::merged_url_variables(&remote, stored_vars, body.url_variables.as_ref())
+            .map_err(|e| mcp_inputs::remote_error(&e))?;
+        let url = hi::finish_url(&remote, &vars).map_err(|e| mcp_inputs::remote_error(&e))?;
+        validate_outbound_urls(Some(&url), None, None, None, None, MCP_EGRESS)?;
+        (url, mcp_inputs::url_values_used(&remote, &vars))
+    } else {
+        let kept = stored_vars
+            .iter()
+            .filter(|(k, _)| remote.variables.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (existing.upstream_url.clone(), kept)
+    };
+    let transport = remote.kind.transport_str();
+
+    // Admin values: a stored value whose input is no longer admin-filled is
+    // dropped, then the patch applies; every required admin input must hold
+    // a value afterwards.
+    let ops = mcp_inputs::plan_value_patch(&remote, &specs, Filler::Admin, &body.inputs, &body.secret_inputs)
+        .map_err(mcp_inputs::PatchRefusal::into_api)?;
+    let (set, remove) = mcp_inputs::encrypt_ops(&ops)?;
+    let mut admin_values: HashMap<String, String> = existing
+        .encrypted_admin_inputs
+        .0
+        .iter()
+        .filter(|(k, _)| specs.iter().any(|s| s.filler == Filler::Admin && &s.declared.id == *k))
+        // A value stored as a secret is never shown back; if its input stops
+        // being secret it is dropped (and must be set again), not revealed.
+        .filter(|(k, _)| {
+            let now = specs.iter().find(|s| &s.declared.id == *k);
+            let before = stored_specs.iter().find(|s| &s.declared.id == *k);
+            match (now, before) {
+                (Some(n), Some(b)) => {
+                    mcp_inputs::is_secret(&remote, n) == mcp_inputs::is_secret(stored_remote, b)
+                }
+                _ => true,
+            }
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for id in &remove {
+        admin_values.remove(id);
     }
-    .flatten();
+    admin_values.extend(set);
+    mcp_inputs::require_filled(&specs, Filler::Admin, &admin_values)?;
+    if remote_changed {
+        mcp_inputs::require_stored_values_valid(&specs, Filler::Admin, &admin_values)?;
+    }
+    let admin_changed = admin_values != existing.encrypted_admin_inputs.0;
+
+    // A change of the client-filled headers re-runs the collision rule on
+    // every virtual server this upstream is routed on.
+    if mcp_inputs::client_headers(&specs) != mcp_inputs::client_headers(&stored_specs) {
+        let name = body.name.as_deref().unwrap_or(&existing.name);
+        mcp_inputs::check_upstream_collisions(&mut tx, id, name, &specs, &locked_vs).await?;
+    }
+
+    // Users keep only the values of inputs that are still user-filled and
+    // whose accepted values did not change: a value the new `choices` or
+    // `format` might refuse is dropped, so the user is asked for it again
+    // rather than shown as connected while the gateway ignores it.
+    if remote_changed {
+        let user_ids: Vec<String> = specs
+            .iter()
+            .filter(|s| s.filler == Filler::User)
+            .filter(|s| {
+                stored_specs.iter().any(|old| {
+                    old.filler == Filler::User
+                        && old.declared.id == s.declared.id
+                        && old.declared.input.choices == s.declared.input.choices
+                        && old.declared.input.format == s.declared.input.format
+                })
+            })
+            .map(|s| s.declared.id.clone())
+            .collect();
+        sqlx::query(
+            r#"UPDATE mcp_user_inputs
+               SET encrypted_values = (
+                       SELECT COALESCE(jsonb_object_agg(e.key, e.value), '{}'::jsonb)
+                       FROM jsonb_each(encrypted_values) e
+                       WHERE e.key = ANY($2)),
+                   updated_at = NOW()
+               WHERE upstream_server_id = $1
+                 AND EXISTS (SELECT 1 FROM jsonb_object_keys(encrypted_values) k
+                             WHERE NOT (k = ANY($2)))"#,
+        )
+        .bind(id)
+        .bind(&user_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(fail)?;
+        // A user left with no value has no connection to show or revoke.
+        sqlx::query(
+            "DELETE FROM mcp_user_inputs WHERE upstream_server_id = $1 AND encrypted_values = '{}'::jsonb",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(fail)?;
+    }
+
+    // A server moved to another origin never receives what users gave the
+    // old one: every user's entered values and OAuth tokens are deleted, and
+    // each enters or connects again for the new server.
+    let origin = |u: &str| url::Url::parse(u).ok().map(|u| u.origin().ascii_serialization());
+    if origin(&upstream_url) != origin(&existing.upstream_url) {
+        for table in ["mcp_user_inputs", "mcp_user_credentials"] {
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table} WHERE upstream_server_id = $1")))
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(fail)?;
+        }
+    }
+
     let encrypted_oauth_client_secret = oauth_client_secret
         .map(|plain| encrypt_mcp_credential(Some(plain)))
         .transpose()?
@@ -1031,60 +1118,58 @@ pub async fn update_mcp_upstream_server(
         if t.is_empty() { None } else { Some(t) }
     });
 
-    let row = sqlx::query_as::<_, McpUpstreamServerRow>(
+    // cred_version keys the proxy's capability cache and its handshake /
+    // listener reset, so it moves with everything that changes what reaches
+    // the upstream: the declaration or its fillers, an admin value, the URL,
+    // the transport, the OAuth client secret. Cosmetic edits (name,
+    // description, enabled, timeouts, oauth_*_url metadata) leave it.
+    let bump = remote_changed
+        || admin_changed
+        || upstream_url != existing.upstream_url
+        || transport != existing.transport
+        || encrypted_oauth_client_secret.is_some();
+    let required_user_input_ids = hi::required_user_input_ids(&specs);
+
+    let row = sqlx::query_as::<_, UpstreamDbRow>(sqlx::AssertSqlSafe(format!(
         r#"UPDATE mcp_upstream_servers SET
                name                   = COALESCE($2, name),
                description            = CASE
                                             WHEN $3::boolean THEN $4
                                             ELSE description
                                         END,
-               upstream_url           = COALESCE($5, upstream_url),
-               transport              = COALESCE($6, transport),
+               upstream_url           = $5,
+               transport              = $6,
                enabled                = COALESCE($7, enabled),
                connect_timeout_ms     = COALESCE($8, connect_timeout_ms),
                request_timeout_ms     = COALESCE($9, request_timeout_ms),
-               encrypted_credential   = COALESCE($10, encrypted_credential),
-               oauth_issuer_url        = COALESCE($11, oauth_issuer_url),
-               oauth_authorization_url = COALESCE($12, oauth_authorization_url),
-               oauth_token_url         = COALESCE($13, oauth_token_url),
-               oauth_revocation_url    = CASE WHEN $18 THEN $14 ELSE oauth_revocation_url END,
-               oauth_client_id         = COALESCE($15, oauth_client_id),
-               encrypted_oauth_client_secret = COALESCE($16, encrypted_oauth_client_secret),
-               oauth_default_scopes    = CASE WHEN $19 THEN $17 ELSE oauth_default_scopes END,
-               -- cred_version participates in the proxy capability cache key
-               -- ((upstream_id, cred_version, method)). Bump only when the
-               -- mutation affects what's cached: the credential, the OAuth
-               -- client secret, the upstream URL, or the transport. Cosmetic
-               -- edits (name, description, enabled, timeouts, oauth_*_url
-               -- metadata) leave the cache valid.
-               cred_version = cred_version + CASE
-                   WHEN $10::bytea IS NOT NULL THEN 1
-                   WHEN $16::bytea IS NOT NULL THEN 1
-                   WHEN $5::text IS NOT NULL AND $5 IS DISTINCT FROM upstream_url THEN 1
-                   WHEN $6::text IS NOT NULL AND $6 IS DISTINCT FROM transport THEN 1
-                   ELSE 0
-               END,
+               remote                 = $10,
+               encrypted_admin_inputs = $11,
+               required_user_input_ids = $12,
+               oauth_issuer_url        = COALESCE($13, oauth_issuer_url),
+               oauth_authorization_url = COALESCE($14, oauth_authorization_url),
+               oauth_token_url         = COALESCE($15, oauth_token_url),
+               oauth_revocation_url    = CASE WHEN $20 THEN $16 ELSE oauth_revocation_url END,
+               oauth_client_id         = COALESCE($17, oauth_client_id),
+               encrypted_oauth_client_secret = COALESCE($18, encrypted_oauth_client_secret),
+               oauth_default_scopes    = CASE WHEN $21 THEN $19 ELSE oauth_default_scopes END,
+               cred_version = cred_version + CASE WHEN $22 THEN 1 ELSE 0 END,
+               url_variables = $23,
                updated_at = NOW()
            WHERE id = $1
-           RETURNING id, name, description, upstream_url, transport, auth_mode, enabled,
-                     connect_timeout_ms, request_timeout_ms, cred_version,
-                     (encrypted_credential IS NOT NULL) AS has_credential,
-                     oauth_issuer_url, oauth_authorization_url, oauth_token_url,
-                     oauth_revocation_url, oauth_client_id,
-                     (encrypted_oauth_client_secret IS NOT NULL) AS has_oauth_client_secret,
-                     COALESCE(oauth_default_scopes, ARRAY[]::TEXT[]) AS oauth_default_scopes,
-                     built_in, created_at, updated_at"#,
-    )
+           RETURNING {UPSTREAM_COLS}"#
+    )))
     .bind(id)
     .bind(&body.name)
     .bind(description_param.is_some())
     .bind(description_param.flatten())
-    .bind(&body.upstream_url)
-    .bind(&body.transport)
+    .bind(&upstream_url)
+    .bind(transport)
     .bind(body.enabled)
     .bind(body.connect_timeout_ms)
     .bind(body.request_timeout_ms)
-    .bind(encrypted_credential)
+    .bind(sqlx::types::Json(&remote))
+    .bind(sqlx::types::Json(&admin_values))
+    .bind(&required_user_input_ids)
     .bind(oauth_issuer_url)
     .bind(oauth_authorization_url)
     .bind(oauth_token_url)
@@ -1092,19 +1177,250 @@ pub async fn update_mcp_upstream_server(
     .bind(oauth_client_id)
     .bind(encrypted_oauth_client_secret)
     .bind(oauth_default_scopes)
-    .bind(body.oauth_revocation_url.is_some()) // $18
-    .bind(body.oauth_default_scopes.is_some()) // $19
+    .bind(body.oauth_revocation_url.is_some()) // $20
+    .bind(body.oauth_default_scopes.is_some()) // $21
+    .bind(bump) // $22
+    .bind(sqlx::types::Json(&url_variables)) // $23
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(fail)?;
+    tx.commit().await.map_err(fail)?;
+
+    Ok(Json(row.into()))
+}
+
+/// What the console's Test button found on one upstream, probed with the
+/// administrator's own values only (no user, no client).
+#[derive(Serialize, ToSchema)]
+pub struct McpUpstreamTestResult {
+    pub upstream_id: Uuid,
+    pub upstream_name: String,
+    pub upstream_url: String,
+    pub auth_mode: String,
+    /// One of: `ok`; `needs_user_value` (a required input each user fills —
+    /// the test has no user, so it does not call); `needs_client_value` (a
+    /// required header the client sends on each request); `needs_user_sign_in`
+    /// (a per-user OAuth upstream: the call carries a user's token);
+    /// `unavailable` (an administrator value is missing, unreadable or no
+    /// longer fits its declaration); `redirected` (a 3xx, never followed);
+    /// `http_error`; `jsonrpc_error`.
+    pub status: String,
+    /// Human-readable detail when `status != ok`, in the gateway's own words
+    /// (never text the upstream sent).
+    pub error: Option<String>,
+    /// The required user-filled inputs the test could not fill.
+    pub needs_user_input_ids: Vec<String>,
+    /// The required client-filled inputs the test could not fill.
+    pub needs_client_input_ids: Vec<String>,
+    pub tools: Vec<super::portal_mcp_test::PortalMcpTestEntry>,
+    pub prompts: Vec<super::portal_mcp_test::PortalMcpTestEntry>,
+    pub resources: Vec<super::portal_mcp_test::PortalMcpTestResource>,
+    /// Only for a gateway-internal upstream (the built-in web server): its
+    /// configuration state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_status: Option<super::portal_mcp_test::PortalMcpBuiltinStatus>,
+}
+
+/// Why the console's test does not call the upstream.
+#[derive(Debug, PartialEq, Eq)]
+struct TestBlocked {
+    status: &'static str,
+    message: String,
+    user_ids: Vec<String>,
+    client_ids: Vec<String>,
+}
+
+impl TestBlocked {
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self { status: "unavailable", message: message.into(), user_ids: vec![], client_ids: vec![] }
+    }
+}
+
+/// Whether a call to an upstream can go out at all, whoever makes it: the
+/// administrator's values decrypted, or why every call fails — a stored
+/// administrator value that cannot be read, a required one missing, a
+/// declaration that no longer validates, or a per-user OAuth upstream with no
+/// token URL or client ID. A call that can go out may still wait on a user's
+/// or the client's value. The console's test reports these as `unavailable`;
+/// the alert scan notifies the administrator of them.
+pub(crate) fn upstream_unusable(
+    remote: &Remote,
+    auth_mode: &str,
+    encrypted_admin_inputs: &HashMap<String, String>,
+    oauth_token_url: Option<&str>,
+    oauth_client_id: Option<&str>,
+    log: Log,
+) -> Result<HashMap<String, String>, String> {
+    let admin = mcp_inputs::decrypt_values_with(encrypted_admin_inputs, log == Log::Warn);
+    if admin.len() != encrypted_admin_inputs.len() {
+        return Err("a stored administrator value cannot be read; set it again".into());
+    }
+    let oauth = mcp_inputs::is_oauth(auth_mode);
+    if oauth && oauth_token_url.is_none_or(str::is_empty) {
+        return Err("its OAuth client has no token URL; set it in the upstream's settings".into());
+    }
+    if oauth && oauth_client_id.is_none_or(str::is_empty) {
+        return Err("its OAuth client has no client ID; set it in the upstream's settings".into());
+    }
+    match admin_test_auth(remote, oauth, &admin, log) {
+        Err(b) if b.status == "unavailable" => Err(b.message),
+        _ => Ok(admin),
+    }
+}
+
+/// Whether a check logs what it finds: the console's test does, once per press;
+/// the alert scan, which re-checks every cycle, does not (its notification is
+/// the record).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Log {
+    Warn,
+    Quiet,
+}
+
+/// The headers the console's test sends: the administrator's values alone,
+/// through the gateway's own resolver. An input a user or the client fills is
+/// reported, never guessed; a per-user OAuth upstream needs a user's token.
+fn admin_test_auth(
+    remote: &Remote,
+    oauth: bool,
+    admin: &HashMap<String, String>,
+    log: Log,
+) -> Result<hi::UpstreamAuth, TestBlocked> {
+    let values = hi::InputValues { admin: Some(admin), user: None, client: None };
+    match hi::resolve(remote, oauth, values) {
+        Ok(_) if oauth => Err(TestBlocked {
+            status: "needs_user_sign_in",
+            message: "needs a user's OAuth sign-in: every call carries the signed-in user's token".into(),
+            user_ids: vec![],
+            client_ids: vec![],
+        }),
+        Ok(auth) => Ok(auth),
+        Err(hi::ResolveError::Missing(m)) if !m.admin.is_empty() => Err(TestBlocked::unavailable(format!(
+            "an administrator value is missing or no longer fits its declaration: {}",
+            m.admin.join(", ")
+        ))),
+        Err(hi::ResolveError::Missing(m)) => {
+            let mut parts = Vec::new();
+            if !m.user.is_empty() {
+                parts.push(format!("needs a user's value: {}", m.user.join(", ")));
+            }
+            if !m.client.is_empty() {
+                parts.push(format!("needs the client's value: {}", m.client.join(", ")));
+            }
+            let status = if m.user.is_empty() { "needs_client_value" } else { "needs_user_value" };
+            Err(TestBlocked { status, message: parts.join("; "), user_ids: m.user, client_ids: m.client })
+        }
+        Err(e) => {
+            if log == Log::Warn {
+                tracing::warn!("admin mcp test: headers unresolved: {e:?}");
+            }
+            Err(TestBlocked::unavailable("the stored declaration does not validate"))
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/mcp/upstream-servers/{id}/actions/test",
+    tag = "MCP Servers",
+    params(("id" = Uuid, Path, description = "Upstream server ID")),
+    responses(
+        (status = 200, description = "What the test call to the upstream returned", body = McpUpstreamTestResult),
+        (status = 404, description = "Not found", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn test_mcp_upstream_server(
+    mut db: TenantConn,
+    Path(id): Path<Uuid>,
+) -> Result<Json<McpUpstreamTestResult>, ApiError> {
+    #[derive(sqlx::FromRow)]
+    struct TestRow {
+        name: String,
+        upstream_url: String,
+        auth_mode: String,
+        remote: sqlx::types::Json<Remote>,
+        encrypted_admin_inputs: sqlx::types::Json<HashMap<String, String>>,
+        request_timeout_ms: i32,
+        oauth_token_url: Option<String>,
+        oauth_client_id: Option<String>,
+    }
+    let row = sqlx::query_as::<_, TestRow>(
+        r#"SELECT name, upstream_url, auth_mode, remote, encrypted_admin_inputs, request_timeout_ms,
+                  oauth_token_url, oauth_client_id
+           FROM mcp_upstream_servers WHERE id = $1"#,
+    )
+    .bind(id)
     .fetch_optional(db.conn())
     .await
     .map_err(|e| {
-        tracing::error!("update mcp_upstream_server: {e}");
-        ApiError::internal("failed to update mcp upstream server")
+        tracing::error!("admin mcp test: load upstream: {e}");
+        ApiError::internal("failed to load mcp upstream server")
     })?
-    .ok_or_else(|| {
-        ApiError::not_found("mcp upstream server not found", ApiErrorCode::McpUpstreamServerNotFound)
-    })?;
+    .ok_or_else(|| ApiError::not_found("mcp upstream server not found", ApiErrorCode::McpUpstreamServerNotFound))?;
 
-    Ok(Json(row))
+    let mut result = McpUpstreamTestResult {
+        upstream_id: id,
+        upstream_name: row.name,
+        upstream_url: row.upstream_url.clone(),
+        auth_mode: row.auth_mode.clone(),
+        status: "ok".into(),
+        error: None,
+        needs_user_input_ids: vec![],
+        needs_client_input_ids: vec![],
+        tools: vec![],
+        prompts: vec![],
+        resources: vec![],
+        builtin_status: None,
+    };
+
+    if streamscope_core::web::is_internal_upstream_url(&row.upstream_url) {
+        let tenant_id = db.tenant_uuid();
+        let preview =
+            super::portal_mcp_test::preview_internal_upstream(db.conn(), tenant_id, &row.upstream_url, "").await?;
+        result.tools = preview.tools;
+        result.prompts = preview.prompts;
+        result.resources = preview.resources;
+        result.builtin_status = Some(preview.builtin_status);
+        return Ok(Json(result));
+    }
+
+    let auth = match upstream_unusable(
+        &row.remote.0,
+        &row.auth_mode,
+        &row.encrypted_admin_inputs.0,
+        row.oauth_token_url.as_deref(),
+        row.oauth_client_id.as_deref(),
+        Log::Warn,
+    ) {
+        Err(reason) => Err(TestBlocked::unavailable(reason)),
+        Ok(admin) => admin_test_auth(&row.remote.0, mcp_inputs::is_oauth(&row.auth_mode), &admin, Log::Warn),
+    };
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(blocked) => {
+            result.status = blocked.status.into();
+            result.error = Some(blocked.message);
+            result.needs_user_input_ids = blocked.user_ids;
+            result.needs_client_input_ids = blocked.client_ids;
+            return Ok(Json(result));
+        }
+    };
+
+    // The call may ride TLS to a server behind a private CA: read the trusted
+    // CAs fresh (only the replica that imported one refreshes its cache).
+    crate::custom_ca::refresh_from_conn(db.conn()).await;
+    // The probe can take several upstream round trips: the pooled connection
+    // goes back before it, not after.
+    drop(db);
+    let probe =
+        super::portal_mcp_test::probe_upstream(&row.upstream_url, &auth, row.request_timeout_ms, "").await;
+    result.status = probe.status.into();
+    result.error = probe.error;
+    result.tools = probe.tools;
+    result.prompts = probe.prompts;
+    result.resources = probe.resources;
+    Ok(Json(result))
 }
 
 #[utoipa::path(
@@ -1170,22 +1486,23 @@ pub async fn delete_mcp_upstream_server(
 }
 
 // ===========================================================================
-// MCP UPSTREAM CONNECTIONS (per-user OAuth admin view)
+// MCP UPSTREAM CONNECTIONS (per-user admin view)
 // ===========================================================================
 //
-// Lists which tenant users have/haven't connected each per-user-OAuth
-// upstream + lets the admin revoke a user's session. LEFT JOIN against
-// `users` so disconnected users appear with NULL credentials columns —
-// surfaces the "8 / 12 connected" tenant-wide picture in one query. The
-// row delete is operator-side; the proxy picks it up in the tenant's config
-// body.
+// Lists which tenant users have/haven't connected each upstream users connect
+// to — a per-user OAuth one, or one with user-filled header inputs — and lets
+// the admin revoke a user's connection. LEFT JOINs against `users` so
+// disconnected users appear with NULL columns — surfaces the "8 / 12
+// connected" tenant-wide picture in one query. The row delete is
+// operator-side; the proxy picks it up in the tenant's config body.
 
 #[derive(Serialize, sqlx::FromRow, ToSchema)]
 pub struct McpUpstreamUserConnection {
     pub user_id: Uuid,
     pub email: String,
     pub display_name: Option<String>,
-    /// `mcp_user_credentials.created_at` for connected users; null otherwise.
+    /// When the user first connected (OAuth credential, else first filled
+    /// input); null when neither exists.
     pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Bumped on each successful upstream call. Null when never used or not connected.
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1193,6 +1510,11 @@ pub struct McpUpstreamUserConnection {
     pub scope: Option<String>,
     /// True when a `mcp_user_credentials` row exists for this (user, upstream).
     pub has_session: bool,
+    /// The user-filled inputs this user has a value for (never the value).
+    pub filled_input_ids: Vec<String>,
+    /// The user can call the upstream: an OAuth credential when the upstream
+    /// is per-user OAuth, and every required user input filled.
+    pub connected: bool,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -1200,8 +1522,8 @@ pub struct McpUpstreamUserConnection {
 pub struct McpConnectionsListQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    /// When false, only return rows for users who have actually connected.
-    /// Default true (full per-user-OAuth admin view = connected + disconnected).
+    /// When false, only return rows for users who have an OAuth credential
+    /// or filled inputs. Default true (connected + disconnected).
     pub include_disconnected: Option<bool>,
 }
 
@@ -1214,7 +1536,8 @@ pub struct McpConnectionsListQuery {
         McpConnectionsListQuery,
     ),
     responses(
-        (status = 200, description = "Per-user OAuth connection state for this upstream", body = OffsetPage<McpUpstreamUserConnection>),
+        (status = 200, description = "Per-user connection state for this upstream", body = OffsetPage<McpUpstreamUserConnection>),
+        (status = 400, description = "Users do not connect to this upstream", body = ApiErrorResponse),
         (status = 404, description = "Upstream not found", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
     ),
@@ -1229,57 +1552,58 @@ pub async fn list_mcp_upstream_connections(
     let offset = crate::routes::resolve_offset(query.offset);
     let include_disconnected = query.include_disconnected.unwrap_or(true);
 
-    // Verify upstream exists in this tenant (RLS-scoped).
-    let exists: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM mcp_upstream_servers WHERE id = $1",
+    // Verify the upstream exists in this tenant (RLS-scoped) and read what a
+    // user connects to on it.
+    let upstream: Option<(String, sqlx::types::Json<Remote>, Vec<String>)> = sqlx::query_as(
+        "SELECT auth_mode, remote, required_user_input_ids FROM mcp_upstream_servers WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(db.conn())
     .await
     .map_err(|e| {
-        tracing::error!("list mcp upstream connections (existence): {e}");
+        tracing::error!("list mcp upstream connections (upstream): {e}");
         ApiError::internal("failed to check upstream existence")
     })?;
-    if exists.is_none() {
+    let Some((auth_mode, remote, required)) = upstream else {
         return Err(ApiError::not_found("mcp upstream server not found", ApiErrorCode::McpUpstreamServerNotFound));
+    };
+
+    // Connections only make sense where a user connects: per-user OAuth, or a
+    // user-filled input. Reject any other upstream early so callers don't
+    // render a confusing wall of "disconnected" rows.
+    let oauth = mcp_inputs::is_oauth(&auth_mode);
+    let has_user_inputs = mcp_inputs::stored_specs(id, &remote, &auth_mode)
+        .is_some_and(|specs| specs.iter().any(|s| s.filler == Filler::User));
+    if !oauth && !has_user_inputs {
+        return Err(ApiError::bad_request(
+            "users do not connect to this upstream: it has neither per-user OAuth nor user-filled inputs",
+        )
+        .code(ApiErrorCode::McpUpstreamNotPerUserOauth));
     }
 
-    // Connections only make sense for `per_user_oauth` upstreams. Reject
-    // any other auth_mode early so callers don't render a confusing wall
-    // of "disconnected" rows for service-account/byot/no_auth upstreams.
-    let auth_mode: Option<(String,)> = sqlx::query_as(
-        "SELECT auth_mode::text FROM mcp_upstream_servers WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("list mcp upstream connections (auth_mode): {e}");
-        ApiError::internal("failed to read upstream auth_mode")
-    })?;
-    if let Some((mode,)) = auth_mode
-        && mode != "per_user_oauth"
-    {
-        return Err(ApiError::bad_request(format!(
-            "connections are only available on per_user_oauth upstreams (this one is {mode})"
-        ))
-        .code(ApiErrorCode::McpUpstreamCredentialNotAllowed));
-    }
-
-    let connected_only_clause = if include_disconnected { "" } else { " AND c.id IS NOT NULL" };
+    let connected_only_clause =
+        if include_disconnected { "" } else { " AND (c.id IS NOT NULL OR i.id IS NOT NULL)" };
     let sql = format!(
         "SELECT u.id AS user_id, \
                 u.email AS email, \
                 u.display_name AS display_name, \
-                c.created_at AS connected_at, \
+                COALESCE(c.created_at, i.created_at) AS connected_at, \
                 c.last_used_at AS last_used_at, \
                 c.scope AS scope, \
-                (c.id IS NOT NULL) AS has_session \
+                (c.id IS NOT NULL) AS has_session, \
+                ARRAY(SELECT k FROM jsonb_object_keys(COALESCE(i.encrypted_values, '{{}}'::jsonb)) k ORDER BY k) \
+                    AS filled_input_ids, \
+                ((NOT $4 OR (c.id IS NOT NULL AND (c.expires_at IS NULL OR c.expires_at > now() \
+                                                   OR c.encrypted_refresh_token IS NOT NULL))) \
+                 AND $5::text[] <@ ARRAY(SELECT jsonb_object_keys(COALESCE(i.encrypted_values, '{{}}'::jsonb)))) \
+                    AS connected \
          FROM users u \
          LEFT JOIN mcp_user_credentials c \
                 ON c.user_id = u.id AND c.upstream_server_id = $1 \
+         LEFT JOIN mcp_user_inputs i \
+                ON i.user_id = u.id AND i.upstream_server_id = $1 \
          WHERE u.is_active = true{connected_only_clause} \
-         ORDER BY (c.id IS NOT NULL) DESC, u.email \
+         ORDER BY (c.id IS NOT NULL OR i.id IS NOT NULL) DESC, u.email \
          LIMIT $2 OFFSET $3"
     );
 
@@ -1287,6 +1611,8 @@ pub async fn list_mcp_upstream_connections(
         .bind(id)
         .bind(limit + 1)
         .bind(offset)
+        .bind(oauth)
+        .bind(&required)
         .fetch_all(db.conn())
         .await
         .map_err(|e| {
@@ -1318,23 +1644,37 @@ pub async fn delete_mcp_upstream_connection(
 ) -> Result<Json<ActionResponse>, ApiError> {
     // Best-effort RFC 7009 revoke at the upstream IdP is the portal's
     // responsibility (see `mcp/oauth.rs` POST /actions/revoke). Admin-side
-    // this is an operator-initiated cleanup: drop the row, signal the
-    // proxy to refresh the per-tenant snapshot. The next request from
-    // this user will fail credential resolution and force a re-connect.
-    let result = sqlx::query(
+    // this is an operator-initiated cleanup: drop the user's OAuth credential
+    // and filled inputs together; the proxy picks the change up in the
+    // tenant's config body, and the user's next request asks for a re-connect.
+    let fail = |e: sqlx::Error| {
+        tracing::error!("delete mcp upstream connection: {e}");
+        ApiError::internal("failed to delete user connection")
+    };
+    let mut tx = db.conn().begin().await.map_err(fail)?;
+    let creds = sqlx::query(
         "DELETE FROM mcp_user_credentials \
          WHERE upstream_server_id = $1 AND user_id = $2",
     )
     .bind(upstream_id)
     .bind(user_id)
-    .execute(db.conn())
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("delete mcp upstream connection: {e}");
-        ApiError::internal("failed to delete user connection")
-    })?;
+    .map_err(fail)?
+    .rows_affected();
+    let inputs = sqlx::query(
+        "DELETE FROM mcp_user_inputs \
+         WHERE upstream_server_id = $1 AND user_id = $2",
+    )
+    .bind(upstream_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(fail)?
+    .rows_affected();
+    tx.commit().await.map_err(fail)?;
 
-    if result.rows_affected() == 0 {
+    if creds + inputs == 0 {
         return Err(ApiError::not_found("user connection not found", ApiErrorCode::McpUserCredentialNotFound));
     }
 
@@ -1381,8 +1721,31 @@ pub struct McpVirtualServerRow {
     /// the admin UI marks it not-grantable. Required-field set mirrors
     /// `oauth_client_missing_fields` / `ensure_endpoint_oauth_grantable`.
     pub oauth_incomplete: bool,
+    /// The headers a client must send to this endpoint (lowercased): the
+    /// client-filled inputs of its enabled routes' upstreams.
+    #[sqlx(skip)]
+    pub client_headers: Vec<String>,
+    /// `true` when one of those headers is `Authorization`: the gateway key
+    /// then rides the `/fwd/{key}/mcp/<slug>` path instead of that header.
+    #[sqlx(skip)]
+    pub fwd_mount: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Fill each row's client-header facts.
+async fn with_client_facts(
+    conn: &mut crate::db::tenant::Scoped,
+    rows: &mut [McpVirtualServerRow],
+) -> Result<(), ApiError> {
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let mut facts = mcp_inputs::vs_client_facts(conn, &ids).await?;
+    for r in rows {
+        let f = facts.remove(&r.id).unwrap_or_default();
+        r.client_headers = f.client_headers;
+        r.fwd_mount = f.fwd_mount;
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1530,6 +1893,8 @@ pub async fn list_mcp_virtual_servers(
         tracing::error!("list mcp_virtual_servers: {e}");
         ApiError::internal("failed to list mcp virtual servers")
     })?;
+    let mut rows = rows;
+    with_client_facts(db.conn(), &mut rows).await?;
     Ok(Json(TotalPage::new(rows, limit, offset, total)))
 }
 
@@ -1575,6 +1940,9 @@ pub async fn get_mcp_virtual_server(
         ApiError::internal("failed to fetch mcp virtual server")
     })?
     .ok_or_else(|| ApiError::not_found("mcp virtual server not found", ApiErrorCode::McpVirtualServerNotFound))?;
+    let mut rows = [row];
+    with_client_facts(db.conn(), &mut rows).await?;
+    let [row] = rows;
     Ok(Json(row))
 }
 
@@ -1699,6 +2067,7 @@ pub async fn create_mcp_virtual_server(
         (status = 200, description = "Updated", body = McpVirtualServerRow),
         (status = 400, description = "Invalid", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 409, description = "OAuth slug taken in another tenant, or an upstream routed here reads the client's own Authorization", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1723,11 +2092,12 @@ pub async fn update_mcp_virtual_server(
         tracing::error!("update mcp_virtual_server: begin tx: {e}");
         ApiError::internal("failed to update mcp virtual server")
     })?;
-    let current: Option<(String, bool, bool, Option<String>)> = sqlx::query_as(
+    let current: Option<(String, bool, bool, Option<String>, bool)> = sqlx::query_as(
         r#"SELECT slug,
                   sampling_intercept_enabled,
                   (sampling_credential IS NOT NULL) AS has_cred,
-                  sampling_model_alias
+                  sampling_model_alias,
+                  oauth_enabled
            FROM mcp_virtual_servers
            WHERE id = $1
            FOR UPDATE"#,
@@ -1764,7 +2134,16 @@ pub async fn update_mcp_virtual_server(
         Some(s) if s.trim().is_empty() => (true, None),
         Some(s) => (true, Some(validate_website_url(s)?)),
     };
-    if let Some((_, cur_enabled, cur_has_cred, cur_alias)) = current.as_ref() {
+    // Turning OAuth sign-in on: no upstream routed here may read the client's
+    // own Authorization, which an OAuth client spends on the gateway's token.
+    // The row lock above is the first half of the route binding's lock order.
+    if let Some((slug, _, _, _, was_oauth)) = current.as_ref()
+        && body.oauth_enabled == Some(true)
+        && !was_oauth
+    {
+        mcp_inputs::check_oauth_sign_in_bindings(&mut tx, id, slug).await?;
+    }
+    if let Some((_, cur_enabled, cur_has_cred, cur_alias, _)) = current.as_ref() {
         let final_enabled = body.sampling_intercept_enabled.unwrap_or(*cur_enabled);
         let final_has_cred = if update_cred { cred_bytes.is_some() } else { *cur_has_cred };
         let final_has_alias = if update_alias {
@@ -1860,6 +2239,9 @@ pub async fn update_mcp_virtual_server(
         tracing::error!("update mcp_virtual_server: commit tx: {e}");
         ApiError::internal("failed to update mcp virtual server")
     })?;
+    let mut rows = [row];
+    with_client_facts(db.conn(), &mut rows).await?;
+    let [row] = rows;
     Ok(Json(row))
 }
 
@@ -2063,7 +2445,7 @@ pub async fn list_mcp_virtual_routes(
         (status = 201, description = "Created", body = McpVirtualRouteRow),
         (status = 400, description = "Invalid", body = ApiErrorResponse),
         (status = 404, description = "Virtual server or upstream not found", body = ApiErrorResponse),
-        (status = 409, description = "Prefix collision", body = ApiErrorResponse),
+        (status = 409, description = "Prefix collision, a client header collision, or a client-filled Authorization on an OAuth sign-in virtual server", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2076,32 +2458,27 @@ pub async fn create_mcp_virtual_route(
         return Err(ApiError::bad_request(PREFIX_RULE).code(ApiErrorCode::McpRoutePrefixInvalid));
     }
 
-    // Verify virtual_server + upstream_server exist for this tenant.
-    let vs_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM mcp_virtual_servers WHERE id = $1)",
-    )
-    .bind(body.virtual_server_id)
-    .fetch_one(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("create mcp_virtual_route check vs: {e}");
-        ApiError::internal("failed to verify virtual server")
-    })?;
-    if !vs_exists {
-        return Err(ApiError::not_found("virtual server not found", ApiErrorCode::McpVirtualServerNotFound));
-    }
-    let up_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM mcp_upstream_servers WHERE id = $1)",
-    )
-    .bind(body.upstream_server_id)
-    .fetch_one(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("create mcp_virtual_route check up: {e}");
-        ApiError::internal("failed to verify upstream server")
-    })?;
-    if !up_exists {
-        return Err(ApiError::not_found("upstream server not found", ApiErrorCode::McpUpstreamServerNotFound));
+    let fail = |e: sqlx::Error| {
+        tracing::error!("create mcp_virtual_route: {e}");
+        ApiError::internal("failed to create mcp virtual route")
+    };
+    let tenant_id = db.tenant_uuid();
+    // One transaction: the virtual server row lock taken by the collision
+    // check serialises route inserts on it until this one commits.
+    let mut tx = db.conn().begin().await.map_err(fail)?;
+
+    // The virtual server and upstream exist in this tenant, and the upstream
+    // reads no client header another upstream on this server already reads.
+    match mcp_inputs::lock_and_check_route_binding(&mut tx, body.virtual_server_id, body.upstream_server_id)
+        .await?
+    {
+        None => {
+            return Err(ApiError::not_found("virtual server not found", ApiErrorCode::McpVirtualServerNotFound));
+        }
+        Some(false) => {
+            return Err(ApiError::not_found("upstream server not found", ApiErrorCode::McpUpstreamServerNotFound));
+        }
+        Some(true) => {}
     }
 
     // If prefix is empty, allow only when no other route exists on the
@@ -2112,12 +2489,9 @@ pub async fn create_mcp_virtual_route(
             "SELECT COUNT(*) FROM mcp_virtual_routes WHERE virtual_server_id = $1",
         )
         .bind(body.virtual_server_id)
-        .fetch_one(db.conn())
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| {
-            tracing::error!("create mcp_virtual_route count siblings: {e}");
-            ApiError::internal("failed to validate prefix")
-        })?;
+        .map_err(fail)?;
         if other > 0 {
             return Err(ApiError::bad_request(
                 "empty prefix is only allowed on the first route of a virtual server",
@@ -2125,12 +2499,6 @@ pub async fn create_mcp_virtual_route(
             .code(ApiErrorCode::McpRoutePrefixInvalid));
         }
     }
-
-    // BYOT routing requires single-route virtual servers — enforce on
-    // create. Mixing a `byot` upstream with any other route would break the
-    // forward-auth contract (which upstream gets the client's bearer?).
-    validate_byot_route_invariant(&mut db, body.virtual_server_id, body.upstream_server_id, None)
-        .await?;
 
     let enabled = body.enabled.unwrap_or(true);
     let position = body.position.unwrap_or(0);
@@ -2144,7 +2512,7 @@ pub async fn create_mcp_virtual_route(
                      tools_filter, resources_filter, prompts_filter,
                      enabled, position, created_at, updated_at"#,
     )
-    .bind(db.tenant_uuid())
+    .bind(tenant_id)
     .bind(body.virtual_server_id)
     .bind(body.upstream_server_id)
     .bind(&prefix)
@@ -2153,7 +2521,7 @@ pub async fn create_mcp_virtual_route(
     .bind(&body.prompts_filter)
     .bind(enabled)
     .bind(position)
-    .fetch_one(db.conn())
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
         if super::is_unique_violation(&e) {
@@ -2163,6 +2531,7 @@ pub async fn create_mcp_virtual_route(
             ApiError::internal("failed to create mcp virtual route")
         }
     })?;
+    tx.commit().await.map_err(fail)?;
     Ok((StatusCode::CREATED, Json(row)))
 }
 
@@ -2211,13 +2580,12 @@ pub async fn get_mcp_virtual_route(
     ),
     security(("bearer_auth" = []))
 )]
-// BYOT single-route invariant: `upstream_server_id` and `virtual_server_id` are
-// intentionally NOT in the PATCH allow-list — flipping either could route a
-// byot virtual server to a non-byot upstream or convert a single-route VS into
-// a multi-route one without re-running `validate_byot_route_invariant`. That
-// validator counts disabled routes by design, so toggling `enabled=false` here
-// also does NOT relax the invariant. Do not add either id to
-// `UpdateMcpVirtualRoute` without re-validating BYOT shape on the parent VS.
+// Client-header collision rule: `upstream_server_id` and `virtual_server_id`
+// are intentionally NOT in the PATCH allow-list — rebinding either would pair
+// two upstreams on one virtual server without re-running
+// `mcp_inputs::lock_and_check_route_binding`. That check counts disabled routes
+// by design, so toggling `enabled` here cannot create a collision either. Do
+// not add either id to `UpdateMcpVirtualRoute` without running it.
 pub async fn update_mcp_virtual_route(
     mut db: TenantConn,
     Path(id): Path<Uuid>,
@@ -2298,6 +2666,111 @@ pub async fn delete_mcp_virtual_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_remote(headers: &[(&str, bool, Filler)]) -> Remote {
+        use streamscope_core::mcp::header_inputs::{Input, InputsMeta, KeyValueInput, RemoteMeta};
+        Remote {
+            url: "https://mcp.example/mcp".into(),
+            headers: headers
+                .iter()
+                .map(|(name, required, _)| KeyValueInput {
+                    name: (*name).into(),
+                    input: Input { is_required: *required, ..Default::default() },
+                    variables: BTreeMap::new(),
+                })
+                .collect(),
+            meta: Some(RemoteMeta {
+                inputs: InputsMeta {
+                    fillers: headers.iter().map(|(name, _, f)| ((*name).to_string(), *f)).collect(),
+                },
+                ..RemoteMeta::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The console's test sends the administrator's values alone: it calls
+    /// when they are all the upstream needs (an optional user input left
+    /// out), and otherwise names who must supply what — never calling with a
+    /// header missing.
+    /// Every call fails, whoever makes it, on an unreadable or missing
+    /// administrator value or an incomplete OAuth client; one waiting only on
+    /// a user's or the client's value is usable (the controls).
+    #[test]
+    fn an_upstream_is_unusable_only_for_what_the_administrator_must_fix() {
+        // SAFETY: same value as every other ENCRYPTION_KEY setter in this binary.
+        unsafe {
+            std::env::set_var("ENCRYPTION_KEY", "test-oidc-flow-key-long-enough");
+        }
+        let ct = |v: &str| mcp_inputs::encrypt_value(v).expect("encrypts");
+        let r = test_remote(&[("X-Url", true, Filler::Admin), ("X-Token", true, Filler::User)]);
+        let set = HashMap::from([("X-Url".to_string(), ct("https://jira"))]);
+        let tok = Some("https://idp/token");
+        let cid = Some("client");
+
+        // Usable: the admin's value is set; the user's is theirs to fill.
+        let admin = upstream_unusable(&r, "headers", &set, None, None, Log::Quiet).expect("usable");
+        assert_eq!(admin.get("X-Url").map(String::as_str), Some("https://jira"));
+        let client_only = test_remote(&[("X-Key", true, Filler::Client)]);
+        assert!(upstream_unusable(&client_only, "headers", &HashMap::new(), None, None, Log::Quiet).is_ok());
+
+        // The admin's required value missing, or stored but unreadable.
+        let e = upstream_unusable(&r, "headers", &HashMap::new(), None, None, Log::Quiet).unwrap_err();
+        assert!(e.contains("X-Url"), "{e}");
+        let bad = HashMap::from([("X-Url".to_string(), "not-a-ciphertext".to_string())]);
+        assert!(upstream_unusable(&r, "headers", &bad, None, None, Log::Quiet).unwrap_err().contains("cannot be read"));
+
+        // Per-user OAuth: complete client usable; each missing field named.
+        let oauth = test_remote(&[("X-Url", true, Filler::Admin)]);
+        assert!(upstream_unusable(&oauth, "per_user_oauth", &set, tok, cid, Log::Quiet).is_ok());
+        assert!(upstream_unusable(&oauth, "per_user_oauth", &set, None, cid, Log::Quiet).unwrap_err().contains("token URL"));
+        assert!(upstream_unusable(&oauth, "per_user_oauth", &set, Some(""), cid, Log::Quiet).unwrap_err().contains("token URL"));
+        assert!(upstream_unusable(&oauth, "per_user_oauth", &set, tok, None, Log::Quiet).unwrap_err().contains("client ID"));
+        // The OAuth fields are not read on a header upstream.
+        assert!(upstream_unusable(&r, "headers", &set, None, None, Log::Quiet).is_ok());
+    }
+
+    #[test]
+    fn the_console_test_calls_with_the_admin_values_or_names_what_it_lacks() {
+        let admin = HashMap::from([("X-Url".to_string(), "https://jira".to_string())]);
+        let none = HashMap::new();
+
+        // Positive: every required input is the admin's; an optional user one is absent.
+        let r = test_remote(&[("X-Url", true, Filler::Admin), ("X-Team", false, Filler::User)]);
+        let auth = admin_test_auth(&r, false, &admin, Log::Quiet).expect("calls");
+        let names: Vec<&str> = auth.headers().iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["x-url"]);
+
+        // A required user input: reported, not a failure.
+        let r = test_remote(&[("X-Url", true, Filler::Admin), ("X-Token", true, Filler::User)]);
+        let b = admin_test_auth(&r, false, &admin, Log::Quiet).unwrap_err();
+        assert_eq!((b.status, b.user_ids.clone(), b.client_ids.clone()), ("needs_user_value", vec!["X-Token".to_string()], vec![]));
+        assert!(b.message.contains("needs a user's value: X-Token"), "{}", b.message);
+
+        // A required client input.
+        let r = test_remote(&[("X-Key", true, Filler::Client)]);
+        let b = admin_test_auth(&r, false, &none, Log::Quiet).unwrap_err();
+        assert_eq!((b.status, b.client_ids.clone()), ("needs_client_value", vec!["X-Key".to_string()]));
+        assert!(b.message.contains("needs the client's value: X-Key"), "{}", b.message);
+
+        // Both: the user's need leads, both are named.
+        let r = test_remote(&[("X-Token", true, Filler::User), ("X-Key", true, Filler::Client)]);
+        let b = admin_test_auth(&r, false, &none, Log::Quiet).unwrap_err();
+        assert_eq!(b.status, "needs_user_value");
+        assert_eq!((b.user_ids, b.client_ids), (vec!["X-Token".to_string()], vec!["X-Key".to_string()]));
+
+        // The administrator's own value missing: the upstream is unavailable.
+        let r = test_remote(&[("X-Url", true, Filler::Admin), ("X-Token", true, Filler::User)]);
+        let b = admin_test_auth(&r, false, &none, Log::Quiet).unwrap_err();
+        assert_eq!(b.status, "unavailable");
+        assert!(b.message.contains("X-Url") && b.user_ids.is_empty(), "{}", b.message);
+
+        // Per-user OAuth: the call needs a user's token, whatever the headers.
+        let r = test_remote(&[("X-Url", true, Filler::Admin)]);
+        assert_eq!(admin_test_auth(&r, true, &admin, Log::Quiet).unwrap_err().status, "needs_user_sign_in");
+        // A remote with no header at all calls with none.
+        assert!(admin_test_auth(&test_remote(&[]), false, &none, Log::Quiet).expect("calls").headers().is_empty());
+    }
 
     #[test]
     fn slug_validation() {

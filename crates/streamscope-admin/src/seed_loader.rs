@@ -117,15 +117,8 @@ pub struct CatalogEntry {
     pub output_vector_size: Option<i32>,
 }
 
-/// One tool advertised by a catalog MCP server (probed via tools/list at import).
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct McpCatalogTool {
-    pub name: String,
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-/// An MCP catalog entry loaded from `mcp_servers/catalog.json`.
+/// An MCP catalog entry loaded from `mcp_servers/catalog.json`: a canonical
+/// `server.json` document under its stable per-tenant seed key.
 ///
 /// The shape mirrors the offline import script's output. `source_name` is the
 /// stable per-tenant seed key.
@@ -134,50 +127,19 @@ pub struct McpCatalogSeed {
     #[serde(default)]
     pub source: Option<String>,
     pub source_name: String,
-    pub name: String,
-    #[serde(default)]
-    pub display_title: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub category: Option<String>,
-    #[serde(default)]
-    pub featured: bool,
-    #[serde(default)]
-    pub website_url: Option<String>,
-    #[serde(default)]
-    pub repository_url: Option<String>,
-    #[serde(default)]
-    pub icon_url: Option<String>,
-    pub upstream_url: String,
-    #[serde(default = "default_transport")]
-    pub transport: String,
-    #[serde(default = "default_auth_mode")]
-    pub auth_mode: String,
-    #[serde(default)]
-    pub oauth_issuer_url: Option<String>,
-    #[serde(default)]
-    pub oauth_authorization_url: Option<String>,
-    #[serde(default)]
-    pub oauth_token_url: Option<String>,
-    #[serde(default)]
-    pub oauth_revocation_url: Option<String>,
-    #[serde(default)]
-    pub oauth_default_scopes: Vec<String>,
-    #[serde(default)]
-    pub tools: Vec<McpCatalogTool>,
-    #[serde(default)]
-    pub tool_count: Option<i32>,
-    #[serde(default)]
-    pub liveness: Option<String>,
+    pub server_json: streamscope_core::mcp::header_inputs::ServerJson,
 }
 
-fn default_transport() -> String {
-    "streamable_http".to_string()
-}
-
-fn default_auth_mode() -> String {
-    "no_auth".to_string()
+/// Parse the MCP catalog seed and validate every entry's `server.json`.
+pub(crate) fn parse_mcp_catalog(content: &str) -> Result<Vec<McpCatalogSeed>, String> {
+    let entries: Vec<McpCatalogSeed> =
+        serde_json::from_str(content).map_err(|e| format!("invalid MCP catalog seed: {e}"))?;
+    for e in &entries {
+        e.server_json
+            .validate()
+            .map_err(|err| format!("invalid MCP catalog seed entry '{}': {err}", e.source_name))?;
+    }
+    Ok(entries)
 }
 
 /// A QoS class loaded from `seeds/qos_classes/classes.json`.
@@ -429,25 +391,17 @@ impl SeedLoader {
         }
     }
 
-    /// Load MCP catalog entries from `seeds/mcp_servers/catalog.json`.
-    pub fn load_mcp_catalog(&self) -> Vec<McpCatalogSeed> {
+    /// Load MCP catalog entries from `seeds/mcp_servers/catalog.json`. Every
+    /// entry's document must parse and validate: a file that does not is an
+    /// error, never an empty catalog (a reset would otherwise wipe the tenant's
+    /// catalog and re-seed nothing).
+    pub fn load_mcp_catalog(&self) -> Result<Vec<McpCatalogSeed>, String> {
         let path = self.base_dir.join("mcp_servers/catalog.json");
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match serde_json::from_str::<Vec<McpCatalogSeed>>(&content) {
-                Ok(entries) => {
-                    tracing::info!(count = entries.len(), "loaded MCP catalog seeds");
-                    entries
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "invalid MCP catalog seed");
-                    Vec::new()
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to read MCP catalog seed");
-                Vec::new()
-            }
-        }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read MCP catalog seed: {e}"))?;
+        let entries = parse_mcp_catalog(&content)?;
+        tracing::info!(count = entries.len(), "loaded MCP catalog seeds");
+        Ok(entries)
     }
 
     /// Load prompt snippets from `seeds/snippets/*.md`.
@@ -1255,6 +1209,31 @@ let y = 2;
         SeedLoader {
             base_dir: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../seeds")),
         }
+    }
+
+    /// The shipped MCP catalog parses, every document validates, and its seed
+    /// keys are unique (the upsert's conflict target).
+    #[test]
+    fn the_shipped_mcp_catalog_validates() {
+        let entries = repo_seed_loader().load_mcp_catalog().expect("the shipped MCP catalog loads");
+        assert!(!entries.is_empty());
+        let mut keys = std::collections::HashSet::new();
+        for e in &entries {
+            assert!(keys.insert(e.source_name.clone()), "duplicate source_name {}", e.source_name);
+        }
+    }
+
+    /// One entry that does not validate fails the whole load — never an empty
+    /// or partial catalog.
+    #[test]
+    fn an_invalid_mcp_catalog_entry_fails_the_load() {
+        let good = r#"{"source_name": "a", "server_json": {"name": "io.x/a", "description": "A",
+            "version": "1", "remotes": [{"type": "streamable-http", "url": "https://a.example/mcp"}]}}"#;
+        let bad = r#"{"source_name": "b", "server_json": {"name": "no-slash", "description": "B",
+            "version": "1", "remotes": [{"type": "streamable-http", "url": "https://b.example/mcp"}]}}"#;
+        assert_eq!(parse_mcp_catalog(&format!("[{good}]")).map(|v| v.len()), Ok(1));
+        assert!(parse_mcp_catalog(&format!("[{good}, {bad}]")).is_err());
+        assert!(parse_mcp_catalog("{}").is_err());
     }
 
     /// The opening of each client's real system prompt (its latest release),

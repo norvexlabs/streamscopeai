@@ -522,6 +522,25 @@ fn build_passthrough_target(
     }
 }
 
+/// The provider host a request names (`X-Origin-Host`): the one reader of the
+/// header, so every path routes, scopes credentials and lists models from the
+/// same answer.
+///
+/// An Inline AI key MUST name it. The inline gateway sends every provider's
+/// traffic to the one key, so the host is the only fact saying which provider
+/// the client's credential belongs to; without it the key's pass-through count
+/// or the request's protocol would infer one, and a wrong inference hands the
+/// credential to another provider. Any other forward key names its provider by
+/// what it was granted, and may omit the header.
+pub(crate) fn origin_host<'h>(headers: &'h axum::http::HeaderMap, user: &UserContext) -> Result<Option<&'h str>, AppError> {
+    match headers.get("x-origin-host").and_then(|v| v.to_str().ok()) {
+        None if user.inline_ai => Err(AppError::BadRequest(
+            "an Inline AI key's request must name the provider host it was sent to (X-Origin-Host)".to_string(),
+        )),
+        host => Ok(host),
+    }
+}
+
 /// Select the BYOK pass-through entry for a request from the key's set.
 ///
 /// The gateway-supplied intercepted origin host (X-Origin-Host) is the
@@ -531,7 +550,10 @@ fn build_passthrough_target(
 /// anywhere else would hand the client's credential for one provider to another
 /// (an Inline AI key granted only OpenAI still receives every host the inline gateway
 /// redirects). Without a host, a single-entry key resolves to its one target, and
-/// a larger set only to the one entry speaking the request's protocol.
+/// a larger set only to the one entry speaking the request's protocol. A client
+/// request on an Inline AI key always carries a host — [`origin_host`] refuses
+/// it otherwise; only the gateway's own calls, which forward no client
+/// credential, resolve without one.
 pub(crate) fn select_byok_passthrough<'a>(
     set: &'a [crate::config::model_map::ByokPassthrough],
     protocol: ApiVersion,
@@ -1368,6 +1390,26 @@ mod tests {
         );
     }
 
+    /// An Inline AI key's request names its provider host or is refused; any
+    /// other forward key may omit it.
+    #[test]
+    fn an_inline_key_must_name_the_origin_host() {
+        let mut inline = make_user_context(ModelMap::default());
+        inline.forward_auth = true;
+        inline.inline_ai = true;
+        inline.byok_passthrough = vec![byok_pt("openai", "https://api.openai.com", "chat_completions")];
+        let none = axum::http::HeaderMap::new();
+        assert_matches!(origin_host(&none, &inline), Err(AppError::BadRequest(_)));
+        // Positive control: the same key naming the host.
+        let mut named = axum::http::HeaderMap::new();
+        named.insert("x-origin-host", axum::http::HeaderValue::from_static("api.openai.com"));
+        assert_matches!(origin_host(&named, &inline), Ok(Some("api.openai.com")));
+        // A forward key that is not inline may leave it out.
+        let mut byok = inline.clone();
+        byok.inline_ai = false;
+        assert_matches!(origin_host(&none, &byok), Ok(None));
+    }
+
     #[test]
     fn passthrough_target_carries_the_endpoint_path_override() {
         // A BYOK pass-through with a chat_endpoint_path override propagates it onto
@@ -1611,6 +1653,7 @@ mod tests {
                 headers.insert("x-origin-host", axum::http::HeaderValue::from_static(h));
             }
             crate::proxy::resolved_entries(&user, &[crate::api::sse::ApiVersion::ChatCompletions], &headers)
+                .expect("a key that is not inline lists without a host")
                 .into_iter()
                 .map(|e| e.alias)
                 .collect()
@@ -1624,8 +1667,8 @@ mod tests {
         stored.forward_auth = false;
         let headers = axum::http::HeaderMap::new();
         assert_eq!(
-            crate::proxy::resolved_entries(&stored, &[crate::api::sse::ApiVersion::ChatCompletions], &headers).len(),
-            1
+            crate::proxy::resolved_entries(&stored, &[crate::api::sse::ApiVersion::ChatCompletions], &headers).map(|e| e.len()).ok(),
+            Some(1)
         );
     }
 
@@ -1644,7 +1687,9 @@ mod tests {
             }
         }
         let headers = axum::http::HeaderMap::new();
-        let listed = |callers: &[crate::api::sse::ApiVersion]| crate::proxy::resolved_entries(&user, callers, &headers).len();
+        let listed = |callers: &[crate::api::sse::ApiVersion]| {
+            crate::proxy::resolved_entries(&user, callers, &headers).map(|e| e.len()).unwrap_or(usize::MAX)
+        };
         assert_eq!(listed(&[ChatCompletions]), 0, "a Chat call's credential is the Chat pass-through's");
         assert_eq!(listed(&[Responses]), 1, "a Responses call's credential is the override provider's");
         assert_eq!(listed(&[ChatCompletions, Responses]), 1);

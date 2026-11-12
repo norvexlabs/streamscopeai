@@ -4,6 +4,7 @@ import {
   groupIndexFor,
   llmTemplateGroups,
   mcpAuthModeOf,
+  mcpOnlyTemplateIndex,
   offersOpenAiAndAnthropic,
   templateLabel,
   templateNeedsLlm,
@@ -269,5 +270,34 @@ describe('groupIndexFor', () => {
       t('llm', 'anthropic_messages', 'Aider · shell env for Anthropic'),
     ];
     expect(groupIndexFor(templates, 1)).toBe(1);
+  });
+});
+
+describe('mcpOnlyTemplateIndex', () => {
+  const templates = [
+    { kind: 'combined', title: 'Full', local_mcp: 'config' as const },
+    { kind: 'mcp', title: 'MCP (sign-in)', local_mcp: 'none' as const },
+    { kind: 'mcp', title: 'MCP (project)', local_mcp: 'project' as const },
+    { kind: 'mcp', title: 'MCP (file)', local_mcp: 'config' as const },
+  ];
+
+  it('opens the first MCP template when the workspace offers gateway servers only', () => {
+    expect(mcpOnlyTemplateIndex(templates, { gateway: true, local: false })).toBe(1);
+  });
+
+  it('opens the MCP template that writes a local server whenever local servers are offered', () => {
+    // It writes gateway servers too, so it serves a workspace offering both.
+    expect(mcpOnlyTemplateIndex(templates, { gateway: true, local: true })).toBe(3);
+    expect(mcpOnlyTemplateIndex(templates, { gateway: false, local: true })).toBe(3);
+  });
+
+  it('falls back to the first MCP template when none writes a local server and a gateway one is offered', () => {
+    expect(mcpOnlyTemplateIndex(templates.slice(0, 3), { gateway: true, local: true })).toBe(1);
+  });
+
+  it('finds none where nothing is offered, or nothing fits what is', () => {
+    expect(mcpOnlyTemplateIndex(templates, { gateway: false, local: false })).toBe(-1);
+    expect(mcpOnlyTemplateIndex(templates.slice(0, 3), { gateway: false, local: true })).toBe(-1);
+    expect(mcpOnlyTemplateIndex(templates.slice(0, 1), { gateway: true, local: true })).toBe(-1);
   });
 });

@@ -106,6 +106,21 @@ pub struct PortalUser {
     pub session_iat: Option<usize>,
 }
 
+/// Present on a request authenticated with a CLI-provisioning token
+/// ([`SCOPE_PROVISION`]): the caller is `ssai`, not the portal in a browser.
+#[derive(Clone, Copy)]
+pub struct ProvisionToken;
+
+impl PortalUser {
+    /// Whether the caller is the CLI — a provisioning token, or an `ak-` key
+    /// (what `ssai` runs with unattended) — rather than a member's browser
+    /// session. Decides nothing about access: only which of a client's
+    /// configs the caller can write (the CLI writes a project's own file).
+    pub fn is_cli(&self, provision: Option<&ProvisionToken>) -> bool {
+        provision.is_some() || self.key_id.is_some()
+    }
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct PortalLoginRequest {
     pub email: String,
@@ -142,7 +157,9 @@ pub struct PortalUserResponse {
 // ---------------------------------------------------------------------------
 
 /// Middleware that validates portal user JWT tokens.
-/// Attaches `PortalUser` to request extensions if valid.
+/// Attaches `PortalUser` to request extensions if valid, and beside it what
+/// the portal hides for that caller (`HiddenPages`) — resolved here, once per
+/// request, for the page fences and the handlers that read it.
 /// Rejects admin JWTs (role != "user").
 pub async fn portal_auth(
     State(state): State<Arc<AdminState>>,
@@ -173,6 +190,20 @@ pub async fn portal_auth(
             &state.automation_key_rate_limiter,
             req.headers(),
         );
+        // The key is checked: from here a database that does not answer is
+        // this request's own 503, not an unverified key's. The key scan holds
+        // no connection once it returns, so this takes one — released before
+        // the handler takes its own.
+        let hidden = {
+            let unanswered = |e: sqlx::Error| {
+                tracing::warn!(tenant_id = %portal_user.tenant_id, "portal key: hidden pages read failed: {e}");
+                super::db_read_error(&e, "session could not be checked")
+            };
+            let tenant = crate::db::tenant::TenantId::from_credential(portal_user.tenant_id);
+            let mut db = crate::db::tenant::TenantConn::acquire(&state.db, tenant).await.map_err(unanswered)?;
+            super::client_access_profiles::hidden_pages(db.conn(), &portal_user).await.map_err(unanswered)?
+        };
+        req.extensions_mut().insert(hidden);
         req.extensions_mut().insert(portal_user);
         return Ok(next.run(req).await);
     }
@@ -298,17 +329,55 @@ pub async fn portal_auth(
             // throttle in its WHERE returns no row whenever the throttle
             // suppresses the write, which this caller reads as "not live" —
             // turning a stamp nobody needs into a 401 on a good token.
+            //
+            // The same write records what the CLI says it is (its version,
+            // OS and host, from the `User-Agent`), for the portal Home's
+            // "out of date" notice. A changed report is written at once, so
+            // the notice clears on the first call after `ssai update`; an
+            // unchanged one rides the throttle; a request without one keeps
+            // what was recorded.
+            let agent = req
+                .headers()
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_cli_agent);
             let _ = sqlx::query(
-                "UPDATE oauth_issued_tokens SET last_used_at = NOW() \
+                "UPDATE oauth_issued_tokens SET last_used_at = NOW(), \
+                        cli_version = COALESCE($2, cli_version), cli_os = COALESCE($3, cli_os), \
+                        cli_host = COALESCE($4, cli_host) \
                  WHERE jti = $1 AND surface = 'cli' \
-                   AND (last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '60 seconds')",
+                   AND (last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '60 seconds' \
+                        OR ($2::text IS NOT NULL \
+                            AND (cli_version, cli_os, cli_host) IS DISTINCT FROM ($2::text, $3::text, $4::text)))",
             )
             .bind(jti)
+            .bind(agent.as_ref().map(|a| a.version))
+            .bind(agent.as_ref().map(|a| a.os))
+            .bind(agent.as_ref().map(|a| a.host))
             .execute(db.conn())
             .await;
         }
         _ => return Err(rejected_credential()),
     }
+
+    if claims.scope == SCOPE_PROVISION {
+        req.extensions_mut().insert(ProvisionToken);
+    }
+    let user = PortalUser {
+        user_id,
+        session_iat: Some(claims.iat),
+        email: claims.email,
+        tenant_id,
+        key_id: None,
+        key_workspace_id: None,
+    };
+    // What the portal hides for the caller, on the connection the session
+    // check already holds: one statement per request, read by every fence and
+    // handler after it instead of a connection of their own.
+    let hidden = match super::client_access_profiles::hidden_pages(db.conn(), &user).await {
+        Ok(hidden) => hidden,
+        Err(e) => return Ok(lookup_failed("hidden pages read", &e)),
+    };
 
     // Release the pool connection BEFORE running the handler — handlers
     // acquire their own `TenantConn`, and holding this one across `next.run`
@@ -316,16 +385,44 @@ pub async fn portal_auth(
     drop(db);
 
     // Attach portal user context.
-    req.extensions_mut().insert(PortalUser {
-        user_id,
-        session_iat: Some(claims.iat),
-        email: claims.email,
-        tenant_id,
-        key_id: None,
-        key_workspace_id: None,
-    });
+    req.extensions_mut().insert(user);
+    req.extensions_mut().insert(hidden);
 
     Ok(next.run(req).await)
+}
+
+// ---------------------------------------------------------------------------
+// The CLI's self-description
+// ---------------------------------------------------------------------------
+
+/// What an `ssai` CLI says about itself in its `User-Agent`:
+/// `ssai/<version> (<os>; <host>)`. Self-reported and never an authorisation
+/// input — it only names a host in the caller's own portal Home.
+pub(crate) struct CliAgent<'a> {
+    pub version: &'a str,
+    pub os: &'a str,
+    pub host: &'a str,
+}
+
+/// The longest version, OS and host name recorded (a DNS label is 63).
+const CLI_VERSION_MAX: usize = 32;
+const CLI_OS_MAX: usize = 16;
+const CLI_HOST_MAX: usize = 63;
+
+/// Parses an `ssai` `User-Agent`, or `None` for any other client and for one
+/// whose parts are empty, too long or carry a character outside their set
+/// (version: ASCII alphanumerics and `.+-`; OS: lowercase alphanumerics and
+/// `_`; host: ASCII alphanumerics and `.-_`) — nothing unexpected is stored.
+pub(crate) fn parse_cli_agent(ua: &str) -> Option<CliAgent<'_>> {
+    let rest = ua.strip_prefix("ssai/")?;
+    let (version, rest) = rest.split_once(" (")?;
+    let inner = rest.strip_suffix(')')?;
+    let (os, host) = inner.split_once("; ")?;
+    let ok = |s: &str, max: usize, allowed: fn(char) -> bool| !s.is_empty() && s.len() <= max && s.chars().all(allowed);
+    (ok(version, CLI_VERSION_MAX, |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+        && ok(os, CLI_OS_MAX, |c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && ok(host, CLI_HOST_MAX, |c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+    .then_some(CliAgent { version, os, host })
 }
 
 // ---------------------------------------------------------------------------
@@ -340,6 +437,7 @@ pub async fn portal_auth(
 const PROVISION_ALLOWED: &[(&str, &str)] = &[
     ("GET", "/auth/me"),
     ("GET", "/mcp/virtual-servers"),
+    ("GET", "/mcp/local-servers"),
     ("GET", "/keys"),
     ("POST", "/keys"),
     ("POST", "/keys/{}/actions/revoke"),
@@ -885,6 +983,56 @@ mod provision_fence_tests {
         // Nest-stripped paths must NOT match (regression guard for the
         // OriginalUri requirement).
         assert!(!provision_scope_allows(&Method::GET, "/auth/me"));
+    }
+
+    fn parts(ua: &str) -> Option<(&str, &str, &str)> {
+        parse_cli_agent(ua).map(|a| (a.version, a.os, a.host))
+    }
+
+    #[test]
+    fn a_cli_user_agent_names_its_version_os_and_host() {
+        assert_eq!(
+            parts("ssai/2026.11.9 (linux; build-01)"),
+            Some(("2026.11.9", "linux", "build-01"))
+        );
+        assert_eq!(
+            parts("ssai/2026.11.30 (macos; Dev-MacBook_Pro.lan)"),
+            Some(("2026.11.30", "macos", "Dev-MacBook_Pro.lan"))
+        );
+        // The longest parts still recorded.
+        let host = "h".repeat(CLI_HOST_MAX);
+        let ua = format!("ssai/{} ({}; {host})", "1".repeat(CLI_VERSION_MAX), "o".repeat(CLI_OS_MAX));
+        assert!(parse_cli_agent(&ua).is_some());
+    }
+
+    #[test]
+    fn anything_but_a_well_formed_cli_user_agent_records_nothing() {
+        for ua in [
+            "",
+            "curl/8.5.0",
+            "reqwest/0.12",
+            "ssai/2026.11.9",
+            "ssai/2026.11.9 (linux)",
+            "ssai/2026.11.9 (linux; )",
+            "ssai/ (linux; box)",
+            "ssai/2026.11.9 (; box)",
+            "ssai/2026.11.9 (linux; box",
+            "ssai/2026.11.9 (linux; box) extra",
+            "ssai/2026.11.9 (Linux; box)",
+            "ssai/2026.11.9 (linux; my box)",
+            "ssai/2026.11.9 (linux; box<script>)",
+            "ssai/2026 11 (linux; box)",
+            "ssai/2026.11.9 (linux; bôx)",
+        ] {
+            assert_eq!(parts(ua), None, "{ua:?}");
+        }
+        // One past each length.
+        let too_long_host = format!("ssai/1 (linux; {})", "h".repeat(CLI_HOST_MAX + 1));
+        let too_long_os = format!("ssai/1 ({}; box)", "o".repeat(CLI_OS_MAX + 1));
+        let too_long_version = format!("ssai/{} (linux; box)", "1".repeat(CLI_VERSION_MAX + 1));
+        for ua in [too_long_host, too_long_os, too_long_version] {
+            assert_eq!(parts(&ua), None, "{ua:?}");
+        }
     }
 
     #[test]

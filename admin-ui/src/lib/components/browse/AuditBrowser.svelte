@@ -25,6 +25,7 @@
   import { useRefreshView } from '#lib/loadView.svelte.js';
   import { setPortalWorkspace, setSelfScoped } from '#lib/selfScoped.js';
   import { searchTooShort, MIN_SEARCH_CHARS } from '#lib/browse/search.js';
+  import { pageHidden } from '#lib/portalPages.svelte.js';
   import Page from '#lib/components/page/Page.svelte';
   import EmptyState from '#lib/components/EmptyState.svelte';
   import Skeleton from '#lib/components/Skeleton.svelte';
@@ -90,8 +91,17 @@
   const scope = $derived<Record<string, string>>(Object.fromEntries(p.scopeKeys.map((k) => [k, filters.values[k] ?? ''])));
   const userFilter = $derived(p.filtersByUser(scope));
 
+  // Conversation content is hidden for the viewer's workspaces (portal): the
+  // gateway answers each row with its metadata only and refuses its detail,
+  // so a row does not open, and the search and the filters on what is
+  // withheld — which the gateway would ignore — are not offered.
+  const contentHidden = $derived(pageHidden('sessions', page.data));
+  $effect(() => {
+    if (contentHidden) expandedId = null;
+  });
+
   const pager = usePagination({ limit: 50 });
-  const shortSearch = $derived(searchTooShort(filters.values.search));
+  const shortSearch = $derived(!contentHidden && searchTooShort(filters.values.search));
 
   usePeriodicLoad(async () => {
     try {
@@ -125,7 +135,7 @@
       finish_reason: when(['llm'], v.finish_reason),
       upstream_server: when(['llm'], v.upstream_server),
       api_version: when(['llm'], v.api_version),
-      media_type: when(['llm'], v.media_type),
+      media_type: contentHidden ? undefined : when(['llm'], v.media_type),
       // A policy refusal is badged on an LLM row (a suppressed tool call) and on
       // an A2A row (a refused agent call).
       has_blocked: (filterKind === 'llm' || filterKind === 'a2a') && v.has_blocked === 'true' ? true : undefined,
@@ -136,7 +146,7 @@
       surface: when(['web'], v.surface),
       operation: when(['web'], v.operation),
       tool_id: when(['mcp'], v.tool_id),
-      resource_uri: when(['mcp'], v.resource_uri),
+      resource_uri: contentHidden ? undefined : when(['mcp'], v.resource_uri),
       prompt_id: when(['mcp'], v.prompt_id),
       virtual_server_id: when(['mcp'], v.virtual_server_id),
       upstream_server_id: when(['mcp'], v.upstream_server_id),
@@ -147,7 +157,7 @@
       end: narrowed ? undefined : end,
       // A term too short to search is left out (the API refuses it): the bar
       // says why, and every other filter still applies.
-      search: shortSearch ? undefined : v.search?.trim() || undefined,
+      search: shortSearch || contentHidden ? undefined : v.search?.trim() || undefined,
       request_id: focusedRid ?? undefined,
       limit: pager.limit,
       offset: pager.offset,
@@ -170,7 +180,7 @@
       } else {
         logs = pager.absorbOffset(data);
         // A deep link selecting one row lands with it open.
-        if (focusedRid && logs.length > 0 && !view.refreshing) expandedId = focusedRid;
+        if (focusedRid && logs.length > 0 && !view.refreshing && !contentHidden) expandedId = focusedRid;
       }
     } catch (e) {
       toast.error(extractError(e));
@@ -259,9 +269,11 @@
         <option value="web">{m.browse_kind_web()}</option>
       </SelectInput>
     </FilterField>
-    <FilterField label={m.browse_filter_search()} class="flex-1 min-w-40">
-      <TextInput bind:value={filters.values.search} onkeydown={handleFilterKeydown} placeholder={m.browse_search_placeholder()} />
-    </FilterField>
+    {#if !contentHidden}
+      <FilterField label={m.browse_filter_search()} class="flex-1 min-w-40">
+        <TextInput bind:value={filters.values.search} onkeydown={handleFilterKeydown} placeholder={m.browse_search_placeholder()} />
+      </FilterField>
+    {/if}
     <ScopeFilters {plane} {filters} {userFilter} onchange={applyFilters} onteam={changeTeam} />
     <div class="pb-px"><PeriodSelector selected={period.value} onchange={period.change} /></div>
     <FilterField label={m.browse_filter_app()} class="min-w-27.5">
@@ -310,16 +322,18 @@
           <option value="google_gemini">Google Gemini</option>
         </SelectInput>
       </FilterField>
-      <FilterField label={m.browse_filter_media()} class="min-w-32.5">
-        <SelectInput bind:value={filters.values.media_type} onchange={applyFilters}>
-          <option value="">{m.browse_all()}</option>
-          <option value="_any">{m.browse_filter_media_any()}</option>
-          <option value="image">{m.browse_filter_media_image()}</option>
-          <option value="audio">{m.browse_filter_media_audio()}</option>
-          <option value="embedding">{m.browse_filter_media_embedding()}</option>
-          <option value="video">{m.browse_filter_media_video()}</option>
-        </SelectInput>
-      </FilterField>
+      {#if !contentHidden}
+        <FilterField label={m.browse_filter_media()} class="min-w-32.5">
+          <SelectInput bind:value={filters.values.media_type} onchange={applyFilters}>
+            <option value="">{m.browse_all()}</option>
+            <option value="_any">{m.browse_filter_media_any()}</option>
+            <option value="image">{m.browse_filter_media_image()}</option>
+            <option value="audio">{m.browse_filter_media_audio()}</option>
+            <option value="embedding">{m.browse_filter_media_embedding()}</option>
+            <option value="video">{m.browse_filter_media_video()}</option>
+          </SelectInput>
+        </FilterField>
+      {/if}
       <FilterField label={m.browse_filter_blocked_tools()} class="min-w-32.5">
         <SelectInput bind:value={filters.values.has_blocked} onchange={applyFilters}>
           <option value="">{m.browse_all()}</option>
@@ -383,9 +397,11 @@
       <FilterField label={m.browse_filter_tool_id()} class="min-w-35">
         <TextInput bind:value={filters.values.tool_id} onkeydown={handleFilterKeydown} placeholder="tool_id..." mono />
       </FilterField>
-      <FilterField label={m.browse_filter_resource_uri()} class="min-w-40">
-        <TextInput bind:value={filters.values.resource_uri} onkeydown={handleFilterKeydown} placeholder="resource://..." mono />
-      </FilterField>
+      {#if !contentHidden}
+        <FilterField label={m.browse_filter_resource_uri()} class="min-w-40">
+          <TextInput bind:value={filters.values.resource_uri} onkeydown={handleFilterKeydown} placeholder="resource://..." mono />
+        </FilterField>
+      {/if}
       <FilterField label={m.browse_filter_prompt_id()} class="min-w-35">
         <TextInput bind:value={filters.values.prompt_id} onkeydown={handleFilterKeydown} placeholder={m.browse_filter_prompt_id_placeholder()} mono />
       </FilterField>
@@ -417,6 +433,9 @@
   {#if shortSearch}
     <p class="-mt-3 text-xs text-(--warning)">{m.browse_search_too_short({ min: MIN_SEARCH_CHARS })}</p>
   {/if}
+  {#if contentHidden}
+    <p class="-mt-3 text-xs text-(--text-secondary)" data-testid="content-hidden-note">{m.browse_content_hidden()}</p>
+  {/if}
 
   {#if view.skeleton}
     <div class="bg-(--bg-card) rounded-xl border border-(--border) p-4">
@@ -441,11 +460,11 @@
         <AuditRowCard
           {row}
           expanded={expandedId === row.request_id}
-          onToggle={() => toggleExpand(row.request_id)}
+          onToggle={contentHidden ? undefined : () => toggleExpand(row.request_id)}
           onFilterUser={userFilter ? filterByUser : undefined}
           showKindChip={filterKind === 'all'}
         />
-        {#if expandedId === row.request_id}
+        {#if expandedId === row.request_id && !contentHidden}
           <div class="bg-(--bg-elevated) px-5 py-4">
             {#if row.kind === 'mcp'}
               <McpAuditDetail {row} onfilteruser={userFilter ? filterByUser : undefined} />

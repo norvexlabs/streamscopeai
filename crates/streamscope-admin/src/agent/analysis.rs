@@ -1,7 +1,7 @@
 //! Agent analysis cycle — per-session expert analysis with context budgeting.
 //!
-//! Fetches sessions via direct DB queries (calling `list_sessions_impl` and
-//! `get_conversation_impl` internally, not HTTP). Each session is analyzed
+//! Fetches sessions via direct DB queries (the audit store's landing-order scan
+//! and `get_conversation_impl`, not HTTP). Each session is analyzed
 //! individually with a context budget scaled to 60% of the upstream model's
 //! context window. Produces [`Finding`]s containing program proposals, alerts,
 //! and memory updates. Uses LLM tool calling (`submit_analysis`) for structured output.
@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use crate::AdminState;
 
+use crate::audit_store::sessions::LandedKey;
 use crate::db::tenant::{TenantConn, TenantId};
 use crate::routes::WorkspaceIds;
 
@@ -55,6 +56,35 @@ struct ExpertWithProgress {
 }
 
 
+/// A member's scan position: every session before `key` in landing order has
+/// been passed. `at` is the newest activity that covered, which the console
+/// shows as how far analysis stands; positions compare by `key` alone.
+#[derive(Clone, Copy, Debug)]
+struct Pos {
+    key: LandedKey,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PartialEq for Pos {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+impl Eq for Pos {}
+
+impl PartialOrd for Pos {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Pos {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
 /// Which traffic path a pooled-call group runs over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupPath {
@@ -66,12 +96,12 @@ enum GroupPath {
 /// one position per path, so neither passes what the other has yet to analyze.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum CursorKind {
-    /// Reads one path: `last_processed_at`, and any path position left from
-    /// when it read two is cleared.
+    /// Reads one path: `session_xid`/`session_sid`, and any cluster position left
+    /// from when it read two is cleared.
     Sole,
-    /// The session path of an expert reading both: `last_processed_at`.
+    /// The session path of an expert reading both: `session_xid`/`session_sid`.
     BothSession,
-    /// The cluster path of an expert reading both: `cluster_processed_at`.
+    /// The cluster path of an expert reading both: `cluster_xid`/`cluster_sid`.
     BothCluster,
 }
 
@@ -97,21 +127,26 @@ struct GroupingInput {
     /// workspace scope, so pooling never crosses profiles.
     profile_idx: usize,
     merge_enabled: bool,
+    /// The instant the member's analysis was last restarted from: a pooled call
+    /// shows every member the same sessions, so members pool only when they
+    /// skip the same activity.
+    starts_after: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Group (expert, profile, path) participations into pooled-call groups.
 ///
-/// Merge-enabled members sharing (path, routing alias, profile) pool into one
-/// group — one LLM call per session/cluster answers every member axis. A
+/// Merge-enabled members sharing (path, routing alias, profile, restart
+/// instant) pool into one group — one LLM call per session/cluster answers every member axis. A
 /// merge-disabled member is always its own solo group. Group order is
 /// first-occurrence input order, so the round-robin turn order is stable.
 fn group_experts(inputs: &[GroupingInput]) -> Vec<(GroupPath, usize, Vec<usize>)> {
-    let mut keys: Vec<Option<(GroupPath, &str, usize)>> = Vec::new();
+    type Key<'a> = (GroupPath, &'a str, usize, Option<chrono::DateTime<chrono::Utc>>);
+    let mut keys: Vec<Option<Key<'_>>> = Vec::new();
     let mut groups: Vec<(GroupPath, usize, Vec<usize>)> = Vec::new();
 
     for input in inputs {
         if input.merge_enabled {
-            let key = (input.path, input.routing_alias.as_str(), input.profile_idx);
+            let key = (input.path, input.routing_alias.as_str(), input.profile_idx, input.starts_after);
             if let Some(pos) = keys.iter().position(|k| *k == Some(key)) {
                 groups[pos].2.push(input.expert_idx);
                 continue;
@@ -189,7 +224,11 @@ struct GroupRun {
     system_prompt: Option<String>,
     rejected: Vec<Vec<String>>,
     /// Per-member scan cursor, seeded from the position `kinds` names.
-    cursors: Vec<Option<chrono::DateTime<chrono::Utc>>>,
+    cursors: Vec<Option<Pos>>,
+    /// Activity at or before this instant is not read: the instant an admin last
+    /// restarted the members' analysis from (members pool only when it is the
+    /// same for each, `group_experts`).
+    starts_after: Option<chrono::DateTime<chrono::Utc>>,
     /// Per-member `cursor_generation` read with the cursor. An advance applies
     /// only while it still matches, so an admin's restart wins over this cycle.
     generations: Vec<i64>,
@@ -221,15 +260,15 @@ struct GroupRun {
     /// The newest activity the refused request covered: restarting after it passes
     /// that request.
     refused_through: Option<chrono::DateTime<chrono::Utc>>,
-    /// The instant the latest scan looked up to. A session active after it is not
-    /// in what the scan fetched, so the end-of-cycle jump goes no further.
-    scanned_to: chrono::DateTime<chrono::Utc>,
+    /// Where the latest scan passed every session it could: the end-of-cycle
+    /// jump goes no further. `None` when it stopped at its first session.
+    scanned_to: Option<Pos>,
 }
 
 impl GroupRun {
     /// Group scan cursor: the oldest member cursor (`None` = a member has
     /// never processed anything, so the scan starts from the beginning).
-    fn scan_cursor(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn scan_cursor(&self) -> Option<Pos> {
         self.cursors.iter().copied().min().flatten()
     }
 }
@@ -251,19 +290,24 @@ async fn run_session_group_turn(
     run: &mut GroupRun,
     active_programs: &[String],
 ) -> anyhow::Result<()> {
-    run.scanned_to = effective_now(cooldown);
-    let sessions = fetch_sessions_via_db(
+    let batch = fetch_sessions_via_db(
         pool,
         tenant_id,
         run.scan_cursor(),
+        run.starts_after,
         cooldown,
         run.ws_filter.as_ref(),
         run.include_keyless,
     )
     .await?;
+    run.scanned_to = batch.end;
+    let reached_end = batch.reached_end;
+    let sessions = batch.sessions;
 
+    // Empty is the end only when the scan says so: a full page whose sessions
+    // were all deleted before it read them has more after it.
     if sessions.is_empty() {
-        run.drained = true;
+        run.drained = reached_end;
         run.done = true;
         return Ok(());
     }
@@ -289,14 +333,14 @@ async fn run_session_group_turn(
         );
     }
 
-    // Member positions each session still applies to (cursor < session ts) —
+    // Member positions each session still applies to (cursor < session's) —
     // after a partial hold, re-fetched sessions re-run only for the lagging
     // members.
     let applicable_per_session: Vec<Vec<usize>> = sessions
         .iter()
         .map(|s| {
             (0..run.member_idx.len())
-                .filter(|&p| match (run.cursors[p], s.last_timestamp) {
+                .filter(|&p| match (run.cursors[p], s.pos) {
                     (None, _) => true,
                     (Some(c), Some(ts)) => ts > c,
                     (Some(_), None) => false,
@@ -368,9 +412,9 @@ async fn run_session_group_turn(
 
     // Fold per member.
     let n = run.member_idx.len();
-    let mut advanceable: Vec<Vec<chrono::DateTime<chrono::Utc>>> = vec![Vec::new(); n];
-    let mut successes: Vec<Vec<chrono::DateTime<chrono::Utc>>> = vec![Vec::new(); n];
-    let mut min_hold: Vec<Option<chrono::DateTime<chrono::Utc>>> = vec![None; n];
+    let mut advanceable: Vec<Vec<Pos>> = vec![Vec::new(); n];
+    let mut successes: Vec<Vec<Pos>> = vec![Vec::new(); n];
+    let mut min_hold: Vec<Option<Pos>> = vec![None; n];
     let mut any_transient = false;
 
     for ((session, applicable), res) in sessions
@@ -384,7 +428,7 @@ async fn run_session_group_turn(
             run.model_unavailable = Some(model.to_string());
             run.refused_through = run.refused_through.or(session.last_timestamp);
         }
-        let Some(ts) = session.last_timestamp else {
+        let Some(ts) = session.pos else {
             continue;
         };
         match res {
@@ -506,10 +550,10 @@ async fn run_session_group_turn(
         return Ok(());
     }
 
-    // A short batch means the scan reached the end of the backlog — safe to
-    // jump un-held members to where the scan looked at finalize even if this turn also
-    // held someone.
-    if batch_size < crate::settings::admin_settings().agent_session_batch_limit {
+    // A scan that reached the end of the backlog (a short batch, or a session
+    // still in its cooldown) — safe to jump un-held members to where the scan
+    // passed at finalize even if this turn also held someone.
+    if reached_end {
         run.drained = true;
     }
 
@@ -549,26 +593,31 @@ async fn run_cluster_group_turn(
     run: &mut GroupRun,
     active_programs: &[String],
 ) -> anyhow::Result<()> {
-    run.scanned_to = effective_now(cooldown);
-    let sessions = fetch_sessions_via_db(
+    let batch = fetch_sessions_via_db(
         pool,
         tenant_id,
         run.scan_cursor(),
+        run.starts_after,
         cooldown,
         run.ws_filter.as_ref(),
         run.include_keyless,
     )
     .await?;
+    run.scanned_to = batch.end;
+    let reached_end = batch.reached_end;
+    let sessions = batch.sessions;
 
+    // Empty is the end only when the scan says so: a full page whose sessions
+    // were all deleted before it read them has more after it.
     if sessions.is_empty() {
-        run.drained = true;
+        run.drained = reached_end;
         run.done = true;
         return Ok(());
     }
 
     let batch_size = sessions.len() as i64;
     run.total_sessions += batch_size;
-    let batch_max_ts = sessions.iter().filter_map(|s| s.last_timestamp).max();
+    let batch_max_ts = sessions.iter().filter_map(|s| s.pos).max();
 
     // Group by (key_id, app_id) — same key can be used in multiple clients.
     let mut clusters: std::collections::HashMap<(uuid::Uuid, String), Vec<&SessionMeta>> =
@@ -596,20 +645,18 @@ async fn run_cluster_group_turn(
     }
 
     // Per-member contiguous fold over clusters (the cluster-grained analog of
-    // the per-session fold): an analyzed/skipped cluster advances at its MAX
-    // session timestamp; a held cluster (transient failure / omitted axis)
-    // holds at its MIN session timestamp so the WHOLE cluster re-forms from
-    // the next fetch — holding at the max would refetch only the tail
-    // sessions and analyze a truncated cluster.
+    // the per-session fold): an analyzed/skipped cluster advances at its LAST
+    // session's position; a held cluster (transient failure / omitted axis)
+    // holds at its FIRST so the WHOLE cluster re-forms from the next fetch —
+    // holding at the last would refetch only the tail sessions and analyze a
+    // truncated cluster.
     let n_members = run.member_idx.len();
-    let mut advanceable: Vec<Vec<chrono::DateTime<chrono::Utc>>> = vec![Vec::new(); n_members];
-    // (cluster ts, session count) per ANSWERED cluster — the display counter
-    // covers only what the member actually analyzed.
-    let mut analyzed: Vec<Vec<(chrono::DateTime<chrono::Utc>, i64)>> = vec![Vec::new(); n_members];
-    let mut min_hold: Vec<Option<chrono::DateTime<chrono::Utc>>> = vec![None; n_members];
-    let hold = |min_hold: &mut Vec<Option<chrono::DateTime<chrono::Utc>>>,
-                p: usize,
-                ts: Option<chrono::DateTime<chrono::Utc>>| {
+    let mut advanceable: Vec<Vec<Pos>> = vec![Vec::new(); n_members];
+    // (cluster position, session count) per ANSWERED cluster — the display
+    // counter covers only what the member actually analyzed.
+    let mut analyzed: Vec<Vec<(Pos, i64)>> = vec![Vec::new(); n_members];
+    let mut min_hold: Vec<Option<Pos>> = vec![None; n_members];
+    let hold = |min_hold: &mut Vec<Option<Pos>>, p: usize, ts: Option<Pos>| {
         if let Some(ts) = ts {
             min_hold[p] = Some(min_hold[p].map_or(ts, |m| m.min(ts)));
         }
@@ -617,10 +664,11 @@ async fn run_cluster_group_turn(
 
     // Oldest first, so a hold at one cluster leaves no unvisited one behind it.
     let mut ordered: Vec<_> = clusters.iter().collect();
-    ordered.sort_by_key(|(_, sessions)| sessions.iter().filter_map(|s| s.last_timestamp).min());
+    ordered.sort_by_key(|(_, sessions)| sessions.iter().filter_map(|s| s.pos).min());
     for ((key_id, app_id), cluster_sessions) in ordered {
-        let cluster_max_ts = cluster_sessions.iter().filter_map(|s| s.last_timestamp).max();
-        let cluster_min_ts = cluster_sessions.iter().filter_map(|s| s.last_timestamp).min();
+        let cluster_max_ts = cluster_sessions.iter().filter_map(|s| s.pos).max();
+        let cluster_min_ts = cluster_sessions.iter().filter_map(|s| s.pos).min();
+        let cluster_last_at = cluster_sessions.iter().filter_map(|s| s.last_timestamp).max();
         let applicable: Vec<usize> = (0..run.member_idx.len())
             .filter(|&p| {
                 let ewp = &experts[run.member_idx[p]];
@@ -772,7 +820,7 @@ async fn run_cluster_group_turn(
                     "cluster analysis held, the judge model is unavailable: {e}"
                 );
                 run.model_unavailable = model_unavailable(&e).map(str::to_string);
-                run.refused_through = run.refused_through.or(cluster_max_ts);
+                run.refused_through = run.refused_through.or(cluster_last_at);
                 for p in 0..n_members {
                     hold(&mut min_hold, p, cluster_min_ts);
                 }
@@ -852,9 +900,9 @@ async fn run_cluster_group_turn(
         return Ok(());
     }
 
-    // A short batch means the scan reached the end of the backlog — safe to
-    // jump un-held members to where the scan looked at finalize.
-    if batch_size < crate::settings::admin_settings().agent_session_batch_limit {
+    // A scan that reached the end of the backlog — safe to jump un-held members
+    // to where the scan passed at finalize.
+    if reached_end {
         run.drained = true;
     }
     if run.drained || !cursor_moved {
@@ -886,14 +934,18 @@ async fn finalize_group_run(
         let ewp = &experts[ei];
         let acc = &run.acc[p];
 
-        // Advance to where the last scan looked, past everything it found. Gated on
+        // Advance to where the last scan passed, past everything it found. Gated on
         // BOTH: the member wasn't held, AND the group actually drained its
         // backlog — a group retired early (transient hold, no-progress guard)
         // never scanned past its window, so jumping an un-held member here
         // would silently skip every later session forever.
-        if run.drained && !run.held[p] && run.cursors[p].is_none_or(|c| run.scanned_to > c) {
+        if run.drained
+            && !run.held[p]
+            && let Some(to) = run.scanned_to
+            && run.cursors[p].is_none_or(|c| to > c)
+        {
             update_expert_profile_watermark(
-                pool, tenant_id, run.profile_id, ewp.id, run.generations[p], run.kinds[p], 0, run.scanned_to,
+                pool, tenant_id, run.profile_id, ewp.id, run.generations[p], run.kinds[p], 0, to,
             )
             .await;
         }
@@ -1000,6 +1052,9 @@ struct SessionMeta {
     app_id: Option<String>,
     #[serde(default)]
     first_user_prompt: Option<String>,
+    /// Where the session stands in landing order, and its last activity.
+    #[serde(skip)]
+    pos: Option<Pos>,
 }
 
 /// Run a single analysis cycle for a specific tenant.
@@ -1110,6 +1165,7 @@ pub async fn run_analysis_cycle(
                     routing_alias: alias.clone(),
                     profile_idx: pidx,
                     merge_enabled: ewp.merge_enabled,
+                    starts_after: None,
                 });
             }
             if has_cluster {
@@ -1119,6 +1175,7 @@ pub async fn run_analysis_cycle(
                     routing_alias: alias,
                     profile_idx: pidx,
                     merge_enabled: ewp.merge_enabled,
+                    starts_after: None,
                 });
             }
         }
@@ -1129,17 +1186,65 @@ pub async fn run_analysis_cycle(
     // from now instead of re-scanning history its workspaces already had
     // analyzed under their previous profile.
     let mut cursors_map = load_profile_watermarks(pool, tenant_id).await?;
-    let effective_now = effective_now(cooldown);
+    // A position never passes the bound of the cluster it was taken in, and the
+    // bound never moves back. One past today's bound was taken in another cluster
+    // (a backup restored into a new one, whose transaction ids start over): it
+    // would wait until the ids caught up with it, so it starts over instead — the
+    // session position from the first session landed, the cluster position from
+    // the start of landing order — and its next advance stores the new one.
+    let bound = {
+        let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
+        // The sessions restored with it carry the other cluster's stamps too: they
+        // lose them, as a session no turn has reached since landing order exists.
+        let forgotten = crate::audit_store::sessions::forget_foreign_stamps(db.conn()).await?;
+        if forgotten > 0 {
+            tracing::warn!(
+                %tenant_id,
+                forgotten,
+                "sessions carry landing stamps past the database's transaction ids (restored from \
+                 another database?) — they are read again once a turn reaches them"
+            );
+        }
+        crate::audit_store::sessions::landing_bound(db.conn()).await?
+    };
+    for cursor in cursors_map.values_mut() {
+        let beyond = |pos: Option<Pos>| pos.is_some_and(|p| p.key.xid > bound);
+        if beyond(cursor.position) || beyond(cursor.cluster_position) {
+            tracing::warn!(
+                %tenant_id,
+                bound,
+                "expert analysis position is past the database's transaction ids (restored from another \
+                 database?) — analysis starts over from the first session landed"
+            );
+        }
+        if beyond(cursor.position) {
+            cursor.position = None;
+        }
+        if beyond(cursor.cluster_position) {
+            cursor.cluster_position = cursor.cluster_position.map(|p| Pos { key: LandedKey::before(0), ..p });
+        }
+    }
+    let mut seed: Option<Pos> = None;
     for input in &inputs {
         let key = (profiles[input.profile_idx].id, experts[input.expert_idx].id);
         if let std::collections::hash_map::Entry::Vacant(entry) = cursors_map.entry(key) {
+            let at = match seed {
+                Some(at) => at,
+                None => *seed.insert(seed_position(pool, tenant_id, cooldown).await?),
+            };
+            let starts_after = seed_profile_watermark(pool, tenant_id, key.0, key.1, at).await;
             entry.insert(ProfileCursor {
-                position: Some(effective_now),
+                position: Some(at),
                 generation: 0,
                 cluster_position: None,
+                starts_after,
             });
-            seed_profile_watermark(pool, tenant_id, key.0, key.1, effective_now).await;
         }
+    }
+
+    for input in &mut inputs {
+        let key = (profiles[input.profile_idx].id, experts[input.expert_idx].id);
+        input.starts_after = cursors_map.get(&key).and_then(|c| c.starts_after);
     }
 
     // One (expert, profile) with two participations reads both paths. Its cluster
@@ -1195,6 +1300,8 @@ pub async fn run_analysis_cycle(
             .iter()
             .map(|&i| cursors_map.get(&(profile.id, experts[i].id)).map_or(0, |c| c.generation))
             .collect();
+        let starts_after =
+            cursors_map.get(&(profile.id, experts[first].id)).and_then(|c| c.starts_after);
         let first_model = judge_model(
             experts[first].model_override.as_deref(),
             profile.model.as_deref(),
@@ -1212,6 +1319,7 @@ pub async fn run_analysis_cycle(
             system_prompt,
             rejected,
             cursors,
+            starts_after,
             generations,
             kinds,
             held: vec![false; n],
@@ -1223,7 +1331,7 @@ pub async fn run_analysis_cycle(
             deterministic_sample: None,
             model_unavailable: None,
             refused_through: None,
-            scanned_to: effective_now,
+            scanned_to: None,
             member_idx,
         });
     }
@@ -1351,7 +1459,7 @@ pub async fn run_analysis_cycle(
 struct ModelWait {
     /// The position held. Moves only when analysis progresses or restarts, so past
     /// one refused session the next is told too, however often sessions get traffic.
-    position: Option<chrono::DateTime<chrono::Utc>>,
+    position: Option<Pos>,
     /// The newest activity the refused request covered.
     refused_through: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -1401,7 +1509,7 @@ async fn notify_model_unavailable(
                 "agent_model_unavailable:{model}:{}:{}:{}",
                 chrono::Utc::now().format("%Y-%m-%d"),
                 profile.unwrap_or_default(),
-                wait.position.map_or(0, |at| at.timestamp_micros()),
+                wait.position.map_or_else(String::new, |at| at.key.to_string()),
             ),
             title: "Expert analysis is paused: its judge model is unavailable".to_string(),
             summary,
@@ -2576,9 +2684,12 @@ async fn fetch_rejected_suggestions(pool: &crate::db::Db, tenant_id: uuid::Uuid,
 }
 
 /// Advance one (expert, profile) watermark and increment its session counter.
-/// The expert's legacy display columns follow: `sessions_analyzed` accumulates
-/// the total across profiles, and `last_processed_at` becomes the MIN across
-/// the expert's profile watermarks (the conservative "processed through").
+/// The position moves to `watermark.key`; its display column
+/// (`last_processed_at` / `cluster_processed_at`) to the newest activity
+/// analyzed, never back. The expert's legacy display columns follow:
+/// `sessions_analyzed` accumulates the total across profiles, and
+/// `last_processed_at` becomes the MIN across the expert's profile watermarks
+/// (the conservative "processed through").
 ///
 /// Invariant: the write applies only while `generation` is still the row's, so
 /// a cycle already running can never undo an admin's restart. Returns `false`
@@ -2592,7 +2703,7 @@ async fn update_expert_profile_watermark(
     generation: i64,
     kind: CursorKind,
     sessions: i64,
-    watermark_at: chrono::DateTime<chrono::Utc>,
+    watermark: Pos,
 ) -> bool {
     if expert_id.is_nil() {
         return true;
@@ -2604,7 +2715,8 @@ async fn update_expert_profile_watermark(
         // The row exists: its cluster position was seeded on it.
         sqlx::query(
             "UPDATE expert_profile_watermarks SET \
-                cluster_processed_at = $4, \
+                cluster_xid = $7, cluster_sid = $8, \
+                cluster_processed_at = GREATEST(cluster_processed_at, $4), \
                 sessions_analyzed = sessions_analyzed + $5, \
                 updated_at = now() \
              WHERE tenant_id = $3 AND profile_id = $1 AND expert_id = $2 AND cursor_generation = $6",
@@ -2612,18 +2724,25 @@ async fn update_expert_profile_watermark(
         .bind(profile_id)
         .bind(expert_id)
         .bind(tenant_id)
-        .bind(watermark_at)
+        .bind(watermark.at)
         .bind(sessions)
         .bind(generation)
+        .bind(watermark.key.xid)
+        .bind(watermark.key.session_id)
         .execute(db.conn())
         .await
     } else {
         sqlx::query(
             "INSERT INTO expert_profile_watermarks \
-                (profile_id, expert_id, tenant_id, last_processed_at, sessions_analyzed, cursor_generation) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+                (profile_id, expert_id, tenant_id, last_processed_at, sessions_analyzed, cursor_generation, \
+                 session_xid, session_sid) \
+             VALUES ($1, $2, $3, $4, $5, $6, $8, $9) \
              ON CONFLICT (tenant_id, profile_id, expert_id) DO UPDATE SET \
-                last_processed_at = EXCLUDED.last_processed_at, \
+                session_xid = EXCLUDED.session_xid, \
+                session_sid = EXCLUDED.session_sid, \
+                last_processed_at = GREATEST(expert_profile_watermarks.last_processed_at, EXCLUDED.last_processed_at), \
+                cluster_xid = CASE WHEN $7 THEN NULL ELSE expert_profile_watermarks.cluster_xid END, \
+                cluster_sid = CASE WHEN $7 THEN NULL ELSE expert_profile_watermarks.cluster_sid END, \
                 cluster_processed_at = CASE WHEN $7 THEN NULL \
                                             ELSE expert_profile_watermarks.cluster_processed_at END, \
                 sessions_analyzed = expert_profile_watermarks.sessions_analyzed + EXCLUDED.sessions_analyzed, \
@@ -2633,10 +2752,12 @@ async fn update_expert_profile_watermark(
         .bind(profile_id)
         .bind(expert_id)
         .bind(tenant_id)
-        .bind(watermark_at)
+        .bind(watermark.at)
         .bind(sessions)
         .bind(generation)
         .bind(kind == CursorKind::Sole)
+        .bind(watermark.key.xid)
+        .bind(watermark.key.session_id)
         .execute(db.conn())
         .await
     };
@@ -2847,7 +2968,7 @@ async fn agent_proxy_call(
 
 /// Contiguous-prefix watermark for a processed batch. Returns
 /// `(new_watermark, covered_count)`:
-/// - `new_watermark` = the max **advanceable** timestamp (a success or a
+/// - `new_watermark` = the max **advanceable** position (a success or a
 ///   deterministically-skipped session) **strictly below** the oldest TRANSIENT
 ///   failure — or the overall max advanceable when nothing was held. The
 ///   watermark therefore stops at the first transient failure (which retries
@@ -2856,11 +2977,11 @@ async fn agent_proxy_call(
 /// - `covered_count` = how many TRUE successes the watermark covers (the
 ///   `sessions_analyzed` increment, so the stat isn't inflated by skips or by
 ///   successes beyond a held failure that will be re-analyzed).
-fn contiguous_watermark(
-    advanceable_ts: &[chrono::DateTime<chrono::Utc>],
-    success_ts: &[chrono::DateTime<chrono::Utc>],
-    min_held_ts: Option<chrono::DateTime<chrono::Utc>>,
-) -> (Option<chrono::DateTime<chrono::Utc>>, i64) {
+fn contiguous_watermark<T: Ord + Copy>(
+    advanceable_ts: &[T],
+    success_ts: &[T],
+    min_held_ts: Option<T>,
+) -> (Option<T>, i64) {
     let new_watermark = match min_held_ts {
         Some(mh) => advanceable_ts.iter().copied().filter(|ts| *ts < mh).max(),
         None => advanceable_ts.iter().copied().max(),
@@ -3011,41 +3132,68 @@ fn agent_retry_allowed(is_timeout: bool, attempt: usize, max_retries: usize) -> 
     }
 }
 
-/// Fetch sessions updated since the given watermark via direct DB query.
-/// When `cooldown_mins > 0`, only sessions idle for at least that many minutes are returned.
+/// One scan of a group: the sessions to analyze, in landing order.
+struct ScanBatch {
+    sessions: Vec<SessionMeta>,
+    /// The scan reached the end of what it may read: a short batch, or a session
+    /// still in its cooldown, which stops the batch before it.
+    reached_end: bool,
+    /// Where the scan passed every session it could read: past the last one it
+    /// returned before a session in its cooldown, or else before every
+    /// transaction still running when it began. `None` when a session in its
+    /// cooldown came first.
+    end: Option<Pos>,
+}
+
+/// Fetch the sessions after `after` in the order their turns landed, via the
+/// audit store's scan. Activity at or before `starts_after` is not read. With
+/// `cooldown_mins > 0` a session active in that many minutes ends the batch
+/// before it: it is read once it has been idle that long, and every session
+/// landed after it waits behind it, so none is passed while it is still active.
+/// A session whose last activity is stamped further ahead than a cooldown does
+/// not wait.
 async fn fetch_sessions_via_db(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
-    since: Option<chrono::DateTime<chrono::Utc>>,
+    after: Option<Pos>,
+    starts_after: Option<chrono::DateTime<chrono::Utc>>,
     cooldown_mins: i64,
     workspace_filter: Option<&WorkspaceIds>,
     include_keyless: bool,
-) -> anyhow::Result<Vec<SessionMeta>> {
+) -> anyhow::Result<ScanBatch> {
     let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
-
-    let mut query = crate::routes::audit::SessionListQuery::default();
-    query.limit = Some(crate::settings::admin_settings().agent_session_batch_limit);
-    query.sort = Some(crate::routes::audit::SessionSort::Oldest);
-    query.exclude_user = Some(super::AGENT_EMAIL.to_string());
-    query.updated_since = since;
-    query.updated_before = if cooldown_mins > 0 {
-        Some(chrono::Utc::now() - chrono::Duration::minutes(cooldown_mins))
-    } else {
-        None
-    };
+    let limit = crate::settings::admin_settings().agent_session_batch_limit;
     // Per-profile expert scoping: restrict to sessions in one of the profile's
     // workspaces (`None` = every workspace). Sessions carrying no workspace
     // attribution follow the Default profile.
     let scope = crate::audit_store::AuditScope::tenant(None, workspace_filter.cloned())
         .including_keyless(include_keyless);
+    let page = crate::audit_store::sessions::list_sessions_landed(
+        db.conn(),
+        after.map(|p| p.key),
+        starts_after,
+        super::AGENT_EMAIL,
+        limit,
+        &scope,
+    )
+    .await?;
 
-    let summaries =
-        crate::audit_store::sessions::list_sessions_impl(db.conn(), query, &scope).await?.rows;
-
-    // Convert SessionSummary to SessionMeta (the agent's internal struct)
-    let sessions: Vec<SessionMeta> = summaries
-        .into_iter()
-        .map(|s| SessionMeta {
+    // A gateway clock a little ahead still cools; activity stamped further ahead
+    // than a cooldown is no time to wait for, or one clock that ran ahead would
+    // hold every later session until it passed.
+    let cooling_window = (cooldown_mins > 0).then(|| {
+        let now = chrono::Utc::now();
+        let cooldown = chrono::Duration::minutes(cooldown_mins);
+        (now - cooldown, now + cooldown)
+    });
+    let mut cooling = false;
+    let mut sessions: Vec<SessionMeta> = Vec::with_capacity(page.rows.len());
+    for (s, key) in page.rows {
+        if cooling_window.is_some_and(|(since, until)| s.last_timestamp > since && s.last_timestamp <= until) {
+            cooling = true;
+            break;
+        }
+        sessions.push(SessionMeta {
             session_id: s.session_id,
             user_id: s.user_id,
             key_id: s.key_id,
@@ -3060,10 +3208,15 @@ async fn fetch_sessions_via_db(
             user_email: s.user_email,
             app_id: s.app_id,
             first_user_prompt: s.first_user_prompt,
-        })
-        .collect();
-
-    Ok(sessions)
+            pos: Some(Pos { key, at: s.last_timestamp }),
+        });
+    }
+    let end = if cooling {
+        sessions.last().and_then(|s| s.pos)
+    } else {
+        Some(Pos { key: LandedKey::before(page.bound), at: effective_now(cooldown_mins) })
+    };
+    Ok(ScanBatch { sessions, reached_end: cooling || !page.full, end })
 }
 
 /// One `kind='expert'` profile with its resolved workspace scope and effective
@@ -3187,11 +3340,25 @@ async fn load_expert_profile_partition(
 
 /// One watermark row.
 struct ProfileCursor {
-    /// `last_processed_at`.
-    position: Option<chrono::DateTime<chrono::Utc>>,
+    /// `session_xid`/`session_sid`, shown as `last_processed_at`.
+    position: Option<Pos>,
     generation: i64,
-    /// `cluster_processed_at`.
-    cluster_position: Option<chrono::DateTime<chrono::Utc>>,
+    /// `cluster_xid`/`cluster_sid`, shown as `cluster_processed_at`.
+    cluster_position: Option<Pos>,
+    /// Activity at or before it is not read.
+    starts_after: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A position from its stored columns: set only when both key columns are.
+fn stored_pos(
+    xid: Option<i64>,
+    sid: Option<uuid::Uuid>,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<Pos> {
+    Some(Pos {
+        key: LandedKey::from_columns(xid, sid)?,
+        at: at.unwrap_or(chrono::DateTime::UNIX_EPOCH),
+    })
 }
 
 /// Load every `(profile_id, expert_id)` watermark row.
@@ -3203,71 +3370,112 @@ async fn load_profile_watermarks(
 > {
     let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
     type At = Option<chrono::DateTime<chrono::Utc>>;
-    let rows: Vec<(uuid::Uuid, uuid::Uuid, At, i64, At)> = sqlx::query_as(
-        "SELECT profile_id, expert_id, last_processed_at, cursor_generation, cluster_processed_at \
+    type Row = (uuid::Uuid, uuid::Uuid, Option<i64>, Option<uuid::Uuid>, At, i64, Option<i64>, Option<uuid::Uuid>, At, At);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT profile_id, expert_id, session_xid, session_sid, last_processed_at, cursor_generation, \
+                cluster_xid, cluster_sid, cluster_processed_at, starts_after \
          FROM expert_profile_watermarks",
     )
     .fetch_all(db.conn())
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(p, e, position, generation, cluster_position)| {
-            ((p, e), ProfileCursor { position, generation, cluster_position })
+        .map(|(p, e, xid, sid, at, generation, cluster_xid, cluster_sid, cluster_at, starts_after)| {
+            let cursor = ProfileCursor {
+                position: stored_pos(xid, sid, at),
+                generation,
+                cluster_position: stored_pos(cluster_xid, cluster_sid, cluster_at),
+                starts_after,
+            };
+            ((p, e), cursor)
         })
         .collect())
 }
 
 /// Give an expert reading both paths its cluster position, from where its only
 /// position stands. In one statement, so no advance falls between the read and the
-/// write. A cursor not yet started becomes the epoch: unset would later read the
-/// session path's position as this one's.
+/// write. A cursor not yet started becomes the start of landing order: unset would
+/// later read the session path's position as this one's.
 async fn seed_cluster_position(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
     profile_id: uuid::Uuid,
     expert_id: uuid::Uuid,
-) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+) -> anyhow::Result<Option<Pos>> {
     let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
-    let seeded = sqlx::query_scalar(
+    type At = Option<chrono::DateTime<chrono::Utc>>;
+    let seeded: Option<(Option<i64>, Option<uuid::Uuid>, At)> = sqlx::query_as(
         "UPDATE expert_profile_watermarks SET \
+            cluster_xid = COALESCE(cluster_xid, session_xid, 0), \
+            cluster_sid = CASE WHEN cluster_xid IS NOT NULL THEN cluster_sid \
+                               WHEN session_xid IS NOT NULL THEN session_sid \
+                               ELSE '00000000-0000-0000-0000-000000000000'::uuid END, \
             cluster_processed_at = COALESCE(cluster_processed_at, last_processed_at, 'epoch'::timestamptz) \
          WHERE profile_id = $1 AND expert_id = $2 \
-         RETURNING cluster_processed_at",
+         RETURNING cluster_xid, cluster_sid, cluster_processed_at",
     )
     .bind(profile_id)
     .bind(expert_id)
     .fetch_optional(db.conn())
     .await?;
-    Ok(seeded)
+    Ok(seeded.and_then(|(xid, sid, at)| stored_pos(xid, sid, at)))
+}
+
+/// Where a pair seen for the first time starts: before every session active
+/// within the cooldown and every transaction still running — so a
+/// newly-created/assigned profile reads what lands from now on, and what is still
+/// cooling, instead of re-scanning history.
+async fn seed_position(
+    pool: &crate::db::Db,
+    tenant_id: uuid::Uuid,
+    cooldown: i64,
+) -> anyhow::Result<Pos> {
+    let mut db = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await?;
+    let at = effective_now(cooldown);
+    // A session stamped ahead of now is not cooling (`fetch_sessions_via_db`), so
+    // it does not pull the seed back to where it landed.
+    let until = chrono::Utc::now() + chrono::Duration::minutes(cooldown.max(0));
+    let key = crate::audit_store::sessions::landing_start(db.conn(), at, Some(until)).await?;
+    Ok(Pos { key, at })
 }
 
 /// First sight of a live (profile, expert) pair: seed its watermark at
-/// effective-now so a newly-created/assigned profile starts analyzing from now
-/// instead of re-scanning history (the Default's pairs at tenant creation are
-/// seeded with a NULL cursor and scan from the beginning).
+/// [`seed_position`] (the Default's pairs at tenant creation are seeded with a
+/// NULL cursor and scan from the beginning). It takes the profile's latest
+/// restart instant: it starts after it anyway, and members pool only when theirs
+/// is the same.
 async fn seed_profile_watermark(
     pool: &crate::db::Db,
     tenant_id: uuid::Uuid,
     profile_id: uuid::Uuid,
     expert_id: uuid::Uuid,
-    at: chrono::DateTime<chrono::Utc>,
-) {
+    at: Pos,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     let Ok(mut db) = TenantConn::acquire(pool, TenantId::from_row(tenant_id)).await else {
-        return;
+        return None;
     };
-    if let Err(e) = sqlx::query(
+    let seeded: Result<Option<Option<chrono::DateTime<chrono::Utc>>>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO expert_profile_watermarks \
-            (profile_id, expert_id, tenant_id, last_processed_at) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            (profile_id, expert_id, tenant_id, last_processed_at, session_xid, session_sid, starts_after) \
+         VALUES ($1, $2, $3, $4, $5, $6, \
+                 (SELECT MAX(starts_after) FROM expert_profile_watermarks WHERE profile_id = $1)) \
+         ON CONFLICT DO NOTHING \
+         RETURNING starts_after",
     )
     .bind(profile_id)
     .bind(expert_id)
     .bind(tenant_id)
-    .bind(at)
-    .execute(db.conn())
-    .await
-    {
-        tracing::error!("expert profile watermark seed failed: {e}");
+    .bind(at.at)
+    .bind(at.key.xid)
+    .bind(at.key.session_id)
+    .fetch_optional(db.conn())
+    .await;
+    match seeded {
+        Ok(starts_after) => starts_after.flatten(),
+        Err(e) => {
+            tracing::error!("expert profile watermark seed failed: {e}");
+            None
+        }
     }
 }
 
@@ -5410,6 +5618,7 @@ mod tests {
             user_email: Some("user@test.com".to_string()),
             app_id: Some("claude-code".to_string()),
             first_user_prompt: Some("Hello world".to_string()),
+            pos: None,
         };
         let conv = serde_json::json!({
             "events": [
@@ -5449,6 +5658,7 @@ mod tests {
             user_email: None,
             app_id: None,
             first_user_prompt: None,
+            pos: None,
         };
         // A charged media call, so its line's figure is rendered too.
         let conv = serde_json::json!({ "events": [{
@@ -5492,6 +5702,7 @@ mod tests {
             user_email: Some("user@test.com".to_string()),
             app_id: Some("rag-app".to_string()),
             first_user_prompt: Some("What does the doc say?".to_string()),
+            pos: None,
         };
         // A long retrieved document arriving as a tool_result (the RAG shape) —
         // 1500 chars, well over the old fixed 500-char tool cap.
@@ -5667,6 +5878,7 @@ mod tests {
             user_email: Some("test@example.com".to_string()),
             app_id: None,
             first_user_prompt: None,
+            pos: None,
         };
         let conv = serde_json::json!({});
         let result = render_session(&meta, &conv, 200);
@@ -5691,6 +5903,7 @@ mod tests {
             user_email: Some("user@test.com".to_string()),
             app_id: None,
             first_user_prompt: Some("Generate an image".to_string()),
+            pos: None,
         };
         let conv = serde_json::json!({
             "events": [
@@ -5756,6 +5969,7 @@ mod tests {
             user_email: Some("user@test.com".to_string()),
             app_id: None,
             first_user_prompt: Some("Describe this image".to_string()),
+            pos: None,
         };
         let conv = serde_json::json!({
             "events": [
@@ -5815,6 +6029,7 @@ mod tests {
             user_email: Some("user@test.com".to_string()),
             app_id: None,
             first_user_prompt: Some("Analyze this".to_string()),
+            pos: None,
         };
         let conv = serde_json::json!({
             "events": [
@@ -5861,6 +6076,7 @@ mod tests {
 
     fn ginput(idx: usize, path: GroupPath, alias: &str, pidx: usize, merge: bool) -> GroupingInput {
         GroupingInput {
+            starts_after: None,
             expert_idx: idx,
             path,
             routing_alias: alias.to_string(),
@@ -5880,6 +6096,21 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, GroupPath::Session);
         assert_eq!(groups[0].2, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn members_restarted_from_different_instants_never_pool() {
+        // A pooled call shows every member the same sessions: one restarted later
+        // must not be shown activity from before its restart.
+        let mut inputs = vec![
+            ginput(0, GroupPath::Cluster, "m", 0, true),
+            ginput(1, GroupPath::Cluster, "m", 0, true),
+            ginput(2, GroupPath::Cluster, "m", 0, true),
+        ];
+        inputs[1].starts_after = Some(ts(100));
+        inputs[2].starts_after = Some(ts(100));
+        let groups = group_experts(&inputs);
+        assert_eq!(groups.iter().map(|g| g.2.clone()).collect::<Vec<_>>(), vec![vec![0], vec![1, 2]]);
     }
 
     #[test]

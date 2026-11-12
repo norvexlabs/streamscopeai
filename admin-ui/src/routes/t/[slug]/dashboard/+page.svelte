@@ -339,6 +339,10 @@
 			// gateways page (no per-server detail route — target_id is informational).
 			case 'upstream_server':
 				return thref(slug, '/gateways/llm');
+			// An MCP server every call fails on: its settings are on the MCP
+			// page's upstream tab, where its card names what is missing.
+			case 'mcp_upstream_server':
+				return thref(slug, '/gateways/mcp?tab=upstream-servers');
 			// Guardrail-detection alarm: focus the exact flagged request when known
 			// (a `request_id` deep-link bypasses the /audit period window so the row is
 			// always shown); otherwise fall back to the interleaved filtered list (no

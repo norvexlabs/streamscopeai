@@ -9,7 +9,7 @@
    */
   import { onMount } from 'svelte';
   import { onRefresh } from '#lib/hooks.svelte.js';
-  import type { PortalMe, PortalKey } from '#lib/api-types.js';
+  import type { PortalMe, PortalKey, PortalStats } from '#lib/api-types.js';
   import { portalApi } from '#lib/portal-client.js';
   import { extractError } from '#lib/api-helpers.js';
   import { portalScope } from '#lib/scope.svelte.js';
@@ -20,22 +20,16 @@
   import CreateKeyForm from '#lib/components/CreateKeyForm.svelte';
   import ByokBadge from '#lib/components/ByokBadge.svelte';
   import { budgetSummary, spendVsCap } from '#lib/keyBudget.js';
+  import Panel from '#lib/components/dashboard/Panel.svelte';
+  import SegmentedControl from '#lib/components/forms/SegmentedControl.svelte';
+  import { formatCount, formatKeyLabel, formatSpend, formatTimeAgo, formatTokens } from '#lib/formatters.js';
+  import { keyUsageStart, type KeyUsagePeriod } from '#lib/portalKeyUsage.js';
   import { toast } from '#lib/toast.svelte.js';
-  import { pthref } from '#lib/tenant.js';
   import { m } from '#lib/paraglide/messages.js';
-  import type { PageProps } from './$types';
-
-  let { params }: PageProps = $props();
-
-  let slug = $derived(params.slug);
 
   let me = $state<PortalMe | null>(null);
   let keys = $state<PortalKey[]>([]);
   let loading = $state(true);
-  // Per-user-OAuth upstreams reachable through the user's virtual servers but
-  // not yet connected. Surfaces a banner linking to /portal/mcp/connections.
-  let pendingMcpConnections = $state(0);
-
   let showCreate = $state(false);
   const workspaces = $derived(me?.workspaces ?? []);
   // BYOK pass-through downstreams a vk- key can bind to, scoped to the SELECTED
@@ -69,18 +63,14 @@
     const gen = ++loadGen;
     if (!reload) loading = true;
     try {
-      const [meRes, keysRes, mcpRes] = await Promise.all([
+      const [meRes, keysRes] = await Promise.all([
         portalApi.GET('/api/v1/portal/auth/me'),
         portalApi.GET('/api/v1/portal/keys'),
-        portalApi.GET('/api/v1/portal/mcp/connections'),
       ]);
       if (gen !== loadGen) return;
       if (meRes.data) me = meRes.data;
       if (keysRes.data || !keep) keys = keysRes.data?.items ?? [];
       if (keysRes.error) toast.error(extractError(keysRes.error));
-      if (mcpRes.data || !keep) {
-        pendingMcpConnections = mcpRes.data?.items.filter((c) => c.status !== 'connected').length ?? 0;
-      }
     } catch (e) {
       if (gen === loadGen) toast.error(extractError(e));
     } finally {
@@ -88,11 +78,55 @@
     }
   }
 
-  onMount(() => void loadData());
+  // Each live key's traffic over the picked period: the caller's own rows
+  // (`/portal/stats` without a workspace never widens to a team), shown for
+  // the keys of the header workspace like the list above.
+  let period = $state<KeyUsagePeriod>('last_7_days');
+  let usage = $state<PortalStats['per_key'] | null>(null);
+  let usageLoading = $state(true);
+  let usageError = $state('');
+  let usageGen = 0;
+  const periodOptions = $derived<{ value: KeyUsagePeriod; label: string }[]>([
+    { value: 'today', label: m.portal_keys_usage_today() },
+    { value: 'last_7_days', label: m.portal_keys_usage_7d() },
+    { value: 'last_30_days', label: m.portal_keys_usage_30d() },
+  ]);
+  const visibleIds = $derived(new Set(visibleKeys.map((k) => k.id)));
+  const visibleUsage = $derived((usage ?? []).filter((u) => visibleIds.has(u.key_id)));
+
+  /** A `reload` keeps the rows shown until the new ones land, and a failed
+   *  one keeps them too, saying so in a toast; a period change shows the
+   *  skeleton, and its failure in the panel. */
+  async function loadUsage(reload = false) {
+    const gen = ++usageGen;
+    if (!reload) {
+      usageLoading = true;
+      usage = null;
+    }
+    const { data, error: err } = await portalApi.GET('/api/v1/portal/stats', {
+      params: { query: { start: keyUsageStart(period, new Date()) } },
+    });
+    if (gen !== usageGen) return;
+    if (err && reload) {
+      toast.error(extractError(err, m.portal_keys_usage_err()));
+    } else if (err) {
+      usageError = extractError(err, m.portal_keys_usage_err());
+    } else {
+      usageError = '';
+      usage = data.per_key;
+    }
+    usageLoading = false;
+  }
+
+  onMount(() => {
+    void loadData();
+    void loadUsage();
+  });
   // Every refresh re-reads in place (`loadData(true)`) — not while the page's
   // own load is under way, which it would supersede.
   onRefresh(() => {
     if (!loading) void loadData(true);
+    if (!usageLoading) void loadUsage(true);
   });
 
   /** After a mint or revoke: the page's own latest-wins re-read, so a refresh
@@ -100,7 +134,7 @@
    *  still ends the spinner. Nothing kept on failure: the list shown before
    *  the change is known to be wrong. */
   async function refreshKeys() {
-    await loadData(true, false);
+    await Promise.all([loadData(true, false), loadUsage(true)]);
   }
 
   async function handleCreateKeySubmit(body: {
@@ -171,18 +205,6 @@
     <p class="text-xs text-(--text-secondary) mb-3">
       {m.portal_keys_showing()} <span class="text-(--text-primary) font-medium">{activeWsName}</span>{#if workspaces.length > 1} {m.portal_keys_showing_switch()}{/if}
     </p>
-  {/if}
-  {#if pendingMcpConnections > 0}
-    <a
-      data-testid="mcp-connections-banner"
-      href={pthref(slug, '/portal/mcp/connections')}
-      class="mb-4 px-4 py-3 rounded-xl bg-(--warning-bg) text-sm text-(--warning) hover:bg-(--warning-bg) transition-colors flex items-center justify-between"
-    >
-      <span>
-        {m.portal_keys_mcp_banner({ count: pendingMcpConnections })}
-      </span>
-      <span class="text-xs underline">{m.portal_keys_mcp_banner_link()}</span>
-    </a>
   {/if}
 
   <!-- My Keys -->
@@ -262,6 +284,50 @@
         {m.portal_keys_empty({ ws: activeWsName ?? m.portal_keys_this_workspace() })}
       </div>
     {/if}
+  </div>
+
+  <!-- Usage by key, over the picked period -->
+  <div class="mb-6" data-testid="key-usage">
+    <Panel
+      title={m.portal_keys_usage_title()}
+      flush
+      loading={usageLoading}
+      error={usageError}
+      empty={!usageLoading && visibleUsage.length === 0}
+      emptyMessage={m.portal_keys_usage_empty()}>
+      {#snippet headerExtra()}
+        <SegmentedControl
+          options={periodOptions}
+          bind:value={period}
+          label={m.portal_keys_usage_period()}
+          size="xs"
+          onchange={() => void loadUsage()} />
+      {/snippet}
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="text-[10px] uppercase tracking-wider text-(--text-secondary) border-b border-(--border)">
+            <th class="text-left font-medium px-5 py-2">{m.portal_keys_usage_col_key()}</th>
+            <th class="text-left font-medium px-5 py-2">{m.portal_keys_col_workspace()}</th>
+            <th class="text-right font-medium px-5 py-2">{m.portal_keys_usage_col_requests()}</th>
+            <th class="text-right font-medium px-5 py-2">{m.portal_keys_usage_col_tokens()}</th>
+            <th class="text-right font-medium px-5 py-2">{m.portal_keys_usage_col_spend()}</th>
+            <th class="text-right font-medium px-5 py-2">{m.portal_keys_usage_col_last_used()}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each visibleUsage as k (k.key_id)}
+            <tr class="border-b border-(--border) last:border-0" data-testid="key-usage-row" data-key-id={k.key_id}>
+              <td class="px-5 py-2 text-(--text-primary)">{formatKeyLabel(k.name, k.prefix)}</td>
+              <td class="px-5 py-2 text-(--text-secondary)">{k.workspace}</td>
+              <td class="px-5 py-2 text-right tabular-nums" data-testid="key-usage-requests">{formatCount(k.requests)}</td>
+              <td class="px-5 py-2 text-right font-mono">{formatTokens(k.tokens)}</td>
+              <td class="px-5 py-2 text-right font-mono">{formatSpend(k.spend)}</td>
+              <td class="px-5 py-2 text-right text-(--text-secondary)">{k.last_used ? formatTimeAgo(k.last_used) : '--'}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </Panel>
   </div>
 
   <!-- My Workspaces -->

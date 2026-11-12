@@ -13,7 +13,9 @@
   type Stack = components['schemas']['EffectiveLimitStack'];
   type Layer = components['schemas']['LimitLayer'];
 
-  let { stack }: { stack: Stack } = $props();
+  /** `compact`: for a narrow column (the portal Home) — one meter per row,
+   *  and no precedence line. */
+  let { stack, compact = false }: { stack: Stack; compact?: boolean } = $props();
 
   function bucketLabel(l: Layer): string {
     return limitBucketLabel(l.bucket, l.key_name, l.key_prefix);
@@ -43,7 +45,7 @@
 </script>
 
 <div class="space-y-3">
-  <p class="text-[11px] text-(--text-secondary)">{m.limits_precedence()}</p>
+  {#if !compact}<p class="text-[11px] text-(--text-secondary)">{m.limits_precedence()}</p>{/if}
   {#if stack.layers.length === 0}
     <p class="text-sm text-(--text-secondary)">{m.limits_none()}</p>
   {:else}
@@ -56,7 +58,7 @@
           {#if layer.budget_mode === 'alert_only'}<TagBadge color="amber">{m.limits_alert_only()}</TagBadge>{/if}
           {#if binding}<TagBadge color="orange" class="ml-auto">{m.limits_binding()}</TagBadge>{/if}
         </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-2">
+        <div class="grid grid-cols-1 {compact ? '' : 'sm:grid-cols-2'} gap-x-4 gap-y-2">
           {#if layer.requests_per_minute.cap != null}<LimitMeter label={m.limits_rpm()} used={layer.requests_per_minute.used} cap={layer.requests_per_minute.cap} fmt={count} note={inheritedNote(layer, layer.requests_per_minute)} />{/if}
           {#if layer.tokens_per_minute.cap != null}<LimitMeter label={m.limits_tpm()} used={layer.tokens_per_minute.used} cap={layer.tokens_per_minute.cap} fmt={formatTokens} note={inheritedNote(layer, layer.tokens_per_minute)} />{/if}
           {#if layer.daily_budget.cap != null}<LimitMeter label={m.limits_daily_short()} used={layer.daily_budget.used} cap={layer.daily_budget.cap} fmt={money} note={inheritedNote(layer, layer.daily_budget)} />{/if}

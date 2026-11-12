@@ -1,5 +1,6 @@
 <script lang="ts">
   import { isSelfScoped, portalWorkspace, sessionHref, workspaceQuery } from '#lib/selfScoped.js';
+  import { pageHidden } from '#lib/portalPages.svelte.js';
   // Expanded drawer for an A2A audit row. The call's structured content — the
   // message the caller sent, the agent's reply, its artifacts — renders through
   // the SAME `A2aCallEvent` the session timeline uses, fed by the canonical
@@ -253,7 +254,7 @@
     {/if}
   </div>
 
-  {#if row.session_id}
+  {#if row.session_id && !pageHidden('sessions', page.data)}
     <div class="pt-2 border-t border-(--border)">
       <a
         href={sessionHref(slug, page.url.pathname, row.session_id, viewedWorkspace())}

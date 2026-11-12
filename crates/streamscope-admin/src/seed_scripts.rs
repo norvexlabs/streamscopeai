@@ -757,7 +757,7 @@ async fn seed_builtin_web(
             transport, auth_mode, cred_version, enabled, built_in
          ) VALUES (
             $1, $2, $3, $4, $5,
-            'streamable_http', 'no_auth', 1, true, true
+            'streamable_http', 'headers', 1, true, true
          )
          ON CONFLICT (tenant_id, id) DO NOTHING",
     )
@@ -1274,37 +1274,16 @@ pub(crate) async fn sync_catalog(
 /// user has not edited or suppressed, and only when a seeded column differs —
 /// the `IS DISTINCT FROM` tuples list exactly the columns `SET` writes (locked
 /// by `every_builtin_upsert_compares_exactly_the_columns_it_sets`).
-pub(crate) const MCP_CATALOG_UPSERT: &str = "INSERT INTO mcp_catalog (tenant_id, source, source_name, name, display_title, description, \
-             category, featured, website_url, repository_url, icon_url, upstream_url, transport, auth_mode, \
-             oauth_issuer_url, oauth_authorization_url, oauth_token_url, oauth_revocation_url, \
-             oauth_default_scopes, tools, tool_count, liveness, is_builtin) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, true) \
+pub(crate) const MCP_CATALOG_UPSERT: &str = "INSERT INTO mcp_catalog (tenant_id, source, source_name, server_json, is_builtin) \
+             VALUES ($1, $2, $3, $4, true) \
              ON CONFLICT (tenant_id, source_name) DO UPDATE SET \
                source = EXCLUDED.source, \
-               name = EXCLUDED.name, \
-               display_title = EXCLUDED.display_title, \
-               description = EXCLUDED.description, \
-               category = EXCLUDED.category, \
-               featured = EXCLUDED.featured, \
-               website_url = EXCLUDED.website_url, \
-               repository_url = EXCLUDED.repository_url, \
-               icon_url = EXCLUDED.icon_url, \
-               upstream_url = EXCLUDED.upstream_url, \
-               transport = EXCLUDED.transport, \
-               auth_mode = EXCLUDED.auth_mode, \
-               oauth_issuer_url = EXCLUDED.oauth_issuer_url, \
-               oauth_authorization_url = EXCLUDED.oauth_authorization_url, \
-               oauth_token_url = EXCLUDED.oauth_token_url, \
-               oauth_revocation_url = EXCLUDED.oauth_revocation_url, \
-               oauth_default_scopes = EXCLUDED.oauth_default_scopes, \
-               tools = EXCLUDED.tools, \
-               tool_count = EXCLUDED.tool_count, \
-               liveness = EXCLUDED.liveness, \
+               server_json = EXCLUDED.server_json, \
                is_builtin = true, \
                updated_at = now() \
              WHERE mcp_catalog.is_builtin = true AND NOT mcp_catalog.suppressed \
-               AND (mcp_catalog.source, mcp_catalog.name, mcp_catalog.display_title, mcp_catalog.description, mcp_catalog.category, mcp_catalog.featured, mcp_catalog.website_url, mcp_catalog.repository_url, mcp_catalog.icon_url, mcp_catalog.upstream_url, mcp_catalog.transport, mcp_catalog.auth_mode, mcp_catalog.oauth_issuer_url, mcp_catalog.oauth_authorization_url, mcp_catalog.oauth_token_url, mcp_catalog.oauth_revocation_url, mcp_catalog.oauth_default_scopes, mcp_catalog.tools, mcp_catalog.tool_count, mcp_catalog.liveness) \
-                   IS DISTINCT FROM (EXCLUDED.source, EXCLUDED.name, EXCLUDED.display_title, EXCLUDED.description, EXCLUDED.category, EXCLUDED.featured, EXCLUDED.website_url, EXCLUDED.repository_url, EXCLUDED.icon_url, EXCLUDED.upstream_url, EXCLUDED.transport, EXCLUDED.auth_mode, EXCLUDED.oauth_issuer_url, EXCLUDED.oauth_authorization_url, EXCLUDED.oauth_token_url, EXCLUDED.oauth_revocation_url, EXCLUDED.oauth_default_scopes, EXCLUDED.tools, EXCLUDED.tool_count, EXCLUDED.liveness)";
+               AND (mcp_catalog.source, mcp_catalog.server_json) \
+                   IS DISTINCT FROM (EXCLUDED.source, EXCLUDED.server_json)";
 
 /// Sync the MCP server catalog seed into `mcp_catalog` for one tenant.
 ///
@@ -1312,45 +1291,38 @@ pub(crate) const MCP_CATALOG_UPSERT: &str = "INSERT INTO mcp_catalog (tenant_id,
 /// overwritten from disk. A user-edited row (`is_builtin = false`) is preserved —
 /// the `WHERE mcp_catalog.is_builtin = true AND NOT suppressed` guard on the
 /// UPDATE makes the upsert a no-op against it — so a user-edited or soft-deleted
-/// (suppressed) builtin is never overwritten or resurrected.
+/// (suppressed) builtin is never overwritten or resurrected. A seed file that
+/// does not parse or validate writes nothing and fails the sync.
 pub(crate) async fn sync_mcp_catalog(
     tenant_id: uuid::Uuid,
     conn: &mut Scoped,
     loader: &SeedLoader,
 ) -> Result<usize, sqlx::Error> {
-    let entries = loader.load_mcp_catalog();
-    let mut synced = 0usize;
+    let entries = loader.load_mcp_catalog().map_err(|e| {
+        tracing::error!(%tenant_id, error = %e, "MCP catalog seed unusable, nothing synced");
+        sqlx::Error::Protocol(e)
+    })?;
+    sync_mcp_catalog_entries(tenant_id, conn, &entries).await
+}
 
-    for entry in &entries {
-        let tools = serde_json::to_value(&entry.tools).unwrap_or_else(|_| serde_json::json!([]));
+/// Upsert already-loaded catalog seed entries (see [`sync_mcp_catalog`]).
+pub(crate) async fn sync_mcp_catalog_entries(
+    tenant_id: uuid::Uuid,
+    conn: &mut Scoped,
+    entries: &[crate::seed_loader::McpCatalogSeed],
+) -> Result<usize, sqlx::Error> {
+    let mut synced = 0usize;
+    for entry in entries {
         sqlx::query(MCP_CATALOG_UPSERT)
-        .bind(tenant_id)
-        .bind(&entry.source)
-        .bind(&entry.source_name)
-        .bind(&entry.name)
-        .bind(&entry.display_title)
-        .bind(&entry.description)
-        .bind(&entry.category)
-        .bind(entry.featured)
-        .bind(&entry.website_url)
-        .bind(&entry.repository_url)
-        .bind(&entry.icon_url)
-        .bind(&entry.upstream_url)
-        .bind(&entry.transport)
-        .bind(&entry.auth_mode)
-        .bind(&entry.oauth_issuer_url)
-        .bind(&entry.oauth_authorization_url)
-        .bind(&entry.oauth_token_url)
-        .bind(&entry.oauth_revocation_url)
-        .bind(&entry.oauth_default_scopes)
-        .bind(&tools)
-        .bind(entry.tool_count)
-        .bind(&entry.liveness)
-        .execute(&mut *conn)
-        .await
-        .inspect_err(|e| {
-            tracing::error!(server = %entry.source_name, error = %e, "failed to sync MCP catalog")
-        })?;
+            .bind(tenant_id)
+            .bind(&entry.source)
+            .bind(&entry.source_name)
+            .bind(sqlx::types::Json(&entry.server_json))
+            .execute(&mut *conn)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(server = %entry.source_name, error = %e, "failed to sync MCP catalog")
+            })?;
         synced += 1;
     }
     tracing::debug!(%tenant_id, synced, "synced MCP catalog");

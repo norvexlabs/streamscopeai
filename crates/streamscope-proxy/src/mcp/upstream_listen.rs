@@ -39,6 +39,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use serde_json::Value;
 use streamscope_core::api::sse::SseDecoder;
+use streamscope_core::mcp::header_inputs::UpstreamAuth;
 use tokio_util::codec::Decoder;
 use uuid::Uuid;
 
@@ -82,10 +83,10 @@ impl ListenTransport {
 #[derive(Debug)]
 struct ListenerShared {
     cancelled: AtomicBool,
-    /// The bearer the task presents on its next reconnect. Swapped rather than
-    /// captured so a per-user OAuth rotation reaches a stream that may have
-    /// been open since before the refresh.
-    bearer: ArcSwap<Option<String>>,
+    /// The headers the task presents on its next reconnect. Swapped rather
+    /// than captured so a per-user OAuth rotation reaches a stream that may
+    /// have been open since before the refresh.
+    upstream_auth: ArcSwap<UpstreamAuth>,
     /// Set when the task ended on a settled answer — the upstream offers no
     /// stream. (A URL the SSRF guard refuses is not one: the egress lists
     /// change at runtime, so it is retried like a failed connection.) Distinct from
@@ -111,6 +112,11 @@ pub struct UpstreamListener {
     /// re-handshakes, and without this the listener would reconnect with the
     /// dead id forever while `ensure` kept calling it healthy.
     transport: std::sync::Mutex<ListenTransport>,
+    /// The stored inputs the stream was opened under
+    /// ([`super::upstream_auth::inputs_fingerprint`]). A changed admin or
+    /// user input re-opens the stream rather than leaving it connected under
+    /// the old credentials.
+    inputs_fingerprint: u64,
     task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -189,7 +195,9 @@ pub struct UpstreamListenerMap {
 pub struct ListenRequest {
     pub key: ListenerKey,
     pub upstream_url: String,
-    pub bearer: Option<String>,
+    pub upstream_auth: UpstreamAuth,
+    /// See [`UpstreamListener::inputs_fingerprint`].
+    pub inputs_fingerprint: u64,
     pub transport: ListenTransport,
     /// What the caller needs delivered. Only read for a modern stream.
     pub filter: modern::SubscriptionFilter,
@@ -215,7 +223,7 @@ impl UpstreamListenerMap {
         let mut req = req;
         if let Some(existing) = self.listeners.get(&req.key) {
             existing.touch();
-            existing.shared.bearer.store(Arc::new(req.bearer.clone()));
+            existing.shared.upstream_auth.store(Arc::new(req.upstream_auth.clone()));
             if existing.shared.settled.load(Ordering::SeqCst) {
                 // The upstream answered that it has no stream to offer. That
                 // is a fixed answer, not a failure to retry — but it is also
@@ -223,6 +231,7 @@ impl UpstreamListenerMap {
                 return false;
             }
             let reusable = existing.is_live()
+                && existing.inputs_fingerprint == req.inputs_fingerprint
                 && *existing.transport.lock_or_poisoned() == req.transport
                 && {
                     let current = existing.filter.lock_or_poisoned();
@@ -269,7 +278,7 @@ impl UpstreamListenerMap {
 
         let shared = Arc::new(ListenerShared {
             cancelled: AtomicBool::new(false),
-            bearer: ArcSwap::from(Arc::new(req.bearer)),
+            upstream_auth: ArcSwap::from(Arc::new(req.upstream_auth)),
             settled: AtomicBool::new(false),
         });
         let listener = Arc::new(UpstreamListener {
@@ -277,6 +286,7 @@ impl UpstreamListenerMap {
             last_activity: std::sync::Mutex::new(Instant::now()),
             filter: std::sync::Mutex::new(req.filter.clone()),
             transport: std::sync::Mutex::new(req.transport.clone()),
+            inputs_fingerprint: req.inputs_fingerprint,
             task: std::sync::Mutex::new(None),
         });
 
@@ -436,11 +446,11 @@ async fn run_listener(
         // this module exists to prevent, and no test shorter than the timeout
         // would show it. Fetched per connection: a list change rebuilds it.
         let client = super::upstream::guarded_stream_client(egress);
-        let bearer = shared.bearer.load_full();
+        let upstream_auth = shared.upstream_auth.load_full();
         let outcome = listen_once(
             &client,
             &upstream_url,
-            bearer.as_deref(),
+            &upstream_auth,
             &transport,
             &filter,
             shared.as_ref(),
@@ -557,13 +567,13 @@ async fn classify_non_stream_answer(
 async fn listen_once(
     client: &reqwest::Client,
     upstream_url: &str,
-    bearer: Option<&str>,
+    upstream_auth: &UpstreamAuth,
     transport: &ListenTransport,
     filter: &modern::SubscriptionFilter,
     shared: &ListenerShared,
     sink: &dyn UpstreamEventSink,
 ) -> Result<Unsupported, String> {
-    let mut builder = match transport {
+    let builder = match transport {
         ListenTransport::LegacyGet {
             session_id,
             protocol_version,
@@ -613,9 +623,7 @@ async fn listen_once(
                 .body(body)
         }
     };
-    if let Some(token) = bearer {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
+    let builder = upstream_auth.apply(builder);
     let resp = builder.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if status.as_u16() == 405 || status.as_u16() == 501 {
@@ -761,7 +769,8 @@ mod tests {
         ListenRequest {
             key: nil_key(),
             upstream_url: "http://127.0.0.1:1/mcp".to_string(),
-            bearer: None,
+            upstream_auth: UpstreamAuth::none(),
+            inputs_fingerprint: 0,
             transport: ListenTransport::ModernListen {
                 client_capabilities: serde_json::json!({}),
                 client_info: serde_json::json!({}),
@@ -1061,6 +1070,28 @@ mod tests {
         assert!(map.ensure(legacy(), sink));
         let now = map.listeners.get(&nil_key()).unwrap().shared.clone();
         assert!(Arc::ptr_eq(&first, &now), "a healthy legacy stream was re-opened");
+    }
+
+    /// A stream opened under one set of stored inputs is re-opened when they
+    /// change, and kept while they do not (the positive control).
+    #[tokio::test]
+    async fn a_changed_input_re_opens_the_stream_and_an_unchanged_one_keeps_it() {
+        let map = UpstreamListenerMap::new(4);
+        let sink: Arc<dyn UpstreamEventSink> = Arc::new(Collect(std::sync::Mutex::new(Vec::new())));
+        let with_inputs = |fp: u64| {
+            let mut r = request(filter(true, &[]));
+            r.inputs_fingerprint = fp;
+            r
+        };
+        assert!(map.ensure(with_inputs(1), sink.clone()));
+        let first = map.listeners.get(&nil_key()).unwrap().shared.clone();
+        assert!(map.ensure(with_inputs(1), sink.clone()));
+        let same = map.listeners.get(&nil_key()).unwrap().shared.clone();
+        assert!(Arc::ptr_eq(&first, &same), "unchanged inputs re-opened the stream");
+        assert!(map.ensure(with_inputs(2), sink));
+        let now = map.listeners.get(&nil_key()).unwrap().shared.clone();
+        assert!(!Arc::ptr_eq(&first, &now), "changed inputs kept the old stream");
+        assert!(first.cancelled.load(Ordering::SeqCst), "the old stream was not cancelled");
     }
 
     #[test]

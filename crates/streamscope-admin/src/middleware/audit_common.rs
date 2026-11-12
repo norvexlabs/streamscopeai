@@ -402,7 +402,13 @@ const REDACT_KEYS: &[&str] = &[
 /// every audited failure across all three planes and leave an operator unable to
 /// tell one refusal from another. Applied at the top level only, which is where
 /// OAuth parameters live.
-const REQUEST_ONLY_REDACT_KEYS: &[&str] = &["code"];
+///
+/// `inputs` is an MCP upstream's or a user's non-secret header-input values on
+/// the way in. A secret sent there by mistake is refused, but the refused body
+/// is still audited, and nothing here knows which inputs the server declares
+/// secret — so the whole map is redacted (`secret_inputs` already is, by name).
+/// The upstream row it answers with is not a request body and keeps them.
+const REQUEST_ONLY_REDACT_KEYS: &[&str] = &["code", "inputs"];
 
 /// True when a *path parameter name* holds a secret. Broader than
 /// [`is_redact_key`] by exactly [`REQUEST_ONLY_REDACT_KEYS`]: `code` is scoped
@@ -563,6 +569,8 @@ pub(crate) const ADMIN_ACTION_OVERRIDES: &[(Method, &str, &str)] = &[
     (Method::DELETE, "/workspaces/{id}/providers/{provider_id}", "workspaces.revoke_provider"),
     (Method::POST, "/workspaces/{id}/mcp-servers", "workspaces.grant_mcp_access"),
     (Method::DELETE, "/workspaces/{id}/mcp-servers/{server_id}", "workspaces.revoke_mcp_access"),
+    (Method::POST, "/workspaces/{id}/mcp-local-servers", "workspaces.grant_mcp_local_access"),
+    (Method::DELETE, "/workspaces/{id}/mcp-local-servers/{server_id}", "workspaces.revoke_mcp_local_access"),
     (Method::POST, "/workspaces/{id}/a2a-agents", "workspaces.grant_a2a_access"),
     (Method::DELETE, "/workspaces/{id}/a2a-agents/{agent_id}", "workspaces.revoke_a2a_access"),
     // Server batch model ops.
@@ -591,6 +599,7 @@ pub(crate) const ADMIN_ACTION_OVERRIDES: &[(Method, &str, &str)] = &[
     (Method::POST, "/mcp/upstream-servers/actions/discover-oauth", "mcp.discover_upstream_oauth"),
     (Method::PATCH, "/mcp/upstream-servers/{id}", "mcp.update_upstream_server"),
     (Method::DELETE, "/mcp/upstream-servers/{id}", "mcp.delete_upstream_server"),
+    (Method::POST, "/mcp/upstream-servers/{id}/actions/test", "mcp.test_upstream_server"),
     (Method::POST, "/mcp/virtual-servers", "mcp.create_virtual_server"),
     (Method::PATCH, "/mcp/virtual-servers/{id}", "mcp.update_virtual_server"),
     (Method::DELETE, "/mcp/virtual-servers/{id}", "mcp.delete_virtual_server"),
@@ -630,6 +639,7 @@ pub(crate) const CONTROL_PLANE_ACTION_OVERRIDES: &[(Method, &str, &str)] = &[
     (Method::POST, "/keys", "portal_key.create"),
     (Method::POST, "/mcp/connections/{upstream_id}/actions/connect", "portal_mcp.connect"),
     (Method::POST, "/mcp/connections/{upstream_id}/actions/revoke", "portal_mcp.revoke_connection"),
+    (Method::PATCH, "/mcp/connections/{upstream_id}/inputs", "portal_mcp.update_inputs"),
     (Method::POST, "/mcp/virtual-servers/{virtual_server_id}/actions/test", "portal_mcp.test"),
     // Workspace automation accounts + portal `ak-` keys (manager self-serve).
     (Method::POST, "/workspaces/{id}/automation-accounts", "portal_automation.create_account"),
@@ -804,6 +814,7 @@ fn diff_target_table(base: &str) -> Option<(&'static str, &'static str)> {
         "/mcp/virtual-routes" => row("mcp_virtual_routes"),
         "/mcp/oauth-clients" => row("mcp_oauth_clients"),
         "/mcp/catalog" => row("mcp_catalog"),
+        "/mcp/local-servers" => row("mcp_local_servers"),
         "/mcp/issued-tokens" => Some(("oauth_issued_tokens", "jti")),
         "/route-policies" => row("route_policies"),
         "/cache-presets" => row("cache_presets"),
@@ -1514,6 +1525,30 @@ mod tests {
         redact_in_place(&mut v);
         assert_eq!(v["API_KEY"], "[REDACTED]");
         assert_eq!(v["Password"], "[REDACTED]");
+    }
+
+    /// An MCP header input's value travels under `inputs` when the declaration
+    /// says it is not secret and under `secret_inputs` when it is. The header
+    /// names keying both maps say nothing about secrecy (`X-Jira-Token`), and a
+    /// refused body (a secret sent under `inputs` by mistake) is audited too, so
+    /// the redactor blanks both maps whole.
+    #[test]
+    fn mcp_input_values_are_blanked_whole_in_a_request_body() {
+        let body = Bytes::from(
+            r#"{"inputs": {"X-Jira-Url": "https://jira.example"},
+                "secret_inputs": {"X-Jira-Token": "t0k3n-value", "Authorization/token": "b34rer"}}"#,
+        );
+        let v = parse_and_redact(&body).expect("a JSON body is recorded");
+        assert_eq!(v["secret_inputs"], "[REDACTED]");
+        assert!(!v.to_string().contains("t0k3n-value"), "{v}");
+        assert!(!v.to_string().contains("b34rer"), "{v}");
+        // A secret sent under `inputs` by mistake is refused, but the body is
+        // still audited: the map is blanked whole too.
+        assert_eq!(v["inputs"], "[REDACTED]");
+        assert!(!v.to_string().contains("jira.example"), "{v}");
+        // Positive control: a neighbouring field is kept.
+        let v = parse_and_redact(&Bytes::from(r#"{"inputs": {"a": "b"}, "name": "jicon"}"#)).expect("JSON");
+        assert_eq!(v["name"], "jicon");
     }
 
     #[test]

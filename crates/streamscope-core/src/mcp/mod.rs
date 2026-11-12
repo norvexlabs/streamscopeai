@@ -7,6 +7,8 @@
 //! OAuth hop: the guarded transport and client shape that admin-api's
 //! authorization-code exchange and the proxy's token refresh both use.
 
+pub mod header_inputs;
+pub mod local_server;
 pub mod oauth_client;
 pub mod oauth_http;
 pub mod sse_events;

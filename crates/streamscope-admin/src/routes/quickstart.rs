@@ -2,10 +2,9 @@
 //!
 //! Two endpoints scoped under `/api/v1/portal/quickstart/*`:
 //!
-//! * `GET /clients` — lists `ClientProfile` entries from this tenant's
-//!   `client_profiles` table, filtered to those the caller could actually use
-//!   (compatible with the user's accessible downstream providers and/or MCP
-//!   virtual servers).
+//! * `GET /clients` — lists the `ClientProfile` entries the named workspace is
+//!   offered (its client-access profile), each marked compatible or not with
+//!   the downstream providers and MCP virtual servers that workspace grants.
 //! * `POST /render` — mints any keys the chosen template needs, builds the
 //!   placeholder map (resolved capabilities, endpoint URLs, gateway origin,
 //!   …), runs the shared `streamscope-client-templates` render engine, and returns
@@ -34,13 +33,15 @@ use streamscope_core::proxy::routing::upstream_api_version_for_provider;
 
 use crate::AdminState;
 use crate::db::tenant::{Scoped, TenantConn};
+use streamscope_core::mcp::local_server::LocalLaunch;
 use streamscope_client_templates::{
-    companion_files, render, upstream_mcp_bearer_placeholder, ClientProfile, McpAuthMode,
+    companion_files, mcp_client_header_placeholder, mcp_header_item, mcp_local_server_item, render, ClientProfile, LocalMcpForm,
+    McpAuthMode,
     TemplateKind, Value, API_KEY_PLACEHOLDER, UPSTREAM_API_KEY_PLACEHOLDER,
 };
 
 use super::portal_auth::PortalUser;
-use super::portal_manager::confine_to_key_workspace;
+use super::portal_manager::{confine_to_key_workspace, require_workspace_member, MemberOf};
 use super::{ApiError, ApiErrorCode, ApiErrorResponse, OffsetPage, PageQuery};
 
 // ---------------------------------------------------------------------------
@@ -69,24 +70,64 @@ pub struct ListClientsResponse {
     pub clients: Vec<ClientProfileSummary>,
 }
 
+/// Query of the two client reads: the workspace the answer is for.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct QuickstartClientsQuery {
+    /// The workspace whose clients are read: what it is offered depends on the
+    /// client-access profile assigned to it. Required for a signed-in member,
+    /// who must belong to it. An `ak-` key answers for the workspace it is
+    /// bound to: it may leave this out, and is refused another workspace.
+    pub workspace_id: Option<Uuid>,
+}
+
+/// The workspace a client read is for: the one named, else the one an `ak-`
+/// key is bound to. A signed-in member who names none is refused — no answer
+/// stands for "across my workspaces", since each may be offered different
+/// clients.
+fn named_workspace(asked: Option<Uuid>, key_workspace_id: Option<Uuid>) -> Result<Uuid, ApiError> {
+    asked.or(key_workspace_id).ok_or_else(|| {
+        ApiError::bad_request("workspace_id is required: name the workspace whose clients to read")
+            .code(ApiErrorCode::ValidationFailed)
+    })
+}
+
+/// [`named_workspace`], once the caller is established as acting in it.
+async fn clients_workspace(
+    conn: &mut Scoped,
+    user: &PortalUser,
+    q: &QuickstartClientsQuery,
+) -> Result<MemberOf, ApiError> {
+    let workspace_id = named_workspace(q.workspace_id, user.key_workspace_id)?;
+    require_workspace_member(conn, user, workspace_id).await
+}
+
 #[utoipa::path(
     get,
     path = "/api/v1/portal/quickstart/clients",
     tag = "Portal Quickstart",
     operation_id = "portal_quickstart_list_clients",
+    params(QuickstartClientsQuery),
     responses(
-        (status = 200, description = "Compatible client profiles for this user", body = ListClientsResponse),
+        (status = 200, description = "The client profiles the workspace is offered, each marked compatible or not with what the workspace grants", body = ListClientsResponse),
+        (status = 400, description = "No workspace named", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Not a member of the workspace, or a key bound to another", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_clients(
     mut db: TenantConn,
     Extension(user): Extension<PortalUser>,
+    provision: Option<Extension<super::portal_auth::ProvisionToken>>,
+    axum::extract::Query(q): axum::extract::Query<QuickstartClientsQuery>,
 ) -> Result<Json<ListClientsResponse>, ApiError> {
-    let profiles = load_offered_profiles(db.conn(), user.key_workspace_id).await?;
+    let cli = user.is_cli(provision.as_ref().map(|p| &p.0));
+    let member = clients_workspace(db.conn(), &user, &q).await?;
+    let workspace_id = member.workspace_id();
+    let profiles = load_offered_profiles(db.conn(), member).await?;
 
-    // Compatibility is binary: "does the user reach at least one LLM
+    // Compatibility is binary: "does the workspace grant at least one LLM
     // provider?" (or one MCP virtual server). Upstream `upstream_api_format`
     // never enters the predicate — the proxy translates between any client
     // protocol and any upstream protocol. A granted provider counts when it
@@ -95,20 +136,19 @@ pub async fn list_clients(
     // gating on `downstream_routes` alone would wrongly mark a BYOK-only
     // workspace as having no LLM access (disabling LLM-only clients like codex
     // that have no MCP template to slip through on).
-    // A portal `ak-` key (`key_workspace_id` Some) evaluates compatibility from
-    // its bound workspace only; a human session (None) across all its workspaces.
+    // Read for the named workspace alone: a render draws only on its grants.
+    // The caller's membership of it is already proved (`member`), so both reads
+    // key on the workspace.
     static HAS_LLM_ACCESS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
         crate::routes::with_live_provider_grants(concat!(
             r#"SELECT EXISTS(
             SELECT 1
             FROM downstream_providers dp
             WHERE EXISTS (
-                    SELECT 1 FROM workspace_members wm
-                    JOIN (
+                    SELECT 1 FROM (
 --{live_provider_grants}
-                    ) wda ON wda.workspace_id = wm.workspace_id
-                    WHERE wm.user_id = $1 AND wda.downstream_provider_id = dp.id
-                      AND ($2::uuid IS NULL OR wm.workspace_id = $2)
+                    ) wda
+                    WHERE wda.downstream_provider_id = dp.id AND wda.workspace_id = $1
                   )
               AND (
                     dp.byok = true
@@ -123,8 +163,7 @@ pub async fn list_clients(
         ))
     });
     let has_llm_access: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(HAS_LLM_ACCESS.as_str()))
-    .bind(user.user_id)
-    .bind(user.key_workspace_id)
+    .bind(workspace_id)
     .fetch_one(db.conn())
     .await
     .unwrap_or(false);
@@ -133,15 +172,24 @@ pub async fn list_clients(
         r#"SELECT EXISTS(
             SELECT 1 FROM mcp_virtual_servers vs
             WHERE vs.enabled AND EXISTS (
-                    SELECT 1 FROM workspace_members wm
-                    JOIN workspace_mcp_access wma ON wma.workspace_id = wm.workspace_id
-                    WHERE wm.user_id = $1 AND wma.virtual_server_id = vs.id
-                      AND ($2::uuid IS NULL OR wm.workspace_id = $2)
+                    SELECT 1 FROM workspace_mcp_access wma
+                    WHERE wma.workspace_id = $1 AND wma.virtual_server_id = vs.id
                   )
         )"#,
     )
-    .bind(user.user_id)
-    .bind(user.key_workspace_id)
+    .bind(workspace_id)
+    .fetch_one(db.conn())
+    .await
+    .unwrap_or(false);
+
+    let has_local_mcp_access: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+            SELECT 1 FROM mcp_local_servers l \
+            WHERE l.enabled AND EXISTS ( \
+                    SELECT 1 FROM workspace_mcp_local_access a \
+                    WHERE a.workspace_id = $1 AND a.local_server_id = l.id))",
+    )
+    .bind(workspace_id)
     .fetch_one(db.conn())
     .await
     .unwrap_or(false);
@@ -155,7 +203,9 @@ pub async fn list_clients(
     // on the required key).
     let template_reachable = |t: &streamscope_client_templates::ClientProfileTemplate| match t.kind {
         TemplateKind::Llm | TemplateKind::Instructions | TemplateKind::Combined => has_llm_access,
-        TemplateKind::Mcp => has_mcp_access,
+        // A local MCP server stands in for a virtual one where the caller can
+        // write it with this template.
+        TemplateKind::Mcp => has_mcp_access || (has_local_mcp_access && writes_local_for(t.local_mcp, cli)),
     };
 
     let clients = profiles
@@ -175,15 +225,15 @@ pub async fn list_clients(
                 None
             } else if needs_llm && needs_mcp && !has_llm_access && !has_mcp_access {
                 Some(
-                    "Your workspaces grant no LLM downstream provider and no MCP virtual server is reachable. Ask an admin to grant access on /admin/workspaces.".to_string(),
+                    "This workspace grants no LLM downstream provider and no MCP virtual server. Ask an admin to grant access on /admin/workspaces.".to_string(),
                 )
             } else if needs_llm && !has_llm_access {
                 Some(
-                    "Your workspaces grant no LLM downstream provider. Ask an admin to grant access on /admin/workspaces.".to_string(),
+                    "This workspace grants no LLM downstream provider. Ask an admin to grant access on /admin/workspaces.".to_string(),
                 )
             } else if needs_mcp && !has_mcp_access {
                 Some(
-                    "No MCP virtual servers are reachable from your workspaces. Ask an admin to set one up at /admin/gateways/mcp and grant access on /admin/workspaces.".to_string(),
+                    "This workspace grants no MCP virtual server. Ask an admin to set one up at /admin/gateways/mcp and grant access on /admin/workspaces.".to_string(),
                 )
             } else {
                 None
@@ -212,9 +262,11 @@ pub async fn list_clients(
     path = "/api/v1/portal/quickstart/clients/{id}",
     tag = "Portal Quickstart",
     operation_id = "portal_quickstart_get_client",
-    params(("id" = String, Path, description = "Client profile id (e.g. 'claude-code')")),
+    params(("id" = String, Path, description = "Client profile id (e.g. 'claude-code')"), QuickstartClientsQuery),
     responses(
         (status = 200, description = "Full client profile with template list", body = ClientProfile),
+        (status = 400, description = "No workspace named", body = ApiErrorResponse),
+        (status = 403, description = "Not a member of the workspace, a key bound to another, or a client the workspace is not offered", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
     ),
@@ -224,13 +276,15 @@ pub async fn get_client(
     mut db: TenantConn,
     Extension(user): Extension<PortalUser>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<QuickstartClientsQuery>,
 ) -> Result<Json<ClientProfile>, ApiError> {
+    let member = clients_workspace(db.conn(), &user, &q).await?;
     let profiles = load_profiles(db.conn()).await?;
     let profile = profiles.into_iter().find(|p| p.id == id).ok_or_else(|| {
         ApiError::not_found("client profile not found", ApiErrorCode::ClientProfileNotFound)
     })?;
-    let access = super::client_access_profiles::effective_client_access(db.conn(), user.key_workspace_id).await?;
-    if !access.offers(&profile.id) {
+    let offered = super::client_access_profiles::offered_clients(db.conn(), member).await?;
+    if !offered.contains(&profile.id) {
         return Err(super::client_access_profiles::client_disabled(&profile.id));
     }
     Ok(Json(profile))
@@ -488,6 +542,11 @@ pub struct RenderRequest {
     /// section in `{{#if mcp_servers}}`). Each must be granted by the workspace.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSelection>,
+    /// Local MCP servers (run on the member's own machine) to write into the
+    /// config. Each must be granted by the workspace. A template with no form
+    /// for one leaves it out and says so in `warnings`.
+    #[serde(default)]
+    pub mcp_local_servers: Vec<McpLocalServerSelection>,
 }
 
 /// The gateway key a render embeds. Exactly one mode: mint a fresh key
@@ -534,6 +593,195 @@ pub struct McpServerSelection {
     pub virtual_server_id: Uuid,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct McpLocalServerSelection {
+    pub local_server_id: Uuid,
+}
+
+/// The MCP servers one render was asked for: the gateway's, and the local
+/// ones as [`load_local_selection`] read them.
+#[derive(Clone, Copy)]
+pub(crate) struct McpSelections<'a> {
+    pub servers: &'a [McpServerSelection],
+    pub local: &'a [SelectedLocalServer],
+    pub reader: RenderReader,
+}
+
+/// Who reads what [`populate_template_placeholders`] builds. It decides one
+/// thing: whether a local MCP server on a template that writes it only in a
+/// project's own file (`local_mcp = project`) counts as written.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenderReader {
+    /// The web Quickstart: the page shows the config OUTSIDE a project, which
+    /// leaves such a server out — a selection of nothing else has nothing to
+    /// show, and is refused.
+    Web,
+    /// The provision bundle: the CLI decides project or global and renders
+    /// again from the placeholders, so the server travels and a selection of
+    /// nothing else is accepted.
+    Cli,
+}
+
+/// A selected local MCP server, read and checked against the workspace.
+pub(crate) struct SelectedLocalServer {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub launch: LocalLaunch,
+}
+
+/// Whether a caller can be handed a local MCP server through a template of
+/// this form: the CLI writes a project's own file, so any form will do; the
+/// portal page shows the config outside a project, which only a `config`
+/// form writes a local server into — a client offered there on the strength
+/// of a `project` form would be refused at render.
+pub(crate) fn writes_local_for(form: LocalMcpForm, cli: bool) -> bool {
+    match form {
+        LocalMcpForm::None => false,
+        LocalMcpForm::Config => true,
+        LocalMcpForm::Project => cli,
+    }
+}
+
+/// Read the selected local MCP servers in one statement — once per render or
+/// bundle, whatever the number of templates — and hold each to the same gate
+/// as a virtual server: selected once, enabled (a disabled one reads as not
+/// found), and granted to the workspace the caller was established as a
+/// member of — the one the key is bound to. Returned in selection order.
+pub(crate) async fn load_local_selection(
+    tx: &mut Scoped,
+    selection: &[McpLocalServerSelection],
+    member: MemberOf,
+) -> Result<Vec<SelectedLocalServer>, ApiError> {
+    if selection.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<Uuid> = selection.iter().map(|s| s.local_server_id).collect();
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    if !ids.iter().all(|id| seen.insert(*id)) {
+        return Err(ApiError::bad_request("the same local MCP server was selected twice")
+            .code(ApiErrorCode::ValidationFailed));
+    }
+    type Row = (Uuid, String, String, Option<String>, sqlx::types::Json<LocalLaunch>, bool);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT l.id, l.slug, l.name, l.description, l.launch, \
+                EXISTS (SELECT 1 FROM workspace_mcp_local_access a \
+                         WHERE a.workspace_id = $2 AND a.local_server_id = l.id) \
+           FROM mcp_local_servers l WHERE l.id = ANY($1) AND l.enabled",
+    )
+    .bind(&ids)
+    .bind(member.workspace_id())
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("quickstart fetch local mcp servers: {e}");
+        ApiError::internal("internal error")
+    })?;
+    let mut by_id: std::collections::HashMap<Uuid, Row> = rows.into_iter().map(|r| (r.0, r)).collect();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let (id, slug, name, description, launch, granted) = by_id.remove(&id).ok_or_else(|| {
+            ApiError::bad_request("local MCP server not found").code(ApiErrorCode::McpLocalServerNotFound)
+        })?;
+        if !granted {
+            return Err(ApiError::forbidden("this workspace is not granted that local MCP server")
+                .code(ApiErrorCode::PermissionDenied));
+        }
+        out.push(SelectedLocalServer { id, slug, name, description, launch: launch.0 });
+    }
+    Ok(out)
+}
+
+/// Why a selected MCP virtual server was left out of a rendered config.
+#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerOmitReason {
+    /// A sign-in (OAuth) template, and a server whose client sends its own
+    /// `Authorization`: it is reached on the `/fwd/{key}/mcp/<slug>` path,
+    /// and a sign-in setup has no gateway key to put there.
+    SignInCannotReachFwd,
+    /// A pass-through (`vk-`) key, and a server some route of which carries
+    /// more than what the client sends (an OAuth sign-in, an administrator's
+    /// or a user's value): such a key reaches only a server whose every route
+    /// carries just the client's own headers, its `Authorization` included.
+    PassThroughKeyNotAccepted,
+    /// A local MCP server, and a client template with no form for one.
+    LocalServerNotSupported,
+    /// A local MCP server, and a client template that writes one only in a
+    /// project's own config file: the config rendered here (the one outside a
+    /// project) leaves it out. `ssai provision` in a project writes it.
+    LocalServerProjectOnly,
+}
+
+/// Why a virtual server is left out — the two reasons [`mcp_server_item`]
+/// gives, each one of [`McpServerOmitReason`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VirtualOmit {
+    SignInCannotReachFwd,
+    PassThroughKeyNotAccepted,
+}
+
+/// A selected MCP server the rendered config leaves out, and why: a virtual
+/// server (`virtual_server_id`) or a local one (`local_server_id`).
+#[derive(Serialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct McpServerWarning {
+    pub virtual_server_id: Option<Uuid>,
+    pub local_server_id: Option<Uuid>,
+    pub slug: String,
+    pub reason: McpServerOmitReason,
+    /// The same, for a person to read.
+    pub message: String,
+}
+
+impl McpServerWarning {
+    /// A virtual server the template's credential cannot reach.
+    fn new(virtual_server_id: Uuid, slug: &str, omit: VirtualOmit) -> Self {
+        let (reason, message) = match omit {
+            VirtualOmit::SignInCannotReachFwd => (
+                McpServerOmitReason::SignInCannotReachFwd,
+                format!(
+                    "MCP server '{slug}' was left out: it reads the client's own Authorization header, so \
+                     it is reached with the gateway key in its URL, which a sign-in (OAuth) setup does \
+                     not have — use a setup that embeds a gateway key for it"
+                ),
+            ),
+            VirtualOmit::PassThroughKeyNotAccepted => (
+                McpServerOmitReason::PassThroughKeyNotAccepted,
+                format!(
+                    "MCP server '{slug}' was left out: a pass-through key reaches only a server that \
+                     carries just what the client sends, its own Authorization included — use a \
+                     gateway key for it"
+                ),
+            ),
+        };
+        Self { virtual_server_id: Some(virtual_server_id), local_server_id: None, slug: slug.to_string(), reason, message }
+    }
+
+    /// A local server the template has no form for at all (`project_only`
+    /// false), or writes only in a project's own config file.
+    fn local(local_server_id: Uuid, slug: &str, client: &str, project_only: bool) -> Self {
+        let (reason, message) = if project_only {
+            (
+                McpServerOmitReason::LocalServerProjectOnly,
+                format!(
+                    "local MCP server '{slug}' is not in this config: {client} is given a local server only \
+                     in a project's own config file — run `ssai provision` in the project to write it"
+                ),
+            )
+        } else {
+            (
+                McpServerOmitReason::LocalServerNotSupported,
+                format!(
+                    "local MCP server '{slug}' was left out: the {client} setup has no form for a server \
+                     that runs on your machine"
+                ),
+            )
+        };
+        Self { virtual_server_id: None, local_server_id: Some(local_server_id), slug: slug.to_string(), reason, message }
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct RenderedTemplate {
     pub kind: TemplateKind,
@@ -578,6 +826,9 @@ pub struct RenderResponse {
     /// existing key or minted nothing.
     pub minted_keys: Vec<MintedKey>,
     pub minted_secrets: MintedSecrets,
+    /// The selected MCP virtual servers the config leaves out, each with why.
+    /// Empty when every selected server is in it.
+    pub warnings: Vec<McpServerWarning>,
 }
 
 #[utoipa::path(
@@ -601,8 +852,6 @@ pub async fn render_endpoint(
     Extension(user): Extension<PortalUser>,
     Json(body): Json<RenderRequest>,
 ) -> Result<Json<RenderResponse>, ApiError> {
-    // A portal `ak-` key may only render/mint within its bound workspace.
-    confine_to_key_workspace(&user, body.workspace_id)?;
     let tenant_uuid = db.tenant_uuid();
 
     // Every key this render mints is written inside one transaction and
@@ -614,6 +863,12 @@ pub async fn render_endpoint(
         ApiError::internal("internal error")
     })?;
 
+    // Before anything is read for the workspace: a portal `ak-` key renders and
+    // mints only within its bound workspace, and the caller is a member — a
+    // refused client would otherwise tell a non-member what another team is
+    // offered.
+    let member = require_workspace_member(&mut tx, &user, body.workspace_id).await?;
+
     let profiles = load_profiles(&mut tx).await?;
     let profile = profiles
         .into_iter()
@@ -621,8 +876,8 @@ pub async fn render_endpoint(
         .ok_or_else(|| {
             ApiError::not_found("client profile not found", ApiErrorCode::ClientProfileNotFound)
         })?;
-    let access = super::client_access_profiles::effective_client_access(&mut tx, Some(body.workspace_id)).await?;
-    if !access.offers(&profile.id) {
+    let offered = super::client_access_profiles::offered_clients(&mut tx, member).await?;
+    if !offered.contains(&profile.id) {
         return Err(super::client_access_profiles::client_disabled(&profile.id));
     }
 
@@ -641,7 +896,7 @@ pub async fn render_endpoint(
         &state,
         tenant_uuid,
         &user,
-        body.workspace_id,
+        member,
         body.key.as_ref(),
         needs_key,
         &body.client_id,
@@ -650,12 +905,13 @@ pub async fn render_endpoint(
     .await?;
 
     let mut route_cache = RouteCache::new();
-    let placeholders = populate_template_placeholders(
+    let local_servers = load_local_selection(&mut tx, &body.mcp_local_servers, member).await?;
+    let (placeholders, warnings) = populate_template_placeholders(
         &mut tx,
         &ctx,
         &template,
         body.llm_provider_id,
-        &body.mcp_servers,
+        McpSelections { servers: &body.mcp_servers, local: &local_servers, reader: RenderReader::Web },
         body.workspace_id,
         &mut route_cache,
     )
@@ -702,6 +958,7 @@ pub async fn render_endpoint(
         companions,
         minted_keys: ctx.minted_keys,
         minted_secrets: ctx.minted_secrets,
+        warnings,
     }))
 }
 
@@ -736,16 +993,19 @@ pub(crate) struct RenderContext {
     pub key_id: Option<Uuid>,
 }
 
-/// Build the shared render context: tenant placeholders, public origin,
-/// workspace membership gate, and the unified gateway key (mint or reuse)
-/// inside the caller's transaction.
+/// Build the shared render context: tenant placeholders, public origin, and
+/// the unified gateway key (mint or reuse) inside the caller's transaction.
+///
+/// It mints a key bound to a workspace, so it takes the [`MemberOf`] that only
+/// the membership gate hands out: a caller that has not passed the gate for
+/// that workspace cannot call it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_render_context(
     tx: &mut Scoped,
     state: &AdminState,
     tenant_uuid: Uuid,
     user: &PortalUser,
-    workspace_id: Uuid,
+    member: MemberOf,
     key: Option<&KeySpec>,
     needs_key: bool,
     key_name_prefix: &str,
@@ -781,30 +1041,11 @@ pub(crate) async fn build_render_context(
     )
     .await?;
 
-    // ----- Resolve the workspace (membership) -----
-    // The key is bound to this workspace and every provider / MCP server the
-    // snippet wires must be granted by it. Non-members are rejected outright.
-    // The Default workspace gates on its explicit allowlist like any other.
-    let ws_row: Option<(bool,)> = sqlx::query_as(
-        r#"SELECT (w.role = 'default')
-           FROM workspaces w
-           JOIN workspace_members wm ON wm.workspace_id = w.id AND wm.user_id = $2
-           WHERE w.id = $1"#,
-    )
-    .bind(workspace_id)
-    .bind(user.user_id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| {
-        tracing::error!("quickstart workspace lookup: {e}");
-        ApiError::internal("internal error")
-    })?;
-    // Membership is the only gate here; per-provider / per-MCP grants are
-    // verified against the access tables below (the Default workspace included).
-    if ws_row.is_none() {
-        return Err(ApiError::forbidden("you are not a member of this workspace")
-            .code(ApiErrorCode::WorkspaceMembershipRequired));
-    }
+    // The key is bound to the member's workspace; every provider / MCP server
+    // the snippet wires is verified against that workspace's access tables
+    // below — the Default workspace gates on its explicit allowlist like any
+    // other.
+    let workspace_id = member.workspace_id();
 
     // ----- Resolve the gateway key (mint or reuse) -----
     // One unified key serves both the LLM and MCP sections of every template
@@ -1044,17 +1285,22 @@ fn client_provider_key(
 
 /// Build one template's full placeholder map on top of the shared context:
 /// validates the template's LLM / MCP requirements against the request and
-/// the workspace's grants, then runs the provider and MCP branches.
+/// the workspace's grants, then runs the provider and MCP branches. Returns
+/// with it the selected MCP servers the config leaves out — the one function
+/// behind both the Web Quickstart and the CLI bundle, so the two report the
+/// same servers.
 pub(crate) async fn populate_template_placeholders(
     tx: &mut Scoped,
     ctx: &RenderContext,
     template: &streamscope_client_templates::ClientProfileTemplate,
     llm_provider_id: Option<Uuid>,
-    mcp_servers: &[McpServerSelection],
+    mcp: McpSelections<'_>,
     workspace_id: Uuid,
     route_cache: &mut RouteCache,
-) -> Result<BTreeMap<String, Value>, ApiError> {
+) -> Result<(BTreeMap<String, Value>, Vec<McpServerWarning>), ApiError> {
+    let McpSelections { servers: mcp_servers, local: mcp_local_servers, reader } = mcp;
     let mut placeholders = ctx.base_placeholders.clone();
+    let mut warnings: Vec<McpServerWarning> = Vec::new();
     let public_origin = &ctx.public_origin;
     let forward_auth = ctx.forward_auth;
 
@@ -1247,14 +1493,16 @@ pub(crate) async fn populate_template_placeholders(
     // iterates the per-server scope. `kind = mcp` requires at least one. The
     // unified key resolved in the context serves every server; the workspace
     // allowlist gates each target at request time.
-    if mcp_required && mcp_servers.is_empty() {
+    if mcp_required && mcp_servers.is_empty() && mcp_local_servers.is_empty() {
         return Err(
             ApiError::bad_request("this template needs at least one MCP server")
                 .code(ApiErrorCode::ClientProfileNotCompatible),
         );
     }
-    if !mcp_servers.is_empty() {
+    if !mcp_servers.is_empty() || !mcp_local_servers.is_empty() {
         let mut seen: HashSet<Uuid> = HashSet::new();
+        // The slug of every entry this config holds, gateway or local.
+        let mut slugs: HashSet<String> = HashSet::new();
         let mut mcp_items: Vec<BTreeMap<String, Value>> = Vec::new();
         for mcp in mcp_servers {
             if !seen.insert(mcp.virtual_server_id) {
@@ -1303,62 +1551,171 @@ pub(crate) async fn populate_template_placeholders(
                 .code(ApiErrorCode::PermissionDenied));
             }
 
-            // Per-server scope consumed inside `{{#each mcp_servers}}`.
-            let mut item: BTreeMap<String, Value> = BTreeMap::new();
-            item.insert("slug".into(), Value::String(slug.clone()));
-            item.insert("name".into(), Value::String(vs_name));
-            if let Some(d) = vs_desc {
-                item.insert("description".into(), Value::String(d));
-            }
-            item.insert(
-                "transport_hint".into(),
-                Value::String("streamable_http".into()),
-            );
-            item.insert(
-                "oauth_authorize_url".into(),
-                Value::String(format!("{public_origin}/mcp/{slug}/oauth/authorize")),
-            );
-
-            match template.mcp_auth_mode {
-                McpAuthMode::Static => {
-                    // The unified key (resolved in the context) authenticates
-                    // every server. BYOK rides in the `/fwd/` URL path and the
-                    // header carries the user's own upstream bearer; managed keys
-                    // ride in the header via the shared api-key sentinel.
-                    if forward_auth {
-                        let bearer_sentinel = upstream_mcp_bearer_placeholder(&slug);
-                        item.insert(
-                            "url".into(),
-                            Value::String(format!(
-                                "{public_origin}/fwd/{API_KEY_PLACEHOLDER}/mcp/{slug}"
-                            )),
-                        );
-                        item.insert("api_key".into(), Value::String(bearer_sentinel));
-                    } else {
-                        item.insert(
-                            "url".into(),
-                            Value::String(format!("{public_origin}/mcp/{slug}")),
-                        );
-                        item.insert("api_key".into(), Value::String(API_KEY_PLACEHOLDER.into()));
-                    }
-                    item.insert("forward_auth".into(), Value::Bool(forward_auth));
-                    item.insert("auth_mode".into(), Value::String("static".into()));
+            // What the server asks of a client: the headers its upstreams read
+            // from the client, and whether one is `Authorization` (then the
+            // gateway key rides the `/fwd/{key}/mcp/<slug>` path).
+            let facts = super::mcp_inputs::vs_client_facts(tx, &[mcp.virtual_server_id])
+                .await?
+                .remove(&mcp.virtual_server_id)
+                .unwrap_or_default();
+            match mcp_server_item(
+                public_origin,
+                &slug,
+                vs_name,
+                vs_desc,
+                template.mcp_auth_mode,
+                forward_auth,
+                &facts,
+            ) {
+                Ok(item) => {
+                    slugs.insert(slug.clone());
+                    mcp_items.push(item);
                 }
-                McpAuthMode::SpecOauth => {
-                    item.insert(
-                        "url".into(),
-                        Value::String(format!("{public_origin}/mcp/{slug}")),
-                    );
-                    item.insert("forward_auth".into(), Value::Bool(false));
-                    item.insert("auth_mode".into(), Value::String("spec_oauth".into()));
-                }
+                // A sign-in template has no gateway key to put in the `/fwd`
+                // path, and a pass-through key reaches only a server whose
+                // client sends its own Authorization: such a server is left
+                // out, and the response says so.
+                Err(reason) => warnings.push(McpServerWarning::new(mcp.virtual_server_id, &slug, reason)),
             }
-            mcp_items.push(item);
         }
-        placeholders.insert("mcp_servers".into(), Value::List(mcp_items));
+        // Local servers are appended AFTER the gateway's — a template reads
+        // "the first item is local" as "no gateway server is wired" — and only
+        // into a template that declares a form for one; any other says so.
+        let mut local_items = 0usize;
+        // A local server left out because the template writes one only in a
+        // project's own file, which this reader never gets.
+        let mut project_only = false;
+        for local in mcp_local_servers {
+            match template.local_mcp {
+                LocalMcpForm::None => {
+                    warnings.push(McpServerWarning::local(local.id, &local.slug, &template.title, false));
+                    continue;
+                }
+                // The config rendered here is the one outside a project, which
+                // leaves the server out. The CLI renders the project's own
+                // file from the same items, so the item travels to it; the
+                // web page shows this config only, which never holds it.
+                LocalMcpForm::Project => {
+                    warnings.push(McpServerWarning::local(local.id, &local.slug, &template.title, true));
+                    if reader == RenderReader::Web {
+                        project_only = true;
+                        continue;
+                    }
+                }
+                LocalMcpForm::Config => {}
+            }
+            // One entry per slug in a client's config: a clash is between the
+            // entries a config this reader gets can hold — a server left out
+            // above, or a gateway one left out with its own warning, takes no
+            // slug.
+            if !slugs.insert(local.slug.clone()) {
+                return Err(ApiError::bad_request(format!(
+                    "two selected MCP servers share the slug '{}': a client config holds one entry per slug",
+                    local.slug
+                ))
+                .code(ApiErrorCode::McpServerSlugClash));
+            }
+            mcp_items.push(mcp_local_server_item(
+                &local.slug,
+                &local.name,
+                local.description.as_deref(),
+                &local.launch.command,
+                &local.launch.args,
+                &local.launch.env_pairs(),
+            ));
+            local_items += 1;
+        }
+        // A `kind = mcp` template with nothing it can write: every gateway
+        // server left out, and no local server in a file this reader gets.
+        let local_written = local_items > 0;
+        if mcp_required && mcp_items.len() == local_items && project_only && !local_written {
+            return Err(ApiError::bad_request(
+                "this setup writes a local MCP server only in a project's own config file, and nothing else \
+                 was selected for it: run `ssai provision` inside the project, or select a gateway MCP server",
+            )
+            .code(ApiErrorCode::ClientProfileNotCompatible));
+        }
+        if mcp_required && mcp_items.len() == local_items && !local_written {
+            return Err(ApiError::bad_request(
+                "none of the selected MCP servers can be written with this setup: a sign-in (OAuth) \
+                 template cannot reach one that reads the client's own Authorization header, a \
+                 pass-through key reaches only such a server, and a local server needs a template \
+                 with a form for it — pick another template or key",
+            )
+            .code(ApiErrorCode::ClientProfileNotCompatible));
+        }
+        if !mcp_items.is_empty() {
+            placeholders.insert("mcp_servers".into(), Value::List(mcp_items));
+        }
     }
 
-    Ok(placeholders)
+    Ok((placeholders, warnings))
+}
+
+/// One `{{#each mcp_servers}}` item: the server's mount URL and the headers a
+/// client config sends to it — the gateway key as `Authorization: Bearer` on
+/// `/mcp/<slug>` (static templates), plus a fill-in sentinel for each header
+/// the client itself supplies. When the client supplies `Authorization`, the
+/// key moves into the `/fwd/{key}/mcp/<slug>` path instead (`forward_auth`).
+/// The reason it is left out when the template's credential cannot reach it.
+fn mcp_server_item(
+    public_origin: &str,
+    slug: &str,
+    name: String,
+    description: Option<String>,
+    auth_mode: McpAuthMode,
+    byok_key: bool,
+    facts: &super::mcp_inputs::VsClientFacts,
+) -> Result<BTreeMap<String, Value>, VirtualOmit> {
+    let spec_oauth = matches!(auth_mode, McpAuthMode::SpecOauth);
+    if spec_oauth && facts.fwd_mount {
+        return Err(VirtualOmit::SignInCannotReachFwd);
+    }
+    // A BYOK `vk-` key reaches only a server whose every route carries just
+    // what the client sends, its own `Authorization` included (the gateway
+    // stamps no stored credential for it).
+    if byok_key && !facts.pass_through {
+        return Err(VirtualOmit::PassThroughKeyNotAccepted);
+    }
+    // The key rides the `/fwd` path when a client header is `Authorization`
+    // (it would collide with the key). A sign-in template has no key: `/mcp`.
+    let fwd = !spec_oauth && facts.fwd_mount;
+    let mut item: BTreeMap<String, Value> = BTreeMap::new();
+    item.insert("slug".into(), Value::String(slug.to_string()));
+    item.insert("name".into(), Value::String(name));
+    if let Some(d) = description {
+        item.insert("description".into(), Value::String(d));
+    }
+    item.insert("transport_hint".into(), Value::String("streamable_http".into()));
+    item.insert(
+        "oauth_authorize_url".into(),
+        Value::String(format!("{public_origin}/mcp/{slug}/oauth/authorize")),
+    );
+    let url = if fwd {
+        format!("{public_origin}/fwd/{API_KEY_PLACEHOLDER}/mcp/{slug}")
+    } else {
+        format!("{public_origin}/mcp/{slug}")
+    };
+    item.insert("url".into(), Value::String(url));
+    // The `/fwd/` path a template that keeps the key out of its file (in an
+    // environment variable) builds the URL from: `{fwd_prefix}<key>/mcp/<slug>`.
+    item.insert("fwd_prefix".into(), Value::String(format!("{public_origin}/fwd/")));
+    let mut headers: Vec<BTreeMap<String, Value>> = Vec::new();
+    if !spec_oauth && !fwd {
+        headers.push(mcp_header_item("Authorization", format!("Bearer {API_KEY_PLACEHOLDER}")));
+    }
+    for name in &facts.declared_names {
+        headers.push(mcp_header_item(name, mcp_client_header_placeholder(slug, name)));
+    }
+    item.insert("headers".into(), Value::List(headers));
+    item.insert("forward_auth".into(), Value::Bool(fwd));
+    if spec_oauth {
+        item.insert("auth_mode".into(), Value::String("spec_oauth".into()));
+    } else {
+        item.insert("api_key".into(), Value::String(API_KEY_PLACEHOLDER.into()));
+        item.insert("auth_mode".into(), Value::String("static".into()));
+    }
+    Ok(item)
 }
 
 /// Render a template's body + instructions against a placeholder map. The
@@ -1396,14 +1753,11 @@ pub(crate) async fn load_profiles(conn: &mut Scoped) -> Result<Vec<ClientProfile
     super::client_profiles_admin::load_snapshot(conn).await
 }
 
-/// The client profiles `workspace_id` is offered (`None`: a person across their
-/// workspaces) — [`load_profiles`] narrowed by client access.
-pub(crate) async fn load_offered_profiles(
-    conn: &mut Scoped,
-    workspace_id: Option<Uuid>,
-) -> Result<Vec<ClientProfile>, ApiError> {
-    let access = super::client_access_profiles::effective_client_access(conn, workspace_id).await?;
-    Ok(load_profiles(conn).await?.into_iter().filter(|p| access.offers(&p.id)).collect())
+/// The client profiles the member's workspace is offered — [`load_profiles`]
+/// narrowed by client access.
+async fn load_offered_profiles(conn: &mut Scoped, member: MemberOf) -> Result<Vec<ClientProfile>, ApiError> {
+    let offered = super::client_access_profiles::offered_clients(conn, member).await?;
+    Ok(load_profiles(conn).await?.into_iter().filter(|p| offered.contains(&p.id)).collect())
 }
 
 /// Smallest free key name for `(tenant, user)` given a base `prefix`: returns
@@ -2082,6 +2436,21 @@ fn populate_provider_placeholders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
+
+    #[test]
+    fn a_client_read_names_its_workspace_or_is_refused() {
+        let (asked, bound) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        // A signed-in member names it; nothing stands in for a missing one.
+        assert_eq!(named_workspace(Some(asked), None).ok(), Some(asked));
+        let refused = named_workspace(None, None).expect_err("no workspace named");
+        assert_eq!(refused.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(refused.code, ApiErrorCode::ValidationFailed);
+        // A key answers for the workspace it is bound to; one it names is the
+        // one checked, so naming another reaches the confinement refusal.
+        assert_eq!(named_workspace(None, Some(bound)).ok(), Some(bound));
+        assert_eq!(named_workspace(Some(asked), Some(bound)).ok(), Some(asked));
+    }
 
     fn route(context_window: Option<i32>, max_output_tokens: Option<i32>) -> ResolvedRoute {
         ResolvedRoute {
@@ -2507,5 +2876,143 @@ mod tests {
         let zero_preset =
             ResolvedRoute { preset_max_output_tokens: Some(0), ..route(None, Some(40_000)) };
         assert_eq!(max_out(&zero_preset), 40_000);
+    }
+
+    fn facts(declared: &[&str]) -> super::super::mcp_inputs::VsClientFacts {
+        let declared_names: Vec<String> = declared.iter().map(|s| s.to_string()).collect();
+        let client_headers: Vec<String> = declared_names.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let fwd_mount = client_headers.iter().any(|h| h == "authorization");
+        let pass_through = fwd_mount && declared.len() == 1;
+        super::super::mcp_inputs::VsClientFacts { client_headers, declared_names, fwd_mount, pass_through }
+    }
+
+    fn headers_of(item: &BTreeMap<String, Value>) -> Vec<(String, String)> {
+        let Some(Value::List(list)) = item.get("headers") else { panic!("no headers list") };
+        list.iter()
+            .map(|h| match (h.get("name"), h.get("value")) {
+                (Some(Value::String(n)), Some(Value::String(v))) => (n.clone(), v.clone()),
+                _ => panic!("header item without name/value"),
+            })
+            .collect()
+    }
+
+    fn url_of(item: &BTreeMap<String, Value>) -> &str {
+        match item.get("url") {
+            Some(Value::String(u)) => u,
+            _ => panic!("no url"),
+        }
+    }
+
+    /// A static template sends the gateway key as a bearer on `/mcp/<slug>`
+    /// and a sentinel for each header the client fills itself.
+    #[test]
+    fn a_static_item_carries_the_key_header_and_one_sentinel_per_client_header() {
+        let item = mcp_server_item("https://gw", "jira", "Jira".into(), None, McpAuthMode::Static, false, &facts(&["X-Jira-Token"]))
+            .expect("offered");
+        assert_eq!(url_of(&item), "https://gw/mcp/jira");
+        assert_eq!(
+            headers_of(&item),
+            vec![
+                ("Authorization".to_string(), format!("Bearer {API_KEY_PLACEHOLDER}")),
+                ("X-Jira-Token".to_string(), "<paste-your-jira-x-jira-token-here>".to_string()),
+            ]
+        );
+        assert_matches!(item.get("forward_auth"), Some(Value::Bool(false)));
+    }
+
+    /// A client-filled `Authorization` moves the gateway key into the `/fwd`
+    /// path: the header then carries the client's own value, never the key.
+    #[test]
+    fn a_client_authorization_moves_the_key_into_the_fwd_path() {
+        let item = mcp_server_item("https://gw", "gh", "GitHub".into(), None, McpAuthMode::Static, false, &facts(&["Authorization"]))
+            .expect("offered");
+        assert_eq!(url_of(&item), format!("https://gw/fwd/{API_KEY_PLACEHOLDER}/mcp/gh"));
+        assert_eq!(
+            headers_of(&item),
+            vec![("Authorization".to_string(), "<paste-your-gh-authorization-here>".to_string())]
+        );
+        assert_matches!(item.get("forward_auth"), Some(Value::Bool(true)));
+    }
+
+    /// A BYOK `vk-` key reaches only a server whose client sends its own
+    /// `Authorization`, on `/fwd` with the key in the path; any other server
+    /// is left out, naming why.
+    #[test]
+    fn a_byok_key_is_offered_only_the_servers_its_client_authorizes() {
+        let item = mcp_server_item("https://gw", "gh", "GitHub".into(), None, McpAuthMode::Static, true, &facts(&["Authorization"]))
+            .expect("offered");
+        assert_eq!(url_of(&item), format!("https://gw/fwd/{API_KEY_PLACEHOLDER}/mcp/gh"));
+        assert_eq!(
+            headers_of(&item),
+            vec![("Authorization".to_string(), "<paste-your-gh-authorization-here>".to_string())]
+        );
+        assert_eq!(
+            mcp_server_item("https://gw", "jira", "Jira".into(), None, McpAuthMode::Static, true, &facts(&["X-Jira-Token"]))
+                .err(),
+            Some(VirtualOmit::PassThroughKeyNotAccepted)
+        );
+    }
+
+    /// A local server stands in for a gateway one only where the caller can
+    /// write it: any form for the CLI, which writes a project's own file;
+    /// only `config` for the portal page, which renders the config outside a
+    /// project and would refuse a `project` form.
+    #[test]
+    fn a_project_form_counts_as_writable_only_for_the_cli() {
+        for cli in [false, true] {
+            assert!(!writes_local_for(LocalMcpForm::None, cli));
+            assert!(writes_local_for(LocalMcpForm::Config, cli));
+        }
+        assert!(writes_local_for(LocalMcpForm::Project, true));
+        assert!(!writes_local_for(LocalMcpForm::Project, false));
+    }
+
+    /// A left-out server's warning carries its closed reason in snake_case
+    /// and a message naming the server, one per reason.
+    #[test]
+    fn a_warning_names_the_server_and_its_reason() {
+        let id = Uuid::new_v4();
+        let w = McpServerWarning::new(id, "gh", VirtualOmit::SignInCannotReachFwd);
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["reason"], "sign_in_cannot_reach_fwd");
+        assert_eq!(v["slug"], "gh");
+        assert_eq!(v["virtual_server_id"], id.to_string());
+        assert!(w.message.contains("'gh'") && w.message.contains("sign-in"), "{}", w.message);
+        let w = McpServerWarning::new(id, "jira", VirtualOmit::PassThroughKeyNotAccepted);
+        assert_eq!(serde_json::to_value(&w).unwrap()["reason"], "pass_through_key_not_accepted");
+        assert!(w.message.contains("'jira'") && w.message.contains("pass-through"), "{}", w.message);
+
+        // A local server names itself by its own id, never as a virtual one.
+        let w = McpServerWarning::local(id, "fs", "Zed", false);
+        let v = serde_json::to_value(&w).unwrap();
+        assert_eq!(v["reason"], "local_server_not_supported");
+        assert_eq!(v["local_server_id"], id.to_string());
+        assert!(v["virtual_server_id"].is_null());
+        assert!(w.message.contains("'fs'") && w.message.contains("Zed"), "{}", w.message);
+        let w = McpServerWarning::local(id, "fs", "Claude Code", true);
+        assert_eq!(serde_json::to_value(&w).unwrap()["reason"], "local_server_project_only");
+        assert!(w.message.contains("'fs'") && w.message.contains("project"), "{}", w.message);
+    }
+
+    /// A sign-in template carries only the client headers, and a server that
+    /// needs `/fwd` is left out of it (it has no key for the path), naming why.
+    #[test]
+    fn a_sign_in_item_carries_only_client_headers_and_skips_a_fwd_server() {
+        let item = mcp_server_item("https://gw", "jira", "Jira".into(), None, McpAuthMode::SpecOauth, false, &facts(&["X-Jira-Token"]))
+            .expect("offered");
+        assert_eq!(url_of(&item), "https://gw/mcp/jira");
+        assert_eq!(
+            headers_of(&item),
+            vec![("X-Jira-Token".to_string(), "<paste-your-jira-x-jira-token-here>".to_string())]
+        );
+        assert_eq!(
+            mcp_server_item("https://gw", "gh", "GitHub".into(), None, McpAuthMode::SpecOauth, false, &facts(&["Authorization"]))
+                .err(),
+            Some(VirtualOmit::SignInCannotReachFwd)
+        );
+        // Positive control: no client header at all → no header line.
+        let plain = mcp_server_item("https://gw", "w", "W".into(), None, McpAuthMode::SpecOauth, false, &facts(&[]))
+            .expect("offered");
+        assert!(headers_of(&plain).is_empty());
     }
 }

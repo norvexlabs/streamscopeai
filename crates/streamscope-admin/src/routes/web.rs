@@ -526,7 +526,7 @@ async fn builtin_has_credential(
     let row: Option<bool> = sqlx::query_scalar(
         "SELECT (encrypted_credential IS NOT NULL) AS has_credential
          FROM mcp_upstream_servers
-         WHERE name = $1",
+         WHERE name = $1 AND built_in",
     )
     .bind(BUILTIN_WEB_UPSTREAM_NAME)
     .fetch_optional(&mut *conn)
@@ -542,7 +542,7 @@ async fn load_builtin_credential(
     conn: &mut Scoped,
 ) -> Result<Option<String>, ApiError> {
     let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
-        "SELECT encrypted_credential FROM mcp_upstream_servers WHERE name = $1",
+        "SELECT encrypted_credential FROM mcp_upstream_servers WHERE name = $1 AND built_in",
     )
     .bind(BUILTIN_WEB_UPSTREAM_NAME)
     .fetch_optional(&mut *conn)
@@ -585,7 +585,7 @@ async fn rotate_builtin_credential(
          SET encrypted_credential = $1,
              cred_version = cred_version + 1,
              updated_at = now()
-         WHERE name = $2 AND tenant_id = $3",
+         WHERE name = $2 AND tenant_id = $3 AND built_in",
     )
     .bind(new_value)
     .bind(BUILTIN_WEB_UPSTREAM_NAME)

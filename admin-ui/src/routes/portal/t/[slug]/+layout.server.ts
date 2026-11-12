@@ -39,6 +39,11 @@ export const load: LayoutServerLoad = async ({ locals }) => {
   return {
     portalUser,
     portalWorkspaces: me?.workspaces ?? [],
+    // What the portal hides for the viewer's workspaces, as the gateway
+    // answered when this loaded: the sidebar, the pages and the links follow
+    // it, and it is re-read (`invalidateAll`) when a refusal or a refresh
+    // finds it stale. The gateway withholds what is hidden whatever this says.
+    portalHiddenPages: me?.hidden_pages ?? [],
     // Rides the identity payload rather than a call of its own: the portal has
     // no access to the admin settings endpoint the console reads this from.
     accountingCurrency: me?.accounting_currency ?? null,

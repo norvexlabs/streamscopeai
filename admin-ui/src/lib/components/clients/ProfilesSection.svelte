@@ -19,6 +19,7 @@
   type TemplateKind = components['schemas']['TemplateKind'];
   type McpAuthMode = components['schemas']['McpAuthMode'];
   type KeyDelivery = components['schemas']['KeyDelivery'];
+  type LocalMcpForm = components['schemas']['LocalMcpForm'];
   type PlaceholderRef = components['schemas']['PlaceholderRef'];
   type ClientProfilePreview = components['schemas']['ClientProfilePreview'];
 
@@ -29,6 +30,20 @@
   const KINDS: TemplateKind[] = ['llm', 'mcp', 'combined', 'instructions'];
   const MCP_AUTH_MODES: McpAuthMode[] = ['static', 'spec_oauth'];
   const KEY_DELIVERY: KeyDelivery[] = ['config', 'environment'];
+  const LOCAL_MCP: { value: LocalMcpForm; label: string }[] = [
+    { value: 'none', label: 'Not written' },
+    { value: 'config', label: 'Written by this template' },
+    { value: 'project', label: "Written only in a project's own file" },
+  ];
+
+  /** Set a template's local-MCP form. "Not written" is the field's absence,
+   *  so a template that never declared one is saved as it was loaded. */
+  function setLocalMcp(t: ClientProfileTemplate, value: string) {
+    const picked = LOCAL_MCP.find((o) => o.value === value)?.value ?? 'none';
+    if (picked === 'none') delete t.local_mcp;
+    else t.local_mcp = picked;
+    form.markDirty();
+  }
 
   const ID_PATTERN = /^[a-z0-9_-]+$/;
 
@@ -505,6 +520,31 @@
                 <span class="block mt-1 opacity-70">
                   <strong>config</strong> — the key must appear in this template or one of its companions (a template with no file name may instead rely on an LLM-bearing sibling).
                   <strong>environment</strong> — the tool reads it from a shell variable and loads no file we can write; the portal shows the key itself instead.
+                </span>
+              </label>
+            {/if}
+            {#if t.kind === 'mcp' || t.kind === 'combined'}
+              <label class="block text-xs text-(--text-secondary)">Local MCP servers
+                <SelectInput
+                  value={t.local_mcp ?? 'none'}
+                  onchange={(e) => setLocalMcp(t, e.currentTarget.value)}
+                  class="mt-1"
+                  data-testid="template-local-mcp">
+                  {#each LOCAL_MCP as o}
+                    <option value={o.value}>{o.label}</option>
+                  {/each}
+                </SelectInput>
+                <span class="block mt-1 opacity-70">
+                  A template that writes one branches on <code>{'{{#if local}}'}</code> inside
+                  <code>{'{{#each mcp_servers}}'}</code>. Local items come after the gateway ones; each
+                  carries <code>local</code> (true), <code>slug</code>, <code>name</code>,
+                  <code>command</code>, <code>args</code> (each <code>{'{{value}}'}</code>) and
+                  <code>env</code> (each <code>{'{{name}}'}</code> / <code>{'{{value}}'}</code>).
+                  In a YAML template write the command, each argument and each value with
+                  <code>{'{{quoted value}}'}</code>, so <code>8080</code> or <code>true</code> stays text.
+                  {#if (t.local_mcp ?? 'none') === 'none'}
+                    A template with "Not written" is rendered with no local item.
+                  {/if}
                 </span>
               </label>
             {/if}

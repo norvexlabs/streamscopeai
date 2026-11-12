@@ -15,10 +15,6 @@ pub struct AgentProfile {
     pub state_dirs: &'static [&'static str],
     /// Extra env to set for the child (e.g. keyring/home overrides).
     pub env: &'static [(&'static str, &'static str)],
-    /// The client contacts a vendor hub before any LLM call, which the
-    /// gateway-only sandbox egress guard blocks — so `ssai run <client>`
-    /// under a sandbox can't produce a turn. `run` prints an up-front notice.
-    pub hub_dependent: bool,
     /// The client is a front end to a separate server process (its "engine")
     /// that runs the tools. Under a sandbox, `run` starts a private engine
     /// inside the same confinement and points the client at it — see
@@ -204,7 +200,6 @@ pub const AGENTS: &[AgentProfile] = &[
             "~/.mcp.json",
         ],
         env: &[],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: Some("@anthropic-ai/claude-code"),
@@ -218,7 +213,6 @@ pub const AGENTS: &[AgentProfile] = &[
         names: &["codex"],
         state_dirs: &["~/.codex", "~/.cache/codex"],
         env: &[],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: Some("@openai/codex"),
@@ -234,7 +228,6 @@ pub const AGENTS: &[AgentProfile] = &[
         names: &["gemini", "gemini-cli"],
         state_dirs: &["~/.gemini", "~/.cache/gemini"],
         env: &[],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: Some("@google/gemini-cli"),
@@ -247,7 +240,6 @@ pub const AGENTS: &[AgentProfile] = &[
         names: &["qwen", "qwen-code"],
         state_dirs: &["~/.qwen", "~/.cache/qwen"],
         env: &[("QWEN_CODE_SUPPRESS_YOLO_WARNING", "1")],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: Some("@qwen-code/qwen-code"),
@@ -267,7 +259,6 @@ pub const AGENTS: &[AgentProfile] = &[
             "~/.local/state/opencode",
         ],
         env: &[],
-        hub_dependent: false,
         engine: Some(&OPENCODE_ENGINE),
         config_dir_env: Some("OPENCODE_CONFIG_DIR"),
         npm_package: Some("@opencode/cli"),
@@ -287,7 +278,6 @@ pub const AGENTS: &[AgentProfile] = &[
             "~/.local/state/goose",
         ],
         env: &[("GOOSE_DISABLE_KEYRING", "true")],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: None,
@@ -301,7 +291,6 @@ pub const AGENTS: &[AgentProfile] = &[
         names: &["aider"],
         state_dirs: &["~/.aider", "~/.aider.conf.yml", "~/.aider.model.metadata.json", "~/.aider.model.settings.yml", "~/.config/aider", "~/.cache/aider"],
         env: &[],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: None,
@@ -310,12 +299,13 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_seed: &[],
     },
     AgentProfile {
-        // The Continue CLI (`cn`) bootstraps against its hub (api.continue.dev)
-        // before any LLM call; the gateway-only egress guard blocks that.
+        // The Continue CLI (`cn`). Its hub call (api.continue.dev) is refused by
+        // the guard and is not fatal; its MCP client uses Node's built-in
+        // `fetch`, which goes through the guard only on a Node that honours
+        // `NODE_USE_ENV_PROXY` (see `sandbox_env_with`).
         names: &["cn", "continue"],
         state_dirs: &["~/.continue", "~/.config/continue", "~/.cache/continue"],
         env: &[],
-        hub_dependent: true,
         engine: None,
         config_dir_env: None,
         npm_package: Some("@continuedev/cli"),
@@ -327,7 +317,6 @@ pub const AGENTS: &[AgentProfile] = &[
         names: &["crush"],
         state_dirs: &["~/.config/crush", "~/.cache/crush", "~/.local/share/crush"],
         env: &[],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: Some("@charmland/crush"),
@@ -339,7 +328,6 @@ pub const AGENTS: &[AgentProfile] = &[
         names: &["vibe"],
         state_dirs: &["~/.vibe", "~/.config/vibe", "~/.cache/vibe"],
         env: &[],
-        hub_dependent: false,
         engine: None,
         config_dir_env: None,
         npm_package: None,

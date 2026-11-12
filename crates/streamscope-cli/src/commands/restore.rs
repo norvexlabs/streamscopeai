@@ -263,7 +263,7 @@ mod tests {
     fn client(id: &str, path: &str, key: Option<&str>, hash: &str) -> serde_json::Value {
         serde_json::json!({
             "client_id": id, "template_index": 0, "last_provisioned": "2026-10-09T12:00:00Z",
-            "mode": "gateway", "provider_id": null, "key_id": key, "mcp_server_ids": [],
+            "mode": "gateway", "provider_id": null, "key_id": key, "mcp_server_ids": [], "mcp_local_servers": [], "mcp_local_commands": {},
             "launch_command": null,
             "files": [{ "path": path, "format": "json", "owned": [], "file_hash": hash }]
         })

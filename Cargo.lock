@@ -4373,6 +4373,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "shlex",
  "thiserror 2.0.21",
  "toml",
  "utoipa",

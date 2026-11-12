@@ -1,10 +1,14 @@
-//! Portal — per-user OAuth connections.
+//! Portal — the user's own MCP connections.
 //!
-//! Endpoints for the portal user to manage their OAuth connections to
-//! `auth_mode = per_user_oauth` upstream MCP servers:
+//! An upstream asks something of each user when it is `per_user_oauth` (the
+//! user's OAuth token) or declares user-filled header inputs (values the user
+//! types in, stored encrypted per user). Endpoints:
 //!
-//! - `GET  /portal/mcp/connections` — list per-(virtual server, upstream)
-//!   connection status (visible upstreams the user has RBAC for).
+//! - `GET  /portal/mcp/connections` — list per-upstream connection status
+//!   (visible upstreams the user has RBAC for) with the user inputs'
+//!   declarations, never a value.
+//! - `PATCH /portal/mcp/connections/{upstream_id}/inputs` — set or clear the
+//!   user's own input values.
 //! - `POST /portal/mcp/connections/{upstream_id}/actions/connect` — generate
 //!   a PKCE-protected authorization URL + persist a `mcp_pending_authorizations`
 //!   row.
@@ -12,11 +16,12 @@
 //!   for tokens, encrypt + UPSERT into `mcp_user_credentials`, redirect back
 //!   to the tenant-prefixed portal connections page.
 //! - `POST /portal/mcp/connections/{upstream_id}/actions/revoke` — delete
-//!   the user's stored credential (best-effort revocation_endpoint call).
+//!   the user's stored credential (best-effort revocation_endpoint call) and
+//!   filled inputs.
 //!
-//! A credential change reaches every proxy in the tenant's config body (the
-//! change triggers on `mcp_user_credentials`). There is no dedicated per-user
-//! event channel.
+//! A credential or input change reaches every proxy in the tenant's config
+//! body (the change triggers on `mcp_user_credentials` and `mcp_user_inputs`).
+//! There is no dedicated per-user event channel.
 
 use crate::db::Global;
 use std::borrow::Cow;
@@ -35,28 +40,82 @@ use streamscope_core::mcp::oauth_http::GuardedOauthHttpClient;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
+use streamscope_core::mcp::header_inputs::{self as hi, Filler, InputFormat, InputSpec, Remote};
+
+use super::mcp_inputs;
 use super::portal_auth::PortalUser;
 use super::{ActionResponse, ApiError, ApiErrorCode, ApiErrorResponse};
 use super::oauth_common::urlencode;
 use crate::AdminState;
-use crate::db::tenant::TenantConn;
+use crate::db::tenant::{Scoped, TenantConn};
 
 #[derive(Serialize, ToSchema)]
 pub struct PortalConnectionItem {
     pub upstream_server_id: Uuid,
     pub upstream_name: String,
     pub upstream_description: Option<String>,
-    /// One of: `connected` (credential present, not expired), `expired`
-    /// (credential present but `expires_at < now`), `not_connected` (no
-    /// credential row).
+    /// What connecting takes: `oauth` (sign in), `inputs` (fill in values),
+    /// or `oauth_inputs` (both).
+    pub kind: String,
+    /// One of: `connected` (the OAuth credential is present and unexpired
+    /// where one is needed, and every required input is filled), `expired`
+    /// (the OAuth credential is present but `expires_at < now`),
+    /// `not_connected` (anything else).
     pub status: String,
+    /// Whether the caller's OAuth sign-in is done: a credential present and
+    /// unexpired. Always false on an `inputs` upstream. On `oauth_inputs` it
+    /// tells "values missing, signed in" from "values missing, not signed in",
+    /// which `status` alone does not.
+    pub signed_in: bool,
     pub scope: Option<String>,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The inputs the user fills on this upstream — their declarations,
+    /// whether each has a value, and the caller's own value of each NON-secret
+    /// one (a secret one is presence-only). Inputs the administrator or the
+    /// client fills are not listed.
+    pub inputs: Vec<PortalConnectionInput>,
     /// Virtual servers this upstream is reachable through (the agent calls
     /// `/mcp/<slug>` per virtual server). Useful for the portal to show
     /// "this connection unlocks tools on N virtual servers".
     pub virtual_servers: Vec<PortalConnectionVirtualServer>,
+}
+
+/// One input a user fills, as its upstream declares it.
+#[derive(Serialize, ToSchema)]
+pub struct PortalConnectionInput {
+    /// The input id: the header name, or `<Header>/<variable>` for one
+    /// variable of a header template.
+    pub id: String,
+    pub header: String,
+    pub description: Option<String>,
+    /// Send its value under `secret_inputs`, never `inputs`.
+    pub is_secret: bool,
+    /// The upstream is unusable until it has a value.
+    pub is_required: bool,
+    /// When not empty, the only values accepted.
+    pub choices: Vec<String>,
+    pub placeholder: Option<String>,
+    pub format: InputFormat,
+    pub default: Option<String>,
+    /// The user has stored a value.
+    pub filled: bool,
+    /// The caller's own stored value, for a NON-secret input (to prefill the
+    /// form). Always `None` for a secret input, and when nothing is stored.
+    pub value: Option<String>,
+}
+
+/// Request body of `PATCH …/connections/{upstream_id}/inputs`.
+#[derive(Deserialize, ToSchema)]
+pub struct PortalUpdateMcpInputs {
+    /// NON-secret values: a value sets, `null` clears.
+    #[serde(default)]
+    pub inputs: HashMap<String, Option<String>>,
+    /// Secret values: a value sets, `""` clears, `null` keeps.
+    #[serde(default)]
+    pub secret_inputs: HashMap<String, Option<String>>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -124,60 +183,62 @@ pub async fn list_connections(
     mut db: TenantConn,
     Extension(user): Extension<PortalUser>,
 ) -> Result<Json<PortalConnectionsList>, ApiError> {
-    // The tenant's per-user-OAuth upstreams that route through any virtual
-    // server the user has RBAC access to. Include both connected and
-    // not-connected so the portal can show the full setup state.
-    let rows: Vec<UpstreamRow> = sqlx::query_as::<_, UpstreamRow>(
-        r#"
-        SELECT DISTINCT u.id, u.name, u.description
-        FROM mcp_upstream_servers u
-        JOIN mcp_virtual_routes r ON r.upstream_server_id = u.id AND r.enabled
-        JOIN mcp_virtual_servers vs ON vs.id = r.virtual_server_id AND vs.enabled
-        WHERE u.auth_mode = 'per_user_oauth'
-          AND u.enabled
-          AND EXISTS (
-                SELECT 1 FROM workspace_members wm
-                JOIN workspace_mcp_access wma ON wma.workspace_id = wm.workspace_id
-                WHERE wm.user_id = $1 AND wma.virtual_server_id = vs.id
-                  AND ($2::uuid IS NULL OR wm.workspace_id = $2)
-              )
-        ORDER BY u.name
-        "#,
-    )
-    .bind(user.user_id)
-    .bind(user.key_workspace_id)
-    .fetch_all(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("list portal mcp connections: {e}");
-        ApiError::internal("failed to list connections")
-    })?;
+    let tenant_id = db.tenant_uuid();
+    let rows = connectable_upstreams(db.conn(), &user, None).await?;
 
     let mut items = Vec::with_capacity(rows.len());
-    for u in rows {
-        let creds: Option<CredRow> = sqlx::query_as::<_, CredRow>(
-            r#"SELECT scope, expires_at, last_used_at
-               FROM mcp_user_credentials
+    for (u, specs) in rows {
+        let oauth = mcp_inputs::is_oauth(&u.auth_mode);
+        let creds: Option<CredRow> = if oauth {
+            sqlx::query_as::<_, CredRow>(
+                r#"SELECT scope, expires_at, last_used_at
+                   FROM mcp_user_credentials
+                   WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
+            )
+            .bind(tenant_id)
+            .bind(user.user_id)
+            .bind(u.id)
+            .fetch_optional(db.conn())
+            .await
+            .map_err(|e| {
+                tracing::error!("portal mcp creds lookup: {e}");
+                ApiError::internal("failed to load credential state")
+            })?
+        } else {
+            None
+        };
+        let stored: HashMap<String, String> = sqlx::query_scalar::<_, sqlx::types::Json<HashMap<String, String>>>(
+            r#"SELECT encrypted_values
+               FROM mcp_user_inputs
                WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
         )
-        .bind(db.tenant_uuid())
+        .bind(tenant_id)
         .bind(user.user_id)
         .bind(u.id)
         .fetch_optional(db.conn())
         .await
         .map_err(|e| {
-            tracing::error!("portal mcp creds lookup: {e}");
-            ApiError::internal("failed to load credential state")
-        })?;
+            tracing::error!("portal mcp inputs lookup: {e}");
+            ApiError::internal("failed to load input state")
+        })?
+        .map(|j| j.0)
+        .unwrap_or_default();
+        let filled: Vec<String> = stored.keys().cloned().collect();
+        let plain = plain_user_values(&u.remote, &specs, &stored);
 
-        let status = match creds.as_ref() {
-            None => "not_connected",
-            Some(c) => match c.expires_at {
-                Some(at) if at <= chrono::Utc::now() => "expired",
-                _ => "connected",
-            },
-        }
-        .to_string();
+        let inputs = user_inputs_of(&u.remote, &specs, &filled, &plain);
+        let status = connection_status(
+            oauth,
+            creds.as_ref(),
+            &hi::required_user_input_ids(&specs),
+            &filled,
+            chrono::Utc::now(),
+        );
+        let kind = match (oauth, inputs.is_empty()) {
+            (true, true) => "oauth",
+            (true, false) => "oauth_inputs",
+            (false, _) => "inputs",
+        };
 
         let vs_list: Vec<PortalConnectionVirtualServer> = sqlx::query_as::<_, VirtualServerRow>(
             r#"
@@ -211,14 +272,108 @@ pub async fn list_connections(
             upstream_server_id: u.id,
             upstream_name: u.name,
             upstream_description: u.description,
-            status,
+            kind: kind.to_string(),
+            status: status.to_string(),
+            signed_in: oauth
+                && creds.as_ref().is_some_and(|c| c.expires_at.is_none_or(|at| at > chrono::Utc::now())),
             scope: creds.as_ref().and_then(|c| c.scope.clone()),
             expires_at: creds.as_ref().and_then(|c| c.expires_at),
             last_used_at: creds.as_ref().and_then(|c| c.last_used_at),
+            inputs,
             virtual_servers: vs_list,
         });
     }
     Ok(Json(PortalConnectionsList { items }))
+}
+
+/// A user's connection status on one upstream — the same predicate as the
+/// portal's `needs_connection` (`portal_mcp::NEEDS_CONNECTION`): the OAuth
+/// credential present and unexpired when the upstream is per-user OAuth, and
+/// every required user input filled. `credential` is the stored credential's
+/// expiry (`None` inside: no known expiry), absent when there is none.
+fn connection_status(
+    oauth: bool,
+    credential: Option<&CredRow>,
+    required: &[String],
+    filled: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> &'static str {
+    if oauth {
+        match credential.map(|c| c.expires_at) {
+            None => return "not_connected",
+            Some(Some(at)) if at <= now => return "expired",
+            Some(_) => {}
+        }
+    }
+    if required.iter().all(|id| filled.contains(id)) { "connected" } else { "not_connected" }
+}
+
+/// The caller's stored values of the NON-secret inputs they fill, decrypted.
+/// A secret input's ciphertext, and any value of an input the user does not
+/// fill, is never decrypted.
+fn plain_user_values(
+    remote: &Remote,
+    specs: &[InputSpec],
+    stored: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let shown: HashMap<String, String> = specs
+        .iter()
+        .filter(|s| {
+            s.filler == Filler::User
+                && !mcp_inputs::is_secret(remote, s)
+                && !names_a_credential(&s.declared.id)
+        })
+        .filter_map(|s| stored.get(&s.declared.id).map(|ct| (s.declared.id.clone(), ct.clone())))
+        .collect();
+    mcp_inputs::decrypt_values(&shown)
+}
+
+/// Whether an input's id — its header's name, and for a template variable the
+/// variable's name too (`X-Config/apiKey`) — says it carries a credential
+/// (`Authorization`, a cookie, a token, a key, a secret, a password): its
+/// value is never shown back, even when its declaration does not mark it
+/// secret — a pasted `server.json` often leaves `isSecret` off.
+fn names_a_credential(input_id: &str) -> bool {
+    let h = input_id.to_ascii_lowercase();
+    ["auth", "cookie", "token", "key", "secret", "passw", "credential", "session"]
+        .iter()
+        .any(|w| h.contains(w))
+}
+
+/// The declarations of the inputs a user fills, with whether each is filled
+/// and, for a NON-secret one, the value from `plain`.
+fn user_inputs_of(
+    remote: &Remote,
+    specs: &[InputSpec],
+    filled: &[String],
+    plain: &HashMap<String, String>,
+) -> Vec<PortalConnectionInput> {
+    specs
+        .iter()
+        .filter(|s| s.filler == Filler::User)
+        .map(|s| {
+            let header = remote.headers.iter().find(|h| h.name == s.declared.header);
+            // A template variable's own text first, else its header's.
+            let description = s.declared.input.description.clone()
+                .or_else(|| header.and_then(|h| h.input.description.clone()));
+            let placeholder = s.declared.input.placeholder.clone()
+                .or_else(|| header.and_then(|h| h.input.placeholder.clone()));
+            let is_secret = mcp_inputs::is_secret(remote, s);
+            PortalConnectionInput {
+                id: s.declared.id.clone(),
+                header: s.declared.header.clone(),
+                description,
+                is_secret,
+                is_required: s.declared.required,
+                choices: s.declared.input.choices.clone(),
+                placeholder,
+                format: s.declared.input.format,
+                default: s.declared.input.default.clone(),
+                filled: filled.contains(&s.declared.id),
+                value: if is_secret { None } else { plain.get(&s.declared.id).cloned() },
+            }
+        })
+        .collect()
 }
 
 #[derive(sqlx::FromRow)]
@@ -226,6 +381,65 @@ struct UpstreamRow {
     id: Uuid,
     name: String,
     description: Option<String>,
+    auth_mode: String,
+    remote: sqlx::types::Json<Remote>,
+}
+
+/// The upstreams a user connects to — the one predicate behind the list, the
+/// inputs PATCH and its negative cases: enabled, routed by an enabled route on
+/// an enabled virtual server that one of the caller's workspaces is granted
+/// (only the bound workspace for a portal `ak-` key), and asking something of
+/// the user — per-user OAuth or a user-filled input. `only` narrows the read
+/// to one upstream.
+async fn connectable_upstreams(
+    conn: &mut Scoped,
+    user: &PortalUser,
+    only: Option<Uuid>,
+) -> Result<Vec<(UpstreamRow, Vec<InputSpec>)>, ApiError> {
+    let rows: Vec<UpstreamRow> = sqlx::query_as::<_, UpstreamRow>(
+        r#"
+        SELECT u.id, u.name, u.description, u.auth_mode, u.remote
+        FROM mcp_upstream_servers u
+        WHERE u.enabled
+          AND ($3::uuid IS NULL OR u.id = $3)
+          AND EXISTS (
+                SELECT 1
+                FROM mcp_virtual_routes r
+                JOIN mcp_virtual_servers vs ON vs.id = r.virtual_server_id AND vs.enabled
+                JOIN workspace_mcp_access wma ON wma.virtual_server_id = vs.id
+                JOIN workspace_members wm ON wm.workspace_id = wma.workspace_id
+                WHERE r.upstream_server_id = u.id AND r.enabled
+                  AND wm.user_id = $1
+                  AND ($2::uuid IS NULL OR wm.workspace_id = $2)
+              )
+        ORDER BY u.name
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(user.key_workspace_id)
+    .bind(only)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| {
+        tracing::error!("list portal mcp connections: {e}");
+        ApiError::internal("failed to list connections")
+    })?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|u| {
+            // An OAuth server stays listed even when its stored declaration
+            // does not validate (no inputs then), so the user can still see
+            // and disconnect the credential they hold for it.
+            let oauth = mcp_inputs::is_oauth(&u.auth_mode);
+            let specs = match mcp_inputs::stored_specs(u.id, &u.remote, &u.auth_mode) {
+                Some(specs) => specs,
+                None if oauth => Vec::new(),
+                None => return None,
+            };
+            let asks = oauth || specs.iter().any(|s| s.filler == Filler::User);
+            asks.then_some((u, specs))
+        })
+        .collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -233,6 +447,90 @@ struct CredRow {
     scope: Option<String>,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+// ===========================================================================
+// INPUTS — the user's own values
+// ===========================================================================
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/portal/mcp/connections/{upstream_id}/inputs",
+    tag = "Portal MCP",
+    operation_id = "portal_update_mcp_inputs",
+    params(("upstream_id" = Uuid, Path, description = "Upstream MCP server id")),
+    request_body = PortalUpdateMcpInputs,
+    responses(
+        (status = 200, description = "The caller's values were saved", body = ActionResponse),
+        (status = 400, description = "An input the administrator sets, one the caller cannot set, or a value its declaration refuses", body = ApiErrorResponse),
+        (status = 403, description = "No virtual server the caller's workspaces reach asks the caller for this upstream", body = ApiErrorResponse),
+        (status = 404, description = "No such upstream", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_inputs(
+    mut db: TenantConn,
+    Extension(user): Extension<PortalUser>,
+    Path(upstream_id): Path<Uuid>,
+    Json(body): Json<PortalUpdateMcpInputs>,
+) -> Result<Json<ActionResponse>, ApiError> {
+    let tenant_id = db.tenant_uuid();
+    let fail = |e: sqlx::Error| {
+        tracing::error!("portal update mcp inputs: {e}");
+        ApiError::internal("failed to save inputs")
+    };
+    let mut tx = db.conn().begin().await.map_err(fail)?;
+    // A share lock on the upstream: a concurrent upstream PATCH changing who
+    // fills what waits for this write, then strips any value that is no
+    // longer user-filled — so none survives the change.
+    let exists: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM mcp_upstream_servers WHERE id = $1 FOR SHARE")
+            .bind(upstream_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(fail)?;
+    if exists.is_none() {
+        return Err(ApiError::not_found("upstream not found", ApiErrorCode::McpUpstreamServerNotFound));
+    }
+    let Some((u, specs)) = connectable_upstreams(&mut tx, &user, Some(upstream_id)).await?.pop() else {
+        return Err(ApiError::forbidden("you do not have access to this upstream")
+            .code(ApiErrorCode::PermissionDenied));
+    };
+
+    let ops = mcp_inputs::plan_value_patch(&u.remote, &specs, Filler::User, &body.inputs, &body.secret_inputs)
+        .map_err(mcp_inputs::PatchRefusal::into_api)?;
+    if !ops.is_empty() {
+        let (set, remove) = mcp_inputs::encrypt_ops(&ops)?;
+        sqlx::query(
+            r#"INSERT INTO mcp_user_inputs (tenant_id, user_id, upstream_server_id, encrypted_values)
+               VALUES ($1, $2, $3, $4::jsonb - $5::text[])
+               ON CONFLICT (tenant_id, user_id, upstream_server_id) DO UPDATE
+               SET encrypted_values = (mcp_user_inputs.encrypted_values || EXCLUDED.encrypted_values) - $5::text[],
+                   updated_at = NOW()"#,
+        )
+        .bind(tenant_id)
+        .bind(user.user_id)
+        .bind(upstream_id)
+        .bind(sqlx::types::Json(&set))
+        .bind(&remove)
+        .execute(&mut *tx)
+        .await
+        .map_err(fail)?;
+        // Clearing every value leaves no connection behind to show or revoke.
+        sqlx::query(
+            "DELETE FROM mcp_user_inputs \
+             WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3 \
+               AND encrypted_values = '{}'::jsonb",
+        )
+        .bind(tenant_id)
+        .bind(user.user_id)
+        .bind(upstream_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(fail)?;
+    }
+    tx.commit().await.map_err(fail)?;
+    Ok(Json(ActionResponse::ok().with_message("Saved. It takes effect within seconds.")))
 }
 
 #[derive(sqlx::FromRow)]
@@ -986,21 +1284,38 @@ pub async fn revoke_connection(
         }
     }
 
-    let deleted = sqlx::query(
+    // The OAuth credential and the filled inputs go together.
+    let tenant_id = db.tenant_uuid();
+    let fail = |e: sqlx::Error| {
+        tracing::error!("portal revoke delete: {e}");
+        ApiError::internal("failed to revoke credential")
+    };
+    let mut tx = db.conn().begin().await.map_err(fail)?;
+    let creds = sqlx::query(
         r#"DELETE FROM mcp_user_credentials
            WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
     )
-    .bind(db.tenant_uuid())
+    .bind(tenant_id)
     .bind(user.user_id)
     .bind(upstream_id)
-    .execute(db.conn())
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("portal revoke delete: {e}");
-        ApiError::internal("failed to revoke credential")
-    })?;
+    .map_err(fail)?
+    .rows_affected();
+    let inputs = sqlx::query(
+        r#"DELETE FROM mcp_user_inputs
+           WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
+    )
+    .bind(tenant_id)
+    .bind(user.user_id)
+    .bind(upstream_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(fail)?
+    .rows_affected();
+    tx.commit().await.map_err(fail)?;
 
-    if deleted.rows_affected() == 0 {
+    if creds + inputs == 0 {
         return Err(ApiError::not_found("no credential to revoke", ApiErrorCode::McpUserCredentialNotFound));
     }
     Ok(Json(ActionResponse::ok().with_message("Connection disconnected.")))
@@ -1184,5 +1499,145 @@ mod tests {
         assert_eq!(p["redirect_uri"], "https://gw.example.test/cb?x=1&y=2");
         assert_eq!(p["state"], "acme.a+b/c");
         assert_eq!(p["scope"], "a b");
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Connected needs both halves: the OAuth credential (present, unexpired)
+    /// when the upstream is per-user OAuth, and every required input filled.
+    #[test]
+    fn connection_status_needs_the_credential_and_every_required_input() {
+        let now = chrono::Utc::now();
+        let cred = |expires_at| CredRow { scope: None, expires_at, last_used_at: None };
+        let (no_expiry, later, earlier) =
+            (cred(None), cred(Some(now + chrono::Duration::hours(1))), cred(Some(now - chrono::Duration::hours(1))));
+        let req = ids(&["X-Token"]);
+        // Inputs only.
+        assert_eq!(connection_status(false, None, &req, &ids(&["X-Token"]), now), "connected");
+        assert_eq!(connection_status(false, None, &req, &ids(&["X-Other"]), now), "not_connected");
+        assert_eq!(connection_status(false, None, &[], &[], now), "connected");
+        // OAuth only.
+        assert_eq!(connection_status(true, None, &[], &[], now), "not_connected");
+        assert_eq!(connection_status(true, Some(&no_expiry), &[], &[], now), "connected");
+        assert_eq!(connection_status(true, Some(&later), &[], &[], now), "connected");
+        assert_eq!(connection_status(true, Some(&earlier), &[], &[], now), "expired");
+        // Both: a fresh credential is not enough without the inputs.
+        assert_eq!(connection_status(true, Some(&later), &req, &[], now), "not_connected");
+        assert_eq!(connection_status(true, Some(&later), &req, &req, now), "connected");
+    }
+
+    /// The form is prefilled with the caller's own NON-secret values only: a
+    /// secret one stays presence-only even when its ciphertext is stored, and
+    /// a stored value of an input the user does not fill is never decrypted.
+    /// A header named like a credential is never shown back, whatever its
+    /// declaration says; a plain setting is (the control).
+    #[test]
+    fn a_credential_named_header_is_never_shown_back() {
+        for h in ["Authorization", "X-Api-Key", "X-Jira-Token", "Cookie", "X-Client-Secret", "X-Password", "X-Session"] {
+            assert!(names_a_credential(h), "{h}");
+        }
+        assert!(names_a_credential("X-Config/apiKey"), "a credential-named template variable");
+        for h in ["X-Team", "X-Jira-Url", "X-Region", "Accept-Language", "X-Config/region"] {
+            assert!(!names_a_credential(h), "{h}");
+        }
+    }
+
+    #[test]
+    fn only_the_users_own_non_secret_values_are_shown_back() {
+        use std::collections::BTreeMap;
+        use streamscope_core::mcp::header_inputs::{Input, InputsMeta, KeyValueInput, RemoteMeta};
+        // SAFETY: same value as every other ENCRYPTION_KEY setter in this binary.
+        unsafe {
+            std::env::set_var("ENCRYPTION_KEY", "test-oidc-flow-key-long-enough");
+        }
+        let h = |name: &str, secret: bool| KeyValueInput {
+            name: name.into(),
+            input: Input { is_secret: secret, ..Default::default() },
+            variables: BTreeMap::new(),
+        };
+        let remote = Remote {
+            url: "https://j.example/mcp".into(),
+            headers: vec![h("X-Team", false), h("X-Token", true), h("X-Url", false)],
+            meta: Some(RemoteMeta {
+                inputs: InputsMeta {
+                    fillers: [
+                        ("X-Team".to_string(), Filler::User),
+                        ("X-Token".to_string(), Filler::User),
+                        ("X-Url".to_string(), Filler::Admin),
+                    ]
+                    .into(),
+                },
+                ..RemoteMeta::default()
+            }),
+            ..Default::default()
+        };
+        let specs = hi::validate_fillers(&remote, false).unwrap();
+        let ct = |v: &str| mcp_inputs::encrypt_value(v).expect("encrypts");
+        let stored: HashMap<String, String> = [
+            ("X-Team".to_string(), ct("blue")),
+            ("X-Token".to_string(), ct("s3cret-token")),
+            ("X-Url".to_string(), ct("https://admin")),
+        ]
+        .into();
+        let plain = plain_user_values(&remote, &specs, &stored);
+        assert_eq!(plain, HashMap::from([("X-Team".to_string(), "blue".to_string())]));
+        let filled: Vec<String> = stored.keys().cloned().collect();
+        // Even handed a secret's plaintext, the listing never shows it.
+        let mut leaked = plain.clone();
+        leaked.insert("X-Token".into(), "s3cret-token".into());
+        let listed = user_inputs_of(&remote, &specs, &filled, &leaked);
+        let by_id: HashMap<&str, &PortalConnectionInput> = listed.iter().map(|i| (i.id.as_str(), i)).collect();
+        assert_eq!(by_id["X-Team"].value.as_deref(), Some("blue"));
+        assert!(by_id["X-Token"].filled && by_id["X-Token"].value.is_none());
+        assert!(!by_id.contains_key("X-Url"), "an admin input is never listed");
+    }
+
+    /// Only user-filled inputs are listed — never an admin or client one —
+    /// with the header's text for a template variable that has none.
+    #[test]
+    fn the_listed_inputs_are_the_users_own() {
+        use std::collections::BTreeMap;
+        use streamscope_core::mcp::header_inputs::{Input, InputsMeta, KeyValueInput, RemoteMeta};
+        let h = |name: &str, secret: bool, desc: Option<&str>| KeyValueInput {
+            name: name.into(),
+            input: Input {
+                is_secret: secret,
+                is_required: true,
+                description: desc.map(str::to_string),
+                ..Default::default()
+            },
+            variables: BTreeMap::new(),
+        };
+        let mut templ = h("Authorization", true, Some("Your Jira PAT"));
+        templ.input.value = Some("Bearer {token}".into());
+        templ.variables.insert("token".into(), Input::default());
+        let remote = Remote {
+            url: "https://j.example/mcp".into(),
+            headers: vec![h("X-Url", false, None), templ, h("X-Key", true, None)],
+            meta: Some(RemoteMeta {
+                inputs: InputsMeta {
+                    fillers: [
+                        ("X-Url".to_string(), Filler::Admin),
+                        ("Authorization/token".to_string(), Filler::User),
+                        ("X-Key".to_string(), Filler::Client),
+                    ]
+                    .into(),
+                },
+                ..RemoteMeta::default()
+            }),
+            ..Default::default()
+        };
+        let specs = hi::validate_fillers(&remote, false).unwrap();
+        let listed = user_inputs_of(&remote, &specs, &ids(&["Authorization/token"]), &HashMap::new());
+        assert!(listed[0].value.is_none());
+        assert_eq!(listed.len(), 1);
+        let i = &listed[0];
+        assert_eq!(i.id, "Authorization/token");
+        assert_eq!(i.header, "Authorization");
+        assert_eq!(i.description.as_deref(), Some("Your Jira PAT"));
+        assert!(i.is_secret, "a variable of a secret header is secret");
+        assert!(i.is_required && i.filled);
     }
 }

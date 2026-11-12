@@ -111,7 +111,7 @@
       title: 'MCP Gateway',
       tagline: 'One URL, every tool server.',
       blurb:
-        'Agents connect to /mcp/<slug>; we hold the upstream credentials (service-account, per-user OAuth, or BYOT), enforce tool & resource policy, and audit every call. Built-in web search included.',
+        'Agents connect to /mcp/<slug>; we hold the upstream credentials (shared headers, values or an OAuth sign-in per user, or headers the client sends), enforce tool & resource policy, and audit every call. Built-in web search included.',
       stats: [
         { label: 'Upstream tool servers', value: fmt(mcpUpstreams) },
         { label: 'Endpoints', value: fmt(mcpEndpoints) },

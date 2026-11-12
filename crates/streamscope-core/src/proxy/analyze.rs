@@ -735,12 +735,18 @@ async fn analyze_request(
         });
         let rtr = (!transform_result.redacted_tool_results.is_empty())
             .then_some(transform_result.redacted_tool_results);
-        let (transform_diff, effective_tools) = content::build_transform_diff(
+        // The effective request — the system prompt, messages and tools the
+        // turn records as sent — is what the caller forwards: the transformed
+        // body only when it forwards it, else the client's own request — a
+        // refused request records no change either. What policy would have
+        // changed stays on the steps, the blocked entries and the badges.
+        let sends_transformed = applied && outcome.verdict != AnalyzeVerdict::Block;
+        let (mut transform_diff, effective_tools) = content::build_transform_diff(
             &pre_content,
             &api_request,
             program_outcomes.clone(),
-            flags.system_prompt_modified,
-            flags.tools_modified,
+            flags.system_prompt_modified && sends_transformed,
+            flags.tools_modified && sends_transformed,
             transform_result.step_diffs,
             ib,
             bt,
@@ -748,6 +754,10 @@ async fn analyze_request(
             (!inbound_guardrail_steps.is_empty()).then(|| inbound_guardrail_steps.clone()),
             Vec::new(), // telemetry_dropped — inline AI never translates protocols
         );
+        if !sends_transformed {
+            transform_diff.effective_messages = None;
+            transform_diff.messages_after_count = transform_diff.messages_original_count;
+        }
         Some(ContentMeta {
             request_messages_json: pre_content.messages_json,
             media_scan_needed: pre_content.media_scan_needed,

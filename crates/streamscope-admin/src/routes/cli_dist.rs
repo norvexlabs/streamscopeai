@@ -91,6 +91,17 @@ struct CliArtifact {
     sha256: String,
 }
 
+/// Whether the binary carries `version` — the version string not followed
+/// by a digit (`2026.11.3` must not match a `2026.11.30` build).
+fn carries_version(bytes: &[u8], version: &str) -> bool {
+    let v = version.as_bytes();
+    !v.is_empty()
+        && bytes
+            .windows(v.len())
+            .enumerate()
+            .any(|(i, w)| w == v && !bytes.get(i + v.len()).is_some_and(u8::is_ascii_digit))
+}
+
 /// Load + cache one target's binary. `Ok(None)` when the target is unknown,
 /// or known but the image carries no binary for it (a deployment built without
 /// that artifact) — its endpoints then 404. Only the two *definitive* outcomes
@@ -128,6 +139,42 @@ async fn artifact(target: &str) -> Result<Option<&'static CliArtifact>, ApiError
         })
         .await
         .map(Option::as_ref)
+}
+
+/// Whether this gateway serves a CLI of its own release for the operating
+/// system a CLI reports (`std::env::consts::OS`: `linux`, `macos`,
+/// `windows`) — so `ssai update` there would bring a CLI on that version.
+/// False for an OS it serves no binary for, a lagging binary, or one it cannot
+/// read now.
+///
+/// The answer is kept per target for the process's life (the image's binaries
+/// never change under it); the binary is read once to find it and not kept,
+/// so this costs no download cache. A read that fails is not kept: the next
+/// call reads again.
+pub(crate) async fn serves_current_for_os(os: &str) -> bool {
+    static CURRENT: [OnceCell<bool>; 3] = [const { OnceCell::const_new() }; 3];
+    let target = match os {
+        "linux" => CLI_TARGET_LINUX_X86_64,
+        "macos" => CLI_TARGET_DARWIN_ARM64,
+        "windows" => CLI_TARGET_WINDOWS_X86_64,
+        _ => return false,
+    };
+    let Some(i) = TARGETS.iter().position(|t| t.name == target) else { return false };
+    let path = TARGETS[i].image_path;
+    CURRENT[i]
+        .get_or_try_init(|| async {
+            match tokio::fs::read(path).await {
+                // The scan walks the whole binary: off the async workers.
+                Ok(bytes) => Ok(tokio::task::spawn_blocking(move || carries_version(&bytes, streamscope_core::VERSION))
+                    .await
+                    .unwrap_or(false)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .copied()
+        .unwrap_or(false)
 }
 
 /// Collect `(target, sha256)` for every target this image actually ships, in
@@ -597,6 +644,16 @@ echo "Next: ssai login <your portal URL>"
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_binary_carries_a_version_only_as_a_whole_number() {
+        use super::carries_version;
+        assert!(carries_version(b"\0ssai 2026.11.30\0", "2026.11.30"));
+        assert!(carries_version(b"2026.11.30", "2026.11.30"));
+        assert!(!carries_version(b"ssai 2026.11.30", "2026.11.3"), "a longer number is another version");
+        assert!(!carries_version(b"ssai 2026.11.29", "2026.11.30"));
+        assert!(!carries_version(b"anything", ""));
+    }
+
     use super::*;
 
     #[test]

@@ -462,8 +462,10 @@ async fn spawn_unconfined(spec: &LaunchSpec) -> Result<i32> {
 }
 
 /// The client's env under a sandbox: `spec.env` plus the proxy vars that
-/// funnel it through the guard. Node ignores `HTTPS_PROXY` without
-/// `NODE_USE_ENV_PROXY=1`. Loopback is exempt (`NO_PROXY`): a client that talks
+/// funnel it through the guard. Node's built-in `fetch` ignores `HTTPS_PROXY`
+/// without `NODE_USE_ENV_PROXY=1`, which Node honours from 22.21 and 24.0: on
+/// an older Node that `fetch` connects directly, and the sandbox refuses the
+/// connection. Loopback is exempt (`NO_PROXY`): a client that talks
 /// to a local helper over HTTP — an engine-backed client to its engine — would
 /// otherwise send that traffic to the guard, which refuses it. A loopback name
 /// a gateway origin uses is NOT exempt — that gateway is reached through the
@@ -1150,6 +1152,17 @@ fn prune_kept_engine_logs(dir: &Path, keep: usize) {
     }
 }
 
+/// Whether process `pid` (above 0) exists: one `kill` may not signal (EPERM) is alive.
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: i32) -> bool {
+    // 0 and below name a process group, or every process: never one process.
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
 /// Whether the `ssai run` that named an engine log is still running.
 fn log_owner_alive(name: &str) -> bool {
     let Some(pid) = name
@@ -1165,9 +1178,7 @@ fn log_owner_alive(name: &str) -> bool {
     }
     #[cfg(unix)]
     {
-        // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
-        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        pid_alive(pid)
     }
     #[cfg(not(unix))]
     {

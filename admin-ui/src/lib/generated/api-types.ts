@@ -2256,6 +2256,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/mcp/local-servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_mcp_local_servers"];
+        put?: never;
+        post: operations["create_mcp_local_server"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/mcp/local-servers/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_mcp_local_server"];
+        put?: never;
+        post?: never;
+        delete: operations["delete_mcp_local_server"];
+        options?: never;
+        head?: never;
+        patch: operations["update_mcp_local_server"];
+        trace?: never;
+    };
     "/api/v1/admin/mcp/oauth-clients": {
         parameters: {
             query?: never;
@@ -2366,6 +2398,22 @@ export interface paths {
         options?: never;
         head?: never;
         patch: operations["update_mcp_upstream_server"];
+        trace?: never;
+    };
+    "/api/v1/admin/mcp/upstream-servers/{id}/actions/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["test_mcp_upstream_server"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/v1/admin/mcp/upstreams/{id}/connections": {
@@ -2675,6 +2723,11 @@ export interface paths {
         delete?: never;
         options?: never;
         head?: never;
+        /**
+         * Replace the sections sent — the clients offered, the destination lists, the
+         *     sandbox settings, the hidden portal pages — and leave the others as they
+         *     are.
+         */
         patch: operations["update_profile_client_access"];
         trace?: never;
     };
@@ -4136,6 +4189,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/workspaces/{id}/mcp-local-servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_workspace_mcp_local_servers"];
+        put?: never;
+        post: operations["add_mcp_local_server"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/admin/workspaces/{id}/mcp-local-servers/{server_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["remove_mcp_local_server"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/admin/workspaces/{id}/mcp-servers": {
         parameters: {
             query?: never;
@@ -4975,6 +5060,12 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
+        /**
+         * The caller's requests. While conversation content is hidden for the caller
+         *     (`sessions` in `hidden_pages`) each row carries its metadata only — the
+         *     content fields are absent or null — and `search`, `resource_uri` and
+         *     `media_type` are accepted and not applied.
+         */
         get: operations["my_audit"];
         put?: never;
         post?: never;
@@ -5302,6 +5393,38 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["portal_revoke_mcp_connection"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/portal/mcp/connections/{upstream_id}/inputs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["portal_update_mcp_inputs"];
+        trace?: never;
+    };
+    "/api/v1/portal/mcp/local-servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["portal_list_mcp_local_servers"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -6112,8 +6235,8 @@ export interface components {
              * @description What an automatic token-latency target holds this engine to:
              *     `AUTO_ITL_TARGET_RATIO` times `low_load_itl_ms` — the figure each
              *     replica applies is its own, and this one the slowest. `null` until
-             *     learned: an automatic target holds nothing until then. Reported
-             *     whatever the server's setting.
+             *     EVERY replica reporting the engine has learned its own: a replica still
+             *     learning holds nothing. Reported whatever the server's setting.
              */
             auto_itl_target_ms?: number | null;
             /**
@@ -6143,6 +6266,10 @@ export interface components {
         AddA2aAgentRequest: {
             /** Format: uuid */
             agent_id: string;
+        };
+        AddMcpLocalServerRequest: {
+            /** Format: uuid */
+            local_server_id: string;
         };
         AddMcpServerRequest: {
             /** Format: uuid */
@@ -6222,31 +6349,89 @@ export interface components {
             /** Format: uuid */
             tenant_id: string;
         };
-        /** @description Request body for adopting a catalog entry. */
+        /**
+         * @description Request body for adopting a catalog entry: one of its remotes (the gateway
+         *     connects to it) or one of its packages (a developer's machine starts it).
+         */
         AdoptCatalogEntry: {
             /**
-             * @description Shared bearer token — required when the entry's `auth_mode` is
-             *     `service_account`. Encrypted at rest.
+             * @description `headers` or `per_user_oauth`. Defaults to `per_user_oauth` when the
+             *     entry carries OAuth hints, else `headers`.
              */
-            credential?: string | null;
+            auth_mode?: string | null;
+            /**
+             * @description The local server's description (a package adopt). Defaults to the
+             *     document's.
+             */
+            description?: string | null;
+            /**
+             * @description Who fills each input the remote declares: input id → `admin` | `user`
+             *     | `client`. Every declared input needs one.
+             */
+            fillers?: {
+                [key: string]: components["schemas"]["Filler"];
+            };
+            /** @description Values of the NON-secret admin-filled inputs: input id → value. */
+            inputs?: {
+                [key: string]: string;
+            };
+            launch?: components["schemas"]["LocalLaunch"] | null;
+            /**
+             * @description The local server's name (a package adopt). Defaults to the document's
+             *     title, else its name; validated like a typed server's.
+             */
+            name?: string | null;
             /** @description OAuth client id/secret to register on the upstream (per_user_oauth). */
             oauth_client_id?: string | null;
             oauth_client_secret?: string | null;
             /**
-             * @description Slug for the new `/mcp/<slug>` endpoint. Defaults to a slugified name;
-             *     a numeric suffix is appended on collision.
+             * @description Which of the document's `packages[]` to adopt as a local server. The
+             *     remote-only fields (`url_variables`, `auth_mode`, `fillers`, `inputs`,
+             *     `secret_inputs`, the OAuth client) are then refused.
+             */
+            package_index?: number | null;
+            /**
+             * @description Which of the document's `remotes[]` to adopt. Defaults to the first
+             *     when no `package_index` is given; refused beside one.
+             */
+            remote_index?: number | null;
+            /**
+             * @description Values of the secret admin-filled inputs: input id → value. Encrypted
+             *     at rest, never echoed.
+             */
+            secret_inputs?: {
+                [key: string]: string;
+            };
+            /**
+             * @description Slug for the new `/mcp/<slug>` endpoint, or for the local server.
+             *     Defaults to a slugified name. For an endpoint a numeric suffix is
+             *     appended on collision; for a local server only a slug the server
+             *     derived is suffixed — one given here that is taken is a 409.
              */
             slug?: string | null;
+            /**
+             * @description Values of the remote URL's `{variables}` (a variable's default fills
+             *     an absent one). Never secret. Stored, with the defaults used, as the
+             *     upstream's `url_variables`.
+             */
+            url_variables?: {
+                [key: string]: string;
+            };
             /** @description Workspaces to grant the new endpoint to. */
             workspace_ids?: string[];
         };
-        /** @description Result of an adopt action. */
+        /**
+         * @description Result of an adopt action: the upstream and endpoint a remote adopt
+         *     created, or the local server a package adopt created.
+         */
         AdoptResult: {
+            /** Format: uuid */
+            local_server_id?: string | null;
             slug: string;
             /** Format: uuid */
-            upstream_id: string;
+            upstream_id?: string | null;
             /** Format: uuid */
-            virtual_server_id: string;
+            virtual_server_id?: string | null;
             /** Format: int64 */
             workspaces_granted: number;
         };
@@ -6391,7 +6576,7 @@ export interface components {
          *     never on the message.
          * @enum {string}
          */
-        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "profile_kind_default_only" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted";
+        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden";
         /** @description Structured error response body matching the proxy's `ErrorResponse` format. */
         ApiErrorResponse: {
             error: components["schemas"]["ApiErrorBody"];
@@ -8280,12 +8465,6 @@ export interface components {
              */
             user_id?: string | null;
         };
-        /**
-         * @description Which budget window a warning or a figure is about: the UTC day, or the
-         *     fixed 30-day period.
-         * @enum {string}
-         */
-        BudgetWindow: "daily" | "monthly";
         BulkUpdateModelsRequest: {
             enabled: boolean;
             /** @description If provided, only update these model IDs (overrides server_id). */
@@ -8636,6 +8815,25 @@ export interface components {
             supports_video_input?: boolean | null;
             supports_vision?: boolean | null;
         };
+        /** @description `_meta["ai.streamscope/catalog"]` of a catalog document. */
+        CatalogMeta: {
+            category?: string | null;
+            featured?: boolean;
+            /**
+             * @description `alive` | `auth_required` | `dead`, as probed when the entry was
+             *     generated; absent when it was not probed (a templated URL names no host).
+             */
+            liveness?: string | null;
+            oauth?: components["schemas"]["OAuthHints"] | null;
+            /** Format: int32 */
+            toolCount?: number | null;
+            tools?: components["schemas"]["CatalogTool"][];
+        };
+        /** @description A tool a catalog entry advertised when it was imported. */
+        CatalogTool: {
+            description?: string | null;
+            name: string;
+        };
         /** @description Changelog response with markdown content and current version. */
         ChangelogResponse: {
             /** @description Markdown content of the full changelog. */
@@ -8868,6 +9066,13 @@ export interface components {
             /** @description Every live client profile, offered or not. */
             clients: components["schemas"]["ClientAccessClient"][];
             destinations: components["schemas"]["AttachedDestinationList"][];
+            /**
+             * @description What the portal hides from the members of the workspaces on this
+             *     profile, `sessions` before `requests`: `sessions` is the Sessions page
+             *     and every conversation's content, `requests` the Requests page. Hidden
+             *     for a member only when every workspace they belong to hides it.
+             */
+            hidden_pages: components["schemas"]["PortalPage"][];
             is_default: boolean;
             settings: components["schemas"]["SandboxSettings"];
         };
@@ -8975,6 +9180,11 @@ export interface components {
                 [key: string]: string;
             };
             kind: components["schemas"]["TemplateKind"];
+            /**
+             * @description Whether, and where, this template writes a local MCP server — see
+             *     [`LocalMcpForm`]. Omitted from the wire when it has no form.
+             */
+            local_mcp?: components["schemas"]["LocalMcpForm"];
             /**
              * @description Only meaningful on `kind = mcp` and `kind = combined` templates;
              *     ignored otherwise. Defaults to `static`.
@@ -9709,45 +9919,50 @@ export interface components {
              */
             proxy_base_url?: string | null;
         };
-        /** @description Request body for creating a custom catalog entry. */
+        /**
+         * @description Request body for creating a custom catalog entry: a pasted `server.json`
+         *     document (the gateway fetches nothing).
+         */
         CreateMcpCatalogEntry: {
-            auth_mode?: string;
-            category?: string | null;
-            description?: string | null;
-            display_title?: string | null;
-            featured?: boolean;
-            icon_url?: string | null;
-            name: string;
-            oauth_authorization_url?: string | null;
-            oauth_default_scopes?: string[];
-            oauth_issuer_url?: string | null;
-            oauth_revocation_url?: string | null;
-            oauth_token_url?: string | null;
-            repository_url?: string | null;
-            /** @description Seed-sync dedupe key. Defaults to `name` (uniquified per tenant). */
+            enabled?: boolean | null;
+            /**
+             * @description A `server.json` document: its keys are the MCP Registry schema's own
+             *     camelCase (`websiteUrl`, `_meta`), unlike the rest of this body.
+             */
+            server_json: components["schemas"]["ServerJson"];
+            /**
+             * @description Seed-sync dedupe key, unique in the tenant. Defaults to
+             *     `server_json.name`.
+             */
             source_name?: string | null;
-            tools?: components["schemas"]["McpCatalogToolSchema"][];
-            transport?: string;
-            upstream_url: string;
-            website_url?: string | null;
+        };
+        /** @description Request body for creating a local server from a typed command line. */
+        CreateMcpLocalServer: {
+            description?: string | null;
+            enabled?: boolean | null;
+            launch: components["schemas"]["LocalLaunch"];
+            name: string;
+            slug: string;
+            /**
+             * @description Workspaces to grant the new server to. The Agent and Inline AI
+             *     workspaces are refused.
+             */
+            workspace_ids?: string[];
         };
         CreateMcpUpstreamServer: {
             /**
-             * @description Defaults to `"no_auth"`. All four modes (`"no_auth"`,
-             *     `"service_account"`, `"per_user_oauth"`, `"byot"`) are honored.
+             * @description `headers` (default) or `per_user_oauth` (the declared headers plus the
+             *     user's OAuth token as `Authorization: Bearer`).
              */
             auth_mode?: string | null;
             /** Format: int32 */
             connect_timeout_ms?: number | null;
-            /**
-             * @description Bearer token plaintext. Required when `auth_mode =
-             *     "service_account"`; rejected when any other auth_mode is set. Encrypted
-             *     at rest with AES-256-GCM (`ENCRYPTION_KEY` HKDF-derived). Never echoed
-             *     in responses — `has_credential: bool` surfaces presence.
-             */
-            credential?: string | null;
             description?: string | null;
             enabled?: boolean | null;
+            /** @description Values of the NON-secret admin-filled inputs: input id → value. */
+            inputs?: {
+                [key: string]: string;
+            };
             name: string;
             oauth_authorization_url?: string | null;
             oauth_client_id?: string | null;
@@ -9761,11 +9976,31 @@ export interface components {
             oauth_issuer_url?: string | null;
             oauth_revocation_url?: string | null;
             oauth_token_url?: string | null;
+            /**
+             * @description The `server.json` remote, with each declared input's filler in
+             *     `_meta["ai.streamscope/inputs"].fillers`. `{"type": "streamable-http",
+             *     "url": "…"}` declares no header (no auth).
+             *     Its keys are the MCP Registry schema's own camelCase (`isRequired`,
+             *     `_meta`), unlike the rest of this body: it is that canonical document.
+             */
+            remote: components["schemas"]["Remote"];
             /** Format: int32 */
             request_timeout_ms?: number | null;
-            /** @description Defaults to `"streamable_http"`. */
-            transport?: string | null;
-            upstream_url: string;
+            /**
+             * @description Values of the secret admin-filled inputs: input id → value. Encrypted
+             *     at rest, never echoed.
+             */
+            secret_inputs?: {
+                [key: string]: string;
+            };
+            /**
+             * @description Values of the remote URL's `{variables}` (a variable's default fills an
+             *     absent one). Never secret. Stored, with the defaults used, as the row's
+             *     `url_variables`.
+             */
+            url_variables?: {
+                [key: string]: string;
+            };
         };
         CreateMcpVirtualRoute: {
             enabled?: boolean | null;
@@ -9912,6 +10147,7 @@ export interface components {
             /**
              * @description How the new profile relates to the Default and what it starts from
              *     (defaults to Layered + Blank — inherits the Default with no own content).
+             *     A `client_access` profile takes Standalone with `seed` or `copy` only.
              */
             start_from?: components["schemas"]["ProfileStartChoice"];
         };
@@ -11862,6 +12098,11 @@ export interface components {
          */
         FieldSource: "user" | "synced" | "catalog" | "default";
         /**
+         * @description Who supplies an input's value.
+         * @enum {string}
+         */
+        Filler: "admin" | "user" | "client";
+        /**
          * @description Wire shape for `GET /api/v1/admin/settings`. Bundles the writable per-tenant
          *     `TenantSettings` with the read-only `inherited` block so the UI can show
          *     "Currently inheriting `<X>`" chips without a follow-up call.
@@ -12152,6 +12393,12 @@ export interface components {
             revision: number;
             version: string;
         };
+        Icon: {
+            mimeType?: string | null;
+            sizes?: string[];
+            src: string;
+            theme?: string | null;
+        };
         /** @description Returned on `?dry_run=true` — preview of how many users/keys are affected. */
         ImpactCheck: {
             /** Format: int64 */
@@ -12214,6 +12461,31 @@ export interface components {
             scope: string;
             /** @description Transform or policy name (e.g. "secure_coding_guardrails", "tool_policy"). */
             transform: string;
+        };
+        /** @description `server.json` `Input`. */
+        Input: {
+            choices?: string[];
+            default?: string | null;
+            description?: string | null;
+            format?: components["schemas"]["InputFormat"];
+            isRequired?: boolean;
+            isSecret?: boolean;
+            placeholder?: string | null;
+            /** @description A fixed value, or a `{var}` template over `variables` (on a header). */
+            value?: string | null;
+        };
+        /**
+         * @description `Input.format`. `filepath` names a file on the user's own machine, which a
+         *     gateway cannot read, so a declaration using it is refused.
+         * @enum {string}
+         */
+        InputFormat: "string" | "number" | "boolean" | "filepath";
+        /** @description The gateway's own facts on an adopted remote. */
+        InputsMeta: {
+            /** @description Input id → filler. Every input the remote declares has an entry. */
+            fillers?: {
+                [key: string]: components["schemas"]["Filler"];
+            };
         };
         /**
          * @description One instance's state, restated every heartbeat interval. The stated parts
@@ -12644,6 +12916,13 @@ export interface components {
             /** Format: int64 */
             total_requests: number;
         };
+        /** @description `server.json` `KeyValueInput` — one declared header. */
+        KeyValueInput: components["schemas"]["Input"] & {
+            name: string;
+            variables?: {
+                [key: string]: components["schemas"]["Input"];
+            };
+        };
         /**
          * @description One known native server-tool wire tag — surfaced through the admin API so
          *     the UI's `server_type` autocomplete tracks the canonical Rust source of
@@ -12731,6 +13010,40 @@ export interface components {
         ListClientsResponse: {
             clients: components["schemas"]["ClientProfileSummary"][];
         };
+        /** @description One environment variable of a local server. */
+        LocalEnv: {
+            name: string;
+            /** @description A secret (a token, a password): it never holds a value here. */
+            secret?: boolean;
+            /**
+             * @description The value the administrator set. Absent: the developer fills it in
+             *     their own config file, which is written with a paste-here placeholder.
+             */
+            value?: string | null;
+        };
+        /** @description How a client starts a local server: what a client config is written with. */
+        LocalLaunch: {
+            args?: string[];
+            /** @description The program: a name found on the developer's `PATH`, or a path. */
+            command: string;
+            env?: components["schemas"]["LocalEnv"][];
+        };
+        /**
+         * @description Whether a template has a form for a LOCAL MCP server — one the developer's
+         *     own machine starts from a command line, written as the client's stdio
+         *     entry — and where it writes it. A declaration, never inferred from the
+         *     body: the server merges local servers only into a template that declares a
+         *     form, and says so for every other selected client instead of dropping them
+         *     silently.
+         *
+         *     A local server is an `mcp_servers[]` item with `local = true`, appended
+         *     after the gateway's: it carries `slug`, `name`, `command`, `args` (a list
+         *     of `{value}`) and `env` (a list of `{name, value}`), and none of a gateway
+         *     item's `url` / `headers`. A template with a form branches on
+         *     `{{#if local}}` inside its `{{#each mcp_servers}}` loop.
+         * @enum {string}
+         */
+        LocalMcpForm: "none" | "config" | "project";
         LoginRequest: {
             email: string;
             password: string;
@@ -12854,46 +13167,88 @@ export interface components {
          * @enum {string}
          */
         McpAuthMode: "static" | "spec_oauth";
+        /** @description One local server adopted from a catalog entry. */
+        McpCatalogAdoptedLocalServer: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            slug: string;
+        };
+        /** @description One upstream adopted from a catalog entry. */
+        McpCatalogAdoptedUpstream: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
         /** @description A catalog entry as returned to the admin UI. */
         McpCatalogEntry: {
-            auth_mode: string;
-            category?: string | null;
+            /** @description The local servers adopted from this entry, by name. Empty when none is. */
+            adopted_local_servers: components["schemas"]["McpCatalogAdoptedLocalServer"][];
+            /**
+             * @description The upstreams adopted from this entry (each upstream records the entry
+             *     it was adopted from), by name. Empty when none is.
+             */
+            adopted_upstreams: components["schemas"]["McpCatalogAdoptedUpstream"][];
             /** Format: date-time */
             created_at: string;
-            description?: string | null;
-            display_title?: string | null;
             enabled: boolean;
-            featured: boolean;
-            icon_url?: string | null;
             /** Format: uuid */
             id: string;
             is_builtin: boolean;
-            liveness?: string | null;
-            name: string;
-            oauth_authorization_url?: string | null;
-            oauth_default_scopes: string[];
-            oauth_issuer_url?: string | null;
-            oauth_revocation_url?: string | null;
-            oauth_token_url?: string | null;
-            repository_url?: string | null;
+            /**
+             * @description The document's `packages[]`, each as adopting it would start the
+             *     local-server form. Empty for a document that declares none.
+             */
+            packages: components["schemas"]["McpCatalogPackage"][];
+            /**
+             * @description The whole `server.json` document. The gateway's own facts (category,
+             *     featured, liveness, tools, OAuth hints) are in its
+             *     `_meta["ai.streamscope/catalog"]`.
+             *     A `server.json` document: its keys are the MCP Registry schema's own
+             *     camelCase (`websiteUrl`, `_meta`), unlike the rest of this body.
+             */
+            server_json: components["schemas"]["ServerJson"];
             source?: string | null;
+            /** @description The per-tenant seed key; unique in the tenant. */
             source_name: string;
-            /** Format: int32 */
-            tool_count?: number | null;
-            tools: components["schemas"]["McpCatalogToolSchema"][];
-            transport: string;
             /** Format: date-time */
             updated_at: string;
-            upstream_url: string;
-            website_url?: string | null;
         };
         /**
-         * @description OpenAPI projection of the JSONB `tools` element (the row type uses the
-         *     `sqlx::types::Json` wrapper, which isn't itself `ToSchema`).
+         * @description One package of a catalog document, as adopting it starts the local-server
+         *     form.
          */
-        McpCatalogToolSchema: {
-            description?: string | null;
-            name: string;
+        McpCatalogPackage: {
+            /**
+             * @description The derived launch as one line, for display (the administrator-set
+             *     environment as `NAME=value`, then the command and its arguments).
+             *     Absent when no command was derived.
+             */
+            command_line?: string | null;
+            identifier: string;
+            /**
+             * @description The package's position in the document's `packages[]`: what adopt takes
+             *     as `package_index`.
+             */
+            index: number;
+            /**
+             * @description The command line derived from the package. Its `command` is empty and
+             *     it has no argument when none is derived; its `env` is the package's
+             *     either way.
+             */
+            launch: components["schemas"]["LocalLaunch"];
+            registry_type: string;
+            /** @description The package's transport type (`stdio`, `streamable-http`, `sse`). */
+            transport: string;
+            /** @description The same, for a person to read. */
+            underived_message?: string | null;
+            /**
+             * @description Why no command was derived (`registry_type`, `transport`, `no_version`,
+             *     `invalid_version`, `invalid_identifier`, `runtime_hint`,
+             *     `runtime_arguments`, `argument`, `interpolation`). Absent when one was.
+             */
+            underived_reason?: string | null;
+            version?: string | null;
         };
         /**
          * @description Wrapper response for the dashboard panels. `total_calls` lets the UI
@@ -13019,6 +13374,49 @@ export interface components {
             /** @description `"tools"` | `"resources"` | `"prompts"`. */
             kind: string;
         };
+        /** @description A local MCP server as returned to the console. */
+        McpLocalServer: {
+            /**
+             * Format: uuid
+             * @description The catalog entry the server was adopted from, while it exists.
+             */
+            catalog_entry_id?: string | null;
+            /**
+             * @description `launch` as one line, for display: the administrator's environment
+             *     values as `NAME=value`, then the command and its arguments, each part
+             *     quoted as a shell would need it. A variable left to the developer is
+             *     not in it.
+             */
+            command_line: string;
+            /** Format: date-time */
+            created_at: string;
+            description?: string | null;
+            enabled: boolean;
+            /** Format: uuid */
+            id: string;
+            /** @description The command line a client config is written with. */
+            launch: components["schemas"]["LocalLaunch"];
+            name: string;
+            /**
+             * @description The server's key in a client's MCP config, and the prefix of its tool
+             *     names (`mcp__<slug>__…`).
+             */
+            slug: string;
+            /** Format: date-time */
+            updated_at: string;
+            /** @description The workspaces the server is granted to, by name. Empty when none is. */
+            workspaces: components["schemas"]["McpLocalServerWorkspace"][];
+        };
+        McpLocalServerSelection: {
+            /** Format: uuid */
+            local_server_id: string;
+        };
+        /** @description A workspace a local server is granted to. */
+        McpLocalServerWorkspace: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
         /**
          * @description Mirrors `streamscope_core::config::tool_rules::RiskResult` as the proxy's MCP
          *     audit writer stamps it into `transform_diff.policy_classification`.
@@ -13083,9 +13481,28 @@ export interface components {
             /** @description Opaque JSON-RPC id (string | number | null). */
             rpc_id: Record<string, never>;
         };
+        /**
+         * @description Why a selected MCP virtual server was left out of a rendered config.
+         * @enum {string}
+         */
+        McpServerOmitReason: "sign_in_cannot_reach_fwd" | "pass_through_key_not_accepted" | "local_server_not_supported" | "local_server_project_only";
         McpServerSelection: {
             /** Format: uuid */
             virtual_server_id: string;
+        };
+        /**
+         * @description A selected MCP server the rendered config leaves out, and why: a virtual
+         *     server (`virtual_server_id`) or a local one (`local_server_id`).
+         */
+        McpServerWarning: {
+            /** Format: uuid */
+            local_server_id?: string | null;
+            /** @description The same, for a person to read. */
+            message: string;
+            reason: components["schemas"]["McpServerOmitReason"];
+            slug: string;
+            /** Format: uuid */
+            virtual_server_id?: string | null;
         };
         McpStreamSummary: {
             /** Format: int32 */
@@ -13161,6 +13578,7 @@ export interface components {
             transport?: string | null;
         };
         McpUpstreamServerRow: {
+            /** @description `headers` | `per_user_oauth`. */
             auth_mode: string;
             /**
              * @description `true` for synthetic gateway-managed rows (e.g. `builtin-web` for the
@@ -13170,6 +13588,14 @@ export interface components {
              *     CRUD form.
              */
             built_in: boolean;
+            /**
+             * Format: uuid
+             * @description The catalog entry the upstream was adopted from; `None` for one created
+             *     by hand, or once that entry is deleted.
+             */
+            catalog_entry_id?: string | null;
+            /** @description The headers a client must send for this upstream, lowercased. */
+            client_headers: string[];
             /** Format: int32 */
             connect_timeout_ms: number;
             /** Format: date-time */
@@ -13179,17 +13605,16 @@ export interface components {
             description?: string | null;
             enabled: boolean;
             /**
-             * @description Presence-only signal. `true` iff `encrypted_credential`
-             *     IS NOT NULL on the underlying row. The plaintext is never echoed.
-             */
-            has_credential: boolean;
-            /**
              * @description Presence-only signal for the encrypted client secret. `true` iff the
              *     underlying row has a non-NULL `encrypted_oauth_client_secret`.
              */
             has_oauth_client_secret: boolean;
             /** Format: uuid */
             id: string;
+            /** @description The NON-secret admin-filled values, input id → value. */
+            inputs: {
+                [key: string]: string;
+            };
             name: string;
             oauth_authorization_url?: string | null;
             oauth_client_id?: string | null;
@@ -13197,21 +13622,83 @@ export interface components {
             oauth_issuer_url?: string | null;
             oauth_revocation_url?: string | null;
             oauth_token_url?: string | null;
+            /**
+             * @description The adopted `server.json` remote: its declared headers and, in
+             *     `_meta["ai.streamscope/inputs"].fillers`, who fills each input.
+             *     Its keys are the MCP Registry schema's own camelCase (`isRequired`,
+             *     `_meta`), unlike the rest of this body: it is that canonical document.
+             */
+            remote: components["schemas"]["Remote"];
             /** Format: int32 */
             request_timeout_ms: number;
+            /** @description The user-filled inputs a user must fill before the upstream is usable. */
+            required_user_input_ids: string[];
+            /** @description The secret admin-filled inputs that have a value (never the value). */
+            secret_input_ids: string[];
+            /** @description Derived from `remote.type`. */
             transport: string;
             /** Format: date-time */
             updated_at: string;
+            /** @description The finished URL: the remote's URL template with its variables filled. */
+            upstream_url: string;
+            /**
+             * @description The values `upstream_url` was finished with: variable name → value
+             *     (a default counts as its value). Never secret.
+             */
+            url_variables: {
+                [key: string]: string;
+            };
+        };
+        /**
+         * @description What the console's Test button found on one upstream, probed with the
+         *     administrator's own values only (no user, no client).
+         */
+        McpUpstreamTestResult: {
+            auth_mode: string;
+            builtin_status?: components["schemas"]["PortalMcpBuiltinStatus"] | null;
+            /**
+             * @description Human-readable detail when `status != ok`, in the gateway's own words
+             *     (never text the upstream sent).
+             */
+            error?: string | null;
+            /** @description The required client-filled inputs the test could not fill. */
+            needs_client_input_ids: string[];
+            /** @description The required user-filled inputs the test could not fill. */
+            needs_user_input_ids: string[];
+            prompts: components["schemas"]["PortalMcpTestEntry"][];
+            resources: components["schemas"]["PortalMcpTestResource"][];
+            /**
+             * @description One of: `ok`; `needs_user_value` (a required input each user fills —
+             *     the test has no user, so it does not call); `needs_client_value` (a
+             *     required header the client sends on each request); `needs_user_sign_in`
+             *     (a per-user OAuth upstream: the call carries a user's token);
+             *     `unavailable` (an administrator value is missing, unreadable or no
+             *     longer fits its declaration); `redirected` (a 3xx, never followed);
+             *     `http_error`; `jsonrpc_error`.
+             */
+            status: string;
+            tools: components["schemas"]["PortalMcpTestEntry"][];
+            /** Format: uuid */
+            upstream_id: string;
+            upstream_name: string;
             upstream_url: string;
         };
         McpUpstreamUserConnection: {
             /**
+             * @description The user can call the upstream: an OAuth credential when the upstream
+             *     is per-user OAuth, and every required user input filled.
+             */
+            connected: boolean;
+            /**
              * Format: date-time
-             * @description `mcp_user_credentials.created_at` for connected users; null otherwise.
+             * @description When the user first connected (OAuth credential, else first filled
+             *     input); null when neither exists.
              */
             connected_at?: string | null;
             display_name?: string | null;
             email: string;
+            /** @description The user-filled inputs this user has a value for (never the value). */
+            filled_input_ids: string[];
             /** @description True when a `mcp_user_credentials` row exists for this (user, upstream). */
             has_session: boolean;
             /**
@@ -13244,6 +13731,11 @@ export interface components {
             virtual_server_id: string;
         };
         McpVirtualServerRow: {
+            /**
+             * @description The headers a client must send to this endpoint (lowercased): the
+             *     client-filled inputs of its enabled routes' upstreams.
+             */
+            client_headers: string[];
             /** Format: date-time */
             created_at: string;
             description?: string | null;
@@ -13254,6 +13746,11 @@ export interface components {
              */
             display_title?: string | null;
             enabled: boolean;
+            /**
+             * @description `true` when one of those headers is `Authorization`: the gateway key
+             *     then rides the `/fwd/{key}/mcp/<slug>` path instead of that header.
+             */
+            fwd_mount: boolean;
             /** Format: uuid */
             id: string;
             name: string;
@@ -13699,7 +14196,8 @@ export interface components {
              * @description `budget_breach` | `budget_approaching` | `session_major_alert` |
              *     `credential_expiring` | `guardrail_detection` | `upstream_unhealthy` |
              *     `upstream_recovered` | `appliance_upgrade_available` |
-             *     `agent_analysis_failing` | `edge_sync_rows_dropped`.
+             *     `agent_analysis_failing` | `edge_sync_rows_dropped` |
+             *     `mcp_upstream_unusable`.
              */
             kind: string;
             /**
@@ -13712,12 +14210,23 @@ export interface components {
             target_id?: string | null;
             /**
              * @description `workspace` | `user` | `session` | `api_key` | `guardrail` |
-             *     `upstream_server` — drives the UI deep-link.
+             *     `upstream_server` | `mcp_upstream_server` — drives the UI deep-link.
              */
             target_kind?: string | null;
             title: string;
             /** Format: uuid */
             workspace_id?: string | null;
+        };
+        /**
+         * @description OAuth endpoints an entry's server is known to use, for a per-user OAuth
+         *     adopt when the server publishes no metadata.
+         */
+        OAuthHints: {
+            authorizationUrl?: string | null;
+            defaultScopes?: string[];
+            issuerUrl?: string | null;
+            revocationUrl?: string | null;
+            tokenUrl?: string | null;
         };
         /** @description One row in `GET /api/v1/admin/mcp/oauth-clients`. */
         OauthClientRow: {
@@ -14919,16 +15428,74 @@ export interface components {
          * @description Default pagination shape — no `total`, cheap on partitioned/hot tables.
          *     Handlers select `limit + 1` rows; `has_more` is `true` when the extra row existed.
          */
+        OffsetPage_McpLocalServer: {
+            has_more: boolean;
+            items: {
+                /**
+                 * Format: uuid
+                 * @description The catalog entry the server was adopted from, while it exists.
+                 */
+                catalog_entry_id?: string | null;
+                /**
+                 * @description `launch` as one line, for display: the administrator's environment
+                 *     values as `NAME=value`, then the command and its arguments, each part
+                 *     quoted as a shell would need it. A variable left to the developer is
+                 *     not in it.
+                 */
+                command_line: string;
+                /** Format: date-time */
+                created_at: string;
+                description?: string | null;
+                enabled: boolean;
+                /** Format: uuid */
+                id: string;
+                /** @description The command line a client config is written with. */
+                launch: components["schemas"]["LocalLaunch"];
+                name: string;
+                /**
+                 * @description The server's key in a client's MCP config, and the prefix of its tool
+                 *     names (`mcp__<slug>__…`).
+                 */
+                slug: string;
+                /** Format: date-time */
+                updated_at: string;
+                /** @description The workspaces the server is granted to, by name. Empty when none is. */
+                workspaces: components["schemas"]["McpLocalServerWorkspace"][];
+            }[];
+            /** Format: int64 */
+            limit: number;
+            /** Format: int64 */
+            offset: number;
+            /**
+             * @description `true` when a text search stopped at its scan budget before it could
+             *     fill the page: more matches may exist past what was scanned, and
+             *     `has_more` says nothing about them — narrow the window or the term.
+             *     Always `false` for a list without a search.
+             */
+            scan_cut: boolean;
+        };
+        /**
+         * @description Default pagination shape — no `total`, cheap on partitioned/hot tables.
+         *     Handlers select `limit + 1` rows; `has_more` is `true` when the extra row existed.
+         */
         OffsetPage_McpUpstreamUserConnection: {
             has_more: boolean;
             items: {
                 /**
+                 * @description The user can call the upstream: an OAuth credential when the upstream
+                 *     is per-user OAuth, and every required user input filled.
+                 */
+                connected: boolean;
+                /**
                  * Format: date-time
-                 * @description `mcp_user_credentials.created_at` for connected users; null otherwise.
+                 * @description When the user first connected (OAuth credential, else first filled
+                 *     input); null when neither exists.
                  */
                 connected_at?: string | null;
                 display_name?: string | null;
                 email: string;
+                /** @description The user-filled inputs this user has a value for (never the value). */
+                filled_input_ids: string[];
                 /** @description True when a `mcp_user_credentials` row exists for this (user, upstream). */
                 has_session: boolean;
                 /**
@@ -14995,7 +15562,8 @@ export interface components {
                  * @description `budget_breach` | `budget_approaching` | `session_major_alert` |
                  *     `credential_expiring` | `guardrail_detection` | `upstream_unhealthy` |
                  *     `upstream_recovered` | `appliance_upgrade_available` |
-                 *     `agent_analysis_failing` | `edge_sync_rows_dropped`.
+                 *     `agent_analysis_failing` | `edge_sync_rows_dropped` |
+                 *     `mcp_upstream_unusable`.
                  */
                 kind: string;
                 /**
@@ -15008,7 +15576,7 @@ export interface components {
                 target_id?: string | null;
                 /**
                  * @description `workspace` | `user` | `session` | `api_key` | `guardrail` |
-                 *     `upstream_server` — drives the UI deep-link.
+                 *     `upstream_server` | `mcp_upstream_server` — drives the UI deep-link.
                  */
                 target_kind?: string | null;
                 title: string;
@@ -16210,6 +16778,32 @@ export interface components {
          * @description Default pagination shape — no `total`, cheap on partitioned/hot tables.
          *     Handlers select `limit + 1` rows; `has_more` is `true` when the extra row existed.
          */
+        OffsetPage_WorkspaceMcpLocalServer: {
+            has_more: boolean;
+            items: {
+                description?: string | null;
+                enabled: boolean;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                slug: string;
+            }[];
+            /** Format: int64 */
+            limit: number;
+            /** Format: int64 */
+            offset: number;
+            /**
+             * @description `true` when a text search stopped at its scan budget before it could
+             *     fill the page: more matches may exist past what was scanned, and
+             *     `has_more` says nothing about them — narrow the window or the term.
+             *     Always `false` for a list without a search.
+             */
+            scan_cut: boolean;
+        };
+        /**
+         * @description Default pagination shape — no `total`, cheap on partitioned/hot tables.
+         *     Handlers select `limit + 1` rows; `has_more` is `true` when the extra row existed.
+         */
         OffsetPage_WorkspaceMcpServer: {
             has_more: boolean;
             items: {
@@ -16722,6 +17316,20 @@ export interface components {
              */
             workspace_id?: string | null;
         };
+        /** @description A host the caller's `ssai` CLI ran on, as it reported itself. */
+        PortalCliHost: {
+            /** @description The host name the CLI reported (its first label). */
+            host: string;
+            /**
+             * Format: date-time
+             * @description When it was last seen (to about a minute).
+             */
+            last_seen_at: string;
+            /** @description `linux` | `macos` | `windows`, as the CLI reported it. */
+            os: string;
+            /** @description The version it last reported on this host. */
+            version: string;
+        };
         PortalConnectInitResponse: {
             authorization_url: string;
             /** Format: date-time */
@@ -16732,16 +17340,62 @@ export interface components {
              */
             pending_id: string;
         };
+        /** @description One input a user fills, as its upstream declares it. */
+        PortalConnectionInput: {
+            /** @description When not empty, the only values accepted. */
+            choices: string[];
+            default?: string | null;
+            description?: string | null;
+            /** @description The user has stored a value. */
+            filled: boolean;
+            format: components["schemas"]["InputFormat"];
+            header: string;
+            /**
+             * @description The input id: the header name, or `<Header>/<variable>` for one
+             *     variable of a header template.
+             */
+            id: string;
+            /** @description The upstream is unusable until it has a value. */
+            is_required: boolean;
+            /** @description Send its value under `secret_inputs`, never `inputs`. */
+            is_secret: boolean;
+            placeholder?: string | null;
+            /**
+             * @description The caller's own stored value, for a NON-secret input (to prefill the
+             *     form). Always `None` for a secret input, and when nothing is stored.
+             */
+            value?: string | null;
+        };
         PortalConnectionItem: {
             /** Format: date-time */
             expires_at?: string | null;
+            /**
+             * @description The inputs the user fills on this upstream — their declarations,
+             *     whether each has a value, and the caller's own value of each NON-secret
+             *     one (a secret one is presence-only). Inputs the administrator or the
+             *     client fills are not listed.
+             */
+            inputs: components["schemas"]["PortalConnectionInput"][];
+            /**
+             * @description What connecting takes: `oauth` (sign in), `inputs` (fill in values),
+             *     or `oauth_inputs` (both).
+             */
+            kind: string;
             /** Format: date-time */
             last_used_at?: string | null;
             scope?: string | null;
             /**
-             * @description One of: `connected` (credential present, not expired), `expired`
-             *     (credential present but `expires_at < now`), `not_connected` (no
-             *     credential row).
+             * @description Whether the caller's OAuth sign-in is done: a credential present and
+             *     unexpired. Always false on an `inputs` upstream. On `oauth_inputs` it
+             *     tells "values missing, signed in" from "values missing, not signed in",
+             *     which `status` alone does not.
+             */
+            signed_in: boolean;
+            /**
+             * @description One of: `connected` (the OAuth credential is present and unexpired
+             *     where one is needed, and every required input is filled), `expired`
+             *     (the OAuth credential is present but `expires_at < now`),
+             *     `not_connected` (anything else).
              */
             status: string;
             upstream_description?: string | null;
@@ -16778,10 +17432,28 @@ export interface components {
             name: string;
         };
         /**
-         * @description The portal Home: what needs doing, the caller's spend, their team (managers),
-         *     and their latest sessions.
+         * @description The portal Home: what needs doing, the caller's spend, their limits, their
+         *     team (managers), and their latest sessions.
          */
         PortalHome: {
+            /**
+             * @description The hosts whose `ssai` last reported a version older than
+             *     `cli_version` (at most 5), most recently seen first. A host not seen
+             *     in 30 days, one on the served version or newer, one whose version is
+             *     not a dotted number, and one on an OS whose served binary does not
+             *     carry `cli_version` (`ssai update` would not bring it) are not listed.
+             */
+            cli_updates: components["schemas"]["PortalCliHost"][];
+            /**
+             * @description The `ssai` version this gateway serves — what `/api/v1/cli/version`
+             *     advertises and `ssai update` installs.
+             */
+            cli_version: string;
+            /**
+             * @description The caller's own LLM traffic per UTC day, the 7 days ending today,
+             *     oldest first — a day without traffic included, with zeros.
+             */
+            daily: components["schemas"]["PortalSpendDay"][];
             /**
              * @description The caller's unrevoked keys that expire within 7 days or expired in the
              *     last 7 (at most 5): those still working first, soonest first — a key
@@ -16791,18 +17463,26 @@ export interface components {
             expiring_keys: components["schemas"]["PortalExpiringKey"][];
             /** @description The caller holds at least one live (unrevoked, unexpired) key. */
             has_active_key: boolean;
-            /** @description The caller's own LLM traffic over the last 7 days. */
-            last_7_days: components["schemas"]["PortalSpendWindow"];
             /**
-             * @description Budgets in the header workspace at 80 % of their cap or more, as the
-             *     caller may see them (a manager sees the pool's use, a member only when
-             *     the workspace shares it).
+             * @description The caller's own LLM traffic over the last 7 UTC days, today included:
+             *     the sum of `daily`.
              */
-            limit_warnings: components["schemas"]["PortalLimitWarning"][];
+            last_7_days: components["schemas"]["PortalSpendWindow"];
+            limits?: components["schemas"]["EffectiveLimitStack"] | null;
             /** @description MCP servers the caller may use that wait for their sign-in (at most 5). */
             mcp_sign_in: components["schemas"]["PortalMcpSignInNeeded"][];
-            /** @description The caller's 5 latest sessions. */
-            recent_sessions: components["schemas"]["SessionSummary"][];
+            /**
+             * Format: int64
+             * @description How many MCP servers wait for the caller's sign-in, `mcp_sign_in`'s
+             *     first five included.
+             */
+            mcp_sign_in_total: number;
+            /**
+             * @description The caller's 5 latest sessions — `null` while the Sessions page is
+             *     hidden for the caller (`sessions` in `hidden_pages`), which is not
+             *     "no session yet".
+             */
+            recent_sessions?: components["schemas"]["SessionSummary"][] | null;
             team?: components["schemas"]["PortalHomeTeam"] | null;
             /** @description The caller's own LLM traffic since 00:00 UTC. */
             today: components["schemas"]["PortalSpendWindow"];
@@ -16875,22 +17555,6 @@ export interface components {
             tokens: number;
             workspace: string;
         };
-        PortalLimitWarning: {
-            bucket: components["schemas"]["LimitBucket"];
-            /** Format: double */
-            cap: number;
-            /** @description The accounting currency `used` and `cap` are in. */
-            currency: string;
-            /**
-             * @description The key, on a `key` warning: its name, and the prefix that names it
-             *     when it has none.
-             */
-            key_name?: string | null;
-            key_prefix?: string | null;
-            /** Format: double */
-            used: number;
-            window: components["schemas"]["BudgetWindow"];
-        };
         PortalLoginRequest: {
             email: string;
             password: string;
@@ -16932,6 +17596,29 @@ export interface components {
              */
             has_credential: boolean;
         };
+        /**
+         * @description A local MCP server a member's workspace is handed: a server their own
+         *     machine starts.
+         */
+        PortalMcpLocalServer: {
+            /**
+             * @description `launch` as one line, for display: the administrator's environment
+             *     values as `NAME=value`, then the command and its arguments, each part
+             *     quoted as a shell would need it.
+             */
+            command_line: string;
+            description?: string | null;
+            /** Format: uuid */
+            id: string;
+            /**
+             * @description The command line the client config is written with. An `env` entry
+             *     with no value is the member's to fill in their own config.
+             */
+            launch: components["schemas"]["LocalLaunch"];
+            name: string;
+            /** @description The server's key in the client's MCP config. */
+            slug: string;
+        };
         /** @description A virtual server waiting for the caller's sign-in. */
         PortalMcpSignInNeeded: {
             name: string;
@@ -16963,8 +17650,12 @@ export interface components {
             prompts: components["schemas"]["PortalMcpTestEntry"][];
             resources: components["schemas"]["PortalMcpTestResource"][];
             /**
-             * @description One of: `ok`, `needs_connection`, `service_account_unavailable`,
-             *     `unsupported_byot`, `http_error`, `jsonrpc_error`, `disabled`.
+             * @description One of: `ok`, `needs_connection` (the user's OAuth sign-in or a
+             *     required input of theirs is missing), `token_expired`,
+             *     `needs_client_header` (the client sends a required header on each
+             *     request; not a failure), `unavailable` (the administrator's settings
+             *     are incomplete or unreadable), `redirected` (a 3xx, never followed),
+             *     `http_error`, `jsonrpc_error`, `disabled`.
              */
             status: string;
             /** @description Namespaced tool names (`<prefix>__<name>` when prefix is set). */
@@ -16989,26 +17680,37 @@ export interface components {
              */
             built_in: boolean;
             /**
-             * @description Aggregate per-user-OAuth connection state for the **current user**:
-             *     - `none` — no `per_user_oauth` upstreams (nothing to connect).
-             *     - `connected` — every `per_user_oauth` upstream has a present, unexpired
-             *       credential for this user.
-             *     - `needs_connection` — at least one `per_user_oauth` upstream is missing
-             *       a credential or its credential has expired. The config is still valid
-             *       to write; the user connects in the portal to make it live.
+             * @description The headers the client must send itself (lowercased): the
+             *     client-filled inputs of the routed upstreams.
+             */
+            client_headers: string[];
+            /**
+             * @description Aggregate connection state for the **current user**:
+             *     - `none` — no upstream asks anything of the user (nothing to connect).
+             *     - `connected` — on every such upstream the user holds a present,
+             *       unexpired OAuth credential where one is needed and has filled every
+             *       required input.
+             *     - `needs_connection` — at least one is missing. The config is still
+             *       valid to write; the user connects in the portal to make it live.
              *
              *     Both the web quickstart and the `ssai` CLI surface this so a
              *     user is warned to connect first; keep the two in sync.
              */
             connection_status: string;
             description?: string | null;
+            /**
+             * @description `true` when one of those headers is `Authorization`: the gateway key
+             *     then rides the `/fwd/{key}/mcp/<slug>` path.
+             */
+            fwd_mount: boolean;
             /** Format: uuid */
             id: string;
             name: string;
             /**
-             * @description `true` when at least one of this virtual server's routes points at a
-             *     `per_user_oauth` upstream — i.e. the calling user must link their own
-             *     account in the portal before requests through this server succeed.
+             * @description `true` when at least one of this virtual server's routes points at an
+             *     upstream that asks something of each user — a `per_user_oauth` one
+             *     (link their own account) or one with required user-filled inputs —
+             *     before requests through this server succeed.
              */
             requires_connection: boolean;
             slug: string;
@@ -17023,11 +17725,26 @@ export interface components {
              */
             accounting_currency: string;
             downstream_providers: components["schemas"]["PortalProviderInfo"][];
+            /**
+             * @description What the portal hides for the caller — what every workspace they
+             *     belong to hides (a member of none: the Default profile's). `sessions`:
+             *     the Sessions page and every conversation's content (its routes answer
+             *     403 `portal_page_hidden`, and `GET /portal/audit` rows carry metadata
+             *     only). `requests`: the Requests page (`GET /portal/audit` answers that
+             *     403). Held by the API whatever the portal shows.
+             */
+            hidden_pages: components["schemas"]["PortalPage"][];
             tenant_name: string;
             tenant_slug: string;
             user: components["schemas"]["PortalUserDetail"];
             workspaces: components["schemas"]["PortalWorkspaceInfo"][];
         };
+        /**
+         * @description A switch of a profile's Portal pages. The keys are sent
+         *     (`hidden_pages`): append-only. Each is a column of `client_access_portal`.
+         * @enum {string}
+         */
+        PortalPage: "sessions" | "requests";
         PortalProviderInfo: {
             /**
              * @description `true` when this is a BYOK pass-through downstream — provision a `vk-`
@@ -17064,6 +17781,17 @@ export interface components {
             upstream_api_format?: string | null;
             upstream_model: string;
         };
+        /** @description One UTC day of the caller's own LLM traffic. */
+        PortalSpendDay: {
+            /**
+             * Format: date-time
+             * @description 00:00 UTC of the day.
+             */
+            day: string;
+            /** Format: int64 */
+            requests: number;
+            spend?: components["schemas"]["SpendTotal"] | null;
+        };
         PortalSpendWindow: {
             /** Format: int64 */
             requests: number;
@@ -17080,6 +17808,17 @@ export interface components {
             total_requests: number;
             /** Format: int64 */
             total_tokens: number;
+        };
+        /** @description Request body of `PATCH …/connections/{upstream_id}/inputs`. */
+        PortalUpdateMcpInputs: {
+            /** @description NON-secret values: a value sets, `null` clears. */
+            inputs?: {
+                [key: string]: string | null;
+            };
+            /** @description Secret values: a value sets, `""` clears, `null` keeps. */
+            secret_inputs?: {
+                [key: string]: string | null;
+            };
         };
         PortalUserDetail: {
             display_name?: string | null;
@@ -17263,6 +18002,9 @@ export interface components {
          *     - `{"mode":"off"}` → upsert a NULL-profile row → the kind's policy is **fully
          *       disabled** for this workspace (the proxy resolves [`EffectiveProfile::Off`]);
          *     - `{"mode":"profile","id":<uuid>}` → upsert that profile id.
+         *
+         *     The `client_access` kind takes `inherit` and `profile` only, and `profile`
+         *     only on a workspace that is neither the Agent nor the Inline AI one.
          */
         ProfileAssignmentChoice: {
             /** @enum {string} */
@@ -17519,6 +18261,11 @@ export interface components {
              *     template has an LLM section.
              */
             llm_provider_id?: string | null;
+            /**
+             * @description Local MCP servers (run on the developer's own machine) to write into
+             *     every selected template that has a form for one.
+             */
+            mcp_local_servers?: components["schemas"]["McpLocalServerSelection"][];
             /** @description MCP virtual servers to wire into every MCP-capable selected template. */
             mcp_servers?: components["schemas"]["McpServerSelection"][];
             /**
@@ -17574,6 +18321,11 @@ export interface components {
             /** @description The RAW template — the CLI re-renders it locally on later syncs. */
             template: components["schemas"]["ClientProfileTemplate"];
             template_index: number;
+            /**
+             * @description The selected MCP servers, virtual or local, this client's config leaves
+             *     out, each with why — the same list the Web Quickstart returns for the template.
+             */
+            warnings: components["schemas"]["McpServerWarning"][];
         };
         ProvisionClientSelection: {
             /** @description Client profile id (e.g. `claude-code`). */
@@ -17891,6 +18643,40 @@ export interface components {
              */
             client_secret?: string | null;
         };
+        /**
+         * @description `server.json` `RemoteTransport` — a remote endpoint, its URL template and
+         *     the headers it expects.
+         */
+        Remote: {
+            _meta?: components["schemas"]["RemoteMeta"] | null;
+            headers?: components["schemas"]["KeyValueInput"][];
+            type?: components["schemas"]["RemoteType"];
+            /**
+             * @description The URL template. Required by the schema, so [`ServerJson::validate`]
+             *     and [`finish_url`] refuse an empty one; an adopted upstream's finished
+             *     URL is its `upstream_url`, and a built-in upstream stores `{}` here.
+             */
+            url?: string;
+            variables?: {
+                [key: string]: components["schemas"]["Input"];
+            };
+        };
+        /**
+         * @description `_meta` of a remote: the gateway's own namespace, and every other
+         *     namespace kept verbatim so a pasted document round-trips.
+         */
+        RemoteMeta: {
+            /**
+             * @description Left out when no filler is set, so a pasted document that never had
+             *     the namespace reads back exactly as pasted.
+             */
+            "ai.streamscope/inputs"?: components["schemas"]["InputsMeta"];
+        };
+        /**
+         * @description `RemoteTransport.type`.
+         * @enum {string}
+         */
+        RemoteType: "streamable-http" | "sse";
         RemovedModelInfo: {
             /** Format: uuid */
             id: string;
@@ -17911,6 +18697,12 @@ export interface components {
              *     default route, `{{#each routes}}` templates get the full list.
              */
             llm_provider_id?: string | null;
+            /**
+             * @description Local MCP servers (run on the member's own machine) to write into the
+             *     config. Each must be granted by the workspace. A template with no form
+             *     for one leaves it out and says so in `warnings`.
+             */
+            mcp_local_servers?: components["schemas"]["McpLocalServerSelection"][];
             /**
              * @description MCP virtual servers to wire up. A `kind = mcp` template requires at
              *     least one; `kind = combined` accepts 0..N (its body wraps the MCP
@@ -17947,6 +18739,11 @@ export interface components {
             minted_keys: components["schemas"]["MintedKey"][];
             minted_secrets: components["schemas"]["MintedSecrets"];
             template: components["schemas"]["RenderedTemplate"];
+            /**
+             * @description The selected MCP virtual servers the config leaves out, each with why.
+             *     Empty when every selected server is in it.
+             */
+            warnings: components["schemas"]["McpServerWarning"][];
         };
         RenderedTemplate: {
             /**
@@ -17991,6 +18788,12 @@ export interface components {
         ReplayResponse: {
             /** @description Oldest first. */
             events: components["schemas"]["ReplayEvent"][];
+        };
+        Repository: {
+            id?: string | null;
+            source: string;
+            subfolder?: string | null;
+            url: string;
         };
         /**
          * @description A resource body, already canonical (see [`crate::digest`]); the edge
@@ -18592,6 +19395,33 @@ export interface components {
          * @enum {string}
          */
         ServerHealth: "healthy" | "degraded" | "down" | "disabled";
+        /**
+         * @description `server.json` `ServerDetail`. Unknown top-level members are dropped on
+         *     parse: the stored document is this type's serialization.
+         */
+        ServerJson: {
+            $schema?: string | null;
+            /**
+             * @description The spec's extension point: reverse-DNS namespace → vendor object. The
+             *     gateway reads only [`CATALOG_META_KEY`]; other namespaces round-trip.
+             */
+            _meta?: Record<string, never>;
+            description: string;
+            icons?: components["schemas"]["Icon"][];
+            name: string;
+            /**
+             * @description The spec's local `packages[]`, kept verbatim (this type would drop the
+             *     members it does not name). The gateway proxies only remotes; a package
+             *     is read, typed ([`super::local_server::PackageView`]), when the
+             *     document has no remote and when it is adopted as a local server.
+             */
+            packages?: Record<string, never>[] | null;
+            remotes?: components["schemas"]["Remote"][];
+            repository?: components["schemas"]["Repository"] | null;
+            title?: string | null;
+            version: string;
+            websiteUrl?: string | null;
+        };
         /**
          * @description The live load of a server, from the newest reading each gateway replica
          *     sent for each of its gated endpoints.
@@ -20898,36 +21728,37 @@ export interface components {
         TotalPage_McpCatalogEntry: {
             has_more: boolean;
             items: {
-                auth_mode: string;
-                category?: string | null;
+                /** @description The local servers adopted from this entry, by name. Empty when none is. */
+                adopted_local_servers: components["schemas"]["McpCatalogAdoptedLocalServer"][];
+                /**
+                 * @description The upstreams adopted from this entry (each upstream records the entry
+                 *     it was adopted from), by name. Empty when none is.
+                 */
+                adopted_upstreams: components["schemas"]["McpCatalogAdoptedUpstream"][];
                 /** Format: date-time */
                 created_at: string;
-                description?: string | null;
-                display_title?: string | null;
                 enabled: boolean;
-                featured: boolean;
-                icon_url?: string | null;
                 /** Format: uuid */
                 id: string;
                 is_builtin: boolean;
-                liveness?: string | null;
-                name: string;
-                oauth_authorization_url?: string | null;
-                oauth_default_scopes: string[];
-                oauth_issuer_url?: string | null;
-                oauth_revocation_url?: string | null;
-                oauth_token_url?: string | null;
-                repository_url?: string | null;
+                /**
+                 * @description The document's `packages[]`, each as adopting it would start the
+                 *     local-server form. Empty for a document that declares none.
+                 */
+                packages: components["schemas"]["McpCatalogPackage"][];
+                /**
+                 * @description The whole `server.json` document. The gateway's own facts (category,
+                 *     featured, liveness, tools, OAuth hints) are in its
+                 *     `_meta["ai.streamscope/catalog"]`.
+                 *     A `server.json` document: its keys are the MCP Registry schema's own
+                 *     camelCase (`websiteUrl`, `_meta`), unlike the rest of this body.
+                 */
+                server_json: components["schemas"]["ServerJson"];
                 source?: string | null;
+                /** @description The per-tenant seed key; unique in the tenant. */
                 source_name: string;
-                /** Format: int32 */
-                tool_count?: number | null;
-                tools: components["schemas"]["McpCatalogToolSchema"][];
-                transport: string;
                 /** Format: date-time */
                 updated_at: string;
-                upstream_url: string;
-                website_url?: string | null;
             }[];
             /** Format: int64 */
             limit: number;
@@ -20943,6 +21774,7 @@ export interface components {
         TotalPage_McpUpstreamServerRow: {
             has_more: boolean;
             items: {
+                /** @description `headers` | `per_user_oauth`. */
                 auth_mode: string;
                 /**
                  * @description `true` for synthetic gateway-managed rows (e.g. `builtin-web` for the
@@ -20952,6 +21784,14 @@ export interface components {
                  *     CRUD form.
                  */
                 built_in: boolean;
+                /**
+                 * Format: uuid
+                 * @description The catalog entry the upstream was adopted from; `None` for one created
+                 *     by hand, or once that entry is deleted.
+                 */
+                catalog_entry_id?: string | null;
+                /** @description The headers a client must send for this upstream, lowercased. */
+                client_headers: string[];
                 /** Format: int32 */
                 connect_timeout_ms: number;
                 /** Format: date-time */
@@ -20961,17 +21801,16 @@ export interface components {
                 description?: string | null;
                 enabled: boolean;
                 /**
-                 * @description Presence-only signal. `true` iff `encrypted_credential`
-                 *     IS NOT NULL on the underlying row. The plaintext is never echoed.
-                 */
-                has_credential: boolean;
-                /**
                  * @description Presence-only signal for the encrypted client secret. `true` iff the
                  *     underlying row has a non-NULL `encrypted_oauth_client_secret`.
                  */
                 has_oauth_client_secret: boolean;
                 /** Format: uuid */
                 id: string;
+                /** @description The NON-secret admin-filled values, input id → value. */
+                inputs: {
+                    [key: string]: string;
+                };
                 name: string;
                 oauth_authorization_url?: string | null;
                 oauth_client_id?: string | null;
@@ -20979,12 +21818,32 @@ export interface components {
                 oauth_issuer_url?: string | null;
                 oauth_revocation_url?: string | null;
                 oauth_token_url?: string | null;
+                /**
+                 * @description The adopted `server.json` remote: its declared headers and, in
+                 *     `_meta["ai.streamscope/inputs"].fillers`, who fills each input.
+                 *     Its keys are the MCP Registry schema's own camelCase (`isRequired`,
+                 *     `_meta`), unlike the rest of this body: it is that canonical document.
+                 */
+                remote: components["schemas"]["Remote"];
                 /** Format: int32 */
                 request_timeout_ms: number;
+                /** @description The user-filled inputs a user must fill before the upstream is usable. */
+                required_user_input_ids: string[];
+                /** @description The secret admin-filled inputs that have a value (never the value). */
+                secret_input_ids: string[];
+                /** @description Derived from `remote.type`. */
                 transport: string;
                 /** Format: date-time */
                 updated_at: string;
+                /** @description The finished URL: the remote's URL template with its variables filled. */
                 upstream_url: string;
+                /**
+                 * @description The values `upstream_url` was finished with: variable name → value
+                 *     (a default counts as its value). Never secret.
+                 */
+                url_variables: {
+                    [key: string]: string;
+                };
             }[];
             /** Format: int64 */
             limit: number;
@@ -21032,6 +21891,11 @@ export interface components {
         TotalPage_McpVirtualServerRow: {
             has_more: boolean;
             items: {
+                /**
+                 * @description The headers a client must send to this endpoint (lowercased): the
+                 *     client-filled inputs of its enabled routes' upstreams.
+                 */
+                client_headers: string[];
                 /** Format: date-time */
                 created_at: string;
                 description?: string | null;
@@ -21042,6 +21906,11 @@ export interface components {
                  */
                 display_title?: string | null;
                 enabled: boolean;
+                /**
+                 * @description `true` when one of those headers is `Authorization`: the gateway key
+                 *     then rides the `/fwd/{key}/mcp/<slug>` path instead of that header.
+                 */
+                fwd_mount: boolean;
                 /** Format: uuid */
                 id: string;
                 name: string;
@@ -21231,6 +22100,38 @@ export interface components {
          * @description Pagination with `total` — opt-in for lists where `COUNT(*)` is index-only
          *     and under 50 ms at p99.
          */
+        TotalPage_PortalMcpLocalServer: {
+            has_more: boolean;
+            items: {
+                /**
+                 * @description `launch` as one line, for display: the administrator's environment
+                 *     values as `NAME=value`, then the command and its arguments, each part
+                 *     quoted as a shell would need it.
+                 */
+                command_line: string;
+                description?: string | null;
+                /** Format: uuid */
+                id: string;
+                /**
+                 * @description The command line the client config is written with. An `env` entry
+                 *     with no value is the member's to fill in their own config.
+                 */
+                launch: components["schemas"]["LocalLaunch"];
+                name: string;
+                /** @description The server's key in the client's MCP config. */
+                slug: string;
+            }[];
+            /** Format: int64 */
+            limit: number;
+            /** Format: int64 */
+            offset: number;
+            /** Format: int64 */
+            total: number;
+        };
+        /**
+         * @description Pagination with `total` — opt-in for lists where `COUNT(*)` is index-only
+         *     and under 50 ms at p99.
+         */
         TotalPage_PortalMcpVirtualServer: {
             has_more: boolean;
             items: {
@@ -21242,26 +22143,37 @@ export interface components {
                  */
                 built_in: boolean;
                 /**
-                 * @description Aggregate per-user-OAuth connection state for the **current user**:
-                 *     - `none` — no `per_user_oauth` upstreams (nothing to connect).
-                 *     - `connected` — every `per_user_oauth` upstream has a present, unexpired
-                 *       credential for this user.
-                 *     - `needs_connection` — at least one `per_user_oauth` upstream is missing
-                 *       a credential or its credential has expired. The config is still valid
-                 *       to write; the user connects in the portal to make it live.
+                 * @description The headers the client must send itself (lowercased): the
+                 *     client-filled inputs of the routed upstreams.
+                 */
+                client_headers: string[];
+                /**
+                 * @description Aggregate connection state for the **current user**:
+                 *     - `none` — no upstream asks anything of the user (nothing to connect).
+                 *     - `connected` — on every such upstream the user holds a present,
+                 *       unexpired OAuth credential where one is needed and has filled every
+                 *       required input.
+                 *     - `needs_connection` — at least one is missing. The config is still
+                 *       valid to write; the user connects in the portal to make it live.
                  *
                  *     Both the web quickstart and the `ssai` CLI surface this so a
                  *     user is warned to connect first; keep the two in sync.
                  */
                 connection_status: string;
                 description?: string | null;
+                /**
+                 * @description `true` when one of those headers is `Authorization`: the gateway key
+                 *     then rides the `/fwd/{key}/mcp/<slug>` path.
+                 */
+                fwd_mount: boolean;
                 /** Format: uuid */
                 id: string;
                 name: string;
                 /**
-                 * @description `true` when at least one of this virtual server's routes points at a
-                 *     `per_user_oauth` upstream — i.e. the calling user must link their own
-                 *     account in the portal before requests through this server succeed.
+                 * @description `true` when at least one of this virtual server's routes points at an
+                 *     upstream that asks something of each user — a `per_user_oauth` one
+                 *     (link their own account) or one with required user-filled inputs —
+                 *     before requests through this server succeed.
                  */
                 requires_connection: boolean;
                 slug: string;
@@ -22153,6 +23065,12 @@ export interface components {
             clients?: string[] | null;
             /** @description The destination lists the sandbox attaches, each once. */
             destinations?: components["schemas"]["DestinationAttachment"][] | null;
+            /**
+             * @description What the portal hides for the profile's workspaces: the whole set — a
+             *     key left out is shown again. A key that is not a portal page is refused
+             *     (422) and nothing is written.
+             */
+            hidden_pages?: components["schemas"]["PortalPage"][] | null;
             settings?: components["schemas"]["SandboxSettingsPatch"] | null;
         };
         UpdateDestinationListRequest: {
@@ -22294,50 +23212,50 @@ export interface components {
             qos_class_id?: string | null;
         };
         /**
-         * @description Request body for editing a catalog entry. Omitted fields are unchanged and
-         *     `null` or `""` clears an optional text field;
-         *     editing a built-in flips it to a user entry so seed-sync stops overwriting it.
+         * @description Request body for editing a catalog entry. Omitted fields are unchanged;
+         *     `server_json` replaces the whole document. Editing a built-in flips it to
+         *     a user entry so seed-sync stops overwriting it.
          */
         UpdateMcpCatalogEntry: {
-            auth_mode?: string | null;
-            category?: string | null;
-            description?: string | null;
-            display_title?: string | null;
             enabled?: boolean | null;
-            featured?: boolean | null;
-            icon_url?: string | null;
+            server_json?: components["schemas"]["ServerJson"] | null;
+        };
+        /**
+         * @description Request body for editing a local server. Omitted fields are unchanged;
+         *     `launch` replaces the whole command line, except that a variable stored as
+         *     secret keeps the mark for as long as it exists: it is marked again whatever
+         *     the body says, and a value for it is refused. A variable the body no
+         *     longer carries is removed, mark included.
+         */
+        UpdateMcpLocalServer: {
+            /** @description Absent leaves it; `null` (or blank) clears it. */
+            description?: string | null;
+            enabled?: boolean | null;
+            launch?: components["schemas"]["LocalLaunch"] | null;
             name?: string | null;
-            oauth_authorization_url?: string | null;
-            oauth_default_scopes?: string[] | null;
-            oauth_issuer_url?: string | null;
-            oauth_revocation_url?: string | null;
-            oauth_token_url?: string | null;
-            repository_url?: string | null;
-            tools?: components["schemas"]["McpCatalogToolSchema"][];
-            transport?: string | null;
-            upstream_url?: string | null;
-            website_url?: string | null;
+            /**
+             * @description A local server keeps the slug it was created with: it is the server's
+             *     key in every client config already written. Any other value is refused
+             *     (`mcp_local_server_slug_immutable`).
+             */
+            slug?: string | null;
         };
         UpdateMcpUpstreamServer: {
             /**
              * @description Locked post-create — only accepted when equal to the existing value
              *     (idempotent passthrough). Any other value rejects with
-             *     `McpUpstreamAuthModeLocked`. Each mode carries a distinct credential
-             *     shape; flips would silently strand or drop credentials.
+             *     `McpUpstreamAuthModeLocked`.
              */
             auth_mode?: string | null;
             /** Format: int32 */
             connect_timeout_ms?: number | null;
-            /**
-             * @description Rotate the service-account bearer token. Empty string rejects with
-             *     `McpUpstreamCredentialRequired`; supplying any value on a
-             *     non-`service_account` row rejects with `McpUpstreamCredentialNotAllowed`.
-             *     Absent preserves the existing ciphertext.
-             */
-            credential?: string | null;
             /** @description `null` or `""` clears it; absent leaves it. */
             description?: string | null;
             enabled?: boolean | null;
+            /** @description NON-secret admin values: a value sets, `null` clears. */
+            inputs?: {
+                [key: string]: string | null;
+            };
             name?: string | null;
             oauth_authorization_url?: string | null;
             oauth_client_id?: string | null;
@@ -22353,10 +23271,24 @@ export interface components {
             /** @description Optional for every mode, so clearable: `null` or `""` clears it. */
             oauth_revocation_url?: string | null;
             oauth_token_url?: string | null;
+            remote?: components["schemas"]["Remote"] | null;
             /** Format: int32 */
             request_timeout_ms?: number | null;
-            transport?: string | null;
-            upstream_url?: string | null;
+            /** @description Secret admin values: a value sets, `""` clears, `null` keeps. */
+            secret_inputs?: {
+                [key: string]: string | null;
+            };
+            /**
+             * @description Re-finish the URL with these variable values, merged onto the stored
+             *     ones: a variable left out keeps its stored value; one the template
+             *     uses with neither a stored nor a sent value is refused (a default fills
+             *     one only at create and adopt). The URL is recomputed when this is present
+             *     or `remote.url` changes; a stored value of a variable the remote no
+             *     longer declares is dropped.
+             */
+            url_variables?: {
+                [key: string]: string;
+            } | null;
         };
         UpdateMcpVirtualRoute: {
             enabled?: boolean | null;
@@ -23466,6 +24398,11 @@ export interface components {
             a2a_agents: components["schemas"]["WorkspaceA2aAgent"][];
             /** @description Per-kind profile selections (`workspace_profile_assignments` → `profiles`). */
             assigned_profiles: components["schemas"]["AssignedProfile"][];
+            /**
+             * @description The local MCP servers (run on a member's own machine) the workspace is
+             *     handed.
+             */
+            mcp_local_servers: components["schemas"]["WorkspaceMcpLocalServer"][];
             mcp_servers: components["schemas"]["WorkspaceMcpServer"][];
             /** Format: int64 */
             member_count: number;
@@ -23520,6 +24457,15 @@ export interface components {
             tenant_default_daily_budget: number;
             /** Format: double */
             tenant_default_monthly_budget: number;
+        };
+        /** @description A local MCP server granted to a workspace. */
+        WorkspaceMcpLocalServer: {
+            description?: string | null;
+            enabled: boolean;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            slug: string;
         };
         WorkspaceMcpServer: {
             description?: string | null;
@@ -31257,6 +32203,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description An entry with this source_name exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Internal server error */
             500: {
                 headers: {
@@ -31514,6 +32469,15 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Name or slug taken */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -32232,6 +33196,281 @@ export interface operations {
             };
         };
     };
+    list_mcp_local_servers: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. Default 50, capped at `MAX_LIMIT`. */
+                limit?: number;
+                /** @description Number of items to skip from the beginning. Default 0. */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local MCP servers, by name */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OffsetPage_McpLocalServer"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    create_mcp_local_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateMcpLocalServer"];
+            };
+        };
+        responses: {
+            /** @description Local server created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpLocalServer"];
+                };
+            };
+            /** @description Bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description A workspace to grant it to was not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Slug taken */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    get_mcp_local_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local server ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local MCP server */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpLocalServer"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    delete_mcp_local_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local server ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local server deleted, with its workspace grants */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    update_mcp_local_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Local server ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateMcpLocalServer"];
+            };
+        };
+        responses: {
+            /** @description Local server updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpLocalServer"];
+                };
+            };
+            /** @description Bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
     list_oauth_clients: {
         parameters: {
             query?: {
@@ -32682,6 +33921,47 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description Built-in; a client header another upstream on a shared virtual server reads; or a client-filled Authorization on an upstream routed on an OAuth sign-in virtual server */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    test_mcp_upstream_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Upstream server ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description What the test call to the upstream returned */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpUpstreamTestResult"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
         };
     };
     list_mcp_upstream_connections: {
@@ -32690,8 +33970,8 @@ export interface operations {
                 limit?: number;
                 offset?: number;
                 /**
-                 * @description When false, only return rows for users who have actually connected.
-                 *     Default true (full per-user-OAuth admin view = connected + disconnected).
+                 * @description When false, only return rows for users who have an OAuth credential
+                 *     or filled inputs. Default true (connected + disconnected).
                  */
                 include_disconnected?: boolean;
             };
@@ -32704,13 +33984,22 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Per-user OAuth connection state for this upstream */
+            /** @description Per-user connection state for this upstream */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["OffsetPage_McpUpstreamUserConnection"];
+                };
+            };
+            /** @description Users do not connect to this upstream */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
             /** @description Unauthorized */
@@ -32840,7 +34129,7 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
-            /** @description Prefix collision */
+            /** @description Prefix collision, a client header collision, or a client-filled Authorization on an OAuth sign-in virtual server */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -33125,6 +34414,15 @@ export interface operations {
             };
             /** @description Not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description OAuth slug taken in another tenant, or an upstream routed here reads the client's own Authorization */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -33469,7 +34767,7 @@ export interface operations {
                     "application/json": components["schemas"]["Profile"];
                 };
             };
-            /** @description Validation failed */
+            /** @description Validation failed, or a start the kind does not take */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -33809,6 +35107,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description Another profile was set as default at the same time */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Internal server error */
             500: {
                 headers: {
@@ -33938,6 +35245,15 @@ export interface operations {
             };
             /** @description Profile not found / not a client-access profile */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description The body does not parse — a `hidden_pages` key that is not a portal page among them (`validation_failed`); nothing is written */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -40312,6 +41628,15 @@ export interface operations {
                     "application/json": components["schemas"]["Workspace"];
                 };
             };
+            /** @description Validation failed, or a profile choice the kind does not take */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Not found */
             404: {
                 headers: {
@@ -40485,6 +41810,149 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkspaceLimitsOverview"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    list_workspace_mcp_local_servers: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. Default 50, capped at `MAX_LIMIT`. */
+                limit?: number;
+                /** @description Number of items to skip from the beginning. Default 0. */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Granted local MCP servers */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OffsetPage_WorkspaceMcpLocalServer"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    add_mcp_local_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AddMcpLocalServerRequest"];
+            };
+        };
+        responses: {
+            /** @description Local MCP server granted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description The Agent or the Inline AI workspace: it has no developers */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    remove_mcp_local_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                id: string;
+                /** @description Local server id */
+                server_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local MCP server removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
                 };
             };
             /** @description Not found */
@@ -42895,6 +44363,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description The Requests page is hidden for the caller's workspaces (`portal_page_hidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Internal server error */
             500: {
                 headers: {
@@ -42926,6 +44403,15 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Both the Sessions and the Requests page are hidden for the caller's workspaces (`portal_page_hidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -42990,6 +44476,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Blob not found or not owned */
             404: {
                 headers: {
@@ -43030,6 +44525,15 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -43093,6 +44597,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Request not found or not owned */
             404: {
                 headers: {
@@ -43137,6 +44650,15 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -43363,9 +44885,9 @@ export interface operations {
         parameters: {
             query?: {
                 /**
-                 * @description The workspace picked in the portal header: its limits feed the
-                 *     warnings, and its team block is answered to a manager. Absent = no
-                 *     workspace block (a caller with no membership yet).
+                 * @description The workspace picked in the portal header: its limits are answered,
+                 *     and its team block to a manager. Absent = no workspace block (a caller
+                 *     with no membership yet).
                  */
                 workspace_id?: string;
             };
@@ -43693,9 +45215,120 @@ export interface operations {
             };
         };
     };
+    portal_update_mcp_inputs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Upstream MCP server id */
+                upstream_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PortalUpdateMcpInputs"];
+            };
+        };
+        responses: {
+            /** @description The caller's values were saved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResponse"];
+                };
+            };
+            /** @description An input the administrator sets, one the caller cannot set, or a value its declaration refuses */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description No virtual server the caller's workspaces reach asks the caller for this upstream */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description No such upstream */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    portal_list_mcp_local_servers: {
+        parameters: {
+            query?: {
+                /** @description Maximum number of items to return. Default 50, capped at `MAX_LIMIT`. */
+                limit?: number;
+                /** @description Number of items to skip from the beginning. Default 0. */
+                offset?: number;
+                /**
+                 * @description Only the servers this workspace is handed — what a configuration made
+                 *     for it can carry. The caller must be a member. Left out: every server
+                 *     any of the caller's workspaces is handed (an `ak-` key: its bound
+                 *     workspace's).
+                 */
+                workspace_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local MCP servers the user's workspaces are handed — or the one workspace named — by slug */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TotalPage_PortalMcpLocalServer"];
+                };
+            };
+            /** @description Unauthorized */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not a member of the workspace named, or a key bound to another */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
     portal_list_mcp_virtual_servers: {
         parameters: {
             query?: {
+                /**
+                 * @description Only the virtual servers this workspace grants — what a configuration
+                 *     made for it can use. The caller must be a member. Left out: every
+                 *     virtual server any of the caller's workspaces grants (an `ak-` key: its
+                 *     bound workspace's).
+                 */
+                workspace_id?: string;
                 /** @description Maximum number of items to return. Default 50, capped at `MAX_LIMIT`. */
                 limit?: number;
                 /** @description Number of items to skip from the beginning. Default 0. */
@@ -43707,7 +45340,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Virtual servers the user's workspaces allowlist, by slug */
+            /** @description Virtual servers the user's workspaces allowlist — or the one workspace named — by slug */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -43718,6 +45351,15 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not a member of the workspace named, or a key bound to another */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -43899,20 +45541,37 @@ export interface operations {
     };
     portal_quickstart_list_clients: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description The workspace whose clients are read: what it is offered depends on the
+                 *     client-access profile assigned to it. Required for a signed-in member,
+                 *     who must belong to it. An `ak-` key answers for the workspace it is
+                 *     bound to: it may leave this out, and is refused another workspace.
+                 */
+                workspace_id?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Compatible client profiles for this user */
+            /** @description The client profiles the workspace is offered, each marked compatible or not with what the workspace grants */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["ListClientsResponse"];
+                };
+            };
+            /** @description No workspace named */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
             /** @description Unauthorized */
@@ -43924,11 +45583,28 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description Not a member of the workspace, or a key bound to another */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
         };
     };
     portal_quickstart_get_client: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description The workspace whose clients are read: what it is offered depends on the
+                 *     client-access profile assigned to it. Required for a signed-in member,
+                 *     who must belong to it. An `ak-` key answers for the workspace it is
+                 *     bound to: it may leave this out, and is refused another workspace.
+                 */
+                workspace_id?: string;
+            };
             header?: never;
             path: {
                 /** @description Client profile id (e.g. 'claude-code') */
@@ -43947,8 +45623,26 @@ export interface operations {
                     "application/json": components["schemas"]["ClientProfile"];
                 };
             };
+            /** @description No workspace named */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Not a member of the workspace, a key bound to another, or a client the workspace is not offered */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -44111,6 +45805,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Internal server error */
             500: {
                 headers: {
@@ -44158,6 +45861,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
+            /** @description The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`) */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
             /** @description Session not found or not owned */
             404: {
                 headers: {
@@ -44198,6 +45910,15 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`) */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

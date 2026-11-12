@@ -15,6 +15,7 @@
   import CimdClientsCard from '#lib/components/mcp/CimdClientsCard.svelte';
   import WebSettingsTab from '#lib/components/mcp/WebSettingsTab.svelte';
   import CatalogTab from '#lib/components/mcp/CatalogTab.svelte';
+  import LocalServersTab from '#lib/components/mcp/LocalServersTab.svelte';
   import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
   import { useTabState } from '#lib/hooks.svelte.js';
 
@@ -28,8 +29,8 @@
   type OauthClientRow = components['schemas']['OauthClientRow'];
   type CimdClientRow = components['schemas']['CimdClientRow'];
 
-  type Tab = 'endpoints' | 'oauth' | 'upstream-servers' | 'catalog' | 'tokens' | 'web';
-  const TABS = ['endpoints', 'oauth', 'upstream-servers', 'catalog', 'tokens', 'web'] as const satisfies readonly Tab[];
+  type Tab = 'endpoints' | 'oauth' | 'upstream-servers' | 'local-servers' | 'catalog' | 'tokens' | 'web';
+  const TABS = ['endpoints', 'oauth', 'upstream-servers', 'local-servers', 'catalog', 'tokens', 'web'] as const satisfies readonly Tab[];
   const tab = useTabState<Tab>(TABS, 'endpoints');
 
   let upstreams = $state<UpstreamRow[]>([]);
@@ -349,6 +350,7 @@
     { id: 'endpoints', label: 'Endpoints' },
     { id: 'oauth', label: 'OAuth' },
     { id: 'upstream-servers', label: 'Upstream Servers' },
+    { id: 'local-servers', label: 'Local Servers' },
     { id: 'catalog', label: 'Catalog' },
     { id: 'tokens', label: 'Tokens' },
     { id: 'web', label: 'Web' },
@@ -358,9 +360,9 @@
 >
   {#snippet description()}
     Operator-defined endpoints exposed at
-    <code class="bg-(--bg-primary) px-1.5 py-0.5 rounded-sm text-(--text-primary)">/mcp/&lt;slug&gt;</code>. All four upstream
-    auth modes — <code>no_auth</code>, <code>service_account</code>,
-    <code>per_user_oauth</code>, and <code>byot</code> — are honored end-to-end.
+    <code class="bg-(--bg-primary) px-1.5 py-0.5 rounded-sm text-(--text-primary)">/mcp/&lt;slug&gt;</code>. Each upstream
+    declares the headers it needs — filled by you, by each user in the portal, or by the client on every
+    request — optionally with each user's own OAuth sign-in.
   {/snippet}
 
   {#snippet children(active: Tab)}
@@ -411,6 +413,8 @@
         onDelete={(row: UpstreamRow) => (pendingDeleteUpstream = row)}
         onToggleEnabled={toggleUpstreamEnabled}
       />
+    {:else if active === 'local-servers'}
+      <LocalServersTab />
     {:else if active === 'catalog'}
       <CatalogTab onConfigureOauth={configureAdoptedOauth} />
     {:else if active === 'tokens'}

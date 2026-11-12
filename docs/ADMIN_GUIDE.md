@@ -386,7 +386,9 @@ One person can hold either or both. The **+ Add** button grants whichever you pi
 dialog on each card changes the display name, password, and access level per capability — picking
 **No access** and saving removes that side permanently, after a confirmation that previews the
 impact (deleted console account, deleted user and revoked keys). **Disable** on the card suspends a
-capability reversibly; a disabled console account stays disabled even when your identity provider or
+capability reversibly (disabling a user also disconnects them from every MCP server they
+connected: their OAuth sign-ins and the values they entered are deleted, so they connect again
+after **Enable**); a disabled console account stays disabled even when your identity provider or
 authentication proxy still signs the person in — only **Enable** restores it (an account switched
 off because it lost its console group follows the group: it comes back on its own once the group is
 regained, so keep such a person out by removing them from the group in your identity provider). Workspace membership and the member/manager role are managed on the
@@ -1200,8 +1202,9 @@ A workspace is where access, budget, and key issuance come together.
    When the organisation, a workspace, a member, or a key crosses ~80% (approaching) or reaches 100% (breached) of its
    budget for the current window, the gateway records an operator notification — once per
    crossing, so you're alerted when a budget gets tight, not on every check. Major session
-   alerts from the review agent, and **API keys within 7 days of expiry** (so you can rotate
-   before they break), are recorded the same way. These notifications surface in the
+   alerts from the review agent, **API keys within 7 days of expiry** (so you can rotate
+   before they break), and **MCP servers every call fails on** (an administrator value missing
+   or unreadable, an incomplete OAuth client) are recorded the same way. These notifications surface in the
    **Notifications feed on the dashboard Overview** (scoped to the selected workspace, newest
    first; each row links to where you act on it) and in the operator log; deliverable channels
    (webhook, email) are on the roadmap.
@@ -1376,7 +1379,8 @@ A workspace is where access, budget, and key issuance come together.
        follows an engine that slows or speeds up — and measures afresh when the engine restarts (a
        change of its settings or model takes a restart). Until an engine has run at that low load
        long enough to measure, it has no target: the QoS tab and the dashboard say the target is
-       still learning. An engine that is never that lightly loaded is never held to one; choose a
+       still learning, and they say so until every gateway replica has measured its own, since a
+       replica still measuring holds nothing. An engine that is never that lightly loaded is never held to one; choose a
        **Fixed** target in milliseconds for it, or for a target of your own. **Off** lets the limit
        grow as far as memory holds. A fixed target the engine misses even with one request running
        holds the limit at one until the target is raised.
@@ -1479,7 +1483,10 @@ A workspace is where access, budget, and key issuance come together.
    disable that policy for the workspace; **Manage →** opens the profile's editor. Every policy
    page works the same way: a **Profiles** card list (the first tab) where you create profiles
    and open a card to edit it — under **Governance → Policy** (tool), **Guardrail**,
-   **Transforms**, and **Experts**.
+   **Transforms**, and **Experts**. A fifth selector, **Portal & clients**, picks which clients the
+   portal and the CLI offer this workspace's members and what their sandbox may reach
+   (see [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)): the Default or a profile, with no **Off** — and it is not shown on the Agent and
+   Inline AI workspaces, which stay on the Default.
 
 ### 3b. Inline AI — connect an inline gateway
 
@@ -1531,10 +1538,9 @@ ways, with one key, and usually uses both:
   LLM gateway's **Pass-through** tab) and grant it to the Inline AI workspace. A redirecting gateway
   names the provider host the client was talking to, and Streamscope then forwards only to the
   pass-through serving that host: traffic for a provider not granted is refused, so a client's key for
-  one provider never reaches another. **Configure the gateway to always name the host**: a request
-  that names none is sent to the workspace's only pass-through, or to the one pass-through speaking
-  the request's API format, whichever provider the client's key was issued by — and refused when
-  neither picks one. Nothing is granted there by default. A redirected request lands in the audit log
+  one provider never reaches another. **The gateway must name the host** (`X-Origin-Host`): a
+  redirected request that names none is refused, since nothing else says which provider issued the
+  client's key. Nothing is granted there by default. A redirected request lands in the audit log
   like any pass-through request, in the Inline AI workspace, with the end client's address, user and
   groups the gateway reported.
 - **Least privilege by construction.** For analysis only, grant the Inline AI workspace **no
@@ -1706,16 +1712,74 @@ Extend the same auth, audit, policy, and budget controls to Model Context Protoc
 Agents connect to a per-tenant `/mcp/<slug>` endpoint that fans out to one or more upstream
 MCP servers.
 
-1. **Add an MCP upstream server** — name, URL, transport, and **auth mode**:
+1. **Add an MCP upstream server** — a name, the server's address, the **headers** it expects,
+   and whether users also sign in to it with **OAuth**. A server is described the way the MCP
+   Registry describes it (a `server.json` remote): its URL, which may contain `{variables}`
+   you fill once, and a list of headers, each either a value on its own (an `X-Api-Key`) or a
+   template such as `Bearer {token}`. For every value, you choose **who fills it**:
 
-   | Mode | Who holds the credential |
-   |---|---|
-   | `no_auth` | none (public/local upstreams) |
-   | `service_account` | operator — a shared bearer token, encrypted at rest |
-   | `per_user_oauth` | each portal user, via their own OAuth dance |
-   | `byot` | the agent forwards its own bearer (single-route only) |
+   | Filled by | Where the value lives | Typical use |
+   |---|---|---|
+   | **Administrator** | entered here, encrypted at rest, locked — no user can see or change it | a shared token, a server URL, a region |
+   | **Each user** | entered by each user in **Portal → Sign-ins**, encrypted at rest, one value per user | a personal access token |
+   | **The client** | sent by the user's MCP client on every call, never stored | a token the client already holds |
 
-   **How `per_user_oauth` works.** You register **one** OAuth application with the provider
+   A server with no headers needs no credential. **Bearer token (shared)** is a ready-made
+   setup for the common case of one shared token: an `Authorization: Bearer {token}` header
+   filled by the administrator. A value marked secret is never shown again after you save it;
+   you can replace it or clear it. An optional value nobody filled is simply not sent.
+
+   **Address variables.** A variable in the server's address takes a plain value (a site or
+   tenant name, a port): `/`, `?`, `#`, `@`, `\` and spaces are refused, so a value cannot add a
+   path, a query or a login to the address. A variable that forms the host itself still names
+   whatever host you give it — only administrators fill these. A variable you leave empty takes
+   its default, where it declares one. The server keeps the values its address was built from and
+   shows them in its edit form: change one and the others keep theirs. Changing the address
+   template keeps the values of the variables it still has, drops those it no longer has, and
+   asks for a value for any variable it adds — a default fills a variable only when the server is
+   first added. When a server's address moves to another host,
+   every value users entered for it is deleted: each user enters theirs again for the new server.
+
+   **Lock addresses.** When a header carries an address the server will call (a Jira or
+   Confluence URL, for example), have the administrator fill it. A user-filled address lets
+   the server reach any host its user names, and the gateway's own egress controls never see
+   that call.
+
+   **Worked example — a Jira and Confluence server using personal access tokens.** The server
+   expects `X-Jira-Url`, `X-Jira-Token`, `X-Confluence-Url` and `X-Confluence-Token`. Declare
+   the four headers (both tokens secret), set the two URLs to **Administrator** and enter your
+   company's addresses, and set the two tokens to **Each user**. Grant the endpoint to a
+   workspace; each user then opens **Portal → Sign-ins**, sees only the two token fields
+   (the addresses are yours: users never see them), pastes their own tokens, and their calls
+   carry all four headers. Until a user has entered their tokens, the server's tools are left out
+   of that user's tool list, and calling one directly answers "connect this server first" instead
+   of failing. If the server runs on your own network, a
+   platform super-admin adds its host to the **MCP** egress list (section **A**, *Egress*).
+
+   **Values the client sends.** A header set to **The client** is read from the user's own MCP
+   client on every call and forwarded to that server only — no other header the client sends
+   ever reaches the upstream. The client calls the usual `/mcp/<slug>` address with its gateway
+   key. The one exception is a client-sent `Authorization` header: it would collide with the
+   gateway key, so such an endpoint is reached at `/fwd/<gateway key>/mcp/<slug>` instead, and the
+   generated client configuration uses that address. Two servers attached to the same endpoint
+   cannot both expect the same client header — the gateway could not tell whose it is — so
+   attaching the second one is refused. For the same collision, a server that expects the
+   client's own `Authorization` cannot be attached to an endpoint with **Spec OAuth** sign-in
+   (step 4): a signed-in client spends its `Authorization` on the gateway's token, so it could
+   never reach that server. Attaching one, turning sign-in on for an endpoint that has one, or
+   editing an attached server so that its client fills `Authorization` is refused — the message
+   names the endpoint and the server. The gateway keeps no long-lived connection open to such
+   a server for notifications, since it cannot reconnect without the client — and for the same
+   reason a legacy SSE server (transport SSE) cannot take a value from the client. A value the
+   client sends that the header does not accept (outside its choices, say) is refused as missing,
+   never replaced by the default.
+
+   **OAuth** can be combined with headers: the user's OAuth token then travels as
+   `Authorization: Bearer`, so on such a server you cannot also declare an `Authorization`
+   header. Whether a server uses OAuth is chosen when you add it and cannot be switched later —
+   remove the server and add it again to change it.
+
+   **How per-user OAuth works.** You register **one** OAuth application with the provider
    (for example a single GitHub OAuth App) — it identifies *the gateway*, not any person, and
    you set it up once. Each portal user then links their **own** account from **Portal →
    Sign-ins**: they're sent to the provider to sign in and approve, and the gateway keeps a
@@ -1728,7 +1792,7 @@ MCP servers.
    flow — a provider "device flow" option is neither used nor required, and enabling it does no
    harm.
 
-   For `per_user_oauth`, paste the server URL and click **Discover endpoints**: the gateway
+   For OAuth, paste the server URL and click **Discover endpoints**: the gateway
    reads the server's published OAuth metadata and fills in the authorization, token and
    revocation URLs plus default scopes for you to review before saving. Most modern remote
    MCP servers publish this; for one that doesn't, enter the URLs by hand. If the server
@@ -1755,6 +1819,26 @@ MCP servers.
    whose client is still incomplete is flagged in the **Upstream servers** list — open
    **Edit** to add the Client ID and Secret.
 
+   **Test** a server from the **Upstream servers** list: the gateway connects to it with the
+   values you filled — no user's and no client's — and shows the tools, prompts and resources it
+   offers, or why it could not connect. A server that needs a value each user or the client
+   supplies is not called: the result names the values it is waiting for (users enter theirs in
+   **Portal → Sign-ins**; use the portal's **Try a server** page to test as a user). An OAuth
+   server is likewise reported as needing a user's sign-in. Each such result says who acts and
+   where: each user enters their values, or signs in, once under **Portal → Sign-ins**; a value
+   the client sends is written into its configuration by the portal Quickstart and `ssai
+   provision`. A value only you can set (missing, or stored with a key the gateway can no
+   longer read) is reported with an **Open settings** button. Like the portal test, it never
+   follows a redirect, and it is recorded in the audit log.
+
+   Each server's card lists every header it declares and who fills it — **Administrator**,
+   **Each user** or **The client** — and flags a required administrator value that is not set:
+   every call to that server fails until it is. The gateway also records an operator
+   notification (*MCP server cannot be called*) for an enabled server in that state, or with
+   an incomplete OAuth client, linking to the server. It waits ten minutes after the server's
+   last edit, so a server you are still setting up does not notify; it fires once, and again
+   only if a later change to the server's values still leaves it unusable.
+
 2. **Create a virtual endpoint** — a short slug reachable at `/mcp/<slug>`. Attach one or
    more upstreams; give each a namespace prefix when attaching several. A prefix is up to 16
    lowercase letters, digits and single underscores, starts with a letter and does not end in an
@@ -1763,8 +1847,8 @@ MCP servers.
    contain `__` — except a name that starts like another attached upstream's `<prefix>__`: a call
    to it would reach that other upstream, so the endpoint does not list it.
 3. **Grant the endpoint to a workspace** — add it to the workspace **MCP allowlist** (step
-   3.3). Keys reach an endpoint only when allowlisted. An endpoint that routes a
-   `per_user_oauth` server with an incomplete OAuth client can't be allowlisted until you
+   3.3). Keys reach an endpoint only when allowlisted. An endpoint that routes an OAuth
+   server with an incomplete OAuth client can't be allowlisted until you
    finish configuring the client — it is not offered, and the Access tab says how many are left
    out and why.
 4. **(Optional) Spec OAuth** — enable OAuth 2.1 on the endpoint and register OAuth clients
@@ -1787,26 +1871,145 @@ MCP servers.
    Turning it off also tells clients so in the endpoint's published details, so a client
    that would have used it registers normally instead of failing.
 
-The **Catalog** tab browses a curated, built-in list of well-known remote MCP servers
-(name, description, category, tools, and the authentication each needs). Search and filter
-by category or auth mode, and open an entry to review its endpoint, tools, and OAuth scopes.
+The **Catalog** tab browses a curated, built-in list of well-known MCP servers reached at an address
+(name, description, category, tools, the headers each expects and whether it uses OAuth).
+Each entry is a standard MCP Registry `server.json` document — you can view it as such.
+Search and filter by category or by the kind of authentication (none, API key, headers, OAuth),
+and open an entry to review its endpoint, headers, tools, and OAuth scopes. An entry you have
+already adopted is marked **Adopted**, with the servers created from it; each server keeps that
+link until the entry is removed (resetting the catalog keeps it).
 
-**Adopt** an entry to wire it up in one click: it creates the upstream server, an endpoint
+**Adopt** an entry to wire it up in one action: it creates the upstream server, an endpoint
 (`/mcp/<slug>`, slug pre-filled and editable), and the route connecting them — collapsing
-the four manual steps above into one action. The adopt dialog asks only for what the
-server's auth mode needs (a service-account token, or the OAuth client ID and secret) and
+the four manual steps above into one action. The adopt dialog asks for what the server
+needs: the values of any `{variables}` in its address, **who fills each header value**
+(administrator, each user, or the client — address-like values default to the administrator)
+and the administrator's values, and for an OAuth server the OAuth client ID and secret. It
 lets you grant the new endpoint to workspaces right away; everything stays editable on the
-other tabs afterward. For a `per_user_oauth` server you can **Register client
-automatically** here too (for providers that support it), or enter the client ID and
-secret by hand; either way they become **required when you also pick a workspace to grant**
-— adopt without selecting a workspace to stage the server and add the client later (you'll
-be taken straight to its OAuth form to finish).
+other tabs afterward. For an OAuth server you can **Register client automatically** here too
+(for providers that support it), or enter the client ID and secret by hand; either way they
+become **required when you also pick a workspace to grant** — adopt without selecting a
+workspace to stage the server and add the client later (you'll be taken straight to its OAuth
+form to finish).
 
-Use **New entry** to add your own server to the catalog, and **Edit** to change any entry —
-editing a built-in turns it into your own copy, so it's no longer overwritten when the
-catalog is updated (and returns to the shipped version only if you reset). You can also
-**remove** an entry (a removed built-in stays gone) or **reset** the catalog to its shipped
-state — none of these affect servers you've already adopted.
+Use **New entry** to add your own server to the catalog — paste the server's `server.json`
+document (many MCP servers publish one; the MCP Registry hosts thousands) or fill in the form —
+and **Edit** to change any entry. Editing a built-in turns it into your own copy, so it's no
+longer overwritten when the catalog is updated (and returns to the shipped version only if you
+reset). You can also **remove** an entry (a removed built-in stays gone) or **reset** the
+catalog to its shipped state — none of these affect servers you've already adopted.
+
+**Local MCP servers** — the **Local Servers** tab. Some MCP servers do not live at an address:
+they run on the developer's own machine, started by the developer's client (a browser driver, a
+repository indexer, an in-house tool). You keep them in the same place as the others, with the
+same lifecycle: describe one, grant it to workspaces, and it is written into each member's client
+configuration.
+
+- **What you store is a command line**: the command, its arguments, and its environment
+  variables. Anything the developer's machine can start is a local server — a program on the
+  `PATH`, a script, `docker run …`. Each argument is one argument: nothing goes through a shell.
+  **Some clients expand variable-looking text in a value** when they read their configuration
+  (`${VAR}`, `$VAR`, `{env:X}`), so what you type is not always what runs — avoid such text unless
+  you mean it. **The command must be installed on each developer's machine**: `npx` comes with
+  Node.js, `uvx` with uv; nothing installs them for the developer. On Windows some clients cannot
+  start `npx` or `uvx` directly and need the command wrapped (`cmd` with `/c npx …`): give Windows
+  developers a server of their own with that command, or have them edit the written entry.
+- **Add one by hand** with **New local server** — type the command, its arguments and its
+  variables row by row, or paste a whole command line (`LOG_LEVEL=info npx -y some-server
+  --port 8080`) into **Paste a command line** and let the form split it into those rows, which
+  stay editable. The line is ONE command, quoted where a value holds a space: one that needs a
+  shell — a pipe, `&&`, `;`, a redirection, `$(…)`, a comment — is refused and changes nothing,
+  because nothing goes through a shell on the developer's machine. Or add one **from the
+  catalog**: a catalog entry whose
+  `server.json` declares `packages` offers **Add as local server** for each package. Adopting a
+  package only prefills the form, and only what is safe to derive from someone else's document.
+  An npm package becomes `npx -y <package>@<version>` and a PyPI package `uvx <package>==<version>`,
+  followed by the package's own fixed arguments (a flag with no value is written as the flag). Its
+  environment variables are prefilled too: one with a fixed value keeps it, a required one with
+  none is left for each developer, and an optional one with none is left out. Any other package
+  opens the same form with the command empty and a line saying why, and you type it: a container
+  image, a NuGet or MCPB package, one that pins no version, one that does not run over stdio, one
+  that names its own program to run instead of `npx` / `uvx` or passes arguments to the runner
+  itself (they decide what it runs), one with an argument left to the user, and one whose values
+  hold text a client would expand (`$…`, `{env:…}`, a backtick). You can
+  edit the name and the slug before adopting; a slug you choose that is already in use is refused,
+  while one derived for you is made unique. Paste a `server.json` from the MCP Registry with **New
+  entry** to get such an entry; a document may declare a remote address, packages, or both, and one
+  with neither is refused. The shipped catalog lists servers reached at an address only.
+- **No secret goes through the gateway to a configuration file.** An environment variable either
+  holds a plain value you set (a log level, a region), or is **left for each developer**: their
+  configuration is written with a `<paste-your-…-here>` placeholder, they replace it with their
+  own value, and a later update keeps what they pasted. A variable marked **secret** — by you,
+  with its checkbox, or by the package's own description — holds no value here, and keeps the
+  mark for as long as it exists on the server: an edit cannot clear it or give it a value.
+  Removing the variable removes the mark with it. The mark guards against a mistake; it does not
+  stop an administrator from typing a secret into another field, so do not. Values a developer
+  supplies live in the environment only; arguments are always fixed.
+- **Grant it** when you create or adopt it (**Grant to workspaces**), or later on the workspace
+  page under **Local MCP servers**, exactly like an MCP endpoint; the Local Servers list shows
+  the workspaces each server is granted to. The Agent and Inline AI workspaces cannot be granted
+  one: they have no developers. Members of a granted workspace see the server in the portal
+  Quickstart, below the gateway's servers and marked as running on their machine, with its whole
+  command line (your environment values included); `ssai provision` proposes it too. A setup
+  that gets only local servers needs no gateway key, and none is created for it.
+- **Turning one off, revoking its grant or deleting it reaches each developer at their next
+  `ssai sync`**: the whole entry is removed from the client configurations the CLI wrote — the
+  value the developer pasted into it included — the sync says which server was removed, and
+  everything else in those configurations is kept (a client set up for MCP servers only, whose
+  last server this was, simply has nothing more written for it until it is given one again). The one
+  exception is an entry that was already in the developer's file under that name before the
+  server was first written there: it was theirs, so the sync takes out only what it wrote and
+  they did not change, leaves the rest in place and names it. A developer who
+  copied the entry from the Quickstart by hand removes it by hand. Until then the server keeps
+  starting on that machine — the gateway is not on its path and cannot stop it.
+- **The slug** is the server's name in the client's configuration and the prefix of its tool
+  names. It is fixed when the server is created — configurations already written hold the server
+  under it — so the edit form shows it read-only: to change it, delete the server and add it
+  again under the new slug. A local server cannot take the slug of an MCP endpoint, and a configuration is never
+  written with two servers under one name: selecting an endpoint and a local server that share a
+  slug for the same client is refused.
+- **Which clients can be given one.** Claude Code (in a project: the server is written to the
+  project's own MCP file, so provision it from inside the project), Claude Desktop, Cursor, Cline,
+  Codex, Continue, Crush, Gemini CLI, Goose, Mistral Vibe, OpenCode and Qwen Code. Aider, Zed and
+  the curl / SDK snippets take no MCP server; Claude Code outside a project, and its MCP-only
+  setups, register servers with a command of their own rather than a file, and are not given
+  local ones. For those the server is left out and the Quickstart and the CLI say so; nothing is
+  dropped silently. A client template you edit yourself declares whether it writes local servers
+  (**Local MCP servers** on the template).
+
+**What the gateway does not see.** A local server talks to the client directly, on the
+developer's machine. Its calls never reach the gateway: they are not in the MCP audit, the MCP
+dashboard or a session's MCP timeline, and MCP-side policy (which endpoint a key may address,
+resource and prompt rules) does not apply to them. What the gateway does see is the model: when
+the model asks to call one of the server's tools, that request passes through the LLM gateway
+like any tool call, so **tool rules still apply** — a rule with a server filter matches the
+tool's `mcp__<slug>__…` name — and the call appears in the conversation. Choose a local server
+for what must run beside the developer's files; prefer an MCP endpoint when you need the audit.
+
+**A command you save runs on developers' machines.** Treat this tab like a client template:
+only administrators can edit it, every change is in the admin audit log (an adopted package's
+derived command included), and the developer is shown the whole launch — `ssai provision` prints
+each local server's command line, with the environment values you set, before it writes anything;
+`ssai sync` prints it again whenever you change the command, an argument or one of those values,
+as it applies the change; and the Quickstart shows it beside the configuration the member copies.
+The line is written so that it can be pasted into a shell as it stands.
+
+**Local servers and the sandbox** (`ssai run --sandbox …`):
+
+| Sandbox | What happens to a local server |
+|---|---|
+| **Native** | The server is started by the client, so it is confined with it: same files, same network rules. A server that downloads itself on first start (`npx`, `uvx`) needs the npm or PyPI destination list attached to the sandbox, or the download is refused. |
+| **Container** | The command runs inside the container image: its runner must exist there (`npx` does; `uvx` is not there by default), and a path on the developer's machine does not exist inside it. |
+| **Either, for a server started through a container engine** (`docker run …`) | The engine starts the server, not the client, so no sandbox confines it. |
+
+`ssai provision` prints the lines that apply to each local server it adds.
+
+**Test a server** from the portal's **Try a server** page (step 10): it
+connects as that user — your values plus theirs — and reports the tools each upstream offers,
+or why it could not connect. A server that needs a value the client sends cannot be fully
+tested there, and the result says so. The test never follows a redirect: a server that answers
+with one is reported as redirected, so the test never sends a header to a host you did not
+configure.
 
 ### 5b. A2A gateway — **Gateways → A2A** page
 
@@ -2481,7 +2684,7 @@ Identifies the **AI clients/apps** hitting the gateway and serves them per-app o
   laptop that does not require disabling the person's whole account. Filter by lifecycle (active,
   revoked, expired) to audit what is still live.
 
-### 9c. Client access & destinations — **Governance → Client access** / **Destinations**
+### 9c. Portal & clients, and destinations — **Governance → Portal & clients** / **Destinations**
 
 **Destinations** holds the organization's **destination lists**: named sets of network destinations
 that something else attaches, each either as **allow** or as **block**. A list says nothing by itself —
@@ -2509,14 +2712,55 @@ makes it yours (upgrades leave it alone), **Reset** puts it back, deleting it hi
 detaches it everywhere — except the Web tool's only allowed list, whose deletion is refused: without it
 the Web tool would pass every public site. Detach it on the Web tab first.
 
-**Client access** decides what the portal and the CLI offer, for every workspace (one organization-wide
-profile, the **Default**; per-workspace profiles are not offered yet):
+**Portal & clients** decides what the portal and the CLI offer, per workspace. The page lists the
+**profiles**: the **Default**, which applies to every workspace with no profile of its own, and the
+profiles you create for a team. Each line says which workspaces the profile is **used by** and how
+many clients it offers.
+
+- **New profile** makes an independent copy — of the Default unless you pick another profile, or a
+  fresh one that offers every client and attaches no destination list. A profile owns its whole
+  content: a later change to the Default does not reach it, and a change to it does not reach the
+  Default. The one thing profiles share is a destination list's entries — a profile attaches a list,
+  it does not copy it, so editing the list on **Destinations** reaches every profile that attaches it.
+- **Assign** a profile on the workspace's **Access** tab (**Portal & clients**: the Default or a
+  profile). There is no **Off**: a workspace always has a set of clients and sandbox rules. The Agent
+  and Inline AI workspaces cannot be given a profile; they stay on the Default.
+- **Delete** removes a profile; the workspaces it was assigned to go back to the Default. The Default
+  itself cannot be deleted.
+- **Set as default** makes another profile the Default, as it stands — nothing of the previous Default
+  is merged into it, and the previous Default stays in the list as an ordinary profile with its
+  content. Every workspace with no profile of its own, and the Agent and Inline AI workspaces, follow
+  it: the portal Quickstart the next time it loads, a developer's `ssai` at their next provision, sync
+  or run. A workspace that was assigned the promoted profile is simply on the Default from then on —
+  its assignment is removed, so it follows whichever profile is the Default later.
+
+A profile presents; a workspace grants. The profile chooses which clients are offered and how the
+sandbox is set; which providers and MCP servers those clients can be configured with stays the
+workspace's own grants. A member of several workspaces gets, in each, that workspace's clients and
+sandbox rules: the portal Quickstart works in the workspace selected in the portal header, and
+`ssai provision` asks for the workspace before it lists the clients. Both then offer only what that
+workspace grants — its providers and its MCP servers, not those of the member's other workspaces.
+Choosing the Default in a workspace's **Portal & clients** selector is the same as leaving it on the
+Default: the workspace follows whichever profile is the Default later.
+
+For example: the Default offers every client with the sandbox optional. You create **Finance** (a copy
+of the Default), keep only Claude Code, turn on **Require the sandbox**, and pick **Finance** on the
+Finance workspace. A Finance member's Quickstart and `ssai provision` then offer only Claude Code, and
+`ssai run --sandbox off` is refused there. Someone in both Finance and Platform gets Claude Code and
+the required sandbox when working in Finance, and every client when working in Platform.
+
+Open a profile to edit it:
 
 - **Clients** — a switch per client. A disabled client is no longer listed in the portal Quickstart
-  or offered by `ssai provision`, and rendering or provisioning it is refused; a developer who already
-  has it is told by `ssai sync` that it is disabled (its files are left alone; `ssai forget` removes
-  them) and `ssai run` refuses to launch it. A client you create on the Clients page is offered at once;
-  a client a later release adds arrives **disabled**, flagged **new**, until you enable it.
+  or offered by `ssai provision` for the workspaces on this profile, and rendering or provisioning it
+  there is refused; a developer who already has it is told by `ssai sync` that it is disabled (its
+  files are left alone; `ssai forget` removes them) and `ssai run` refuses to launch it. A client you
+  create on the Clients page is offered on the Default as it is when you create the client, and
+  arrives **disabled**, flagged **new**, on every other profile; a client a later release adds arrives **disabled** and
+  **new** on every profile that existed before it — enable it on each profile that should offer it.
+  **New** means exactly that: the client was added after this profile was created and is not offered
+  on it. A profile created afterwards never shows it as new — a copy starts with what its source
+  offers, switched on or off. **Offer all** and **Offer none** switch every client in one step.
 - **Sandbox** — what `ssai run` lets an agent reach besides the gateway: the destination lists
   attached as allow or block. The gateway is always reachable; then a blocked destination is refused,
   an allowed one permitted, and anything else refused. A new organization attaches nothing (the
@@ -2529,9 +2773,39 @@ profile, the **Default**; per-workspace profiles are not offered yet):
   (which leaves the filesystem unconfined); on Windows the developer first runs `ssai sandbox setup` once
   (see *The Windows sandbox* under [Set up tools with the `ssai` CLI](#set-up-tools-with-the-ssai-cli)). **Allow the container sandbox** (on by default) lets developers
   run `ssai run --sandbox docker`, which starts the agent in a container on their Linux machine; turned
-  off, that run is refused and names `--sandbox native`. `ssai` enforces these on the developer's machine: a guard against an agent's mistakes and
+  off, that run is refused and names `--sandbox native`. Both settings apply to the workspaces on this
+  profile. `ssai` enforces these on the developer's machine: a guard against an agent's mistakes and
   injected instructions, not against a developer who edits their own machine. Traffic to an allowed
   destination does not pass the gateway, so it is not in the gateway's audit.
+- **Portal pages** — two switches for what members see of their own activity in the portal:
+  - **Hide conversations** — the Sessions page and all conversation content: a request's details,
+    its media and its tool definitions.
+  - **Hide the Requests page** — the list of requests (model, tokens, cost, status).
+
+  What each combination leaves a member:
+
+  | | Requests page shown | Requests page hidden |
+  |---|---|---|
+  | **Conversations shown** | Sessions, with every conversation. Requests, and each request opens on its content. | Sessions, with every conversation — the requests of a session are read there. No Requests page. |
+  | **Conversations hidden** | No Sessions page. Requests lists each request with its time, model, tokens, cost, duration and status; a request does not open, the list has no content search, and nothing of what was sent or answered is shown — no prompt, answer, tool arguments or results, searched or fetched URLs, media, or error text. An MCP call still names the tool it called. | Neither page. Home, keys, usage figures and limits only. |
+
+  What is hidden is withheld by the gateway, not only left out of the page: opened by its address a
+  hidden page says it is not available, and a script or an automation key asking for the same data is
+  refused. Three things to know:
+  - **Every workspace decides.** Each switch applies to a member only when *every* workspace they
+    belong to is on a profile that has it on. Someone in Finance (hidden) and Platform (shown) keeps
+    it — and sees there what they could see before, Finance's shared activity included. A member of no
+    workspace follows the Default. To hide something from everyone, hide it on the Default and on
+    every other profile.
+  - **Deleting a profile returns its workspaces to the Default** — which may show what the deleted
+    profile hid. Check the Default before you delete a profile that hides something.
+  - **Figures stay.** Home's spend and request counts, a key's usage and a member's limits are not
+    hidden; with conversations hidden, Home no longer lists recent sessions. The console's own
+    Sessions and Audit pages are unaffected: this is about what members see in the portal.
+
+  It takes effect at the member's next request: a page they have open gives way at its next refresh,
+  and comes back the same way when you show it again. An automation key follows the workspace it is
+  bound to.
 
 The developers' CLI picks a change up on its next `ssai sync`, or on its next `ssai run` once its
 copy is an hour old. A CLI that has never received the settings and cannot reach the gateway runs
@@ -2543,7 +2817,11 @@ it reaches it — nor can the tool reach its model.
 Once a workspace has a provider and a user has a portal password (or OIDC access), point
 them at the console host's root, `/` (or `/portal/login/{slug}`). There they:
 
-- **Quickstart** — pick their client (Claude Code, opencode, Cursor, Cline, Claude Desktop,
+- **Quickstart** — opens on **Set up via CLI** (the `ssai` commands that configure every
+  installed tool at once, below); the **Web wizard** tab is the copy-paste alternative. In the
+  wizard — which works in the workspace selected in the portal header and starts over when that
+  changes; a configuration already on screen stays, under a notice, until they start over —
+  they pick their client (Claude Code, opencode, Cursor, Cline, Claude Desktop,
   Continue, Aider, Gemini CLI, Codex, Mistral Vibe, Qwen Code, Goose, Zed, generic curl/SDK); the wizard mints a key bound to the chosen
   provider and renders a copy-paste config with the right base URL, model alias, and flags.
   A tool that can speak both the OpenAI and the Anthropic protocol (OpenCode, Crush, Continue,
@@ -2557,31 +2835,40 @@ them at the console host's root, `/` (or `/portal/login/{slug}`). There they:
   it from `STREAMSCOPE_MCP_KEY`, which the settings file sets; a BYOK server's address carries its key. Where a tool takes its key only from a shell variable and no
   file can hold it, the wizard shows the key itself instead. Either way, **that page is the one
   time the key can be read**: the gateway keeps only a hash of it.
-- **Home** (`/portal/home`) — where every member lands after signing in. It lists what needs
-  doing, and only what applies: no key and no traffic yet (with a link to set up a tool), a key
-  that expires within 7 days or expired in the last 7 (a key created to live 7 days or less, such as
-  the CLI's per-run keys, is not one), an MCP server waiting for their sign-in, and a budget they can see at 80 % or
-  more. Then
-  quick actions (create a key, configure a tool, install the CLI, try an MCP server), their own
-  spend and requests today (UTC) and over the last 7 days, and their 5 latest sessions. A manager of
-  the workspace picked in the header also sees the team: its members, and its spend today and in
-  the current 30-day period against the workspace pool.
+- **Home** (`/portal/home`) — where every member lands after signing in: their dashboard. Three
+  buttons start the common tasks (**New key**, **Set up a tool**, **Try an MCP server**). Their
+  own activity, over every workspace they use: spend and requests today (UTC) and over the last 7
+  days (UTC days, today included), and a bar per day for those 7 days. Their 5 latest sessions.
+  Beside them, only what applies:
+  - **To do** — one line per thing waiting on them, each with the way to fix it: no key and no
+    traffic yet (create one), a key that expires within 7 days or expired in the last 7 (a key
+    created to live 7 days or less, such as the CLI's per-run keys, is not one), the MCP servers
+    waiting for their sign-in or values, and each machine whose `ssai` CLI is older than the one
+    the gateway serves — named by its host, with `ssai update` to copy. A machine is named from
+    what its CLI reports on each call; one not seen in 30 days is not listed, and the line goes
+    away on the machine's first call after the update.
+  - **My limits** — every limit that applies to them in the workspace picked in the header, as on
+    the team pages: the organisation, the workspace pool, their member limit and their keys'
+    budgets, each meter turning to the warning colour at 80 % of its cap. It shows what they have
+    used of their own member limit and keys; the pool's use (everyone's spend) only when the
+    workspace shares usage among its members or they manage it, and the organisation's never.
+    Nothing set, no panel.
+  - **Your team** — for a manager of the header workspace: its members, and its spend today and
+    in the current 30-day period against the workspace pool.
 - **The workspace picker** in the portal header (shown to a member of several workspaces) sets
   the workspace the portal works in — keys, quickstart, the team page and, on the activity pages,
   the **Me / Team** switch, which appears where that workspace shares activity with its members.
-- **API keys** (`/portal/keys`) — mint/revoke their own keys in any workspace they belong to.
-- **My Usage** (`/portal/usage`) — their own spend, requests and tokens over the last 30 days,
-  broken down per key — or, with **Team** on a workspace that shares, that workspace's.
-  **My limits** shows, for each of their workspaces, every limit that applies to them — the
-  organisation, the workspace pool, their member limit and their keys' budgets — and which one will
-  stop them first. It shows what they have used of their own member limit and keys; the pool's use
-  (everyone's spend) only when the workspace shares usage among its members or they manage it, and
-  the organisation's never. A workspace manager sees a member's pool use as well, but not the
-  organisation's.
+- **API keys** (`/portal/keys`) — mint/revoke their own keys in any workspace they belong to,
+  and see each live key's requests, tokens, spend and last use today, over the last 7 days or
+  over the last 30 (UTC days, today included).
 - **My Sessions** (`/portal/sessions`) and **My Requests** (`/portal/audit`) — the console's
   Sessions and Audit pages, with the same filters and details, over their own traffic — or, with
   **Team** on a workspace that shares, that workspace's, where a teammate filter also appears.
-  The default period is the last 7 days.
+  The default period is the last 7 days. An administrator can hide conversations — the Sessions
+  page and every request's content — or the Requests page for a team (**Portal pages** in
+  [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)); with
+  conversations hidden, Requests lists each request's model, tokens, cost and status, and a
+  request does not open.
   - **Requests** lists every kind of request: model calls, MCP tool calls, agent (A2A) calls and
     web searches and fetches, each expandable to its full captured content. The MCP server,
     upstream and agent filters offer only what the member's workspaces are granted.
@@ -2596,16 +2883,25 @@ them at the console host's root, `/` (or `/portal/login/{slug}`). There they:
     sessions.
 - **Members & limits** (`/portal/team`, in the menu for managers only) — managers see the roster
   and per-member usage, provision on behalf of members, and manage member limit exceptions.
-- **Sign-ins** (`/portal/mcp/connections`) — link your **own** account on a
-  `per_user_oauth` upstream (e.g. sign in to GitHub). You're sent to the provider to approve;
-  the gateway then stores and auto-refreshes a token that is yours alone, so your agent acts as
-  you on that upstream. Each member connects once; the page shows what you've connected, the
-  granted scopes, and lets you disconnect.
+- **Sign-ins** (`/portal/mcp/connections`) — connect your **own** account to the MCP servers
+  that need one. Each server shows its state — *Connected*, *Needs your values*, *Needs
+  sign-in* or *Sign-in expired* — and one button for the next step (**Enter values**, **Sign
+  in** or **Reconnect**); a server that needs both your values and a sign-in lists the two steps
+  in order. While any of your servers waits, Home's To do card and the Quickstart page's banner
+  name them with a link here, and an agent calling such a server is answered with this page's
+  address. For an OAuth server (e.g. GitHub) you're sent to the provider to approve; the
+  gateway then stores and auto-refreshes a token that is yours alone, so your agent acts as you
+  on that upstream. For a server that asks each user for values (a personal access token, say),
+  **Enter values** (or **Edit**, once entered) opens a form with just your fields, filled with the values you entered before —
+  secret ones are never shown back (the form only says they are set), and values your
+  administrator set are neither shown nor yours to change. Changes
+  take effect within seconds. Each member connects once; the page shows what you've connected,
+  the granted scopes, and lets you disconnect (which also deletes the values you entered).
 - **Try a server** (`/portal/mcp/test`) — probe a virtual server before pointing an agent at it: runs
   `initialize` / `tools/list` / `resources/list` / `prompts/get` against each upstream the route fans
-  out to and shows the merged catalog, using the same auth the gateway would (BYOT routes are skipped,
-  since they need a per-call bearer). For a `per_user_oauth` upstream you must have connected your
-  account first; if your stored token has expired the test says so and points you back to reconnect —
+  out to and shows the merged catalog, using the same headers the gateway would (a server that needs
+  a value your client sends is reported as needing it, since the test has no client). For an OAuth or
+  per-user-values server you must have connected your account first; if your stored token has expired the test says so and points you back to reconnect —
   your real agent calls are unaffected, since the gateway refreshes the token on its own.
 
 #### Set up tools with the `ssai` CLI
@@ -2619,7 +2915,7 @@ tab shows these commands pre-filled for your portal:
 ```bash
 curl -fsSL https://<portal-host>/api/v1/cli/install.sh | sh   # installs to ~/.local/bin
 ssai login https://<portal-host>/portal/t/<org>   # any portal URL works — opens your browser
-ssai provision                                     # detects installed tools, mints a key per tool, writes configs
+ssai provision                                     # detects installed tools, mints one workspace key, writes configs
 ```
 
 On Windows, install from PowerShell (Windows PowerShell 5.1 or PowerShell 7) instead; the rest is
@@ -2759,7 +3055,39 @@ and none of those flags, no MCP servers are wired. A server that uses **per-user
 *connect first*: the CLI still writes it into your config, but prints a note reminding you to link
 your own account under **Portal → Sign-ins** — requests through that server start working the
 moment you connect (nothing to re-run). This mirrors the portal: the config can be written before you
-connect; connecting makes it live.
+connect; connecting makes it live. A server the tool's setup cannot reach is left out of its config,
+and `provision` prints a warning naming the tool and the server: a sign-in (OAuth) setup cannot
+reach a server that takes your client's own `Authorization` header, and a pass-through key reaches
+only a server that carries nothing but what your client sends. The portal Quickstart shows the same
+warnings for the same choice.
+
+**Local MCP servers.** When your workspace is handed local MCP servers — servers your own machine
+starts — and a tool you're provisioning can be given one, `provision` proposes them too, each with the
+command line it runs. Select them non-interactively with `--local-mcp <slug>` (repeatable). A tool
+you provision again keeps the MCP servers it already has — gateway servers and local servers
+alike — unless you say otherwise: with no MCP flag they stay (each prompt opens with them ticked),
+`--mcp` / `--all-mcp` replace the gateway servers and `--local-mcp` the local ones, `--no-local-mcp`
+takes the local ones out and keeps the gateway servers, and `--no-mcp` selects none of either kind.
+It also stays on the setup it has unless `--template` names another. A tool provisioned for the
+first time with `--yes` and no MCP flag gets none. Before it writes
+anything, `provision` prints each selected server's whole command line (your administrator's
+environment values included), the environment variables you must fill in yourself (the written
+config holds a `<paste-your-…-here>` placeholder for each; a later run keeps what you pasted), and
+what applies to that kind of command: that its runner must be installed, what a sandboxed run
+changes, and on Windows that a client may need the runner wrapped (`cmd /c npx …`). `sync` re-applies
+the same selection: it prints a server's command line when your administrator changed it — the
+command, an argument or an environment value — and removes, saying so, a server the workspace is no
+longer offered (turned off, revoked or deleted), keeping the rest of the configuration. Nothing
+else in the file is touched — the tool's provider, key, model and gateway servers stay — and the
+tool stays managed. A tool set up for MCP servers only that is left with none is simply left alone:
+`provision` and `sync` say there is no MCP server selected for it and nothing to write, and that is
+not an error. Removing a
+server — at a sync, or because you deselected it — takes its whole entry out of the file, the values
+you pasted into it included; an entry your file already had under that name before the server was
+added is not removed: only what was written into it and you did not change goes, and the rest is
+named. A tool that
+cannot be given a local server is provisioned without it and a warning names it; Claude Code is
+given one only in a project (`--local` / `--dir`).
 
 By default `provision` writes each tool's **global** configuration in your home directory. To set a
 tool up for **one project** instead, run `ssai provision --local` from inside the project (or
@@ -2853,7 +3181,9 @@ no longer touches it and its config file is left exactly as it is for you to tak
 changes on the gateway either: `forget` names the key the tool's config still holds, which stays
 valid — other projects may use it — until you revoke it on the **Keys** page. `ssai update` self-updates the CLI from the gateway
 (checksum-verified; on Windows the running `ssai.exe` is set aside as `ssai.old.exe` and removed the
-next time `ssai` starts), and `sync` mentions when a newer version is available. `ssai logout`
+next time `ssai` starts), and `sync` mentions when a newer version is available. Every call `ssai`
+makes to the gateway names its version, its operating system and the machine's host name (its first
+label), which the portal's Home uses to say which of your machines run an older `ssai`. `ssai logout`
 revokes the device's access immediately — the keys already written into your tools keep working
 (revoke those on the **Keys** page if needed). When `ssai` cannot read its record of what it wrote
 — one an earlier version of `ssai` kept — every command stops and leaves the record as it is, except
@@ -2932,8 +3262,12 @@ refused, and so are `--sandbox off` and `--sandbox learn` when the administrator
 sandbox. The sandbox is **fail-closed**: if the machine can't enforce it, `run` refuses rather than
 launch the tool unconfined — use `--sandbox off` to opt out deliberately. This works on Linux and
 WSL2 (the network confinement needs a Linux kernel 6.7 or newer), on macOS (Apple Silicon, via
-the system's built-in Seatbelt) and on Windows (a dedicated sandbox account, below). (`run` only
-launches already-provisioned tools; provision the project first.)
+the system's built-in Seatbelt) and on Windows (a dedicated sandbox account, below). A tool that
+runs on Node.js (the Continue CLI, Gemini CLI, Qwen Code) needs Node.js
+22.21 or newer inside the sandbox: an older Node.js does not send all of its connections through the
+sandbox's gateway route, and the sandbox refuses them (the Continue CLI then stops with "MCP
+server(s) failed to load"). (`run` only launches already-provisioned tools; provision the project
+first.)
 
 The project's git hooks and configuration (`.git/hooks`, `.git/config`, a worktree's or a
 submodule's links and configuration, a hooks folder `core.hooksPath` names) and its
@@ -3049,15 +3383,65 @@ authority publishes revocation lists on.
 
 **The container sandbox (Linux).** `ssai run --sandbox docker <tool>` runs the agent in a container
 built from your project's own image instead of on your machine — for a project whose toolchain lives in
-an image, or one that needs a Docker engine of its own. It needs rootless Podman 4.4 or newer for your
-user (`sudo apt install podman`), cgroup v2 with the memory and pids controllers delegated to users
-(and the cpu one for a `cpus` limit),
-and a subordinate id range (`/etc/subuid`); `run` checks each and names what is missing. The project
-names its image in `.streamscopeai/sandbox.json`:
+an image, or one that needs a Docker engine of its own. Step by step:
+
+1. **Your administrator allows it.** **Allow the container sandbox** is on by default (**Governance →
+   Portal & clients**, the **Sandbox** section of the profile your workspace is on — see [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)). The agent reaches only the gateway and the destination lists attached there,
+   so a project whose agent installs packages or pulls images needs those registries allowed (**Use the
+   developer defaults** covers the public ones).
+2. **Set up rootless Podman, once per machine.** You need Podman 4.4 or newer, run as your own user
+   (never as root), with a subordinate id range for your user and cgroup v2 with the `memory` and
+   `pids` controllers delegated to it (`cpu` too, for a `cpus` limit). On Ubuntu or Debian:
+
+   ```sh
+   sudo apt install podman
+   # a subordinate id range, if `grep $USER /etc/subuid /etc/subgid` shows none: pick one that no
+   # other line of /etc/subuid or /etc/subgid overlaps (200000-265535 here)
+   sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 $USER
+   podman system migrate
+   # delegate the cgroup controllers to your user's session
+   sudo mkdir -p /etc/systemd/system/user@.service.d
+   printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+   sudo systemctl daemon-reload   # then log out and in again
+   ```
+
+   `run` checks each of these before it starts, and names the fix for anything still missing.
+   `"docker": true` (step 3) also needs `/dev/fuse` (the `fuse` kernel module).
+3. **Name the project's image.** In the project, create `.streamscopeai/sandbox.json`. It holds named
+   sandboxes under `sandboxes`; `run` starts the one named `default`, which names either a registry image
+   or the project's dev container:
+
+   ```json
+   {"sandboxes": {"default": {"image": "mcr.microsoft.com/devcontainers/javascript-node:22"}}}
+   ```
+
+   ```json
+   {"sandboxes": {"default": {"devcontainer": ".devcontainer/devcontainer.json", "docker": true, "memory": "6g"}}}
+   ```
+
+   A file naming another sandbox, naming one twice, or whose keys are not under `sandboxes` is refused.
+
+   `run` installs Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue and Crush into the
+   image through its `npm`, so the image needs Node.js; Goose, Aider and Vibe must already be in it.
+   `"docker": true` gives the agent a Docker engine of its own. Every key is in the table below.
+4. **Provision the tool in the project** as for any other run: `ssai provision`.
+5. **Run it:** `ssai run --sandbox docker claude` (or `codex`, `opencode`, …). The first run pulls or
+   builds the image, adds the tool to it and then starts the agent; later runs start at once. `run`
+   prints the image, where the project sits in the container, and the gateway the agent reaches.
+6. **Keep it current.** `ssai sandbox prepare <tool>` rebuilds (or pulls again) the image — one named
+   `localhost/…`, built on this machine, is used as it is — and installs the tool's latest release — the way the tool is updated in the container (an update the tool makes of itself there does
+   not replace that install). `run` stops and asks you to run it when `sandbox.json` names another
+   image, when the image's recipe changed (its Dockerfile or the `devcontainer.json` keys it is built from), and when `"docker": true`
+   was turned on. `ssai sandbox prune` removes every image and
+   volume the container sandbox made.
+
+If a run says it refused a destination, ask your administrator to add it to an allowed list (step 1).
+
+The keys of a sandbox in `.streamscopeai/sandbox.json` (`{"sandboxes": {"default": {…}}}`):
 
 | Key | Meaning |
 |---|---|
-| `image` | an image reference from a registry, e.g. `"mcr.microsoft.com/devcontainers/base:ubuntu-24.04"` (a local archive or folder — `oci-archive:`, `dir:` — is refused) |
+| `image` | an image reference from a registry, e.g. `"mcr.microsoft.com/devcontainers/base:ubuntu-24.04"` (a local archive or folder — `oci-archive:`, `dir:` — is refused). A dev container image's own metadata applies: its user, its variables, and its features' lifecycle commands (below) |
 | `devcontainer` | instead of `image`: the path of a `devcontainer.json` inside the project (its `image`, or `build` with `dockerfile`, `context`, `target` and `args`; its `remoteUser` or `containerUser`; its `workspaceFolder`. `${localWorkspaceFolder}` and `${localWorkspaceFolderBasename}` are expanded in `workspaceFolder`, the users and `build.args`, and `${containerWorkspaceFolder}` in the last two; `${localEnv:…}` is refused, since it would carry your environment into the build) |
 | `docker` | `true` starts a Docker engine inside the container, its image cache kept between runs (needs `/dev/fuse`) |
 | `memory`, `cpus`, `pids` | the container's limits, e.g. `"6g"`, `3`; `pids` defaults to 16384, at least 64 |
@@ -3066,18 +3450,43 @@ A `devcontainer.json` that sets `runArgs`, `mounts`, `workspaceMount`, `privileg
 `securityOpt`, `dockerComposeFile`, `build.options` or the legacy `dockerFile`/`context` is refused, since each would widen what the
 container or its build reaches — and so is a `build` whose Dockerfile or context leads outside the
 project, through a symlink included;
-`initializeCommand`, the lifecycle commands (`onCreateCommand`, `postCreateCommand` and the rest),
-`containerEnv`, `remoteEnv`, `forwardPorts` and `appPort` are not applied, and `run` names each one it
-finds: install the agent's toolchain in the image itself. One that uses
+`initializeCommand` (it would run on your machine), `forwardPorts` and `appPort` are not applied, and
+`run` names each one it finds.
+
+The lifecycle commands run inside the sandbox, as the agent's user, in the project folder, one after
+another and each to its end (named commands too, in the order of their names, which a dev container tool would run side by side; and
+`waitFor` is not read), before the tool starts — a command that keeps running, such as a development
+server, is started in the background (`npm run dev > dev.log 2>&1 &`):
+`onCreateCommand`, `updateContentCommand` and `postCreateCommand` on the tool's first run in the project,
+and again when one of them, their variables, the user they run as, the project's folder in the container or
+the image changes; `postStartCommand` and `postAttachCommand` on every
+run. The commands of the features the image was built with (read from its dev container metadata) run
+first; the commands of the `devcontainer.json` an image was built from do not — for an image built from
+this project's, they are the project's own, which run once from the project (for another image, `run`
+names those it leaves out). An entry of the metadata
+the sandbox cannot read is skipped, and `run` names it. While one run's create commands run, another run
+on the project waits for them (Ctrl-C stops it; on a filesystem that cannot lock, such as some network
+mounts, they run unlocked, and `run` says so). A command that fails stops the run,
+naming it, before the tool starts; when it was a create command, they all run again next time. They reach the network
+only as the tool does, through the sandbox's allowed destinations, so an `npm install` needs its registry
+allowed. What a create command writes outside the project and the agent's home is lost when the run
+ends: the container is new on every run. It runs once per tool, since each tool has its own home.
+`containerEnv` and `remoteEnv` apply to the commands and the tool, `${containerEnv:NAME}` reading the
+container's own value (the image's, or `containerEnv`'s; a `PATH` that does not name it replaces the
+image's, the folder the sandbox installs the tool in kept first; a `null` value leaves the image's own); the sandbox's own variables (its
+proxy, the tool's gateway settings, `HOME`) win over the project's. `${localEnv:…}` is refused there too. One that uses
 `features` is built with the Dev Container CLI (`npm install -g @devcontainers/cli`), and may not set
-`initializeCommand` (that CLI could run it on your machine) nor name a local feature folder (only a
+`initializeCommand` (that CLI could run it on your machine), nor `${env:…}` (that CLI would read it from
+your environment, even the shell's `${env:-x}`), nor name a local feature folder (only a
 published feature is taken). A `workspaceFolder` on a system path of the container (`/etc`, `/run`,
-`/usr` and the like) or over the agent's home is refused. On the first run,
+`/usr` and the like) or over the agent's home is refused, and so is a workspace, or an agent home, at or
+around `/opt/ssai-agent`, where the sandbox installs the tool. On the first run,
 `run` adds the tool to the image (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue and
 Crush, at their latest release, through the image's `npm` — an image without Node.js is refused
 naming that); Goose, Aider and Vibe must already be in the image. Only a project's first image is built (or pulled) by
 `run` on its own. After that, when the image reference changed to one not on this machine yet, or
-the image needs building again (its Dockerfile or `devcontainer.json` changed, or the image was
+the image needs building again (its Dockerfile changed, or the `build` of its `devcontainer.json` —
+any of the file when it uses `features`, which writes its lifecycle commands into the image — or the image was
 removed), `run` stops and asks you to read what it would build — the agent can edit all of it, and
 a pull or a build reaches the network before the sandbox does. A change to other files of the build
 context is not noticed: the image already built keeps being used until you rebuild it; `ssai
@@ -3319,7 +3728,7 @@ others — granting the role stays admin-only.
 
 **The ordinary member view**, for comparison: any member can mint and revoke **their own** keys in
 any workspace they belong to (**Portal → API keys**, `/portal/keys`), run the **Quickstart** wizard to
-get a ready-to-paste client config, and connect `per_user_oauth` MCP upstreams under
+get a ready-to-paste client config, and connect MCP servers that need their own account under
 **Portal → Sign-ins**. A manager has all of this plus the team controls above.
 
 > Budget and rate limits always win. A manager can mint keys freely, but every key the manager
@@ -3352,7 +3761,7 @@ mirrors this under `…/portal/t/<organization>/…`.
 | Governance | Policy | `/policy` | Tool risk rules, profiles, field profiles, suggestions |
 | Governance | Transforms | `/transforms` | Rhai request/response scripts, expert suggestions |
 | Governance | Experts | `/experts` | Expert definitions, prompts, memory, agent control |
-| Governance | Client access | `/client-access` | Clients the portal and CLI offer; what the developers' sandbox may reach |
+| Governance | Portal & clients | `/client-access` | Per workspace: the clients the portal and CLI offer; what the developers' sandbox may reach |
 | Governance | Destinations | `/destinations` | Destination lists the sandbox and the Web tool attach as allow or block |
 | Configuration | Clients | `/clients` | Detect AI apps hitting the gateway; per-app quickstart profiles |
 | Configuration | Gateways → LLM | `/gateways/llm` | Upstream servers, model sync, downstream routes, pricing, aliases |
@@ -3361,7 +3770,7 @@ mirrors this under `…/portal/t/<organization>/…`.
 | Configuration | Auth | `/auth` | Three tabs: auth settings (Internal/OIDC, IdP, groups), human accounts, service accounts |
 | Configuration | Audit (admin) | `/admin-audit` | Who changed what on the control plane — before → after diff (secrets redacted), actor, IP |
 | Configuration | Settings | `/settings` | Defaults, retention, feature toggles, agent, advanced |
-| Portal | Home / Activity / Set up / MCP tools / Team | `/portal/*` | End-user self-service: the Home page, own sessions, requests and usage, quickstart wizard, own keys, MCP sign-ins + server test, team provisioning (managers) |
+| Portal | Home / Activity / Set up / MCP tools / Team | `/portal/*` | End-user self-service: the Home page, own sessions and requests, quickstart wizard, own keys and their usage, MCP sign-ins + server test, team provisioning (managers) |
 
 ## Appendix — gotchas
 
@@ -3370,10 +3779,12 @@ mirrors this under `…/portal/t/<organization>/…`.
 - **MCP and LLM allowlists are independent** — grant each separately per workspace.
 - **Tool profiles are workspace-scoped** — shared builtins apply everywhere; profile rules
   apply only to workspaces selecting that profile.
-- **Key prefix encodes the mount** — `sk-` works on `/v1/*` and `/mcp/<slug>`; `vk-` works
-  only on `/fwd/{key}/...`. Wrong mount → generic `InvalidKey` (no leak of which).
-- **`service_account` MCP upstreams need the credential at write time**; **`byot`**
-  upstreams may wire into only one virtual server.
+- **Key prefix encodes the mount** — `sk-` works on `/v1/*`, `/mcp/<slug>` and
+  `/fwd/{key}/mcp/<slug>`; `vk-` works only on `/fwd/{key}/...`. Wrong mount → generic
+  `InvalidKey` (no leak of which).
+- **A header the client sends belongs to one server per endpoint** — two servers attached to one
+  endpoint cannot both expect the same client header; a client-sent `Authorization` moves the
+  endpoint to `/fwd/{key}/mcp/<slug>`.
 - **OIDC auto-membership and `admin_group` are additive** — they never remove members or
   demote roles; revoke manually.
 - **SYSTEM OIDC flip is last** — finish all provisioning first (section A).

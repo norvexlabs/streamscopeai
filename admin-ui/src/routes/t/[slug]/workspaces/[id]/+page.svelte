@@ -4,6 +4,7 @@
   import { goto } from '$app/navigation';
   import { thref } from '#lib/tenant.js';
   import { profileLists } from '#lib/scope.svelte.js';
+  import { kindTakesOff } from '#lib/profileUsage.js';
   import { formatAmount } from '#lib/formatters.js';
   import { accountingCurrency } from '#lib/currency.svelte.js';
   import WorkspaceProfilePicker from '#lib/components/workspaces/WorkspaceProfilePicker.svelte';
@@ -46,6 +47,8 @@
   let { params }: PageProps = $props();
 
   type McpVirtualServer = components['schemas']['McpVirtualServerRow'];
+  type WorkspaceMcpLocalServer = components['schemas']['WorkspaceMcpLocalServer'];
+  type McpLocalServer = components['schemas']['McpLocalServer'];
   type UserOverride = components['schemas']['UserRateLimitOverride'];
   type LimitsOverview = components['schemas']['WorkspaceLimitsOverview'];
   type LimitStack = components['schemas']['EffectiveLimitStack'];
@@ -57,6 +60,7 @@
   let members = $state<WorkspaceMemberRow[]>([]);
   let providers = $state<WorkspaceProvider[]>([]);
   let mcpServers = $state<WorkspaceMcpServer[]>([]);
+  let mcpLocalServers = $state<WorkspaceMcpLocalServer[]>([]);
   let a2aAgents = $state<WorkspaceA2aAgent[]>([]);
   let overrides = $state<UserOverride[]>([]);
   // Every exception, or none: the exception modal seeds from this list, and a
@@ -70,6 +74,7 @@
   // Reference data (whole tenant pool — toggled against the workspace allowlist).
   let allProviders = $state<DownstreamProvider[]>([]);
   let allMcp = $state<McpVirtualServer[]>([]);
+  let allLocalMcp = $state<McpLocalServer[]>([]);
   let allA2a = $state<A2aAgentRow[]>([]);
 
   const isDefault = $derived(detail?.role === 'default');
@@ -77,6 +82,7 @@
   const isInlineAi = $derived(detail?.role === 'inline');
   const allowedProviderIds = $derived(new Set(providers.map((p) => p.id)));
   const allowedMcpIds = $derived(new Set(mcpServers.map((s) => s.id)));
+  const allowedLocalMcpIds = $derived(new Set(mcpLocalServers.map((s) => s.id)));
   const allowedA2aIds = $derived(new Set(a2aAgents.map((a) => a.id)));
 
   type WsTab = 'overview' | 'members' | 'access' | 'limits';
@@ -92,6 +98,7 @@
     detail = data ?? null;
     providers = data?.providers ?? [];
     mcpServers = data?.mcp_servers ?? [];
+    mcpLocalServers = data?.mcp_local_servers ?? [];
     a2aAgents = data?.a2a_agents ?? [];
   }
 
@@ -185,14 +192,16 @@
   }
 
   async function loadReference() {
-    const [p, m, a] = await Promise.all([
+    const [p, m, a, l] = await Promise.all([
       adminApi.GET('/api/v1/admin/downstream-providers', { params: { query: { offset: 0, limit: 500 } } }),
       adminApi.GET('/api/v1/admin/mcp/virtual-servers', { params: { query: { offset: 0, limit: 500 } } }),
       adminApi.GET('/api/v1/admin/a2a/agents', { params: { query: { offset: 0, limit: 500 } } }),
+      adminApi.GET('/api/v1/admin/mcp/local-servers', { params: { query: { offset: 0, limit: 500 } } }),
     ]);
     allProviders = p.data?.items ?? [];
     allMcp = m.data?.items ?? [];
     allA2a = a.data?.items ?? [];
+    allLocalMcp = l.data?.items ?? [];
   }
 
   async function loadAll() {
@@ -436,6 +445,21 @@
   const mcpOauthIncomplete = $derived(
     allMcp.filter((vs) => !allowedMcpIds.has(vs.id) && vs.oauth_incomplete).length,
   );
+  // A local server runs on the member's machine: a grant has client
+  // provisioning write its command line into the member's client config.
+  const grantedLocalMcp = $derived<GrantEntry[]>(
+    mcpLocalServers.map((s) => ({
+      id: s.id,
+      label: s.name,
+      sublabel: s.slug,
+      warning: s.enabled ? undefined : 'Turned off in the MCP gateway\'s Local servers tab.',
+    })),
+  );
+  const localMcpCandidates = $derived<GrantEntry[]>(
+    allLocalMcp
+      .filter((s) => !allowedLocalMcpIds.has(s.id))
+      .map((s) => ({ id: s.id, label: s.name, sublabel: s.slug })),
+  );
   const grantedA2a = $derived<GrantEntry[]>(
     a2aAgents.map((a) => ({ id: a.id, label: a.name, sublabel: a.slug })),
   );
@@ -468,6 +492,10 @@
     grantChange(adminApi.POST('/api/v1/admin/workspaces/{id}/mcp-servers', { params: { path: { id } }, body: { virtual_server_id: serverId } }));
   const removeMcp = (serverId: string) =>
     grantChange(adminApi.DELETE('/api/v1/admin/workspaces/{id}/mcp-servers/{server_id}', { params: { path: { id, server_id: serverId } } }));
+  const addLocalMcp = (serverId: string) =>
+    grantChange(adminApi.POST('/api/v1/admin/workspaces/{id}/mcp-local-servers', { params: { path: { id } }, body: { local_server_id: serverId } }));
+  const removeLocalMcp = (serverId: string) =>
+    grantChange(adminApi.DELETE('/api/v1/admin/workspaces/{id}/mcp-local-servers/{server_id}', { params: { path: { id, server_id: serverId } } }));
   const addA2a = (agentId: string) =>
     grantChange(adminApi.POST('/api/v1/admin/workspaces/{id}/a2a-agents', { params: { path: { id } }, body: { agent_id: agentId } }));
   const removeA2a = (agentId: string) =>
@@ -849,6 +877,20 @@
             onadd={addMcp}
             onremove={removeMcp}
           />
+          <!-- The Agent and Inline AI workspaces have no developers to run one. -->
+          {#if !isAgent && !isInlineAi}
+          <GrantList
+            title="Local MCP servers"
+            testid="grants-mcp-local"
+            emptyTitle="No local MCP servers granted"
+            granted={grantedLocalMcp}
+            candidates={localMcpCandidates}
+            emptyText="No local MCP server is written into this workspace's members' client configs."
+            addPlaceholder="Search local MCP servers to grant…"
+            onadd={addLocalMcp}
+            onremove={removeLocalMcp}
+          />
+          {/if}
           <GrantList
             title="A2A agents"
             testid="grants-a2a"
@@ -898,6 +940,21 @@
             manageHref={(pid) => `/experts/profiles/${pid}`}
             onchanged={loadDetail}
           />
+          <!-- The Agent and Inline AI workspaces hold service keys, not a
+               team: they stay on the Default, and the API refuses another. -->
+          {#if !isAgent && !isInlineAi}
+            <WorkspaceProfilePicker
+              kind="client_access"
+              label="Portal & clients"
+              workspaceId={id}
+              current={assignmentState('client_access')}
+              profiles={profileLists.clientAccess}
+              allowOff={kindTakesOff('client_access')}
+              help="Which clients the portal and the CLI offer this workspace's members, and what their sandbox may reach."
+              manageHref={(pid) => `/client-access/profiles/${pid}`}
+              onchanged={loadDetail}
+            />
+          {/if}
         </div>
       {:else if active === 'limits'}
         <div class="space-y-5 max-w-3xl">

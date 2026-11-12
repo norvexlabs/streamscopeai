@@ -146,8 +146,11 @@ pub async fn set_analysis_start(
     let mut tx = db.conn().begin().await.map_err(failed)?;
     // Each expert's own position, locked so the audit row shows what this replaced.
     type At = Option<DateTime<Utc>>;
-    let before: Vec<(Uuid, At, At)> = sqlx::query_as(
-        "SELECT expert_id, last_processed_at, cluster_processed_at FROM expert_profile_watermarks \
+    type Before = (Uuid, At, At, Option<i64>, Option<Uuid>, Option<i64>, Option<Uuid>, At);
+    let before: Vec<Before> = sqlx::query_as(
+        "SELECT expert_id, last_processed_at, cluster_processed_at, \
+                session_xid, session_sid, cluster_xid, cluster_sid, starts_after \
+         FROM expert_profile_watermarks \
          WHERE profile_id = $1 AND expert_id = ANY($2) ORDER BY expert_id FOR UPDATE",
     )
     .bind(id)
@@ -155,21 +158,41 @@ pub async fn set_analysis_start(
     .fetch_all(&mut *tx)
     .await
     .map_err(failed)?;
+    let landed = |xid: Option<i64>, sid: Option<Uuid>| {
+        crate::audit_store::sessions::LandedKey::from_columns(xid, sid).map(|k| k.to_string())
+    };
     let before: Vec<serde_json::Value> = before
         .into_iter()
-        .map(|(expert_id, position, cluster_position)| {
-            serde_json::json!({ "expert_id": expert_id, "position": position, "cluster_position": cluster_position })
+        .map(|(expert_id, position, cluster_position, session_xid, session_sid, cluster_xid, cluster_sid, starts_after)| {
+            serde_json::json!({
+                "expert_id": expert_id, "position": position, "cluster_position": cluster_position,
+                "landing_position": landed(session_xid, session_sid),
+                "cluster_landing_position": landed(cluster_xid, cluster_sid),
+                "starts_after": starts_after,
+            })
         })
         .collect();
+    // Where the cycle reads from: before every session active after `from`.
+    let start = crate::audit_store::sessions::landing_start(&mut tx, from, None).await.map_err(|e| {
+        tracing::error!("set analysis start: {e}");
+        ApiError::internal("failed to set the analysis start")
+    })?;
     // Invariant: the generation moves with the cursor, in one write. A cycle
     // that read the previous generation then cannot write over this cursor. No
     // cycle is triggered: the next one, inside the tenant's run window, reads it.
+    // The positions go back to before every session active after `from`, and
+    // activity at or before it is not analyzed: what the cycle reads is what was
+    // active after it.
     sqlx::query(
         "INSERT INTO expert_profile_watermarks \
-            (profile_id, expert_id, tenant_id, last_processed_at, cursor_generation) \
-         SELECT $1, e, $3, $4, 1 FROM unnest($2::uuid[]) AS e \
+            (profile_id, expert_id, tenant_id, last_processed_at, starts_after, session_xid, session_sid, \
+             cursor_generation) \
+         SELECT $1, e, $3, $4, $4, $5, $6, 1 FROM unnest($2::uuid[]) AS e \
          ON CONFLICT (tenant_id, profile_id, expert_id) DO UPDATE SET \
             last_processed_at = EXCLUDED.last_processed_at, \
+            starts_after = EXCLUDED.starts_after, \
+            session_xid = EXCLUDED.session_xid, session_sid = EXCLUDED.session_sid, \
+            cluster_xid = NULL, cluster_sid = NULL, \
             cluster_processed_at = NULL, \
             cursor_generation = expert_profile_watermarks.cursor_generation + 1, \
             updated_at = now()",
@@ -178,6 +201,8 @@ pub async fn set_analysis_start(
     .bind(&members)
     .bind(tenant_id)
     .bind(from)
+    .bind(start.xid)
+    .bind(start.session_id)
     .execute(&mut *tx)
     .await
     .map_err(failed)?;

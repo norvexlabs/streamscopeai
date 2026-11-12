@@ -576,7 +576,7 @@ fn tenant_keys(resp: &ConfigResponse) -> HashMap<[u8; 32], Arc<streamscope_core:
 fn build_mcp_config(resp: &ConfigResponse) -> streamscope_core::config::mcp::McpConfig {
     use streamscope_core::config::mcp::{
         McpAuthMode, McpRouteFilter, McpTransport, McpUpstreamServer, McpUserCredential,
-        McpVirtualRoute, McpVirtualServer, SamplingInterceptConfig,
+        McpUserInputs, McpVirtualRoute, McpVirtualServer, SamplingInterceptConfig,
     };
 
     /// Project the three sampling-intercept columns into a typed
@@ -601,14 +601,6 @@ fn build_mcp_config(resp: &ConfigResponse) -> streamscope_core::config::mcp::Mcp
             _ => McpTransport::StreamableHttp,
         }
     }
-    fn parse_auth_mode(s: &str) -> McpAuthMode {
-        match s {
-            "service_account" => McpAuthMode::ServiceAccount,
-            "per_user_oauth" => McpAuthMode::PerUserOauth,
-            "byot" => McpAuthMode::Byot,
-            _ => McpAuthMode::NoAuth,
-        }
-    }
     fn parse_filter(v: Option<&serde_json::Value>) -> Option<McpRouteFilter> {
         match v {
             Some(value) if !value.is_null() => serde_json::from_value(value.clone()).ok(),
@@ -619,26 +611,52 @@ fn build_mcp_config(resp: &ConfigResponse) -> streamscope_core::config::mcp::Mcp
     let upstreams = resp
         .mcp_upstream_servers
         .iter()
-        .map(|u| McpUpstreamServer {
-            id: u.id,
-            tenant_id: u.tenant_id,
-            name: u.name.clone(),
-            description: u.description.clone(),
-            upstream_url: u.upstream_url.clone(),
-            transport: parse_transport(&u.transport),
-            auth_mode: parse_auth_mode(&u.auth_mode),
-            cred_version: u.cred_version,
-            encrypted_credential: u.encrypted_credential.clone(),
-            oauth_issuer_url: u.oauth_issuer_url.clone(),
-            oauth_authorization_url: u.oauth_authorization_url.clone(),
-            oauth_token_url: u.oauth_token_url.clone(),
-            oauth_revocation_url: u.oauth_revocation_url.clone(),
-            oauth_client_id: u.oauth_client_id.clone(),
-            encrypted_oauth_client_secret: u.encrypted_oauth_client_secret.clone(),
-            oauth_default_scopes: u.oauth_default_scopes.clone(),
-            enabled: u.enabled,
-            connect_timeout_ms: u.connect_timeout_ms,
-            request_timeout_ms: u.request_timeout_ms,
+        .filter_map(|u| {
+            // Fail closed: an upstream whose auth mode or declaration this
+            // build cannot read is left out of the snapshot (unreachable),
+            // never served with a guessed credential.
+            let Some(auth_mode) = McpAuthMode::parse(&u.auth_mode) else {
+                tracing::warn!(upstream = %u.id, auth_mode = %u.auth_mode, "MCP upstream skipped: unknown auth mode");
+                return None;
+            };
+            let remote = match serde_json::from_value(u.remote.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(upstream = %u.id, error = %e, "MCP upstream skipped: unreadable remote");
+                    return None;
+                }
+            };
+            let encrypted_admin_inputs = match serde_json::from_value(u.encrypted_admin_inputs.clone()) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(upstream = %u.id, error = %e, "MCP upstream skipped: unreadable admin inputs");
+                    return None;
+                }
+            };
+            Some(McpUpstreamServer {
+                id: u.id,
+                tenant_id: u.tenant_id,
+                name: u.name.clone(),
+                description: u.description.clone(),
+                upstream_url: u.upstream_url.clone(),
+                transport: parse_transport(&u.transport),
+                auth_mode,
+                cred_version: u.cred_version,
+                encrypted_credential: u.encrypted_credential.clone(),
+                remote,
+                encrypted_admin_inputs,
+                oauth_issuer_url: u.oauth_issuer_url.clone(),
+                oauth_authorization_url: u.oauth_authorization_url.clone(),
+                oauth_token_url: u.oauth_token_url.clone(),
+                oauth_revocation_url: u.oauth_revocation_url.clone(),
+                oauth_client_id: u.oauth_client_id.clone(),
+                encrypted_oauth_client_secret: u.encrypted_oauth_client_secret.clone(),
+                oauth_default_scopes: u.oauth_default_scopes.clone(),
+                enabled: u.enabled,
+                connect_timeout_ms: u.connect_timeout_ms,
+                request_timeout_ms: u.request_timeout_ms,
+                input_specs_cache: Default::default(),
+            })
         })
         .collect();
 
@@ -699,6 +717,25 @@ fn build_mcp_config(resp: &ConfigResponse) -> streamscope_core::config::mcp::Mcp
         virtual_servers,
         routes,
         user_credentials,
+    );
+    // A row whose values this build cannot read is left out: its user then
+    // reads as not connected, never as connected with guessed values.
+    cfg.set_user_inputs(
+        resp.mcp_user_inputs
+            .iter()
+            .filter_map(|r| match serde_json::from_value(r.encrypted_values.clone()) {
+                Ok(encrypted_values) => Some(McpUserInputs {
+                    tenant_id: r.tenant_id,
+                    user_id: r.user_id,
+                    upstream_server_id: r.upstream_server_id,
+                    encrypted_values,
+                }),
+                Err(e) => {
+                    tracing::warn!(upstream = %r.upstream_server_id, error = %e, "MCP user inputs skipped: unreadable values");
+                    None
+                }
+            })
+            .collect(),
     );
     cfg.revoked_jtis = resp.mcp_revoked_jtis.iter().copied().collect();
     cfg.jwks = resp.mcp_jwks.clone();
@@ -1110,6 +1147,7 @@ pub(crate) mod tests {
             mcp_virtual_servers: vec![],
             mcp_virtual_routes: vec![],
             mcp_user_credentials: vec![],
+            mcp_user_inputs: vec![],
             mcp_revoked_jtis: vec![],
             mcp_jwks: vec![],
             a2a_agents: vec![],
@@ -1311,6 +1349,7 @@ pub(crate) mod tests {
             mcp_virtual_servers: vec![],
             mcp_virtual_routes: vec![],
             mcp_user_credentials: vec![],
+            mcp_user_inputs: vec![],
             mcp_revoked_jtis: vec![],
             mcp_jwks: vec![],
             a2a_agents: vec![],
@@ -1579,6 +1618,7 @@ pub(crate) mod tests {
             mcp_virtual_servers: vec![],
             mcp_virtual_routes: vec![],
             mcp_user_credentials: vec![],
+            mcp_user_inputs: vec![],
             mcp_revoked_jtis: vec![],
             mcp_jwks: vec![],
             a2a_agents: vec![],
@@ -1662,6 +1702,7 @@ pub(crate) mod tests {
             mcp_virtual_servers: vec![],
             mcp_virtual_routes: vec![],
             mcp_user_credentials: vec![],
+            mcp_user_inputs: vec![],
             mcp_revoked_jtis: vec![],
             mcp_jwks: vec![],
             a2a_agents: vec![],
@@ -1718,6 +1759,7 @@ pub(crate) mod tests {
             mcp_virtual_servers: vec![],
             mcp_virtual_routes: vec![],
             mcp_user_credentials: vec![],
+            mcp_user_inputs: vec![],
             mcp_revoked_jtis: vec![],
             mcp_jwks: vec![],
             a2a_agents: vec![],
@@ -1970,5 +2012,84 @@ pub(crate) mod tests {
         let resp: MultiTenantConfigResponse = serde_json::from_value(json).unwrap();
         assert!(resp.log_level.is_none());
         assert!(resp.tenants.is_empty());
+    }
+
+    fn edge_upstream(auth_mode: &str, remote: serde_json::Value) -> streamscope_edge_api::config::EdgeMcpUpstreamServer {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "tenant_id": uuid::Uuid::new_v4(),
+            "name": "u",
+            "upstream_url": "https://up.example/mcp",
+            "transport": "streamable_http",
+            "auth_mode": auth_mode,
+            "cred_version": 1,
+            "remote": remote,
+            "encrypted_admin_inputs": {},
+            "enabled": true,
+            "connect_timeout_ms": 1000,
+            "request_timeout_ms": 1000,
+        }))
+        .unwrap()
+    }
+
+    fn upstream_ids(rows: Vec<streamscope_edge_api::config::EdgeMcpUpstreamServer>) -> Vec<uuid::Uuid> {
+        let mut resp = make_response(vec![]);
+        resp.mcp_upstream_servers = rows;
+        build_mcp_config(&resp).upstream_servers.keys().copied().collect()
+    }
+
+    /// Both stored auth modes are read; any other value — a retired one
+    /// included — leaves the upstream out rather than serving it unauthenticated.
+    #[test]
+    fn an_unknown_auth_mode_leaves_the_upstream_out_and_a_known_one_keeps_it() {
+        for mode in ["headers", "per_user_oauth"] {
+            let row = edge_upstream(mode, serde_json::json!({}));
+            assert_eq!(upstream_ids(vec![row.clone()]), vec![row.id], "{mode} was dropped");
+        }
+        for mode in ["no_auth", "service_account", "byot", ""] {
+            assert!(upstream_ids(vec![edge_upstream(mode, serde_json::json!({}))]).is_empty(), "{mode} was kept");
+        }
+    }
+
+    /// A remote this build cannot read leaves the upstream out; a readable
+    /// declaration (the positive control) keeps it with its headers.
+    #[test]
+    fn an_unreadable_remote_leaves_the_upstream_out() {
+        let bad = edge_upstream("headers", serde_json::json!({"headers": "not-a-list"}));
+        assert!(upstream_ids(vec![bad]).is_empty());
+        let good = edge_upstream(
+            "headers",
+            serde_json::json!({"type": "streamable-http", "url": "https://up.example/mcp",
+                "headers": [{"name": "X-Token", "isRequired": true}],
+                "_meta": {"ai.streamscope/inputs": {"fillers": {"X-Token": "client"}}}}),
+        );
+        let mut resp = make_response(vec![]);
+        resp.mcp_upstream_servers = vec![good.clone()];
+        let cfg = build_mcp_config(&resp);
+        assert_eq!(cfg.upstream_servers[&good.id].remote.headers[0].name, "X-Token");
+    }
+
+    /// A user's inputs reach the snapshot; a row whose values are not an
+    /// object of strings is left out (the user reads as not connected).
+    #[test]
+    fn a_users_inputs_reach_the_snapshot_unless_unreadable() {
+        let up = edge_upstream("headers", serde_json::json!({}));
+        let (good_user, bad_user) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let row = |user: uuid::Uuid, values: serde_json::Value| -> streamscope_edge_api::config::EdgeMcpUserInputs {
+            serde_json::from_value(serde_json::json!({
+                "tenant_id": up.tenant_id, "user_id": user,
+                "upstream_server_id": up.id, "encrypted_values": values,
+            }))
+            .unwrap()
+        };
+        let mut resp = make_response(vec![]);
+        resp.mcp_upstream_servers = vec![up.clone()];
+        resp.mcp_user_inputs = vec![
+            row(good_user, serde_json::json!({"X-Token": "c2VhbGVk"})),
+            row(bad_user, serde_json::json!({"X-Token": 7})),
+        ];
+        let cfg = build_mcp_config(&resp);
+        assert_eq!(cfg.user_inputs(good_user, up.id).unwrap().encrypted_values["X-Token"], "c2VhbGVk");
+        assert!(cfg.user_inputs(bad_user, up.id).is_none());
     }
 }

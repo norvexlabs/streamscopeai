@@ -191,17 +191,6 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     let tier = sandbox::select_tier(choice)?;
 
-    // A hub-dependent client (e.g. the Continue CLI) contacts its vendor hub
-    // before any LLM call; the gateway-only sandbox egress guard blocks that, so
-    // it exits without producing a turn. Warn up front instead of failing opaquely.
-    if !matches!(tier, sandbox::Tier::Off)
-        && sandbox::profiles::agent_for(&spec.command).is_some_and(|a| a.hub_dependent)
-    {
-        crate::ui::warn("", format_args!("`{}` needs egress to its vendor hub, which the sandbox blocks — it will \
-             exit without producing a turn. Run it with `--sandbox off`, or outside \
-             `ssai run`.", spec.command));
-    }
-
     let code = sandbox::launch(spec, tier, args.verbose).await?;
     std::process::exit(code);
 }
@@ -568,7 +557,7 @@ mod tests {
     fn client(id: &str) -> serde_json::Value {
         serde_json::json!({
             "client_id": id, "template_index": 0, "mode": "gateway", "provider_id": null, "key_id": null,
-            "mcp_server_ids": [], "files": [],
+            "mcp_server_ids": [], "mcp_local_servers": [], "mcp_local_commands": {}, "files": [],
             "last_provisioned": "2026-10-09T12:00:00Z", "launch_command": id
         })
     }
@@ -640,7 +629,7 @@ mod tests {
         let managed = |path: &str| -> ManagedClient {
             serde_json::from_value(serde_json::json!({
                 "client_id": "opencode", "template_index": 0, "last_provisioned": "2026-10-09T12:00:00Z",
-                "mode": "gateway", "provider_id": null, "key_id": null, "mcp_server_ids": [],
+                "mode": "gateway", "provider_id": null, "key_id": null, "mcp_server_ids": [], "mcp_local_servers": [], "mcp_local_commands": {},
                 "launch_command": null,
                 "files": [{ "path": path, "format": "json", "owned": [], "file_hash": "" }]
             }))

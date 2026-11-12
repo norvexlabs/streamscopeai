@@ -78,13 +78,73 @@ pub(crate) fn confine_to_key_workspace(
     user: &PortalUser,
     workspace_id: Uuid,
 ) -> Result<(), ApiError> {
-    if let Some(bound) = user.key_workspace_id
-        && bound != workspace_id
-    {
-        return Err(ApiError::forbidden("this key is scoped to a different workspace")
-            .code(ApiErrorCode::WorkspaceManagerRequired));
+    key_confined_to(user, workspace_id, || {
+        ApiError::forbidden("this key is scoped to a different workspace").code(ApiErrorCode::WorkspaceManagerRequired)
+    })
+}
+
+/// The one check that an `ak-` portal key acts only in the workspace it is
+/// bound to (a person, with no key, passes); `refusal` is what the caller
+/// answers a key aimed elsewhere.
+fn key_confined_to(
+    user: &PortalUser,
+    workspace_id: Uuid,
+    refusal: impl FnOnce() -> ApiError,
+) -> Result<(), ApiError> {
+    match user.key_workspace_id {
+        Some(bound) if bound != workspace_id => Err(refusal()),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// Proof that the caller may act in one workspace as a member of it. Its field
+/// is private and [`require_workspace_member`] is the only code that makes
+/// one, so whatever takes a `MemberOf` — the client-access resolution, the
+/// render context that mints a workspace-bound key — cannot be reached by a
+/// caller that skipped the gate: it does not compile. Never add a constructor.
+#[derive(Clone, Copy)]
+pub(crate) struct MemberOf {
+    workspace_id: Uuid,
+}
+
+impl MemberOf {
+    pub(crate) fn workspace_id(self) -> Uuid {
+        self.workspace_id
+    }
+}
+
+/// Require the caller to act in `workspace_id` as one of its members: an `ak-`
+/// portal key only in the workspace it is bound to, and its principal a member
+/// — else 403 `WorkspaceMembershipRequired`, the one refusal for both, so a key
+/// bound elsewhere reads exactly as a person who is not a member. The gate of
+/// everything that answers with what one workspace is offered or acts in it,
+/// so neither learns anything of another team's; the [`MemberOf`] it returns
+/// is what those take.
+pub(crate) async fn require_workspace_member(
+    conn: &mut crate::db::tenant::Scoped,
+    user: &PortalUser,
+    workspace_id: Uuid,
+) -> Result<MemberOf, ApiError> {
+    key_confined_to(user, workspace_id, not_a_member)?;
+    let member: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(user.user_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| {
+        tracing::error!("workspace membership: {e}");
+        ApiError::internal("internal error")
+    })?;
+    if !member {
+        return Err(not_a_member());
+    }
+    Ok(MemberOf { workspace_id })
+}
+
+fn not_a_member() -> ApiError {
+    ApiError::forbidden("you are not a member of this workspace").code(ApiErrorCode::WorkspaceMembershipRequired)
 }
 
 // ---------------------------------------------------------------------------
@@ -800,4 +860,35 @@ pub async fn remove_member_exception(
     let removed = crate::routes::workspaces::delete_member_exception(&mut db, workspace_id, member_id).await?;
     audit_sink.record(removed.as_ref(), None::<&crate::routes::workspaces::UserRateLimitOverride>);
     Ok(Json(ActionResponse::ok().with_message("Member exception removed.")))
+}
+
+#[cfg(test)]
+mod workspace_member_tests {
+    use super::*;
+
+    #[test]
+    fn a_key_acts_only_in_its_workspace_and_is_refused_as_a_non_member() {
+        let (bound, other) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let caller = |key_workspace_id: Option<Uuid>| PortalUser {
+            user_id: Uuid::from_u128(9),
+            email: "bot@test.com".into(),
+            tenant_id: Uuid::from_u128(8),
+            key_id: key_workspace_id.map(|_| Uuid::from_u128(7)),
+            key_workspace_id,
+            session_iat: None,
+        };
+        // A person is held to membership alone.
+        assert!(key_confined_to(&caller(None), other, not_a_member).is_ok());
+        // A key: its own workspace, never another — and the refusal is the
+        // one the caller names, the same a person outside the workspace gets.
+        assert!(key_confined_to(&caller(Some(bound)), bound, not_a_member).is_ok());
+        let refusal = key_confined_to(&caller(Some(bound)), other, not_a_member).expect_err("another workspace");
+        assert_eq!(refusal.code, ApiErrorCode::WorkspaceMembershipRequired);
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        // The manager surfaces keep their own refusal through the same check.
+        assert!(confine_to_key_workspace(&caller(Some(bound)), bound).is_ok());
+        assert!(confine_to_key_workspace(&caller(None), other).is_ok());
+        let manager = confine_to_key_workspace(&caller(Some(bound)), other).expect_err("another workspace");
+        assert_eq!(manager.code, ApiErrorCode::WorkspaceManagerRequired);
+    }
 }

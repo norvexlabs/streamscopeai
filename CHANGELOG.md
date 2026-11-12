@@ -5,6 +5,221 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.35]
+
+- **A more confined installation, on every shape.** The front that terminates TLS runs as an
+  unprivileged user; provisioning, the schema check and the backup runner run with a read-only
+  root and only the capabilities they need; on the VM appliance the firewall also drops traffic
+  forwarded between its own interfaces, IPv6 as IPv4. The front's web server, the backup tool and
+  the release scanner are updated. An existing install is moved over at its upgrade, nothing to do.
+- **The installer says more about itself.** `ssai-stow --version` prints the release it carries;
+  `ssai-stow describe` lists what that release offers without an install; `ssai-stow status --json`
+  also lists every setting the install records.
+
+## [2026.11.34]
+
+- **Hide conversations or the Requests page for a team.** A Portal & clients profile gains a **Portal pages**
+  tab with two switches. **Hide conversations** removes the Sessions page and all conversation content from the
+  member's portal — a request's details, media and tool definitions; the Requests page, if still shown, then
+  lists each request with its time, model, tokens, cost and status only, without a content search, and a
+  request does not open. **Hide the Requests page** removes that list. What is hidden is withheld by the
+  gateway, for scripts and automation keys too, not only left out of the page; a page a member has open gives
+  way at its next refresh and comes back the same way. Each switch applies to a member only when every
+  workspace they belong to has it on; a member of no workspace follows the Default. Usage figures and limits
+  stay visible; with conversations hidden, Home no longer lists recent sessions.
+
+## [2026.11.33]
+
+- **Local MCP servers.** An MCP server that runs on the developer's own machine can now be managed like the
+  others: store its command line on the MCP Gateway page's new **Local servers** tab — typed by hand, or
+  prefilled from a catalog entry's package (npm and PyPI packages derive their `npx` / `uvx` command; any other
+  package opens the form with the reason the command is yours to type) — grant it to workspaces, and the portal
+  Quickstart and `ssai provision --local-mcp <slug>` write it into the member's client configuration (Claude
+  Code in a project, Claude Desktop, Cursor, Cline, Codex, Continue, Crush, Gemini CLI, Goose, Mistral Vibe,
+  OpenCode, Qwen Code; a client that cannot take one says the server was left out). A secret never goes through
+  the gateway: an environment variable holds a plain value or is left for each developer to paste, and a
+  variable marked secret holds no value for as long as it exists. A setup that gets only local servers needs no
+  gateway key. `ssai provision` shows each whole command line before writing; `ssai sync` shows one that
+  changed, and removes — whole, pasted values included — a server that was turned off, revoked or deleted;
+  nothing else in the file is touched and the tool stays managed. A server's slug is fixed once it is created. The
+  gateway does not see a local server's own traffic; tool rules still apply to the model's calls to its tools.
+- **BREAKING** (API): a catalog document may declare packages and no remote (one with neither is refused);
+  the adopt action's result carries `local_server_id`, and its `upstream_id` / `virtual_server_id` are empty for
+  a package; a Quickstart or provision warning names its server by `virtual_server_id` or `local_server_id`.
+  **BREAKING** (CLI): the CLI's record of what it provisioned changed shape — after updating, run `ssai
+  provision` once in each place you provisioned before.
+- **Changed:** `ssai provision` run again on a tool keeps the MCP servers it already has. With no MCP flag a
+  tool's gateway MCP servers used to be dropped under `--yes` (and re-proposed otherwise); they are now kept,
+  like its local ones, while still offered to the workspace. `--mcp` / `--all-mcp` replace the gateway servers,
+  `--local-mcp` the local ones, the new `--no-local-mcp` takes the local ones out, and `--no-mcp` selects none
+  of either kind. A tool also stays on the setup it was provisioned with unless `--template` names another. A
+  first provision is unchanged. A tool set up for MCP servers only with none selected is left as it is, with a
+  line saying so, and one tool refused by the gateway no longer stops the others from being written.
+
+## [2026.11.32]
+
+- **Portal & clients profiles per workspace.** **Governance → Client access** is now **Portal & clients**, a
+  list of profiles: the Default, and the ones you create for a team — each an independent copy that a later
+  change to the Default does not reach. Assign one on the workspace's **Access** tab and that workspace's
+  members get its clients in the portal Quickstart and `ssai provision`, and its sandbox rules (required
+  sandbox, container sandbox, destination lists) in `ssai run`; a member of several workspaces gets each
+  workspace's own. Deleting a profile sends its workspaces back to the Default; **Set as default** promotes a
+  profile as it stands, and developers follow it at their next provision, sync or run. A workspace is never
+  without a profile, and the Agent and Inline AI workspaces stay on the Default. A profile's Clients tab has
+  **Offer all** and **Offer none**.
+- The portal Quickstart wizard works in the workspace selected in the header: it lists that workspace's
+  clients and starts over when you switch. A configuration already on screen stays — its key is shown only
+  once — under a notice naming both workspaces, until you start over. A workspace offered no client says so,
+  and a failed load can be retried. The wizard and `ssai provision` offer only the providers and MCP servers
+  the chosen workspace grants, not those of your other workspaces
+  (`GET /api/v1/portal/mcp/virtual-servers` takes an optional `workspace_id`).
+- **BREAKING:** reading the Quickstart's clients now names the workspace: `GET /api/v1/portal/quickstart/clients`
+  and `GET /api/v1/portal/quickstart/clients/{id}` take a required `workspace_id` for a signed-in member (400
+  without it, 403 for a workspace you are not a member of); an automation key answers for the workspace it is
+  bound to, and one aimed at another workspace is refused with `workspace_membership_required` — on these
+  reads and now also on the Quickstart render and the provision bundle, which answered
+  `workspace_manager_required`. Update `ssai` (`ssai update`): an earlier `ssai provision` is refused. The Quickstart marks a
+  client compatible from the selected workspace's grants alone. The error code `profile_kind_default_only` is
+  gone; a profile choice a kind does not take answers `profile_choice_unsupported`.
+
+## [2026.11.31]
+
+- The portal Home's To do line for an MCP server waiting on you reads **Connect**, whether the server needs a
+  sign-in or your own values; the API keys page no longer repeats it with its own banner.
+
+## [2026.11.30]
+
+- **Portal Home is your dashboard.** Today's and the last 7 days' spend and requests with a spend-per-day strip,
+  your recent sessions, and beside them a **To do** card that appears only when something waits for you: an MCP
+  server that needs your sign-in or values, an API key about to expire, a first key to create, and each machine
+  whose `ssai` is out of date (named by its host, with the `ssai update` to run). **My limits** shows only the
+  limits that are set, and nothing when none is. The start actions are a row of buttons in the header.
+- **BREAKING:** the portal **Usage** page is removed: its figures are on Home, its limits under **My limits**, and
+  the usage of each key (requests, tokens, spend, last used, for today or the last 7 or 30 days) on **API keys**.
+  The portal Home API no longer returns `limit_warnings`; it returns the daily figures, the limits that apply and
+  the out-of-date CLI hosts instead.
+- `ssai` names its version, operating system and host on each call to the gateway, so the portal can tell you
+  which machine to update.
+- The portal **Quickstart** opens on **Set up via CLI**; the web wizard is the second tab. A banner above both
+  names the MCP servers waiting for your sign-in or values.
+- A missing MCP value or sign-in now says who acts and where. The console's **Test** result tells the
+  administrator whether each user enters a value in **Portal → Sign-ins**, the client sends it, or the
+  administrator must set it (with a button to the server's settings), and each server's card lists every header
+  with who fills it and flags a required administrator value that is not set. **Portal → Sign-ins** shows each
+  server's state and one button for the next step. An agent calling a server that waits for the user's value or
+  sign-in is answered with the address of the portal's sign-ins page.
+- The console records a notification (**MCP server cannot be called**) for an enabled MCP server every call to
+  which fails — a required administrator value missing or unreadable, or an incomplete OAuth client — linking to
+  the server.
+- The console's **Test** button calls an MCP server with the administrator's values and lists its tools, prompts
+  and resources, or names the values it waits for — a user's, the client's, or a user's sign-in.
+- An MCP server keeps the values its address was finished with: the editor shows them, and changing one keeps
+  the others. A catalog entry shows which servers were adopted from it, and the link survives a catalog reset.
+- Quickstart and `ssai provision` say which MCP servers they left out of a tool's configuration, and why.
+- Binding an upstream that reads the client's own `Authorization` to an endpoint that signs its clients in with
+  OAuth is refused: such a client could never reach it.
+- The portal **Sign-ins** form is prefilled with the values you entered before, except secret ones.
+- A pasted `server.json` keeps the `_meta` of other vendors, in the catalog and on the adopted server.
+- An MCP server's short secret (under 8 characters) is hidden in error messages only where it stands as a whole
+  word, so it no longer blanks every matching letter.
+- The Continue CLI runs under the native sandbox on Linux; a Node.js tool needs Node.js 22.21 or newer there.
+
+## [2026.11.29]
+
+- **BREAKING:** MCP servers are described the way the MCP Registry describes them, and their credentials are the
+  headers they declare. A catalog entry is a `server.json` document: paste one to add your own, or view any
+  entry as one. An upstream server declares the headers it expects — a value on its own, or a template such as
+  `Bearer {token}` — and each value is filled by the administrator (locked, never shown to users), by each user
+  in **Portal → Sign-ins** (stored encrypted per user), or by the user's MCP client on every call (never
+  stored). This sets up servers such as a Jira and Confluence server that takes personal access tokens in its
+  own headers: the administrator locks the addresses, each user enters their own tokens. OAuth sign-in combines
+  with declared headers on one server. Adopting a catalog entry asks who fills each value, and the values of
+  any variables in its address.
+- **BREAKING:** the upstream modes `no_auth`, `service_account` and `byot` are gone, with the `credential`
+  field. A server with no headers needs no credential; a shared bearer token is an administrator-filled
+  `Authorization: Bearer {token}` header (offered as **Bearer token (shared)**); a token the client sends is a
+  client-filled header. Such a header is forwarded to that server only; the client reaches it on `/mcp/<slug>`
+  with its usual gateway key — except a client-sent `Authorization`, which uses `/fwd/<gateway key>/mcp/<slug>`
+  (a pass-through `vk-` key reaches only an endpoint whose every server takes just that client token). Two
+  servers attached to one endpoint cannot expect the same client header. The MCP admin and portal API shapes
+  change accordingly.
+- **BREAKING:** this release resets every organisation's MCP configuration: the catalog (it is restored from
+  the shipped list, so entries you removed reappear and your own entries are gone), every upstream server,
+  endpoint and route, the workspace grants of the endpoints removed, and every user's MCP sign-ins. The
+  built-in Web endpoint is kept with its grants, but no longer routes to any server you attached to it. API keys,
+  audit records and sessions are untouched. Rolling back across this release is refused: back up before
+  upgrading, and restore that backup to go back. Until every gateway runs this release, one still on the
+  previous release calls MCP servers without their declared headers.
+- **Portal → Sign-ins** lists every server that needs your own account or values, and opens a form with just
+  your fields; disconnecting also deletes the values you entered. **Try a server** reports a server that needs a
+  value your client sends, and a server that answers with a redirect, instead of failing.
+- The gateway no longer follows an MCP server's redirect to another address: a header it declares could reach a
+  host nobody configured.
+- Client configurations generated by the Quickstart and the CLI write every header each MCP server needs, with a
+  placeholder for each value the client sends.
+- The MCP catalog's built-in list is refreshed: 118 servers.
+
+## [2026.11.28]
+
+- The container sandbox runs a dev container's lifecycle commands and applies its environment. `onCreateCommand`,
+  `updateContentCommand` and `postCreateCommand` run before each tool's first run in the project, and again when
+  they, their environment or the image change; `postStartCommand` and `postAttachCommand` run before it on every run. They run as the
+  tool's user in the project folder, one after another and each to its end, through the same sandbox as the tool;
+  a command that fails stops the run before the tool starts. The commands of the features an image was built
+  with run first, and the variables its dev container metadata sets apply, for an image named in `sandbox.json` too. `containerEnv` and `remoteEnv` apply to the commands and the tool (`${containerEnv:PATH}` reads the image's
+  value); the sandbox's own variables, such as its proxy, still win.
+- A dev container built from a Dockerfile is rebuilt only when what it is built from changes (the Dockerfile, and
+  the `build` keys of `devcontainer.json`), no longer for an edit to another key such as a lifecycle command; one
+  that uses `features` is still rebuilt for any edit.
+
+## [2026.11.27]
+
+- **BREAKING:** the container sandbox's `.streamscopeai/sandbox.json` holds named sandboxes:
+  `{"sandboxes": {"default": {"image": "…"}}}`, with the keys of the earlier form inside a named entry.
+  `ssai run --sandbox docker` starts the one named `default`; a file in the earlier form is refused naming the form to
+  use, and one naming another sandbox, or one sandbox twice, is refused.
+
+## [2026.11.26]
+
+- The container sandbox (`ssai run --sandbox docker`) installs a tool where a rebuilt image's newer release always
+  reaches it: `ssai sandbox prepare` now picks up the tool's latest release for an image whose npm installs under
+  the user's home, which the sandbox keeps between runs and which used to hide every later install. The first
+  run of each tool after the update installs it again; the earlier image stays until `ssai sandbox prune`,
+  which also removes every agent home the container sandbox keeps.
+- `ssai sandbox prepare` works for a project whose `sandbox.json` names an image built on this machine
+  (`localhost/…`): it uses that image as it is, where it used to fail trying to pull it from a registry.
+- A dev container that uses `features` is told that the Dev Container CLI building it pulls its `build.cacheFrom`
+  from this machine's network, where it used to be told that cache is not used.
+
+## [2026.11.25]
+
+- Expert analysis reads a turn that reaches the console late. A gateway that could not deliver its records for a
+  while delivers them with the time they happened; when that was further back than the session cooldown, analysis
+  had already passed that time and never read the turn unless the session got more traffic. Analysis now reads
+  sessions in the order their turns arrive. It starts over from the upgrade: a turn that arrived before it and was
+  not yet analyzed is not read, and restarting a profile's analysis from a date reads the sessions active after
+  that date that a turn has reached since the upgrade.
+
+## [2026.11.24]
+
+- **BREAKING** for an inline gateway that redirects traffic without naming the provider host: a request sent with
+  the Inline AI key on the redirect path must now carry `X-Origin-Host`, and one without it is refused. A request
+  naming no host used to go to the workspace's only pass-through, or the one pass-through speaking the request's
+  API format, whichever provider had issued the client's key: a client's key for one provider could reach another.
+  The model list on the redirect path follows the same rule.
+- An analyzed request whose policy changes were not applied no longer shows them as sent. The conversation view
+  showed a blocked tool removed (beside the **Would block** chip), an injected system prompt or rewritten messages,
+  though the inline gateway forwarded the client's request as it was; the turn now records what the model was sent,
+  and the steps still show what policy would have changed. A request the inline gateway refused records no change
+  either.
+
+## [2026.11.23]
+
+- A server's automatic token-latency target is shown only once every gateway replica has learned its own. Each
+  replica holds the limit to the target it learned itself, so while one was still learning, the QoS tab and the
+  dashboard showed a target that replica did not apply, and its limit could grow past it. Until every replica has
+  learned, both now say the target is still learning.
+
 ## [2026.11.22]
 
 - **BREAKING** for an `ssai` older than this release, which cannot render the new Aider configs: `ssai update`

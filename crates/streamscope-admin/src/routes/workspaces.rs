@@ -175,6 +175,9 @@ pub struct WorkspaceDetail {
     pub member_count: i64,
     pub providers: Vec<WorkspaceProvider>,
     pub mcp_servers: Vec<WorkspaceMcpServer>,
+    /// The local MCP servers (run on a member's own machine) the workspace is
+    /// handed.
+    pub mcp_local_servers: Vec<WorkspaceMcpLocalServer>,
     pub a2a_agents: Vec<WorkspaceA2aAgent>,
     /// Per-kind profile selections (`workspace_profile_assignments` → `profiles`).
     pub assigned_profiles: Vec<AssignedProfile>,
@@ -236,6 +239,9 @@ pub struct UpdateWorkspaceRequest {
 /// - `{"mode":"off"}` → upsert a NULL-profile row → the kind's policy is **fully
 ///   disabled** for this workspace (the proxy resolves [`EffectiveProfile::Off`]);
 /// - `{"mode":"profile","id":<uuid>}` → upsert that profile id.
+///
+/// The `client_access` kind takes `inherit` and `profile` only, and `profile`
+/// only on a workspace that is neither the Agent nor the Inline AI one.
 #[derive(Deserialize, ToSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ProfileAssignmentChoice {
@@ -316,6 +322,21 @@ pub struct WorkspaceMcpServer {
 #[derive(Deserialize, ToSchema)]
 pub struct AddMcpServerRequest {
     pub virtual_server_id: Uuid,
+}
+
+/// A local MCP server granted to a workspace.
+#[derive(Serialize, ToSchema, sqlx::FromRow)]
+pub struct WorkspaceMcpLocalServer {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct AddMcpLocalServerRequest {
+    pub local_server_id: Uuid,
 }
 
 #[derive(Serialize, ToSchema, sqlx::FromRow)]
@@ -692,6 +713,7 @@ pub async fn get_workspace(
 
     let providers = fetch_providers(&mut db, id, 0, 1000).await?;
     let mcp_servers = fetch_mcp_servers(&mut db, id, 0, 1000).await?;
+    let mcp_local_servers = fetch_mcp_local_servers(&mut db, id, 0, 1000).await?;
     let a2a_agents = fetch_a2a_agents(&mut db, id, 0, 1000).await?;
     let rate_limits = fetch_rate_limits(&mut db, id).await?;
     let usage = fetch_workspace_usage(&mut db, id).await;
@@ -705,6 +727,7 @@ pub async fn get_workspace(
         member_count,
         providers,
         mcp_servers,
+        mcp_local_servers,
         a2a_agents,
         assigned_profiles,
         rate_limits,
@@ -749,6 +772,43 @@ async fn fetch_workspace_usage(db: &mut TenantConn, id: Uuid) -> WorkspaceBudget
     }
 }
 
+/// The choice as it is stored: one naming the kind's Default profile is
+/// inherit — no assignment row names the Default.
+fn stored_choice(choice: &ProfileAssignmentChoice, names_default: bool) -> &ProfileAssignmentChoice {
+    const INHERIT: ProfileAssignmentChoice = ProfileAssignmentChoice::Inherit;
+    if names_default { &INHERIT } else { choice }
+}
+
+/// What a workspace of `role` may be assigned for the client-access kind
+/// (every other kind takes every choice). Refused before any write:
+/// - **Off** — a workspace always resolves to a client-access profile; with
+///   none it would be offered no client and no sandbox policy;
+/// - **a profile on the Agent or Inline AI workspace** — neither has developers
+///   provisioning clients, and both stay on the tenant's Default.
+///
+/// Inherit is always taken: it removes the assignment.
+fn client_access_assignment_allowed(
+    kind: streamscope_core::config::ProfileKind,
+    role: WorkspaceRole,
+    choice: &ProfileAssignmentChoice,
+) -> Result<(), ApiError> {
+    if kind != streamscope_core::config::ProfileKind::ClientAccess {
+        return Ok(());
+    }
+    match (choice, role) {
+        (ProfileAssignmentChoice::Inherit, _) => Ok(()),
+        (ProfileAssignmentChoice::Off, _) => Err(super::profiles::choice_unsupported(
+            "client access cannot be turned off for a workspace: assign a profile or the Default",
+        )),
+        (ProfileAssignmentChoice::Profile { .. }, WorkspaceRole::Agent | WorkspaceRole::Inline) => {
+            Err(super::profiles::choice_unsupported(
+                "the Agent and Inline AI workspaces keep the Default client-access profile",
+            ))
+        }
+        (ProfileAssignmentChoice::Profile { .. }, WorkspaceRole::Standard | WorkspaceRole::Default) => Ok(()),
+    }
+}
+
 #[utoipa::path(
     patch,
     path = "/api/v1/admin/workspaces/{id}",
@@ -757,6 +817,7 @@ async fn fetch_workspace_usage(db: &mut TenantConn, id: Uuid) -> WorkspaceBudget
     request_body = UpdateWorkspaceRequest,
     responses(
         (status = 200, description = "Workspace updated", body = Workspace),
+        (status = 400, description = "Validation failed, or a profile choice the kind does not take", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -863,11 +924,30 @@ pub async fn update_workspace(
             let kind = streamscope_core::config::ProfileKind::parse(kind_str).ok_or_else(|| {
                 ApiError::bad_request("unknown profile kind").code(ApiErrorCode::ProfileKindInvalid)
             })?;
-            super::profiles::refuse_default_only(kind)?;
+            // The Default client-access profile is never stored as an
+            // assignment: choosing it is choosing to inherit, so the workspace
+            // follows a later Default (the invariant is stated on
+            // `is_default_for_assignment`). Settled before the choice is
+            // judged: naming the Default is inherit on every workspace, the
+            // Agent and Inline AI ones included.
+            let names_default = match sel {
+                ProfileAssignmentChoice::Profile { id: pid }
+                    if kind == streamscope_core::config::ProfileKind::ClientAccess =>
+                {
+                    super::client_access_profiles::is_default_for_assignment(&mut tx, *pid).await?
+                }
+                _ => false,
+            };
+            let sel = stored_choice(sel, names_default);
+            client_access_assignment_allowed(kind, ws.role, sel)?;
             match sel {
                 ProfileAssignmentChoice::Profile { id: pid } => {
-                    // Target must exist in this tenant AND match the kind.
-                    super::profiles::ensure_profile_exists(&mut tx, *pid, kind).await?;
+                    // Target must exist in this tenant AND match the kind —
+                    // which `is_default_for_assignment` established above for
+                    // client access.
+                    if kind != streamscope_core::config::ProfileKind::ClientAccess {
+                        super::profiles::ensure_profile_exists(&mut tx, *pid, kind).await?;
+                    }
                     sqlx::query(
                         "INSERT INTO workspace_profile_assignments (workspace_id, tenant_id, kind, profile_id) \
                          VALUES ($1, $2, $3, $4) \
@@ -1550,6 +1630,135 @@ pub async fn remove_mcp_server(
         serde_json::Value::Null,
     );
     Ok(Json(ActionResponse::ok().with_message("MCP server removed")))
+}
+
+// ---------------------------------------------------------------------------
+// Local MCP servers (allowlist)
+// ---------------------------------------------------------------------------
+
+async fn fetch_mcp_local_servers(
+    db: &mut TenantConn,
+    id: Uuid,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<WorkspaceMcpLocalServer>, ApiError> {
+    sqlx::query_as::<_, WorkspaceMcpLocalServer>(
+        "SELECT l.id, l.slug, l.name, l.description, l.enabled FROM mcp_local_servers l \
+         JOIN workspace_mcp_local_access a ON a.local_server_id = l.id AND a.workspace_id = $1 \
+         ORDER BY l.name ASC, l.id LIMIT $2 OFFSET $3",
+    )
+    .bind(id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db.conn())
+    .await
+    .map_err(|e| {
+        tracing::error!("fetch workspace local mcp servers: {e}");
+        ApiError::internal("failed to list local MCP servers")
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/workspaces/{id}/mcp-local-servers",
+    tag = "Workspaces",
+    params(("id" = Uuid, Path, description = "Workspace id"), PageQuery),
+    responses(
+        (status = 200, description = "Granted local MCP servers", body = OffsetPage<WorkspaceMcpLocalServer>),
+        (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_workspace_mcp_local_servers(
+    mut db: TenantConn,
+    Path(id): Path<Uuid>,
+    Query(page): Query<PageQuery>,
+) -> Result<Json<OffsetPage<WorkspaceMcpLocalServer>>, ApiError> {
+    workspace_role(&mut db, id).await?;
+    let (limit, offset) = page.resolve();
+    let rows = fetch_mcp_local_servers(&mut db, id, offset, limit + 1).await?;
+    Ok(Json(OffsetPage::from_overfetched(rows, limit, offset)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/admin/workspaces/{id}/mcp-local-servers",
+    tag = "Workspaces",
+    params(("id" = Uuid, Path, description = "Workspace id")),
+    request_body = AddMcpLocalServerRequest,
+    responses(
+        (status = 200, description = "Local MCP server granted", body = ActionResponse),
+        (status = 400, description = "The Agent or the Inline AI workspace: it has no developers", body = ApiErrorResponse),
+        (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn add_mcp_local_server(
+    mut db: TenantConn,
+    Path(id): Path<Uuid>,
+    axum::Extension(audit_sink): axum::Extension<AuditDiffSink>,
+    Json(req): Json<AddMcpLocalServerRequest>,
+) -> Result<Json<ActionResponse>, ApiError> {
+    let tenant_id = db.tenant_uuid();
+    // FK validation bypasses RLS — confirm the local server is in this tenant
+    // (RLS-scoped SELECT) before inserting, else a cross-tenant id would take.
+    let exists: Option<Uuid> = sqlx::query_scalar("SELECT id FROM mcp_local_servers WHERE id = $1")
+        .bind(req.local_server_id)
+        .fetch_optional(db.conn())
+        .await
+        .map_err(|e| {
+            tracing::error!("check local mcp server: {e}");
+            ApiError::internal("failed to grant local MCP server")
+        })?;
+    if exists.is_none() {
+        return Err(ApiError::not_found("local MCP server not found", ApiErrorCode::McpLocalServerNotFound));
+    }
+    // The workspace exists and has developers (not the Agent or Inline AI one).
+    super::mcp_local::grant_to_workspaces(db.conn(), tenant_id, req.local_server_id, &[id]).await?;
+    audit_sink.set(
+        serde_json::Value::Null,
+        serde_json::json!({ "workspace_id": id, "local_server_id": req.local_server_id }),
+    );
+    Ok(Json(ActionResponse::ok().with_message("local MCP server granted")))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/v1/admin/workspaces/{id}/mcp-local-servers/{server_id}",
+    tag = "Workspaces",
+    params(
+        ("id" = Uuid, Path, description = "Workspace id"),
+        ("server_id" = Uuid, Path, description = "Local server id"),
+    ),
+    responses(
+        (status = 200, description = "Local MCP server removed", body = ActionResponse),
+        (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_mcp_local_server(
+    mut db: TenantConn,
+    Path((id, server_id)): Path<(Uuid, Uuid)>,
+    axum::Extension(audit_sink): axum::Extension<AuditDiffSink>,
+) -> Result<Json<ActionResponse>, ApiError> {
+    workspace_role(&mut db, id).await?;
+    sqlx::query("DELETE FROM workspace_mcp_local_access WHERE workspace_id = $1 AND local_server_id = $2")
+        .bind(id)
+        .bind(server_id)
+        .execute(db.conn())
+        .await
+        .map_err(|e| {
+            tracing::error!("remove local mcp server: {e}");
+            ApiError::internal("failed to remove local MCP server")
+        })?;
+    audit_sink.set(
+        serde_json::json!({ "workspace_id": id, "local_server_id": server_id }),
+        serde_json::Value::Null,
+    );
+    Ok(Json(ActionResponse::ok().with_message("local MCP server removed")))
 }
 
 // ---------------------------------------------------------------------------
@@ -2251,6 +2460,8 @@ pub fn workspaces_router() -> axum::Router<Arc<AdminState>> {
         .route("/{id}/providers/{provider_id}", delete(remove_provider))
         .route("/{id}/mcp-servers", get(list_workspace_mcp_servers).post(add_mcp_server))
         .route("/{id}/mcp-servers/{server_id}", delete(remove_mcp_server))
+        .route("/{id}/mcp-local-servers", get(list_workspace_mcp_local_servers).post(add_mcp_local_server))
+        .route("/{id}/mcp-local-servers/{server_id}", delete(remove_mcp_local_server))
         .route("/{id}/a2a-agents", get(list_workspace_a2a_agents).post(add_a2a_agent))
         .route("/{id}/a2a-agents/{agent_id}", delete(remove_a2a_agent))
         .route("/{id}/rate-limits", get(get_rate_limits).put(put_rate_limits))
@@ -2291,6 +2502,45 @@ mod tests {
             );
         }
         assert_eq!(WorkspaceRole::parse("bogus"), None);
+    }
+
+    #[test]
+    fn client_access_is_never_off_and_stays_the_default_on_the_built_in_service_workspaces() {
+        use super::{client_access_assignment_allowed as allowed, stored_choice, ProfileAssignmentChoice as Choice};
+        use crate::routes::ApiErrorCode;
+        use streamscope_core::config::ProfileKind;
+
+        let profile = Choice::Profile { id: uuid::Uuid::nil() };
+        let roles = [WorkspaceRole::Standard, WorkspaceRole::Default, WorkspaceRole::Agent, WorkspaceRole::Inline];
+        let refused = |kind, role, choice: &Choice| match allowed(kind, role, choice) {
+            Ok(()) => false,
+            Err(e) => {
+                assert_eq!(e.code, ApiErrorCode::ProfileChoiceUnsupported);
+                assert_eq!(e.status, axum::http::StatusCode::BAD_REQUEST);
+                true
+            }
+        };
+        for role in roles {
+            assert!(refused(ProfileKind::ClientAccess, role, &Choice::Off), "{role:?}: Off");
+            assert!(!refused(ProfileKind::ClientAccess, role, &Choice::Inherit), "{role:?}: Inherit");
+            let service = matches!(role, WorkspaceRole::Agent | WorkspaceRole::Inline);
+            assert_eq!(refused(ProfileKind::ClientAccess, role, &profile), service, "{role:?}: a profile");
+            // The Default named by id is inherit, so it is taken everywhere —
+            // the service workspaces included — while any other profile is
+            // judged as itself.
+            assert!(!refused(ProfileKind::ClientAccess, role, stored_choice(&profile, true)), "{role:?}: the Default");
+            assert_eq!(
+                refused(ProfileKind::ClientAccess, role, stored_choice(&profile, false)),
+                service,
+                "{role:?}: not the Default"
+            );
+            // Every other kind takes every choice on every workspace.
+            for kind in [ProfileKind::Tools, ProfileKind::Guardrail, ProfileKind::Transform, ProfileKind::Expert] {
+                for choice in [&Choice::Off, &Choice::Inherit, &profile] {
+                    assert!(!refused(kind, role, choice), "{role:?} {}", kind.as_str());
+                }
+            }
+        }
     }
 }
 

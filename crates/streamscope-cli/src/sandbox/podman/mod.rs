@@ -97,9 +97,10 @@ fn read_config(root: &Path) -> Result<config::DockerConfig> {
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "--sandbox docker needs {} naming the image — e.g. {{\"image\": \"mcr.microsoft.com/devcontainers/base:ubuntu-24.04\"}} \
-             or {{\"devcontainer\": \".devcontainer/devcontainer.json\"}}",
-            file.display()
+            "--sandbox docker needs {} naming the image — e.g. {} or {}",
+            file.display(),
+            config::example(r#"{"image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04"}"#),
+            config::example(r#"{"devcontainer": ".devcontainer/devcontainer.json"}"#)
         ),
         Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
     };
@@ -180,11 +181,10 @@ fn owner_alive(owner: &str, boot: &str) -> bool {
         return true;
     }
     let Ok(pid) = pid.parse::<i32>() else { return false };
-    if pid <= 0 || !(boot.is_empty() || owner_boot == boot) {
+    if !(boot.is_empty() || owner_boot == boot) {
         return false;
     }
-    // SAFETY: kill(2) with signal 0 only probes the pid.
-    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+    super::pid_alive(pid)
 }
 
 /// The longest path a unix socket binds (`sun_path`, less its NUL).
@@ -300,7 +300,7 @@ async fn run_container(
     }
     // Two mounts on one path, or one inside the other: podman refuses the
     // first, and the second hides one of them.
-    if Path::new(&workspace).starts_with(&home) || Path::new(&home).starts_with(&workspace) {
+    if config::overlaps(&workspace, &home) {
         bail!(
             "the workspace path {workspace} overlaps the agent's home {home} — name the image through a \
              devcontainer.json (`\"devcontainer\"` in sandbox.json) with a `workspaceFolder` elsewhere"
@@ -347,11 +347,43 @@ async fn run_container(
     // container's.
     // What the agent inherits is the image's environment, not this process's;
     // git's `core.sshCommand` is the project's, read on the host.
+    // The project's `containerEnv` lies over it, then its `remoteEnv`;
+    // `${containerEnv:NAME}` reads the container's own: the image's, then
+    // `containerEnv`. The home is the sandbox's (the agent's config and the
+    // create marker live there).
+    let lookup = |over: &[(String, String)], key: &str| {
+        over.iter().rev().chain(prepared.env.iter().rev()).find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    };
+    // A `PATH` of the project's that drops the prefix the tool is installed
+    // in keeps it first, or the tool would not be found.
+    let agent_bin = format!("{}/bin", prepare::AGENT_PREFIX);
+    let on_path = |path: &str| path.split(':').any(|d| d == agent_bin);
+    let installed = lookup(&[], "PATH").is_some_and(|p| on_path(&p));
+    let keep_tool = |env: &mut Vec<(String, String)>| {
+        if installed
+            && let Some(path) = lookup(env, "PATH").filter(|p| !on_path(p))
+        {
+            env.push(("PATH".into(), format!("{agent_bin}:{path}")));
+        }
+    };
+    let mut container: Vec<(String, String)> = Vec::new();
+    for (k, v) in prepared.lifecycle.container_env.iter().filter(|(k, _)| k != "HOME") {
+        // `${containerEnv:…}` here reads the image's: `containerEnv` cannot name itself.
+        let v = config::fill_container_env(v, &|name| lookup(&[], name));
+        container.push((k.clone(), v));
+    }
+    keep_tool(&mut container);
+    let container_env = |name: &str| lookup(&container, name);
+    let mut user_env = container.clone();
+    for (k, v) in prepared.lifecycle.remote_env.iter().filter(|(k, _)| k != "HOME") {
+        user_env.push((k.clone(), config::fill_container_env(v, &container_env)));
+    }
+    keep_tool(&mut user_env);
     let inherited = |key: &str| {
         if key == super::GIT_CORE_SSH_COMMAND {
             return super::git_core_ssh_command(root);
         }
-        prepared.env.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.clone()).filter(|v| !v.is_empty())
+        lookup(&user_env, key).filter(|v| !v.is_empty())
     };
     let mut env = super::sandbox_env_with(spec, RELAY_PORT, Some(plan::INIT_BINARY), &inherited);
     let host_root = root.to_string_lossy().into_owned();
@@ -373,16 +405,45 @@ async fn run_container(
         let at = format!("{}/ca.pem", plan::RUN_MOUNT);
         env.splice(0..0, super::CA_BUNDLE_VARS.iter().map(|k| (k.to_string(), at.clone())));
     }
-    env.push(("PWD".into(), cwd.clone()));
     if let Some(engine) = super::profiles::agent_for(&spec.command).and_then(|a| a.engine) {
         env.extend(engine.env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     }
+
+    // The lifecycle commands, their `${containerEnv:…}` filled in like the
+    // variables'.
+    let steps = |steps: &[config::Step]| -> Vec<config::Step> {
+        steps
+            .iter()
+            .map(|s| config::Step {
+                hook: s.hook.clone(),
+                argv: s.argv.iter().map(|a| config::fill_container_env(a, &container_env)).collect(),
+            })
+            .collect()
+    };
+    let create_steps = steps(&prepared.lifecycle.create);
+    let start_steps = steps(&prepared.lifecycle.start);
+    let create_key = {
+        let mut h = Sha256::new();
+        h.update(prepared.base.as_bytes());
+        h.update(serde_json::to_vec(&create_steps)?);
+        // What they run with — the environment, the user, the workspace: a
+        // change runs them again.
+        h.update(serde_json::to_vec(&(&user_env, prepared.user.uid, prepared.user.gid, &workspace))?);
+        hex::encode(&h.finalize()[..12])
+    };
+    // Laid over the image's environment, last entry winning: the sandbox's
+    // own variables (the proxy, the client's) over the project's.
+    let env: Vec<(String, String)> = user_env.iter().cloned().chain(env).collect();
 
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let exit_file = run.sock.join("exit");
     let start = init::Start {
         argv: std::iter::once(spec.command.clone()).chain(spec.args.iter().cloned()).collect(),
         env,
+        workspace: workspace.clone(),
+        create_steps,
+        start_steps,
+        create_key,
         uid: prepared.user.uid,
         gid: prepared.user.gid,
         home: home.clone(),

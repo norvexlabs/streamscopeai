@@ -8,8 +8,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::render::{Value, API_KEY_PLACEHOLDER};
-use crate::types::{companion_project_path, ClientProfile, KeyDelivery, TemplateFormat, TemplateKind};
+use crate::render::{
+    mcp_client_header_placeholder, mcp_header_item, mcp_local_server_item, Value, API_KEY_PLACEHOLDER,
+};
+use crate::types::{
+    companion_project_path, ClientProfile, KeyDelivery, LocalMcpForm, TemplateFormat, TemplateKind,
+};
 use crate::RenderError;
 
 /// Build the canonical validation placeholder map. Keep the key set in sync
@@ -85,44 +89,140 @@ pub fn validation_placeholders() -> BTreeMap<String, Value> {
 
     // Seed two MCP servers so `{{#each mcp_servers}}` bodies actually iterate
     // at validation time — same rationale as the `routes` list above.
-    let mcp_server = |slug: &str| {
-        let mut m: BTreeMap<String, Value> = BTreeMap::new();
-        m.insert("slug".into(), Value::String(slug.into()));
-        m.insert("name".into(), Value::String(format!("{slug} server")));
-        m.insert("description".into(), Value::String(format!("{slug} mcp")));
-        m.insert(
-            "url".into(),
-            Value::String(format!("https://gw.example.com/mcp/{slug}")),
-        );
-        // DELIBERATELY NOT `API_KEY_PLACEHOLDER`, which is what production
-        // gateway mode actually puts here. The divergence is load-bearing:
-        // it is the only thing that lets a single substring test tell the
-        // GATEWAY credential apart from an MCP bearer nested inside an
-        // `{{#each mcp_servers}}` block, which is what both delivery rules in
-        // `validate_profile` turn on. Aligning this with production would
-        // silently gut them.
-        m.insert(
-            "api_key".into(),
-            Value::String(format!("<paste-your-{slug}-mcp-key-here>")),
-        );
-        m.insert(
-            "transport_hint".into(),
-            Value::String("streamable_http".into()),
-        );
-        m.insert(
-            "oauth_authorize_url".into(),
-            Value::String(format!("https://gw.example.com/mcp/{slug}/oauth/authorize")),
-        );
-        m.insert("forward_auth".into(), Value::Bool(false));
-        m.insert("auth_mode".into(), Value::String("static".into()));
-        m
-    };
     phs.insert(
         "mcp_servers".into(),
-        Value::List(vec![mcp_server("fs"), mcp_server("web")]),
+        Value::List(vec![mcp_server_item("fs", true), mcp_server_item("web", true)]),
     );
 
     phs
+}
+
+/// The client header every validation MCP server declares beside the gateway
+/// key: a header the user's client sends itself (a client-filled input).
+pub const FIXTURE_CLIENT_HEADER: &str = "X-Client-Token";
+
+/// One validation `mcp_servers[]` item, shaped as the server's placeholder
+/// builder shapes it. `gateway_key` puts the gateway key's
+/// `Authorization: Bearer …` first in `headers` — a static-key template on the
+/// `/mcp/<slug>` mount; without it the list carries the client header only, as
+/// for a spec-OAuth template, whose client signs in instead.
+pub fn mcp_server_item(slug: &str, gateway_key: bool) -> BTreeMap<String, Value> {
+    let mut m: BTreeMap<String, Value> = BTreeMap::new();
+    m.insert("slug".into(), Value::String(slug.into()));
+    m.insert("name".into(), Value::String(format!("{slug} server")));
+    m.insert("description".into(), Value::String(format!("{slug} mcp")));
+    m.insert(
+        "url".into(),
+        Value::String(format!("https://gw.example.com/mcp/{slug}")),
+    );
+    // DELIBERATELY NOT `API_KEY_PLACEHOLDER`, which is what production
+    // gateway mode actually puts here and in the gateway header. The
+    // divergence is load-bearing: it is the only thing that lets a single
+    // substring test tell the GATEWAY credential apart from an MCP key nested
+    // inside an `{{#each mcp_servers}}` block, which is what both delivery
+    // rules in `validate_profile` turn on. Aligning this with production would
+    // silently gut them.
+    let key = format!("<paste-your-{slug}-mcp-key-here>");
+    let mut headers = Vec::new();
+    if gateway_key {
+        headers.push(mcp_header_item("Authorization", format!("Bearer {key}")));
+    }
+    headers.push(mcp_header_item(
+        FIXTURE_CLIENT_HEADER,
+        mcp_client_header_placeholder(slug, FIXTURE_CLIENT_HEADER),
+    ));
+    m.insert("api_key".into(), Value::String(key));
+    m.insert("headers".into(), Value::List(headers));
+    m.insert("fwd_prefix".into(), Value::String("https://gw.example.com/fwd/".into()));
+    m.insert(
+        "transport_hint".into(),
+        Value::String("streamable_http".into()),
+    );
+    m.insert(
+        "oauth_authorize_url".into(),
+        Value::String(format!("https://gw.example.com/mcp/{slug}/oauth/authorize")),
+    );
+    // The `/mcp/<slug>` mount: `true` is the `/fwd/{key}/mcp/<slug>` one, which
+    // a server whose client sends its own `Authorization` is reached on.
+    m.insert("forward_auth".into(), Value::Bool(false));
+    m.insert(
+        "auth_mode".into(),
+        Value::String(if gateway_key { "static" } else { "spec_oauth" }.into()),
+    );
+    m
+}
+
+/// The command of the validation local MCP server: a string no gateway item
+/// and no template text holds, so its presence in a render is the local form
+/// having written it.
+pub const FIXTURE_LOCAL_COMMAND: &str = "fixture-local-mcp-runner";
+
+/// The validation local MCP server, shaped as the server's placeholder builder
+/// shapes one: arguments that need escaping in every format, arguments and a
+/// value that read as a number or a boolean and must stay strings (`--port
+/// 8080`, `--python 3.12`, `DEBUG=true`), and one variable left for the
+/// developer.
+pub fn mcp_local_item(slug: &str) -> BTreeMap<String, Value> {
+    mcp_local_server_item(
+        slug,
+        &format!("{slug} server"),
+        Some(&format!("{slug} local mcp")),
+        FIXTURE_LOCAL_COMMAND,
+        &[
+            "-y".to_string(),
+            "@scope/pkg@1.0.0".to_string(),
+            "a \"quoted\" arg".to_string(),
+            "--port".to_string(),
+            "8080".to_string(),
+            "--python".to_string(),
+            "3.12".to_string(),
+        ],
+        &[
+            ("LOG_LEVEL".to_string(), Some("info".to_string())),
+            ("DEBUG".to_string(), Some("true".to_string())),
+            ("API_TOKEN".to_string(), None),
+        ],
+    )
+}
+
+/// The validation placeholders a template is rendered with: the shared map,
+/// plus — for a template that declares a local form, as the server merges a
+/// local server only into such a template — one local MCP server appended to
+/// `mcp_servers`.
+pub fn validation_placeholders_for(template: &crate::types::ClientProfileTemplate) -> BTreeMap<String, Value> {
+    let mut phs = validation_placeholders();
+    append_local(&mut phs, template.local_mcp);
+    phs
+}
+
+fn append_local(phs: &mut BTreeMap<String, Value>, form: LocalMcpForm) {
+    if form.is_none() {
+        return;
+    }
+    if let Some(Value::List(servers)) = phs.get_mut("mcp_servers")
+        && !servers.is_empty()
+    {
+        servers.push(mcp_local_item("localfs"));
+    }
+}
+
+/// The fixture's number-looking arguments and boolean-looking environment
+/// value, as a YAML document must NOT hold them: the number 8080 or 3.12
+/// anywhere, or a non-string under the key `DEBUG`. `None` when the document
+/// holds neither.
+fn retyped_local_value(doc: &yaml_serde::Value) -> Option<&'static str> {
+    use yaml_serde::Value as Y;
+    match doc {
+        Y::Number(n) if n.as_f64().is_some_and(|f| f == 8080.0 || f == 3.12) => Some("argument"),
+        Y::Sequence(items) => items.iter().find_map(retyped_local_value),
+        Y::Mapping(map) => map.iter().find_map(|(k, v)| {
+            if k.as_str() == Some("DEBUG") && !v.is_string() {
+                return Some("environment value");
+            }
+            retyped_local_value(k).or_else(|| retyped_local_value(v))
+        }),
+        _ => None,
+    }
 }
 
 /// Drop the optional, server-omittable placeholders (`context_window`,
@@ -186,6 +286,30 @@ pub enum ProfileInvalid {
         pointer: String,
         reason: String,
     },
+    /// A template declares a local MCP form and a render handed a local server
+    /// writes its command nowhere: the developer would be told the server is
+    /// configured and find nothing.
+    #[error(
+        "template '{title}' declares local_mcp = \"{form}\" but a render with a local MCP server \
+         writes its command nowhere — write it inside {{{{#each mcp_servers}}}} under {{{{#if local}}}}, \
+         or remove the declaration"
+    )]
+    LocalMcpUnwritten { title: String, form: &'static str },
+    /// A YAML template writes a local MCP server's argument or environment
+    /// value where YAML reads it as a number or a boolean: `--port 8080` would
+    /// reach the client as the integer 8080.
+    #[error(
+        "template '{title}' writes a local MCP server's {what} in a bare YAML position, where it is \
+         read as a number or a boolean instead of a string — write it with {{{{quoted value}}}}"
+    )]
+    LocalMcpValueRetyped { title: String, what: &'static str },
+    /// A template declares its local MCP form project-only and writes a local
+    /// server outside a project too.
+    #[error(
+        "template '{title}' declares local_mcp = \"project\" but writes a local MCP server outside a \
+         project scope — declare \"config\", or skip local items there with {{{{#unless local}}}}"
+    )]
+    LocalMcpOutsideProject { title: String },
 }
 
 /// What one template hands the user, observed on a real render rather than by
@@ -370,14 +494,78 @@ pub fn validate_profile(profile: &ClientProfile) -> Result<(), ProfileInvalid> {
                 title: tmpl.title.clone(),
                 error,
             };
-            let body = crate::render::render(&tmpl.body, tmpl.format, &phs).map_err(fail)?;
+            // A template that declares a local form is rendered with a local
+            // server beside the gateway's (the minimal pass wires none).
+            let with_local;
+            let phs = if tmpl.local_mcp.is_none() {
+                &phs
+            } else {
+                with_local = {
+                    let mut p = phs.clone();
+                    append_local(&mut p, tmpl.local_mcp);
+                    p
+                };
+                &with_local
+            };
+            let body = crate::render::render(&tmpl.body, tmpl.format, phs).map_err(fail)?;
             let instructions = match tmpl.instructions.as_deref() {
-                Some(text) => crate::render::render(text, TemplateFormat::Text, &phs)
+                Some(text) => crate::render::render(text, TemplateFormat::Text, phs)
                     .map_err(fail)?,
                 None => String::new(),
             };
             let companions =
-                crate::companions::companion_files(tmpl, &phs).map_err(fail)?;
+                crate::companions::companion_files(tmpl, phs).map_err(fail)?;
+
+            // A local server may be the only one selected: the same template
+            // must render valid output with no gateway server before it (a
+            // separator written for "the next gateway item" breaks only then).
+            if !minimal && !tmpl.local_mcp.is_none() {
+                let mut local_only = phs.clone();
+                local_only.insert("mcp_servers".into(), Value::List(vec![mcp_local_item("localfs")]));
+                crate::render::render(&tmpl.body, tmpl.format, &local_only).map_err(fail)?;
+                crate::companions::companion_files(tmpl, &local_only).map_err(fail)?;
+            }
+
+            // A local server's arguments and values are strings, whatever
+            // they read as. In YAML a bare position would retype the
+            // fixture's `8080`, `3.12` and `true`.
+            if !minimal && !tmpl.local_mcp.is_none() {
+                let yaml_docs = std::iter::once((tmpl.format, body.as_str()))
+                    .chain(companions.iter().map(|c| (c.format, c.body.as_str())))
+                    .filter(|(format, _)| *format == TemplateFormat::Yaml);
+                for (_, text) in yaml_docs {
+                    if let Ok(doc) = yaml_serde::from_str::<yaml_serde::Value>(text)
+                        && let Some(what) = retyped_local_value(&doc)
+                    {
+                        return Err(ProfileInvalid::LocalMcpValueRetyped { title: tmpl.title.clone(), what });
+                    }
+                }
+            }
+
+            // The declared local form is a claim about the render: a local
+            // server's command lands in a file the CLI writes (the body, or a
+            // companion with a path) in every scope the form names, and in no
+            // file outside them.
+            if !minimal && !tmpl.local_mcp.is_none() {
+                let written = body.contains(FIXTURE_LOCAL_COMMAND)
+                    || companions
+                        .iter()
+                        .filter(|c| c.path.is_some() || c.project_path.is_some())
+                        .any(|c| c.body.contains(FIXTURE_LOCAL_COMMAND));
+                let anywhere = written || companions.iter().any(|c| c.body.contains(FIXTURE_LOCAL_COMMAND));
+                match (tmpl.local_mcp, project_scope) {
+                    (LocalMcpForm::Config, _) | (LocalMcpForm::Project, true) if !written => {
+                        return Err(ProfileInvalid::LocalMcpUnwritten {
+                            title: tmpl.title.clone(),
+                            form: if tmpl.local_mcp == LocalMcpForm::Config { "config" } else { "project" },
+                        });
+                    }
+                    (LocalMcpForm::Project, false) if anywhere => {
+                        return Err(ProfileInvalid::LocalMcpOutsideProject { title: tmpl.title.clone() });
+                    }
+                    _ => {}
+                }
+            }
 
             if observing {
                 let seen = Delivered {
@@ -589,6 +777,7 @@ mod tests {
             key_delivery: KeyDelivery::default(),
             companions: Vec::new(),
             keyed_arrays: BTreeMap::new(),
+            local_mcp: Default::default(),
             body: body.into(),
         }
     }
@@ -1570,6 +1759,125 @@ mod tests {
         }
     }
 
+    /// Every template that wires MCP servers writes every header of every
+    /// server — the gateway key's and each one the client sends itself — where
+    /// its client reads a server's headers, in the template's own format: on
+    /// a static-key template (gateway key + client header on `/mcp/<slug>`,
+    /// client headers only on the `/fwd` mount) and a spec-OAuth one (client
+    /// headers only), under a gateway and a BYOK key, user and project scope.
+    /// A profile that writes a fixed `Authorization` instead of the loop
+    /// loses the client header and fails here. Claude Code's static gateway
+    /// key is the one header written as a reference (`${STREAMSCOPE_MCP_KEY}`,
+    /// which its settings' `env` carries — see
+    /// `claude_code_wires_its_mcp_servers_where_claude_code_reads_them`).
+    #[test]
+    fn every_mcp_template_writes_each_header() {
+        fn parsed(format: TemplateFormat, s: &str) -> Vec<serde_json::Value> {
+            match format {
+                TemplateFormat::Json => vec![serde_json::from_str(s).expect("json")],
+                TemplateFormat::Yaml => vec![serde_json::to_value(
+                    yaml_serde::from_str::<yaml_serde::Value>(s).expect("yaml"),
+                )
+                .unwrap()],
+                TemplateFormat::Toml => {
+                    vec![serde_json::to_value(s.parse::<toml::Table>().expect("toml")).unwrap()]
+                }
+                // A command line carries its server as a single-quoted JSON argument.
+                TemplateFormat::Shell | TemplateFormat::Text => s
+                    .split('\'')
+                    .skip(1)
+                    .step_by(2)
+                    .filter_map(|arg| serde_json::from_str(arg).ok())
+                    .collect(),
+            }
+        }
+        // A header map entry, or an `mcp-remote --header Name:Value` argument.
+        fn holds(v: &serde_json::Value, name: &str, value: &str) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.get(name).and_then(|x| x.as_str()) == Some(value)
+                        || m.values().any(|x| holds(x, name, value))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|x| holds(x, name, value)),
+                serde_json::Value::String(s) => *s == format!("{name}:{value}"),
+                _ => false,
+            }
+        }
+        // The `/fwd/{key}/mcp/<slug>` mount: the client sends its own
+        // `Authorization`, so no gateway header.
+        let fwd_item = |slug: &str| {
+            let mut m = mcp_server_item(slug, false);
+            m.insert("url".into(), Value::String(format!("https://gw.example.com/fwd/{API_KEY_PLACEHOLDER}/mcp/{slug}")));
+            m.insert("forward_auth".into(), Value::Bool(true));
+            let Some(Value::List(headers)) = m.get_mut("headers") else { unreachable!() };
+            headers.insert(0, mcp_header_item("Authorization", mcp_client_header_placeholder(slug, "Authorization")));
+            m
+        };
+        let mut checked: Vec<String> = Vec::new();
+        for (_, profile) in seed_profiles() {
+            if !profile.supports_mcp {
+                continue;
+            }
+            for t in &profile.templates {
+                let wires = t.body.contains("mcp_servers")
+                    || t.companions.iter().any(|c| c.body.contains("mcp_servers"));
+                if !wires {
+                    continue;
+                }
+                let is_static = t.mcp_auth_mode == McpAuthMode::Static;
+                let mut server_sets = vec![vec![mcp_server_item("fs", is_static), mcp_server_item("web", is_static)]];
+                if is_static {
+                    server_sets.push(vec![mcp_server_item("fs", true), fwd_item("web")]);
+                }
+                for servers in server_sets {
+                    for (forward_auth, project_scope) in [(false, false), (false, true), (true, false), (true, true)] {
+                        // A template with no project form is written in its global form.
+                        if project_scope && t.project_filename.is_none() {
+                            continue;
+                        }
+                        let ctx = format!("{} byok={forward_auth} project={project_scope}", t.title);
+                        let mut phs = validation_placeholders();
+                        phs.insert("forward_auth".into(), Value::Bool(forward_auth));
+                        phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(project_scope));
+                        phs.insert("mcp_servers".into(), Value::List(servers.clone()));
+                        let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+                        let mut docs = parsed(t.format, &body);
+                        for c in crate::companions::companion_files(t, &phs).expect("companions render") {
+                            docs.extend(parsed(c.format, &c.body));
+                        }
+                        for server in &servers {
+                            let (Some(Value::String(slug)), Some(Value::List(headers)), Some(Value::Bool(fwd))) =
+                                (server.get("slug"), server.get("headers"), server.get("forward_auth"))
+                            else {
+                                unreachable!()
+                            };
+                            for h in headers {
+                                let (Some(Value::String(name)), Some(Value::String(value))) = (h.get("name"), h.get("value"))
+                                else {
+                                    unreachable!()
+                                };
+                                let by_reference = profile.id == "claude-code"
+                                    && name == "Authorization"
+                                    && !fwd
+                                    && !forward_auth;
+                                let expect = if by_reference { "Bearer ${STREAMSCOPE_MCP_KEY}" } else { value.as_str() };
+                                assert!(
+                                    docs.iter().any(|d| holds(d, name, expect)),
+                                    "{ctx}: {slug} {name}: {expect} is not written\n{body}"
+                                );
+                            }
+                        }
+                    }
+                }
+                checked.push(format!("{}/{}", profile.id, t.title));
+            }
+        }
+        // Every MCP-capable profile has a template here: 12 profiles, 23 templates.
+        let profiles: std::collections::BTreeSet<&str> =
+            checked.iter().map(|c| c.split('/').next().unwrap_or_default()).collect();
+        assert_eq!((profiles.len(), checked.len()), (12, 23), "{checked:#?}");
+    }
+
     /// Claude Code reads MCP servers only from `~/.claude.json` (user scope)
     /// or a project's `.mcp.json`, never from `settings.json`; it keeps its own
     /// state in `~/.claude.json`, and loads a project's servers unprompted only
@@ -1579,8 +1887,45 @@ mod tests {
     /// add-json --scope user` command per server and writes no MCP file; a
     /// project render writes `.mcp.json` and enables each server; a static
     /// key reaches the servers only through `STREAMSCOPE_MCP_KEY` in the
-    /// settings `env` (a BYOK server keeps the user's own bearer); a run with
+    /// settings `env` (under a BYOK key each header is written as given); a run with
     /// no server shows and writes nothing for MCP.
+    #[test]
+    fn claude_code_keeps_the_key_out_of_a_fwd_server_url() {
+        // A server on the `/fwd/{key}/mcp/<slug>` mount (its client sends its own
+        // Authorization): with a gateway key, the URL reads the key from the
+        // environment variable like the header does, so `.mcp.json` and the
+        // `claude mcp add-json` line never hold it; with a BYOK key (which the
+        // file holds anyway) the URL is written as rendered.
+        let profile = seed("claude-code");
+        let t = profile
+            .templates
+            .iter()
+            .find(|t| t.mcp_auth_mode == McpAuthMode::Static && t.project_filename.is_some())
+            .expect("a static project template");
+        for (project_scope, byok) in [(true, false), (false, false), (true, true)] {
+            let mut item = mcp_server_item("gh", true);
+            item.insert("forward_auth".into(), Value::Bool(true));
+            // On `/fwd` the key rides the path: the item carries no gateway header.
+            item.insert(
+                "headers".into(),
+                Value::List(vec![mcp_header_item("Authorization", mcp_client_header_placeholder("gh", "Authorization"))]),
+            );
+            item.insert("url".into(), Value::String("https://gw.example.com/fwd/<paste-your-gh-mcp-key-here>/mcp/gh".into()));
+            let mut phs = validation_placeholders();
+            phs.insert("forward_auth".into(), Value::Bool(byok));
+            phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(project_scope));
+            phs.insert("mcp_servers".into(), Value::List(vec![item]));
+            let companions = crate::companions::companion_files(t, &phs).expect("renders");
+            let body = &companions[0].body;
+            if byok {
+                assert!(body.contains("https://gw.example.com/fwd/<paste-your-gh-mcp-key-here>/mcp/gh"), "{body}");
+            } else {
+                assert!(body.contains("https://gw.example.com/fwd/${STREAMSCOPE_MCP_KEY}/mcp/gh"), "{body}");
+                assert!(!body.contains("<paste-your-gh-mcp-key-here>"), "the key is in the file: {body}");
+            }
+        }
+    }
+
     #[test]
     fn claude_code_wires_its_mcp_servers_where_claude_code_reads_them() {
         let profile = seed("claude-code");
@@ -1592,9 +1937,12 @@ mod tests {
                 let mut phs = validation_placeholders();
                 phs.insert("forward_auth".into(), Value::Bool(forward_auth));
                 phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(project_scope));
-                if !with_servers {
-                    phs.insert("mcp_servers".into(), Value::List(Vec::new()));
-                }
+                let servers = if with_servers {
+                    vec![mcp_server_item("fs", is_static), mcp_server_item("web", is_static)]
+                } else {
+                    Vec::new()
+                };
+                phs.insert("mcp_servers".into(), Value::List(servers));
                 let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
                 let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
                 assert!(doc.get("mcpServers").is_none(), "{ctx}: settings.json carries mcpServers");
@@ -1642,6 +1990,12 @@ mod tests {
                     assert_eq!(server["type"], "http", "{ctx}");
                     assert_eq!(server["url"], format!("https://gw.example.com/mcp/{slug}").as_str(), "{ctx}");
                     assert_eq!(server["headers"]["Authorization"].as_str().map(str::to_string), bearer(slug), "{ctx}");
+                    // The header the client sends itself lands verbatim, in every mode.
+                    assert_eq!(
+                        server["headers"][FIXTURE_CLIENT_HEADER],
+                        format!("<paste-your-{slug}-x-client-token-here>").as_str(),
+                        "{ctx}"
+                    );
                 }
             }
         }
@@ -2087,5 +2441,250 @@ mod tests {
     fn a_keyed_array_the_render_leaves_out_is_accepted() {
         let t = keyed_yaml("key: {{api_key}}\n{{#if nothing}}models: []\n{{/if}}", "/models", "name");
         assert!(validate_profile(&profile(vec![t])).is_ok());
+    }
+
+    /// Where a template with a local form writes the validation local server,
+    /// parsed: the rendered body and every companion with a path, merged into
+    /// one document (TOML and JSON alike), under `project_scope` as given.
+    fn local_docs(t: &ClientProfileTemplate, project_scope: bool) -> serde_json::Value {
+        let mut phs = validation_placeholders_for(t);
+        phs.insert("forward_auth".into(), Value::Bool(false));
+        phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(project_scope));
+        let parse = |format: TemplateFormat, s: &str| -> serde_json::Value {
+            match format {
+                TemplateFormat::Json => serde_json::from_str(s).expect("json"),
+                TemplateFormat::Toml => serde_json::to_value(s.parse::<toml::Table>().expect("toml")).unwrap(),
+                TemplateFormat::Yaml => {
+                    serde_json::to_value(yaml_serde::from_str::<yaml_serde::Value>(s).expect("yaml")).unwrap()
+                }
+                _ => serde_json::json!({}),
+            }
+        };
+        let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+        let mut merged = parse(t.format, &body);
+        for c in crate::companions::companion_files(t, &phs).expect("companions render") {
+            if c.path.is_some() || c.project_path.is_some() {
+                let v = parse(c.format, &c.body);
+                merged.as_object_mut().unwrap().extend(v.as_object().cloned().unwrap_or_default());
+            }
+        }
+        merged
+    }
+
+    /// Each v1 client is written a local MCP server as its own reference names
+    /// a stdio server — the keys, the argument list and the environment map —
+    /// with every argument intact (one needing escapes included), an
+    /// administrator's environment value as given and a developer's as the
+    /// paste-here sentinel. One row per client and template: the pointer to
+    /// its servers map and the entry expected there.
+    #[test]
+    fn every_local_form_writes_the_stdio_entry_its_client_reads() {
+        let args = serde_json::json!(["-y", "@scope/pkg@1.0.0", "a \"quoted\" arg", "--port", "8080", "--python", "3.12"]);
+        let env = serde_json::json!({
+            "LOG_LEVEL": "info", "DEBUG": "true", "API_TOKEN": "<paste-your-localfs-api_token-here>",
+        });
+        let plain = serde_json::json!({"command": FIXTURE_LOCAL_COMMAND, "args": args, "env": env});
+        let typed = serde_json::json!({"type": "stdio", "command": FIXTURE_LOCAL_COMMAND, "args": args, "env": env});
+        let opencode = serde_json::json!({
+            "type": "local",
+            "command": [FIXTURE_LOCAL_COMMAND, "-y", "@scope/pkg@1.0.0", "a \"quoted\" arg", "--port", "8080", "--python", "3.12"],
+            "environment": env,
+            "codemode": false,
+        });
+        let continue_ = serde_json::json!({
+            "name": "localfs", "type": "stdio", "command": FIXTURE_LOCAL_COMMAND, "args": args, "env": env,
+        });
+        let goose = serde_json::json!({
+            "enabled": true, "type": "stdio", "name": "localfs", "cmd": FIXTURE_LOCAL_COMMAND, "args": args,
+            "envs": env, "timeout": 300,
+        });
+        let vibe = serde_json::json!({
+            "name": "localfs", "transport": "stdio", "command": FIXTURE_LOCAL_COMMAND, "args": args, "env": env,
+        });
+        // (client, template index, project scope, pointer to the servers map, entry)
+        let rows: Vec<(&str, usize, bool, &str, &serde_json::Value)> = vec![
+            ("claude-code", 0, true, "/mcpServers", &typed),
+            ("claude-code", 1, true, "/mcpServers", &typed),
+            ("claude-desktop", 0, false, "/mcpServers", &plain),
+            ("cursor", 0, false, "/mcpServers", &typed),
+            ("cursor", 1, false, "/mcpServers", &typed),
+            ("cline", 2, false, "/mcpServers", &plain),
+            ("codex", 0, false, "/mcp_servers", &plain),
+            ("gemini-cli", 0, false, "/mcpServers", &plain),
+            ("gemini-cli", 1, false, "/mcpServers", &plain),
+            ("qwen-code", 0, false, "/mcpServers", &plain),
+            ("opencode", 0, false, "/mcp/servers", &opencode),
+            ("opencode", 1, false, "/mcp/servers", &opencode),
+            ("opencode", 2, false, "/mcp/servers", &opencode),
+            ("continue", 0, false, "/mcpServers", &continue_),
+            ("continue", 1, false, "/mcpServers", &continue_),
+            ("continue", 2, false, "/mcpServers", &continue_),
+            ("crush", 0, false, "/mcp", &typed),
+            ("crush", 1, false, "/mcp", &typed),
+            ("crush", 2, false, "/mcp", &typed),
+            ("goose", 0, false, "/extensions", &goose),
+            ("vibe", 0, false, "/mcp_servers", &vibe),
+        ];
+        // A servers map is read by slug; an array of servers by its `name`.
+        let entry = |servers: &serde_json::Value, slug: &str| -> Option<serde_json::Value> {
+            match servers {
+                serde_json::Value::Array(items) => items.iter().find(|s| s["name"] == slug).cloned(),
+                other => other.get(slug).cloned(),
+            }
+        };
+        for (id, index, project_scope, pointer, want) in &rows {
+            let profile = seed(id);
+            let t = &profile.templates[*index];
+            assert!(!t.local_mcp.is_none(), "{id}[{index}] declares no local form");
+            let doc = local_docs(t, *project_scope);
+            let servers = doc.pointer(pointer).unwrap_or_else(|| panic!("{id}[{index}] has no {pointer}: {doc}"));
+            assert_eq!(entry(servers, "localfs").as_ref(), Some(*want), "{id}[{index}]");
+            // The gateway's servers are still written beside it, as before.
+            for slug in ["fs", "web"] {
+                assert!(entry(servers, slug).is_some(), "{id}[{index}] lost the gateway server {slug}: {servers}");
+            }
+            // A servers array is handled entry by entry beside the user's own.
+            if servers.is_array() {
+                assert_eq!(t.keyed_arrays.get(*pointer).map(String::as_str), Some("name"), "{id}[{index}]");
+            }
+            // With a local server alone the same command is written, and the
+            // config still parses.
+            let mut phs = validation_placeholders();
+            phs.insert("forward_auth".into(), Value::Bool(false));
+            phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(*project_scope));
+            phs.insert("mcp_servers".into(), Value::List(vec![mcp_local_item("localfs")]));
+            let body = crate::render::render(&t.body, t.format, &phs).expect("renders with a local server alone");
+            let companions = crate::companions::companion_files(t, &phs).expect("companions render");
+            assert!(
+                body.contains(FIXTURE_LOCAL_COMMAND) || companions.iter().any(|c| c.body.contains(FIXTURE_LOCAL_COMMAND)),
+                "{id}[{index}] writes no local server when it is the only one"
+            );
+        }
+        // The table is the whole set: a template that declares a form and is
+        // missing from it has no assertion of its entry.
+        for (path, profile) in seed_profiles() {
+            for (i, t) in profile.templates.iter().enumerate() {
+                assert_eq!(
+                    !t.local_mcp.is_none(),
+                    rows.iter().any(|(id, index, ..)| *id == profile.id && *index == i),
+                    "{}[{i}]: the local-form table and the seed disagree",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// Claude Code is given a local server in a project's `.mcp.json` only:
+    /// outside a project nothing it writes or prints carries it, and the MCP
+    /// key its settings export is written for a gateway server alone.
+    #[test]
+    fn claude_code_writes_a_local_server_only_in_a_project() {
+        let profile = seed("claude-code");
+        for index in [0, 1] {
+            let t = &profile.templates[index];
+            assert_eq!(t.local_mcp, LocalMcpForm::Project);
+            for local_only in [false, true] {
+                let mut phs = validation_placeholders_for(t);
+                phs.insert("forward_auth".into(), Value::Bool(false));
+                if local_only {
+                    phs.insert("mcp_servers".into(), Value::List(vec![mcp_local_item("localfs")]));
+                }
+                let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+                let companions = crate::companions::companion_files(t, &phs).expect("companions render");
+                assert!(!body.contains(FIXTURE_LOCAL_COMMAND), "{body}");
+                for c in &companions {
+                    assert!(!c.body.contains(FIXTURE_LOCAL_COMMAND) && !c.body.contains("localfs"), "{}", c.body);
+                }
+                // The key: beside a gateway server on the static-key template,
+                // never for a local server alone.
+                let writes_key = body.contains("STREAMSCOPE_MCP_KEY");
+                assert_eq!(writes_key, index == 0 && !local_only, "template {index}, local only {local_only}: {body}");
+
+                phs.insert(crate::render::PROJECT_SCOPE.into(), Value::Bool(true));
+                let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+                let settings: serde_json::Value = serde_json::from_str(&body).expect("json");
+                assert!(
+                    settings["enabledMcpjsonServers"].as_array().is_some_and(|a| a.iter().any(|s| s == "localfs")),
+                    "the project settings enable the local server: {body}"
+                );
+            }
+        }
+    }
+
+    /// Saving a template is refused when it renders invalid output for a
+    /// local server alone, though it renders fine beside a gateway server: a
+    /// separator written before every local item needs an item before it.
+    #[test]
+    fn a_template_that_breaks_with_a_local_server_alone_is_refused() {
+        let leading_comma = "{\"mcpServers\": { {{#each mcp_servers}}{{#if local}}, \"{{slug}}\": {\"command\": \"{{command}}\"}{{else}}{{#unless @first}}, {{/unless}}\"{{slug}}\": {\"url\": \"{{url}}\"}{{/if}}{{/each}} } }";
+        let sound = "{\"mcpServers\": { {{#each mcp_servers}}\"{{slug}}\": {{#if local}}{\"command\": \"{{command}}\"}{{else}}{\"url\": \"{{url}}\"}{{/if}}{{#unless @last}}, {{/unless}}{{/each}} } }";
+        let make = |body: &str| {
+            let mut t = template(TemplateKind::Mcp, body);
+            t.format = TemplateFormat::Json;
+            t.local_mcp = LocalMcpForm::Config;
+            profile(vec![t])
+        };
+        // Beside the two gateway servers the body is valid JSON...
+        let mut phs = validation_placeholders_for(&make(leading_comma).templates[0]);
+        phs.insert("forward_auth".into(), Value::Bool(false));
+        crate::render::render(leading_comma, TemplateFormat::Json, &phs).expect("valid beside gateway servers");
+        // ...and alone it is not: the save is refused as a render failure.
+        assert!(matches!(validate_profile(&make(leading_comma)), Err(ProfileInvalid::Render { .. })));
+        validate_profile(&make(sound)).expect("valid with a local server alone");
+    }
+
+    /// A YAML template that writes a local server's argument or value bare is
+    /// refused — the fixture's `8080` and `true` would reach the client as a
+    /// number and a boolean — and the message names the helper. The same
+    /// template writing them with `{{quoted …}}` is accepted.
+    #[test]
+    fn a_yaml_template_that_retypes_a_local_value_is_refused() {
+        let body = |arg: &str, value: &str| {
+            format!(
+                "servers:\n{{{{#each mcp_servers}}}}  - name: {{{{quoted slug}}}}\n{{{{#if local}}}}    command: {{{{quoted command}}}}\n    args:\n{{{{#each args}}}}      - {arg}\n{{{{/each}}}}    env:\n{{{{#each env}}}}      {{{{name}}}}: {value}\n{{{{/each}}}}{{{{else}}}}    url: {{{{quoted url}}}}\n{{{{/if}}}}{{{{/each}}}}"
+            )
+        };
+        let make = |body: String| {
+            let mut t = template(TemplateKind::Mcp, &body);
+            t.format = TemplateFormat::Yaml;
+            t.local_mcp = LocalMcpForm::Config;
+            profile(vec![t])
+        };
+        validate_profile(&make(body("{{quoted value}}", "{{quoted value}}"))).expect("strings stay strings");
+        let err = validate_profile(&make(body("{{value}}", "{{quoted value}}"))).unwrap_err();
+        assert!(matches!(err, ProfileInvalid::LocalMcpValueRetyped { what: "argument", .. }), "{err}");
+        assert!(err.to_string().contains("{{quoted value}}"), "{err}");
+        let err = validate_profile(&make(body("{{quoted value}}", "{{value}}"))).unwrap_err();
+        assert!(matches!(err, ProfileInvalid::LocalMcpValueRetyped { what: "environment value", .. }), "{err}");
+    }
+
+    /// A declared local form is a checked claim: a template that declares one
+    /// and writes no local server is refused, as is a project-only one that
+    /// writes it outside a project; the same body under the right declaration
+    /// is accepted.
+    #[test]
+    fn a_local_form_declaration_must_match_what_the_template_writes() {
+        let with_form = "{\"mcpServers\": { {{#each mcp_servers}}\"{{slug}}\": {{#if local}}{\"command\": \"{{command}}\"}{{else}}{\"url\": \"{{url}}\"}{{/if}}{{#unless @last}}, {{/unless}}{{/each}} } }";
+        let without = "{\"mcpServers\": { {{#each mcp_servers}}\"{{slug}}\": {\"url\": \"{{url}}\"}{{#unless @last}}, {{/unless}}{{/each}} } }";
+        let make = |body: &str, form: LocalMcpForm| {
+            let mut t = template(TemplateKind::Mcp, body);
+            t.format = TemplateFormat::Json;
+            t.local_mcp = form;
+            profile(vec![t])
+        };
+        validate_profile(&make(with_form, LocalMcpForm::Config)).expect("writes what it declares");
+        validate_profile(&make(without, LocalMcpForm::None)).expect("declares nothing, is handed nothing");
+        assert!(matches!(
+            validate_profile(&make(without, LocalMcpForm::Config)),
+            Err(ProfileInvalid::LocalMcpUnwritten { form: "config", .. })
+        ));
+        assert!(matches!(
+            validate_profile(&make(without, LocalMcpForm::Project)),
+            Err(ProfileInvalid::LocalMcpUnwritten { form: "project", .. })
+        ));
+        assert!(matches!(
+            validate_profile(&make(with_form, LocalMcpForm::Project)),
+            Err(ProfileInvalid::LocalMcpOutsideProject { .. })
+        ));
     }
 }

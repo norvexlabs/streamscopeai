@@ -15,7 +15,6 @@
       "title": "Goose · config.yaml",
       "format": "yaml",
       "instructions": "Place at ~/.config/goose/config.yaml — on Windows %APPDATA%\\Block\\goose\\config\\config.yaml (or merge into your existing one). Goose talks to the gateway in OpenAI wire format via its built-in `openai` provider — `OPENAI_HOST` points at the gateway base URL and `OPENAI_BASE_PATH` names the chat-completions path, and `active_provider` with `providers.openai.model` selects the provider and model (Goose reads those before the flat `GOOSE_PROVIDER` / `GOOSE_MODEL` keys, which stay for older releases), so the gateway translates to whatever the upstream natively speaks. Goose reads provider secrets from your OS keyring by default; the bundled `GOOSE_DISABLE_KEYRING: true` makes it read the key from secrets.yaml instead (written alongside this file: ~/.config/goose/, or %APPDATA%\\Block\\goose\\config\\ on Windows), which is the headless-friendly path. `GOOSE_PLANNER_PROVIDER` / `GOOSE_PLANNER_MODEL` give Goose's `/plan` mode the gateway's plan model (each the default model until an admin fills that slot on the route). Then run `goose run -t \"your task\"` (or `goose session` for interactive). Usage telemetry is off (`GOOSE_TELEMETRY_ENABLED: false`); an admin who wants it back can edit this template.",
-      "body": "GOOSE_DISABLE_KEYRING: true\nGOOSE_TELEMETRY_ENABLED: false\nactive_provider: openai\nproviders:\n  openai:\n    enabled: true\n    configured: true\n    model: {{model_alias}}\nGOOSE_PROVIDER: openai\nGOOSE_MODEL: {{model_alias}}\nGOOSE_PLANNER_PROVIDER: openai\nGOOSE_PLANNER_MODEL: {{model_slot_plan}}\nOPENAI_HOST: {{base_url}}\nOPENAI_BASE_PATH: chat/completions\n{{#if mcp_servers}}extensions:\n{{#each mcp_servers}}  {{slug}}:\n    enabled: true\n    type: streamable_http\n    name: {{slug}}\n    uri: {{url}}\n    timeout: 300\n    headers:\n      Authorization: \"Bearer {{{api_key}}}\"\n{{/each}}{{/if}}",
       "companions": [
         {
           "path": "~/.config/goose/secrets.yaml",
@@ -24,7 +23,9 @@
           "instructions": "config.yaml sets GOOSE_DISABLE_KEYRING, so Goose reads the provider secret from this file instead of the OS keyring. Without it Goose starts with no credential and every request fails to authenticate.",
           "body": "OPENAI_API_KEY: {{api_key}}\n"
         }
-      ]
+      ],
+      "local_mcp": "config",
+      "body": "GOOSE_DISABLE_KEYRING: true\nGOOSE_TELEMETRY_ENABLED: false\nactive_provider: openai\nproviders:\n  openai:\n    enabled: true\n    configured: true\n    model: {{model_alias}}\nGOOSE_PROVIDER: openai\nGOOSE_MODEL: {{model_alias}}\nGOOSE_PLANNER_PROVIDER: openai\nGOOSE_PLANNER_MODEL: {{model_slot_plan}}\nOPENAI_HOST: {{base_url}}\nOPENAI_BASE_PATH: chat/completions\n{{#if mcp_servers}}extensions:\n{{#each mcp_servers}}  {{quoted slug}}:\n    enabled: true\n{{#if local}}    type: stdio\n    name: {{quoted slug}}\n    cmd: {{quoted command}}\n{{#if args}}    args:\n{{#each args}}      - {{quoted value}}\n{{/each}}{{/if}}{{#if env}}    envs:\n{{#each env}}      {{name}}: {{quoted value}}\n{{/each}}{{/if}}    timeout: 300\n{{else}}    type: streamable_http\n    name: {{quoted slug}}\n    uri: {{quoted url}}\n    timeout: 300\n{{#if headers}}    headers:\n{{#each headers}}      {{name}}: {{quoted value}}\n{{/each}}{{/if}}{{/if}}{{/each}}{{/if}}"
     }
   ]
 }

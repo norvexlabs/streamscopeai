@@ -19,6 +19,12 @@
      * row), `'off'` (policy disabled for this workspace), or a profile id.
      */
     current: string;
+    /** Whether the kind can be turned off for a workspace. A kind every
+     *  workspace must resolve (Portal & clients) offers no Off. */
+    allowOff?: boolean;
+    /** What the profile decides, for the help line. Defaults to "applies to
+     *  this workspace's traffic". */
+    help?: string;
     /** Selectable profiles of this kind (tenant pool). */
     profiles: ProfileLite[];
     /** Optional deep-link to manage the selected profile (tenant-relative). */
@@ -27,10 +33,11 @@
     onchanged?: () => void;
   }
 
-  let { kind, label, workspaceId, current, profiles, manageHref, onchanged }: Props = $props();
+  let { kind, label, workspaceId, current, profiles, manageHref, onchanged, allowOff = true, help }: Props = $props();
 
-  // Local selection mirrors the current state; falls back to 'inherit'.
-  let sel = $derived(current || 'inherit');
+  // Local selection mirrors the current state; falls back to 'inherit'. A
+  // kind with no Off reads a stored "off" as the Default, as the server does.
+  let sel = $derived(!current || (current === 'off' && !allowOff) ? 'inherit' : current);
   let saving = $state(false);
 
   async function assign(value: string) {
@@ -58,14 +65,14 @@
 
 <section class="space-y-2 max-w-xl">
   <h3 class="text-sm font-semibold text-(--text-primary)">{label}</h3>
-  <FormField label="Profile" help={`Which ${label.toLowerCase()} profile applies to this workspace's traffic.`}>
+  <FormField label="Profile" help={help ?? `Which ${label.toLowerCase()} profile applies to this workspace's traffic.`}>
     <SelectInput
       value={sel}
       disabled={saving}
       onchange={(e) => assign((e.currentTarget as HTMLSelectElement).value)}
     >
       <option value="inherit">Default (tenant default)</option>
-      <option value="off">Off (no policy)</option>
+      {#if allowOff}<option value="off">Off (no policy)</option>{/if}
       {#each profiles as p (p.id)}
         {#if !p.is_default}<option value={p.id}>{p.name}</option>{/if}
       {/each}

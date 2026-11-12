@@ -11,10 +11,10 @@
 //!   functions below dispatch on `upstream.transport` and call into the
 //!   per-(tenant, upstream, agent_session) `LegacySseSession`.
 //!
-//! `auth_mode = ServiceAccount` is honoured: the proxy decrypts the
-//! per-upstream `encrypted_credential` once per request and stamps it as
-//! `Authorization: Bearer <token>`. `PerUserOauth` and `Byot` are also
-//! supported by the [`super::handler::call_cached`] dispatcher.
+//! Every request carries the upstream's resolved headers — an
+//! [`UpstreamAuth`] built by [`super::upstream_auth::InputsMemo::resolve`] (plus
+//! the user's OAuth token on a `per_user_oauth` upstream) in
+//! [`super::handler::call_cached`] — stamped with [`UpstreamAuth::apply`].
 //!
 //! The MCP Streamable HTTP spec supports two response shapes:
 //! - `Content-Type: application/json` — single-shot JSON body.
@@ -30,7 +30,8 @@ use streamscope_mcp_auth::egress::{Cached, Surface, egress_slot};
 use streamscope_mcp_auth::ssrf::Egress;
 use std::time::Duration;
 
-use streamscope_core::config::mcp::{McpAuthMode, McpUpstreamServer};
+use streamscope_core::config::mcp::McpUpstreamServer;
+use streamscope_core::mcp::header_inputs::UpstreamAuth;
 
 use super::jsonrpc::{JsonRpcRequest, JsonRpcResponse};
 
@@ -50,8 +51,6 @@ pub enum UpstreamReply {
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
-    #[error("auth mode {0:?} not yet supported")]
-    AuthModeUnsupported(McpAuthMode),
     #[error("transport not supported: {0}")]
     TransportUnsupported(&'static str),
     #[error("upstream HTTP error: {status} body={body}")]
@@ -103,10 +102,22 @@ pub enum UpstreamError {
     /// empty response body.
     #[error("upstream asked the client for input instead of answering")]
     ServerInitiatedRequest(serde_json::Value),
-    /// Service-account upstream is missing or has an undecodable credential.
-    /// Surfaces as JSON-RPC `-32500` to the client; admin must (re)set it.
-    #[error("service-account credential missing or undecryptable")]
+    /// The upstream's admin inputs are unfilled or undecryptable, its header
+    /// declaration is invalid, or a value cannot be carried in its header.
+    /// Surfaces as JSON-RPC `-32500` to the client; the admin must fix the
+    /// upstream.
+    #[error("upstream credential missing or undecryptable")]
     CredentialUnavailable,
+    /// The calling user has not filled an input the upstream requires.
+    /// Surfaces as JSON-RPC `-32501`, like a missing OAuth connection: the
+    /// user fills it in the portal.
+    #[error("user has not filled the inputs this upstream requires")]
+    UserInputsMissing,
+    /// The client did not send a header the upstream declares as
+    /// client-filled (the header names, comma-separated). Surfaces as
+    /// JSON-RPC `-32401`.
+    #[error("client did not send the header(s) {0}")]
+    ClientHeaderMissing(String),
     /// Per-user OAuth upstream — the calling user has not yet connected.
     /// Surfaces as JSON-RPC `-32501`; the agent should direct the user to
     /// the portal connections page.
@@ -140,16 +151,11 @@ pub enum UpstreamError {
     SessionLost(String),
 }
 
-// The handler resolves all auth_mode → bearer translations in
-// `handler::call_cached` (so cache hits, single-flight refresh, and per-user
-// credential lookup live in one place). The standalone `call()` wrapper
-// has been folded into `call_with_bearer`.
-
 /// Cap an upstream error body before stuffing it into `UpstreamError::Http`.
-/// Two protections, both mandatory under BYOT:
-///   1. Strip the literal bearer when the caller knows it — BYOT forwards
-///      a per-user PAT verbatim to the upstream, and a misbehaving upstream
-///      may echo it back ("invalid token <pat>").
+///   1. Strip every secret the request carried ([`UpstreamAuth::secrets`]),
+///      however short — an upstream may echo a credential back ("invalid
+///      token <pat>"), and a body that loses a few innocent characters to an
+///      over-eager match is cheaper than one that shows a credential.
 ///   2. Strip generic `Bearer <token>` patterns the upstream may quote at us
 ///      (4xx echo of the request's own auth header is common).
 ///   3. Cap at 200 chars on a UTF-8 boundary so operator logs don't carry
@@ -221,7 +227,17 @@ pub(crate) fn jsonrpc_required_capabilities(bytes: &[u8]) -> Option<serde_json::
     value.is_object().then_some(value)
 }
 
-pub(crate) fn redact_upstream_body(raw: &str, bearer: Option<&str>) -> String {
+/// A secret at least this many characters long is redacted wherever it
+/// appears in an upstream body; a shorter one only where it stands as a
+/// whole token ([`redact_secret`]), so a one-character value does not blank
+/// every such character of the body.
+const SECRET_REDACTED_ANYWHERE_CHARS: usize = 8;
+
+/// An upstream body made fit for a log line and an error message: truncated,
+/// every secret the request carried ([`UpstreamAuth::secrets`]) replaced by
+/// `<REDACTED>` (by [`redact_secret`]'s rule), and any `Bearer <token>`
+/// stripped.
+pub(crate) fn redact_upstream_body(raw: &str, upstream_auth: &UpstreamAuth) -> String {
     // Pre-truncate the input to a generous bound BEFORE we allocate. Operator
     // logs don't need a 5 MB upstream HTML page, and `String::replace` would
     // otherwise copy the full body once per redaction pass.
@@ -230,10 +246,8 @@ pub(crate) fn redact_upstream_body(raw: &str, bearer: Option<&str>) -> String {
         .floor_char_boundary(raw.len().min(PRE_TRUNCATE))
         .min(raw.len());
     let mut s = raw[..pre_cut].to_string();
-    if let Some(token) = bearer
-        && !token.is_empty()
-    {
-        s = s.replace(token, "<REDACTED>");
+    for secret in upstream_auth.secrets() {
+        s = redact_secret(&s, secret);
     }
     // Strip `Bearer <opaque>` (and the case-flipped sibling). The pattern is
     // simple enough that a regex would be overkill; we walk the string once.
@@ -247,6 +261,42 @@ pub(crate) fn redact_upstream_body(raw: &str, bearer: Option<&str>) -> String {
         s.push_str("…[truncated]");
     }
     s
+}
+
+/// Replace `secret` in `s` by `<REDACTED>`: everywhere when it is at least
+/// [`SECRET_REDACTED_ANYWHERE_CHARS`] characters long, otherwise only where it
+/// stands as a whole token — neither preceded nor followed by an ASCII
+/// alphanumeric (punctuation ends a word: a secret after `pin-` or before a
+/// full stop is still redacted). The match is literal (no character in the
+/// secret is a pattern). An empty secret replaces nothing.
+fn redact_secret(s: &str, secret: &str) -> String {
+    const REDACTED: &str = "<REDACTED>";
+    if secret.is_empty() {
+        return s.to_string();
+    }
+    if secret.chars().count() >= SECRET_REDACTED_ANYWHERE_CHARS {
+        return s.replace(secret, REDACTED);
+    }
+    let in_word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let mut out = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(secret) {
+        let at = from + rel;
+        let end = at + secret.len();
+        if !in_word(s[..at].chars().next_back()) && !in_word(s[end..].chars().next()) {
+            out.push_str(&s[copied..at]);
+            out.push_str(REDACTED);
+            copied = end;
+            from = end;
+        } else {
+            // Inside a word: look again from the next character, so an
+            // overlapping occurrence that does stand alone is still found.
+            from = at + s[at..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    out.push_str(&s[copied..]);
+    out
 }
 
 fn strip_bearer_pattern(input: &str) -> String {
@@ -293,8 +343,9 @@ fn strip_bearer_pattern(input: &str) -> String {
 }
 
 /// Max redirect hops tolerated on an external MCP egress call. MCP transports
-/// answer directly, so this absorbs an incidental 3xx rather than enabling a
-/// feature; each hop is re-vetted by [`GuardedResolver`](streamscope_mcp_auth::ssrf::GuardedResolver)
+/// answer directly, so this absorbs an incidental 3xx within the server's own
+/// origin rather than enabling a feature (a hop to another origin is refused:
+/// the declared headers would ride it); each hop is re-vetted by [`GuardedResolver`](streamscope_mcp_auth::ssrf::GuardedResolver)
 /// (hostname targets) and the redirect policy below (IP-literal targets).
 const MCP_MAX_REDIRECTS: usize = 3;
 
@@ -317,7 +368,7 @@ fn build_guarded_client(egress: Egress, streaming: bool) -> reqwest::Client {
     // of what "guarded MCP egress" means. Only the deadline shape and pool
     // sizing are local.
     with_deadlines(
-        streamscope_core::mcp::oauth_http::guarded_egress_builder(
+        streamscope_core::mcp::oauth_http::guarded_same_origin_builder(
             egress,
             MCP_MAX_REDIRECTS,
             streamscope_core::settings::core_settings().custom_ca_bundle.as_deref(),
@@ -458,20 +509,19 @@ fn stamp_outbound_mcp_headers(
     builder
 }
 
-/// One round-trip JSON-RPC call with an explicit bearer token.
+/// One round-trip JSON-RPC call carrying the upstream's resolved headers.
 ///
-/// Used by per-user OAuth: the handler resolves a per-(user, upstream)
-/// access token (refreshing if needed) and passes it here. The caller is
-/// responsible for credential resolution; this function only stamps the
-/// header and forwards the body.
+/// The caller resolves `upstream_auth` (declared inputs, and a per-user
+/// OAuth token refreshed if needed); this function only stamps the headers
+/// and forwards the body.
 ///
 /// Streamable HTTP only. Legacy SSE upstreams are dispatched through
 /// `legacy_sse::LegacySseSessionMap` in [`super::handler::call_cached`];
 /// this entry remains transport-checked so an accidental config-drift call
 /// fails loudly rather than silently going wrong.
-pub async fn call_with_bearer(
+pub async fn call_with_auth(
     upstream: &McpUpstreamServer,
-    bearer: Option<String>,
+    upstream_auth: &UpstreamAuth,
     request: &JsonRpcRequest,
     mcp_session_id: Option<&str>,
     protocol_version: Option<&str>,
@@ -488,7 +538,7 @@ pub async fn call_with_bearer(
     // Fast-fail on an IP-literal internal `upstream_url`; the guarded client
     // additionally pins the resolved IP at DNS time (closing DNS-rebinding) and
     // re-vets redirect hops, so a hostname that resolves internal is refused at
-    // connect rather than receiving the (operator- or user-owned) bearer.
+    // connect rather than receiving the (operator- or user-owned) credentials.
     if let Err(e) = streamscope_mcp_auth::ssrf::check_url_for(
         &upstream.upstream_url,
         MCP_EGRESS,
@@ -510,9 +560,7 @@ pub async fn call_with_bearer(
     if let Some(sid) = mcp_session_id {
         builder = builder.header("Mcp-Session-Id", sid);
     }
-    if let Some(token) = &bearer {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
+    builder = upstream_auth.apply(builder);
 
     let resp = builder.send().await?;
     let status = resp.status();
@@ -534,7 +582,7 @@ pub async fn call_with_bearer(
             .await
             .unwrap_or_default();
         let raw = String::from_utf8_lossy(&raw_bytes);
-        let redacted = redact_upstream_body(&raw, bearer.as_deref());
+        let redacted = redact_upstream_body(&raw, upstream_auth);
         return Err(UpstreamError::Http {
             status: status.as_u16(),
             body: redacted,
@@ -563,7 +611,7 @@ pub async fn call_with_bearer(
     Ok((parsed, response_session_id))
 }
 
-/// Like [`call_with_bearer`] but defers the body read so an
+/// Like [`call_with_auth`] but defers the body read so an
 /// `text/event-stream` response can be streamed verbatim to the downstream
 /// client without buffering the whole stream in memory.
 ///
@@ -573,9 +621,9 @@ pub async fn call_with_bearer(
 /// - [`UpstreamReply::Streaming`] when the upstream replied with SSE — the
 ///   handler attaches the [`reqwest::Response`] to an Axum streaming body,
 ///   wires the multiplex bridge, and returns it to the client.
-pub async fn call_with_bearer_for_streaming(
+pub async fn call_with_auth_for_streaming(
     upstream: &McpUpstreamServer,
-    bearer: Option<String>,
+    upstream_auth: &UpstreamAuth,
     request: &JsonRpcRequest,
     mcp_session_id: Option<&str>,
     protocol_version: Option<&str>,
@@ -607,9 +655,7 @@ pub async fn call_with_bearer_for_streaming(
     if let Some(sid) = mcp_session_id {
         builder = builder.header("Mcp-Session-Id", sid);
     }
-    if let Some(token) = &bearer {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
+    builder = upstream_auth.apply(builder);
 
     let resp = builder.send().await?;
     let status = resp.status();
@@ -630,7 +676,7 @@ pub async fn call_with_bearer_for_streaming(
             .await
             .unwrap_or_default();
         let raw = String::from_utf8_lossy(&raw_bytes);
-        let redacted = redact_upstream_body(&raw, bearer.as_deref());
+        let redacted = redact_upstream_body(&raw, upstream_auth);
         return Err(UpstreamError::Http {
             status: status.as_u16(),
             body: redacted,
@@ -660,7 +706,7 @@ pub async fn call_with_bearer_for_streaming(
 /// the wire — the proxy is a transparent forwarder for the response payload.
 pub async fn forward_client_response(
     upstream_url: &str,
-    bearer: Option<&str>,
+    upstream_auth: &UpstreamAuth,
     body: &serde_json::Value,
     mcp_session_id: &str,
     request_timeout_ms: i32,
@@ -679,9 +725,7 @@ pub async fn forward_client_response(
         .header("Mcp-Session-Id", mcp_session_id)
         .timeout(Duration::from_millis(request_timeout_ms.max(1) as u64))
         .body(serialized);
-    if let Some(token) = bearer {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
+    builder = upstream_auth.apply(builder);
     let resp = builder.send().await?;
     let status = resp.status();
     if !status.is_success() && status.as_u16() != 202 {
@@ -691,7 +735,7 @@ pub async fn forward_client_response(
             .await
             .unwrap_or_default();
         let raw = String::from_utf8_lossy(&raw_bytes);
-        let redacted = redact_upstream_body(&raw, bearer);
+        let redacted = redact_upstream_body(&raw, upstream_auth);
         return Err(UpstreamError::Http {
             status: status.as_u16(),
             body: redacted,
@@ -867,15 +911,85 @@ mod tests {
     #[test]
     fn redact_strips_known_bearer() {
         let body = r#"{"error":"invalid_token","detail":"saw Bearer ghp_secrettoken123 reject"}"#;
-        let out = redact_upstream_body(body, Some("ghp_secrettoken123"));
+        let auth = UpstreamAuth::bearer("ghp_secrettoken123").unwrap();
+        let out = redact_upstream_body(body, &auth);
         assert!(!out.contains("ghp_secrettoken123"));
         assert!(out.contains("<REDACTED>"));
+    }
+
+    /// Every secret the request carried is stripped where the body echoes it
+    /// as a token, not only after `Bearer ` — a short one included.
+    #[test]
+    fn redact_strips_every_secret_however_short() {
+        for secret in ["k1", "pin-123", "a-much-longer-shared-token"] {
+            let auth = UpstreamAuth::bearer(secret).unwrap();
+            let out = redact_upstream_body(&format!("token={secret} refused"), &auth);
+            assert_eq!(out, "token=<REDACTED> refused", "{secret}");
+        }
+    }
+
+    /// From eight characters a secret is redacted wherever it appears, inside
+    /// a word too; at seven, only where it stands alone.
+    #[test]
+    fn a_secret_is_redacted_inside_a_word_from_eight_characters() {
+        assert_eq!(SECRET_REDACTED_ANYWHERE_CHARS, 8);
+        assert_eq!(redact_secret("xabcdefghx", "abcdefgh"), "x<REDACTED>x");
+        assert_eq!(redact_secret("xabcdefgx", "abcdefg"), "xabcdefgx");
+        assert_eq!(redact_secret("x abcdefg x", "abcdefg"), "x <REDACTED> x");
+        // Characters, not bytes: seven two-byte characters are short.
+        assert_eq!(redact_secret("xéééééééx", "ééééééé"), "xéééééééx");
+        assert_eq!(redact_secret("xééééééééx", "éééééééé"), "x<REDACTED>x");
+    }
+
+    /// A short secret inside a word is kept — every neighbour that continues
+    /// a word on either side — and redacted where it stands as a token: a
+    /// JSON string value, after `=`, at either end of the body.
+    #[test]
+    fn a_short_secret_is_redacted_only_as_a_whole_token() {
+        for kept in ["true1", "1true", "xtruex"] {
+            assert_eq!(redact_secret(kept, "true"), kept, "{kept}");
+        }
+        assert_eq!(redact_secret("xKx", "K"), "xKx");
+        // A `.` is not part of a word: a secret ending a sentence is redacted.
+        assert_eq!(redact_secret("invalid key pin-123.", "pin-123"), "invalid key <REDACTED>.");
+        assert_eq!(redact_secret("v.true", "true"), "v.<REDACTED>");
+        // Punctuation is not part of a word either.
+        assert_eq!(redact_secret("pin-482913 rejected", "482913"), "pin-<REDACTED> rejected");
+        assert_eq!(redact_secret("code_482913", "482913"), "code_<REDACTED>");
+        assert_eq!(redact_secret(r#"{"flag":"true"}"#, "true"), r#"{"flag":"<REDACTED>"}"#);
+        assert_eq!(redact_secret("key=k1&b=2", "k1"), "key=<REDACTED>&b=2");
+        assert_eq!(redact_secret("k1", "k1"), "<REDACTED>");
+        assert_eq!(redact_secret("k1 refused", "k1"), "<REDACTED> refused");
+        assert_eq!(redact_secret("refused k1", "k1"), "refused <REDACTED>");
+        assert_eq!(redact_secret("k1k1 k1", "k1"), "k1k1 <REDACTED>");
+        assert_eq!(redact_secret("nothing here", ""), "nothing here");
+    }
+
+    /// The match is literal: a secret holding characters a pattern language
+    /// would read is found as written and nowhere else.
+    #[test]
+    fn a_secret_with_special_characters_is_matched_literally() {
+        assert_eq!(redact_secret("a=a.b* x", "a.b*"), "a=<REDACTED> x");
+        assert_eq!(redact_secret("aXbb x", "a.b*"), "aXbb x");
+        let long = r"p@ss.w*rd(+)?[x]$^\1";
+        assert_eq!(redact_secret(&format!("pw:{long}!"), long), "pw:<REDACTED>!");
+        // A short secret ending in a separator still stands alone after `=`.
+        assert_eq!(redact_secret("t=x=x y", "x=x"), "t=<REDACTED> y");
+    }
+
+    /// Through the body redaction: a one-character secret is redacted where it
+    /// stands alone and nowhere else in the body.
+    #[test]
+    fn a_one_character_secret_does_not_blank_the_body() {
+        let auth = UpstreamAuth::bearer("e").unwrap();
+        let out = redact_upstream_body(r#"{"error":"invalid key","key":"e"}"#, &auth);
+        assert_eq!(out, r#"{"error":"invalid key","key":"<REDACTED>"}"#);
     }
 
     #[test]
     fn redact_strips_generic_bearer_pattern() {
         let body = "401: bearer xyz123abc rejected by IdP";
-        let out = redact_upstream_body(body, None);
+        let out = redact_upstream_body(body, &UpstreamAuth::none());
         assert!(!out.contains("xyz123abc"));
         assert!(out.contains("<REDACTED>"));
     }
@@ -883,7 +997,7 @@ mod tests {
     #[test]
     fn redact_caps_long_bodies() {
         let body = "x".repeat(5000);
-        let out = redact_upstream_body(&body, None);
+        let out = redact_upstream_body(&body, &UpstreamAuth::none());
         // Bound includes the truncation marker; the prefix is the cap.
         assert!(out.starts_with(&"x".repeat(UPSTREAM_BODY_CAP)));
         assert!(out.ends_with("…[truncated]"));
@@ -891,7 +1005,7 @@ mod tests {
 
     #[test]
     fn redact_short_body_passes_through() {
-        let out = redact_upstream_body("not found", None);
+        let out = redact_upstream_body("not found", &UpstreamAuth::none());
         assert_eq!(out, "not found");
     }
 
@@ -900,7 +1014,7 @@ mod tests {
         let mut body = "a".repeat(UPSTREAM_BODY_CAP - 1);
         body.push('é'); // 2-byte char straddling the cap when truncating
         body.push_str("xxxx");
-        let out = redact_upstream_body(&body, None);
+        let out = redact_upstream_body(&body, &UpstreamAuth::none());
         // Should not panic; truncation must respect char boundaries.
         assert!(out.ends_with("…[truncated]"));
     }

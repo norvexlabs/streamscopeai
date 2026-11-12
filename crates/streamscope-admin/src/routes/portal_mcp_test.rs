@@ -1,24 +1,26 @@
 //! Portal — MCP catalog smoke test.
 //!
-//! `POST /api/v1/portal/mcp/test/{virtual_server_id}` runs `tools/list` /
-//! `prompts/list` / `resources/list` against each upstream the chosen virtual
-//! server fans into, using the same auth resolution rules the proxy uses, and
-//! returns the merged catalog the user's `sk-*` key would see when calling
-//! `/mcp/<slug>`.
+//! `POST /api/v1/portal/mcp/virtual-servers/{virtual_server_id}/actions/test`
+//! runs `tools/list` / `prompts/list` / `resources/list` against each upstream
+//! the chosen virtual server fans into, with the headers the proxy would send
+//! for this user (the same resolver,
+//! [`streamscope_core::mcp::header_inputs::resolve`]), and returns the merged
+//! catalog the user's key would see when calling `/mcp/<slug>`.
 //!
 //! Why this lives in admin-api rather than going through the proxy:
 //! - The user already authenticated via the portal session — we don't want
-//!   them to paste their `sk-*` plaintext into a textbox to "test it".
-//! - The test endpoint has the same auth-mode coverage matrix as the proxy
-//!   (no_auth, service_account, per_user_oauth) without dragging in the
-//!   proxy's full multiplexer / session-tracking infrastructure.
+//!   them to paste their key plaintext into a textbox to "test it".
+//! - It needs only the header resolution, not the proxy's multiplexer /
+//!   session-tracking infrastructure.
 //!
 //! Out of scope:
-//! - `byot` upstreams — they only resolve at request time on the `/fwd/{vk-...}`
-//!   path; without the agent's bearer in hand, we can't preview them. The
-//!   endpoint reports `unsupported_byot` so the UI can explain.
-//! - Streaming `tools/call` — this is read-only catalog discovery; the test
-//!   page links to a sample curl for actual tool invocation.
+//! - An upstream needing a header the CLIENT sends on each request: the test
+//!   has no client, so it reports `needs_client_header` rather than calling.
+//! - Streaming `tools/call` — this is read-only catalog discovery.
+//!
+//! What a result says about a failure is the gateway's own sentence (an HTTP
+//! status, a JSON-RPC error code), never text the upstream sent: a portal user
+//! must not read what an upstream echoed back of its credentials.
 
 use std::time::Duration;
 
@@ -34,6 +36,11 @@ use streamscope_core::web::{
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
+use streamscope_core::mcp::header_inputs::{self as hi, InputValues, Remote, ResolveError, UpstreamAuth};
+
+use super::mcp_inputs;
 use super::portal_auth::PortalUser;
 use super::{ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::db::tenant::{Scoped, TenantConn};
@@ -62,8 +69,12 @@ pub struct PortalMcpTestRouteResult {
     pub upstream_url: String,
     pub auth_mode: String,
     pub prefix: String,
-    /// One of: `ok`, `needs_connection`, `service_account_unavailable`,
-    /// `unsupported_byot`, `http_error`, `jsonrpc_error`, `disabled`.
+    /// One of: `ok`, `needs_connection` (the user's OAuth sign-in or a
+    /// required input of theirs is missing), `token_expired`,
+    /// `needs_client_header` (the client sends a required header on each
+    /// request; not a failure), `unavailable` (the administrator's settings
+    /// are incomplete or unreadable), `redirected` (a 3xx, never followed),
+    /// `http_error`, `jsonrpc_error`, `disabled`.
     pub status: String,
     /// Human-readable detail when `status != ok`. None on success.
     pub error: Option<String>,
@@ -121,9 +132,8 @@ struct RouteUpstreamRow {
     upstream_url: String,
     auth_mode: String,
     enabled: bool,
-    /// BYTEA column read as UTF-8 via `convert_from(..., 'UTF8')` — same as
-    /// the proxy's snapshot path. Holds base64 ciphertext.
-    encrypted_credential: Option<String>,
+    remote: sqlx::types::Json<Remote>,
+    encrypted_admin_inputs: sqlx::types::Json<HashMap<String, String>>,
     prefix: String,
     request_timeout_ms: i32,
 }
@@ -202,7 +212,7 @@ pub async fn test_virtual_server(
                   u.upstream_url AS upstream_url,
                   u.auth_mode AS auth_mode,
                   u.enabled AS enabled,
-                  convert_from(u.encrypted_credential, 'UTF8') AS encrypted_credential,
+                  u.remote, u.encrypted_admin_inputs,
                   COALESCE(r.prefix, '') AS prefix,
                   u.request_timeout_ms
            FROM mcp_virtual_routes r
@@ -290,66 +300,11 @@ pub async fn test_virtual_server(
             });
             continue;
         }
-        // Resolve bearer per auth_mode — same matrix as the proxy.
-        let bearer = match route.auth_mode.as_str() {
-            "no_auth" => Ok(None),
-            "service_account" => match (&route.encrypted_credential, streamscope_core::crypto::get_encryption_key()) {
-                (Some(cipher), Some(key)) => streamscope_core::crypto::decrypt(cipher.as_str(), &key)
-                    .map(Some)
-                    .map_err(|_| "service_account_unavailable"),
-                _ => Err("service_account_unavailable"),
-            },
-            "per_user_oauth" => {
-                // `encrypted_access_token` is BYTEA holding the UTF-8 ciphertext
-                // (the store binds `.into_bytes()`); read it back as text with
-                // `convert_from(..., 'UTF8')` — same as the edge-sync forwarder.
-                // A raw `SELECT` of the BYTEA column into a Rust `String` fails
-                // to decode (sqlx maps BYTEA → Vec<u8>).
-                let cred: Option<UserCredRow> = sqlx::query_as::<_, UserCredRow>(
-                    r#"SELECT convert_from(encrypted_access_token, 'UTF8') AS encrypted_access_token,
-                              expires_at
-                       FROM mcp_user_credentials
-                       WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
-                )
-                .bind(db.tenant_uuid())
-                .bind(user.user_id)
-                .bind(route.upstream_id)
-                .fetch_optional(db.conn())
-                .await
-                .map_err(|e| {
-                    tracing::error!("portal mcp test cred lookup: {e}");
-                    ApiError::internal("failed to look up credential")
-                })?;
-                match cred {
-                    None => Err("needs_connection"),
-                    // The proxy refreshes an expired access token transparently
-                    // on real calls; the test path doesn't, so a live probe with
-                    // a stale bearer would 401. Report `token_expired` — the
-                    // connection is fine, it just needs a reconnect to verify here.
-                    Some(c) if c.expires_at.is_some_and(|e| e <= chrono::Utc::now()) => {
-                        Err("token_expired")
-                    }
-                    Some(c) => match streamscope_core::crypto::get_encryption_key() {
-                        Some(key) => streamscope_core::crypto::decrypt(c.encrypted_access_token.as_str(), &key)
-                            .map(Some)
-                            .map_err(|_| "needs_connection"),
-                        None => Err("needs_connection"),
-                    },
-                }
-            }
-            "byot" => Err("unsupported_byot"),
-            _ => Err("service_account_unavailable"),
-        };
-        let bearer = match bearer {
-            Ok(b) => b,
-            Err(status) => {
-                let msg = match status {
-                    "needs_connection" => "no stored OAuth credential — connect first",
-                    "token_expired" => "OAuth token expired — reconnect to test here (real calls refresh it automatically)",
-                    "service_account_unavailable" => "service-account credential is missing or undecryptable",
-                    "unsupported_byot" => "byot upstreams cannot be tested from the portal",
-                    _ => "auth resolution failed",
-                };
+        // The headers the proxy would send for this user: the same resolver,
+        // over the admin's values, the user's own and no client.
+        let auth = match resolve_for_user(&mut db, user.user_id, &route).await? {
+            Ok(auth) => auth,
+            Err((status, msg)) => {
                 results.push(PortalMcpTestRouteResult {
                     upstream_id: route.upstream_id,
                     upstream_name: route.upstream_name,
@@ -357,7 +312,7 @@ pub async fn test_virtual_server(
                     auth_mode: route.auth_mode,
                     prefix: route.prefix,
                     status: status.into(),
-                    error: Some(msg.into()),
+                    error: Some(msg),
                     tools: vec![],
                     prompts: vec![],
                     resources: vec![],
@@ -367,113 +322,12 @@ pub async fn test_virtual_server(
             }
         };
 
-        // Defense-in-depth: reject non-http(s) upstream URLs at the test
-        // endpoint. Today only operators write `upstream_url`, but if the
-        // self-service surface ever grows, this guard prevents a portal user
-        // from steering admin-api into making outbound calls to non-HTTP
-        // schemes (file://, gopher://, …) using a server-decrypted bearer.
-        // Internal upstreams (`internal://...`) are short-circuited above
-        // and never reach this guard.
-        if !route.upstream_url.starts_with("http://")
-            && !route.upstream_url.starts_with("https://")
-        {
-            results.push(PortalMcpTestRouteResult {
-                upstream_id: route.upstream_id,
-                upstream_name: route.upstream_name,
-                upstream_url: route.upstream_url,
-                auth_mode: route.auth_mode,
-                prefix: route.prefix,
-                status: "http_error".into(),
-                error: Some("upstream_url must be http(s)://...".into()),
-                tools: vec![],
-                prompts: vec![],
-                resources: vec![],
-                builtin_status: None,
-            });
-            continue;
-        }
-
-        // Run tools/list, prompts/list, resources/list. Each is a separate
-        // JSON-RPC POST so a server that doesn't support one capability still
-        // surfaces the others. Cap the per-call timeout so a portal user
-        // can't pin an admin-api worker for minutes via a slow upstream.
-        let raw_timeout = u64::try_from(route.request_timeout_ms).unwrap_or(60_000);
-        let timeout = Duration::from_millis(raw_timeout.min(TEST_UPSTREAM_TIMEOUT_CAP_MS));
-
-        // MCP streamable-HTTP handshake, matching what the proxy (and any real
-        // client) does: `initialize` first — capturing any `Mcp-Session-Id` the
-        // server assigns — then `notifications/initialized`, then the list
-        // calls carrying that session. A stateful server (e.g. GitHub) rejects
-        // a bare `tools/list`; a stateless one simply returns no session id and
-        // the calls proceed without one. Replies may be JSON or SSE-framed.
-        let init_params = serde_json::json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": { "name": "streamscope-portal-test", "version": "1" },
-        });
-        // One guarded client per test run — see `guarded_test_client`. A
-        // build failure surfaces on the same path a handshake failure does.
-        let (tools_res, prompts_res, resources_res) = match guarded_test_client() {
-            Err(e) => (Err(e), Err(String::new()), Err(String::new())),
-            Ok(http) => match mcp_rpc(
-                &http, &route.upstream_url, &bearer, &None,
-                "initialize", init_params, timeout,
-            )
-            .await
-            {
-                // Handshake failed — surface it as the primary (tools/list)
-                // error; the other two collapse to empty via the
-                // `Err(_) => vec![]` arms.
-                Err(e) => (Err(e), Err(String::new()), Err(String::new())),
-                Ok((_, session_id)) => {
-                    if session_id.is_some() {
-                        mcp_notify(
-                            &http, &route.upstream_url, &bearer, &session_id,
-                            "notifications/initialized", timeout,
-                        )
-                        .await;
-                    }
-                    let empty = serde_json::json!({});
-                    let tools = mcp_rpc(&http, &route.upstream_url, &bearer, &session_id, "tools/list", empty.clone(), timeout).await.map(|(v, _)| v);
-                    let prompts = mcp_rpc(&http, &route.upstream_url, &bearer, &session_id, "prompts/list", empty.clone(), timeout).await.map(|(v, _)| v);
-                    let resources = mcp_rpc(&http, &route.upstream_url, &bearer, &session_id, "resources/list", empty, timeout).await.map(|(v, _)| v);
-                    (tools, prompts, resources)
-                }
-            },
-        };
-
-        // tools/list is the primary signal — if it failed at the HTTP or
-        // JSON-RPC layer, surface that even if prompts/resources happen to
-        // succeed. prompts/list and resources/list are best-effort: many
-        // servers don't implement them.
-        let mut status = "ok";
-        let mut err_msg: Option<String> = None;
-        let (mut tools, tools_err) = match &tools_res {
-            Ok(v) => (extract_named(v, "tools", &route.prefix), None),
-            Err(e) => (vec![], Some(e.clone())),
-        };
-        if let Some(msg) = tools_err {
-            status = if msg.contains(": HTTP ") {
-                "http_error"
-            } else {
-                "jsonrpc_error"
-            };
-            err_msg = Some(msg);
-        }
-        let mut prompts = match &prompts_res {
-            Ok(v) => extract_named(v, "prompts", &route.prefix),
-            Err(_) => vec![],
-        };
-        routable(&mut tools, &route.prefix);
-        routable(&mut prompts, &route.prefix);
-        let resources = match &resources_res {
-            Ok(v) => extract_resources(v),
-            Err(_) => vec![],
-        };
-
-        total_tools += tools.len();
-        total_prompts += prompts.len();
-        total_resources += resources.len();
+        let mut probe = probe_upstream(&route.upstream_url, &auth, route.request_timeout_ms, &route.prefix).await;
+        routable(&mut probe.tools, &route.prefix);
+        routable(&mut probe.prompts, &route.prefix);
+        total_tools += probe.tools.len();
+        total_prompts += probe.prompts.len();
+        total_resources += probe.resources.len();
 
         results.push(PortalMcpTestRouteResult {
             upstream_id: route.upstream_id,
@@ -481,11 +335,11 @@ pub async fn test_virtual_server(
             upstream_url: route.upstream_url,
             auth_mode: route.auth_mode,
             prefix: route.prefix,
-            status: status.into(),
-            error: err_msg,
-            tools,
-            prompts,
-            resources,
+            status: probe.status.into(),
+            error: probe.error,
+            tools: probe.tools,
+            prompts: probe.prompts,
+            resources: probe.resources,
             builtin_status: None,
         });
     }
@@ -497,6 +351,93 @@ pub async fn test_virtual_server(
         total_prompts,
         total_resources,
     }))
+}
+
+/// What one probe of an upstream found: the catalog it lists, or why the call
+/// failed (`status` as in [`PortalMcpTestRouteResult::status`]).
+pub(crate) struct ProbeOutcome {
+    pub status: &'static str,
+    pub error: Option<String>,
+    pub tools: Vec<PortalMcpTestEntry>,
+    pub prompts: Vec<PortalMcpTestEntry>,
+    pub resources: Vec<PortalMcpTestResource>,
+}
+
+/// Probe one HTTP upstream with `auth`'s headers: the MCP handshake, then
+/// `tools/list`, `prompts/list` and `resources/list`, over the guarded,
+/// no-redirect client, each call capped at [`TEST_UPSTREAM_TIMEOUT_CAP_MS`].
+/// Names are namespaced with `prefix` (`<prefix>__<name>`) when it is set.
+/// The shared probe of the portal's and the console's Test buttons.
+pub(crate) async fn probe_upstream(
+    upstream_url: &str,
+    auth: &UpstreamAuth,
+    request_timeout_ms: i32,
+    prefix: &str,
+) -> ProbeOutcome {
+    // Defense-in-depth: reject non-http(s) upstream URLs before any call, so
+    // a stored URL can never steer admin-api into a non-HTTP scheme with the
+    // upstream's resolved headers. Internal upstreams (`internal://...`) are
+    // previewed by the callers and never reach this.
+    if !upstream_url.starts_with("http://") && !upstream_url.starts_with("https://") {
+        return ProbeOutcome {
+            status: "http_error",
+            error: Some("upstream_url must be http(s)://...".into()),
+            tools: vec![],
+            prompts: vec![],
+            resources: vec![],
+        };
+    }
+
+    // Each list call is a separate JSON-RPC POST so a server that doesn't
+    // support one capability still surfaces the others. The per-call timeout
+    // is capped so a caller can't pin an admin-api worker for minutes via a
+    // slow upstream.
+    let raw_timeout = u64::try_from(request_timeout_ms).unwrap_or(60_000);
+    let timeout = Duration::from_millis(raw_timeout.min(TEST_UPSTREAM_TIMEOUT_CAP_MS));
+
+    // MCP streamable-HTTP handshake, matching what the proxy (and any real
+    // client) does: `initialize` first — capturing any `Mcp-Session-Id` the
+    // server assigns — then `notifications/initialized`, then the list
+    // calls carrying that session. A stateful server (e.g. GitHub) rejects
+    // a bare `tools/list`; a stateless one simply returns no session id and
+    // the calls proceed without one. Replies may be JSON or SSE-framed.
+    let init_params = serde_json::json!({
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": { "name": "streamscope-portal-test", "version": "1" },
+    });
+    // One guarded client per probe — see `guarded_test_client`. A build
+    // failure surfaces on the same path a handshake failure does.
+    let (tools_res, prompts_res, resources_res) = match guarded_test_client() {
+        Err(e) => (Err(e), Err(RpcError::quiet()), Err(RpcError::quiet())),
+        Ok(http) => match mcp_rpc(&http, upstream_url, auth, &None, "initialize", init_params, timeout).await {
+            // Handshake failed — surface it as the primary (tools/list) error;
+            // the other two collapse to empty.
+            Err(e) => (Err(e), Err(RpcError::quiet()), Err(RpcError::quiet())),
+            Ok((_, session_id)) => {
+                if session_id.is_some() {
+                    mcp_notify(&http, upstream_url, auth, &session_id, "notifications/initialized", timeout).await;
+                }
+                let empty = serde_json::json!({});
+                let tools = mcp_rpc(&http, upstream_url, auth, &session_id, "tools/list", empty.clone(), timeout).await.map(|(v, _)| v);
+                let prompts = mcp_rpc(&http, upstream_url, auth, &session_id, "prompts/list", empty.clone(), timeout).await.map(|(v, _)| v);
+                let resources = mcp_rpc(&http, upstream_url, auth, &session_id, "resources/list", empty, timeout).await.map(|(v, _)| v);
+                (tools, prompts, resources)
+            }
+        },
+    };
+
+    // tools/list is the primary signal — if it failed at the HTTP or JSON-RPC
+    // layer, surface that even if prompts/resources happen to succeed.
+    // prompts/list and resources/list are best-effort: many servers don't
+    // implement them.
+    let (status, error, tools) = match &tools_res {
+        Ok(v) => ("ok", None, extract_named(v, "tools", prefix)),
+        Err(e) => (e.status(), Some(e.message.clone()), vec![]),
+    };
+    let prompts = prompts_res.as_ref().map(|v| extract_named(v, "prompts", prefix)).unwrap_or_default();
+    let resources = resources_res.as_ref().map(extract_resources).unwrap_or_default();
+    ProbeOutcome { status, error, tools, prompts, resources }
 }
 
 /// Extract the last SSE `data:` payload from a `text/event-stream` body — the
@@ -522,30 +463,63 @@ fn parse_last_sse_event(text: &str) -> Option<String> {
     last_data
 }
 
+/// Why a test call failed, in the gateway's own words: an HTTP status or a
+/// JSON-RPC error code, never text the upstream sent.
+#[derive(Debug, Clone)]
+struct RpcError {
+    kind: RpcErrorKind,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcErrorKind {
+    Http,
+    Redirected,
+    JsonRpc,
+}
+
+impl RpcError {
+    fn http(method: &str, what: &str) -> Self {
+        Self { kind: RpcErrorKind::Http, message: format!("{method}: {what}") }
+    }
+    /// The placeholder for a call never made (the handshake failed first).
+    fn quiet() -> Self {
+        Self { kind: RpcErrorKind::Http, message: String::new() }
+    }
+    fn status(&self) -> &'static str {
+        match self.kind {
+            RpcErrorKind::Http => "http_error",
+            RpcErrorKind::Redirected => "redirected",
+            RpcErrorKind::JsonRpc => "jsonrpc_error",
+        }
+    }
+}
+
 /// POST one JSON-RPC request over MCP streamable HTTP. Returns the parsed
 /// response and any `Mcp-Session-Id` the server assigned. Sends the
-/// spec-mandated `Accept: application/json, text/event-stream`, forwards the
-/// session id when set, and unwraps an SSE-framed reply — the same transport
-/// the proxy speaks, so the test sees what a real agent would.
+/// spec-mandated `Accept: application/json, text/event-stream`, the upstream's
+/// resolved headers, forwards the session id when set, and unwraps an
+/// SSE-framed reply — the same transport the proxy speaks, so the test sees
+/// what a real agent would.
 async fn mcp_rpc(
     client: &reqwest::Client,
     upstream_url: &str,
-    bearer: &Option<String>,
+    auth: &UpstreamAuth,
     session_id: &Option<String>,
     method: &str,
     params: Value,
     timeout: Duration,
-) -> Result<(Value, Option<String>), String> {
+) -> Result<(Value, Option<String>), RpcError> {
     // Defense-in-depth SSRF guard, layer 1: refuse an internal IP *literal*
     // before we connect. Admin write-time validation is the load-bearing layer
-    // (see `routes/mcp.rs::validate_outbound_urls`); this catch covers legacy
-    // rows + `upstream_url` columns that might bypass the create/update path
-    // in future surfaces. Layer 2 — the connect-time resolver that closes DNS
-    // rebinding, and redirect re-vetting — rides `client`, which MUST be a
-    // guarded one (see `guarded_test_client`). IMDS is refused by both
-    // regardless of the operator's egress posture.
-    streamscope_mcp_auth::ssrf::check_url_for(upstream_url, super::mcp::MCP_EGRESS)
-        .map_err(|e| format!("{method}: upstream URL refused by SSRF guard: {e}"))?;
+    // (see `routes/mcp.rs::validate_outbound_urls`); this catch covers rows
+    // that might bypass the create/update path in future surfaces. Layer 2 —
+    // the connect-time resolver that closes DNS rebinding — rides `client`,
+    // which MUST be a guarded one (see `guarded_test_client`). IMDS is refused
+    // by both regardless of the operator's egress posture.
+    if let Err(e) = streamscope_mcp_auth::ssrf::check_url_for(upstream_url, super::mcp::MCP_EGRESS) {
+        return Err(RpcError::http(method, &format!("upstream URL refused by SSRF guard: {e}")));
+    }
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -557,14 +531,26 @@ async fn mcp_rpc(
         .timeout(timeout)
         .header("Accept", "application/json, text/event-stream")
         .json(&body);
-    if let Some(token) = bearer {
-        req = req.bearer_auth(token);
-    }
+    req = auth.apply(req);
     if let Some(sid) = session_id {
         req = req.header("Mcp-Session-Id", sid.as_str());
     }
-    let resp = req.send().await.map_err(|e| format!("{method}: {e}"))?;
+    let resp = req.send().await.map_err(|e| {
+        tracing::info!(%upstream_url, method, "portal mcp test: request failed: {e}");
+        let what = if e.is_timeout() {
+            "the server did not answer in time"
+        } else {
+            "could not reach the server"
+        };
+        RpcError::http(method, what)
+    })?;
     let status = resp.status();
+    if status.is_redirection() {
+        return Err(RpcError {
+            kind: RpcErrorKind::Redirected,
+            message: format!("{method}: the server answered HTTP {status}, a redirect the gateway does not follow"),
+        });
+    }
     let resp_session = resp
         .headers()
         .get("mcp-session-id")
@@ -585,20 +571,28 @@ async fn mcp_rpc(
         streamscope_core::mcp::MCP_MAX_RESPONSE_BYTES,
     )
     .await
-    .map_err(|e| format!("{method}: {e}"))?;
-    let text = String::from_utf8_lossy(&raw).into_owned();
+    .map_err(|_| RpcError::http(method, "the server's reply could not be read"))?;
     if !status.is_success() {
-        return Err(format!("{method}: HTTP {status}"));
+        return Err(RpcError::http(method, &format!("HTTP {status}")));
     }
+    let text = String::from_utf8_lossy(&raw).into_owned();
     let json_str = if content_type.starts_with("text/event-stream") {
-        parse_last_sse_event(&text).ok_or_else(|| format!("{method}: empty SSE response"))?
+        parse_last_sse_event(&text)
+            .ok_or_else(|| RpcError { kind: RpcErrorKind::JsonRpc, message: format!("{method}: empty SSE response") })?
     } else {
         text
     };
-    let v: Value =
-        serde_json::from_str(&json_str).map_err(|e| format!("{method}: invalid JSON: {e}"))?;
+    let v: Value = serde_json::from_str(&json_str).map_err(|_| RpcError {
+        kind: RpcErrorKind::JsonRpc,
+        message: format!("{method}: the reply is not valid JSON"),
+    })?;
     if let Some(err) = v.get("error") {
-        return Err(format!("{method}: jsonrpc error: {err}"));
+        let code = err.get("code").and_then(Value::as_i64);
+        let message = match code {
+            Some(c) => format!("{method}: the server answered JSON-RPC error {c}"),
+            None => format!("{method}: the server answered a JSON-RPC error"),
+        };
+        return Err(RpcError { kind: RpcErrorKind::JsonRpc, message });
     }
     Ok((v, resp_session))
 }
@@ -608,15 +602,130 @@ async fn mcp_rpc(
 /// The URL is operator-supplied and reached on a portal user's request, so the
 /// hostname-only pre-check in [`mcp_rpc`] is not sufficient on its own: only a
 /// [`GuardedResolver`](streamscope_mcp_auth::ssrf::GuardedResolver)-backed
-/// client validates the address DNS actually returns, at connect time, and
-/// re-vets redirect hops.
-fn guarded_test_client() -> Result<reqwest::Client, String> {
-    streamscope_core::mcp::oauth_http::build_guarded_client(
+/// client validates the address DNS actually returns, at connect time.
+///
+/// It follows NO redirect: the request carries the upstream's declared
+/// headers, and reqwest strips only `Authorization` and `Cookie` on a
+/// cross-origin hop — a custom credential header would ride along to wherever
+/// the 3xx points. A redirect is reported (`redirected`), never followed.
+fn guarded_test_client() -> Result<reqwest::Client, RpcError> {
+    streamscope_core::mcp::oauth_http::guarded_egress_builder(
         super::mcp::MCP_EGRESS,
+        0,
         crate::custom_ca::current().as_deref(),
-        None, // per-call deadlines are applied on each request
     )
-    .map_err(|e| format!("build guarded upstream client: {e}"))
+    .redirect(reqwest::redirect::Policy::none())
+    .build()
+    .map_err(|e| {
+        tracing::error!("build guarded portal test client: {e}");
+        RpcError::http("initialize", "the gateway could not prepare the call")
+    })
+}
+
+/// The headers for one route's upstream, for this user, with no client: the
+/// admin's values, the user's own, and the user's OAuth token on a per-user
+/// OAuth upstream. `Err((status, message))` is a route result, not a failure
+/// of the request.
+async fn resolve_for_user(
+    db: &mut TenantConn,
+    user_id: Uuid,
+    route: &RouteUpstreamRow,
+) -> Result<Result<UpstreamAuth, (&'static str, String)>, ApiError> {
+    let tenant_id = db.tenant_uuid();
+    let oauth = mcp_inputs::is_oauth(&route.auth_mode);
+    let unavailable = || {
+        Err((
+            "unavailable",
+            "this server is not fully set up — ask your administrator".to_string(),
+        ))
+    };
+    let admin = mcp_inputs::decrypt_values(&route.encrypted_admin_inputs.0);
+    if admin.len() != route.encrypted_admin_inputs.0.len() {
+        return Ok(unavailable());
+    }
+    let user_ct: Option<sqlx::types::Json<HashMap<String, String>>> = sqlx::query_scalar(
+        r#"SELECT encrypted_values FROM mcp_user_inputs
+           WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
+    )
+    .bind(tenant_id)
+    .bind(user_id)
+    .bind(route.upstream_id)
+    .fetch_optional(db.conn())
+    .await
+    .map_err(|e| {
+        tracing::error!("portal mcp test inputs lookup: {e}");
+        ApiError::internal("failed to look up inputs")
+    })?;
+    let user = user_ct.map(|j| mcp_inputs::decrypt_values(&j.0)).unwrap_or_default();
+
+    let values = InputValues { admin: Some(&admin), user: Some(&user), client: None };
+    let mut auth = match hi::resolve(&route.remote, oauth, values) {
+        Ok(auth) => auth,
+        Err(ResolveError::Missing(m)) if !m.user.is_empty() => {
+            return Ok(Err((
+                "needs_connection",
+                "fill in your values for this server under Connections first".to_string(),
+            )));
+        }
+        Err(ResolveError::Missing(m)) if m.admin.is_empty() && !m.client.is_empty() => {
+            return Ok(Err((
+                "needs_client_header",
+                format!("needs the client's header: {}", m.client.join(", ")),
+            )));
+        }
+        Err(e) => {
+            tracing::warn!(upstream = %route.upstream_id, "portal mcp test: headers unresolved: {e:?}");
+            return Ok(unavailable());
+        }
+    };
+
+    if oauth {
+        // `encrypted_access_token` is BYTEA holding the UTF-8 ciphertext
+        // (the store binds `.into_bytes()`); read it back as text with
+        // `convert_from(..., 'UTF8')` — same as the edge-sync forwarder.
+        let cred: Option<UserCredRow> = sqlx::query_as::<_, UserCredRow>(
+            r#"SELECT convert_from(encrypted_access_token, 'UTF8') AS encrypted_access_token,
+                      expires_at
+               FROM mcp_user_credentials
+               WHERE tenant_id = $1 AND user_id = $2 AND upstream_server_id = $3"#,
+        )
+        .bind(tenant_id)
+        .bind(user_id)
+        .bind(route.upstream_id)
+        .fetch_optional(db.conn())
+        .await
+        .map_err(|e| {
+            tracing::error!("portal mcp test cred lookup: {e}");
+            ApiError::internal("failed to look up credential")
+        })?;
+        let connect_first = || {
+            Err(("needs_connection", "no stored OAuth credential — connect first".to_string()))
+        };
+        let token = match cred {
+            None => return Ok(connect_first()),
+            // The proxy refreshes an expired access token transparently on
+            // real calls; the test path doesn't, so a live probe with a stale
+            // bearer would 401. Report `token_expired` — the connection is
+            // fine, it just needs a reconnect to verify here.
+            Some(c) if c.expires_at.is_some_and(|e| e <= chrono::Utc::now()) => {
+                return Ok(Err((
+                    "token_expired",
+                    "OAuth token expired — reconnect to test here (real calls refresh it automatically)"
+                        .to_string(),
+                )));
+            }
+            Some(c) => match streamscope_core::crypto::get_encryption_key()
+                .and_then(|key| streamscope_core::crypto::decrypt(&c.encrypted_access_token, &key).ok())
+            {
+                Some(t) => t,
+                None => return Ok(connect_first()),
+            },
+        };
+        if auth.push_bearer(&token).is_none() {
+            return Ok(connect_first());
+        }
+    }
+    Ok(Ok(auth))
 }
 
 /// Fire a JSON-RPC notification (no `id`, no reply) — used for
@@ -626,7 +735,7 @@ fn guarded_test_client() -> Result<reqwest::Client, String> {
 async fn mcp_notify(
     client: &reqwest::Client,
     upstream_url: &str,
-    bearer: &Option<String>,
+    auth: &UpstreamAuth,
     session_id: &Option<String>,
     method: &str,
     timeout: Duration,
@@ -637,9 +746,7 @@ async fn mcp_notify(
         .timeout(timeout)
         .header("Accept", "application/json, text/event-stream")
         .json(&body);
-    if let Some(token) = bearer {
-        req = req.bearer_auth(token);
-    }
+    req = auth.apply(req);
     if let Some(sid) = session_id {
         req = req.header("Mcp-Session-Id", sid.as_str());
     }
@@ -673,14 +780,14 @@ fn extract_named(v: &Value, key: &str, prefix: &str) -> Vec<PortalMcpTestEntry> 
 ///
 /// Returned by [`preview_internal_upstream`] to keep the route-loop body
 /// from juggling the four output lists.
-struct InternalPreview {
-    tools: Vec<PortalMcpTestEntry>,
-    prompts: Vec<PortalMcpTestEntry>,
-    resources: Vec<PortalMcpTestResource>,
-    builtin_status: PortalMcpBuiltinStatus,
+pub(crate) struct InternalPreview {
+    pub(crate) tools: Vec<PortalMcpTestEntry>,
+    pub(crate) prompts: Vec<PortalMcpTestEntry>,
+    pub(crate) resources: Vec<PortalMcpTestResource>,
+    pub(crate) builtin_status: PortalMcpBuiltinStatus,
 }
 
-async fn preview_internal_upstream(
+pub(crate) async fn preview_internal_upstream(
     conn: &mut Scoped,
     tenant_id: Uuid,
     upstream_url: &str,
@@ -718,7 +825,7 @@ async fn preview_builtin_web(
     let has_credential: bool = sqlx::query_scalar(
         "SELECT (encrypted_credential IS NOT NULL)
          FROM mcp_upstream_servers
-         WHERE name = $1 AND tenant_id = $2",
+         WHERE name = $1 AND tenant_id = $2 AND built_in",
     )
     .bind(BUILTIN_WEB_UPSTREAM_NAME)
     .bind(tenant_id)

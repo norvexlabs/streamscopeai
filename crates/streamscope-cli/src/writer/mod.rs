@@ -11,6 +11,12 @@
 //!     hash of the written value, so a later run removes leaves we own that
 //!     dropped out of the render — but ONLY when their live value still
 //!     matches what we wrote (a user-edited value is kept, with a warning);
+//!   * a paste-here placeholder (`<paste-your-…-here>`) never overwrites a
+//!     value we did not write: it replaces the live value only when that
+//!     value is exactly what the last run wrote there;
+//!   * nothing the user wrote is removed by a re-render. The one removal that
+//!     takes their text is asked for by name ([`merge_withdrawing`]): an
+//!     entry the caller recorded as created by us, withdrawn whole;
 //!   * writes are atomic (same-dir temp + rename) with a pre-write backup.
 
 pub(crate) mod envfile;
@@ -23,7 +29,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::state::{sha256_hex, OwnedEntry, OwnedLeaf};
+use crate::state::{sha256_hex, EntryRoot, OwnedEntry, OwnedLeaf};
 use streamscope_client_templates::{TemplateFormat, STRING_ENTRIES};
 
 pub struct MergeOutcome {
@@ -34,6 +40,9 @@ pub struct MergeOutcome {
     /// Leaves we previously owned whose live value was user-edited — kept in
     /// place; surfaced so the caller can warn.
     pub kept_edited: Vec<String>,
+    /// For each root [`merge_withdrawing`] was asked to withdraw, whether it
+    /// stood in the file and was removed.
+    pub withdrawn: Vec<bool>,
 }
 
 /// Merge `rendered` into the current contents of `existing` (None = file
@@ -46,26 +55,175 @@ pub fn merge(
     prev_owned: &[OwnedLeaf],
     keyed_arrays: &BTreeMap<String, String>,
 ) -> Result<MergeOutcome> {
+    merge_withdrawing(format, existing, rendered, prev_owned, keyed_arrays, &[])
+}
+
+/// [`merge`], after taking the entries at `withdraw` out of the file WHOLE —
+/// whatever stands in them now, the user's pasted values included. The caller
+/// names only entries it recorded as created by a previous write; one that
+/// holds no leaf or entry `prev_owned` records is left alone (the record and
+/// the file no longer agree), and so is a root naming the whole file. The
+/// records under a withdrawn root go with it, so nothing in it is reported as
+/// kept. [`MergeOutcome::withdrawn`] says which roots were removed.
+pub fn merge_withdrawing(
+    format: TemplateFormat,
+    existing: Option<&str>,
+    rendered: &str,
+    prev_owned: &[OwnedLeaf],
+    keyed_arrays: &BTreeMap<String, String>,
+    withdraw: &[EntryRoot],
+) -> Result<MergeOutcome> {
     match format {
-        TemplateFormat::Json => json::merge(existing, rendered, prev_owned, keyed_arrays),
-        TemplateFormat::Toml => toml::merge(existing, rendered, prev_owned, keyed_arrays),
+        TemplateFormat::Json => json::merge(existing, rendered, prev_owned, keyed_arrays, withdraw),
+        TemplateFormat::Toml => toml::merge(existing, rendered, prev_owned, keyed_arrays, withdraw),
         // Value-level YAML round-trip: the user's comments/formatting are NOT
         // preserved (yaml_serde has no in-place editor the way toml_edit
         // is for TOML) — the merge semantics are otherwise identical.
-        TemplateFormat::Yaml => yaml::merge(existing, rendered, prev_owned, keyed_arrays),
+        TemplateFormat::Yaml => yaml::merge(existing, rendered, prev_owned, keyed_arrays, withdraw),
         // Env-style KEY=VALUE files are produced by tool quirks (Gemini's
         // ~/.gemini/.env), not by template formats — but the writer speaks
-        // the format so quirks reuse the same pipeline. They have no arrays.
+        // the format so quirks reuse the same pipeline. They have no arrays
+        // and no entries: a variable is a leaf.
         TemplateFormat::Shell => {
             if !keyed_arrays.is_empty() {
                 bail!("an env file has no arrays to merge by key");
             }
-            envfile::merge(existing, rendered, prev_owned)
+            let mut outcome = envfile::merge(existing, rendered, prev_owned)?;
+            outcome.withdrawn = vec![false; withdraw.len()];
+            Ok(outcome)
         }
         TemplateFormat::Text => {
             bail!("structured merge for {format:?} files is not supported")
         }
     }
+}
+
+/// Whether something stands at `root` in `existing` (None = file absent).
+pub fn holds(format: TemplateFormat, existing: Option<&str>, root: &EntryRoot) -> Result<bool> {
+    let Some(existing) = existing.filter(|s| !s.trim().is_empty()) else { return Ok(false) };
+    match format {
+        TemplateFormat::Json => json::holds(existing, root),
+        TemplateFormat::Toml => toml::holds(existing, root),
+        TemplateFormat::Yaml => yaml::holds(existing, root),
+        TemplateFormat::Shell | TemplateFormat::Text => Ok(false),
+    }
+}
+
+/// A record path as its segments: dotted for TOML, pointer tokens (left
+/// escaped) for JSON and YAML.
+fn segments(format: TemplateFormat, path: &str) -> Vec<&str> {
+    match format {
+        TemplateFormat::Toml if path.is_empty() => Vec::new(),
+        TemplateFormat::Toml => path.split('.').collect(),
+        _ => path.split('/').skip(1).collect(),
+    }
+}
+
+fn join_segments(format: TemplateFormat, segments: &[&str]) -> String {
+    match format {
+        TemplateFormat::Toml => segments.join("."),
+        _ => segments.iter().map(|s| format!("/{s}")).collect(),
+    }
+}
+
+/// Whether `record` lies in the entry at `root`: the same keyed-array entry,
+/// or a leaf (or a keyed array's entry) at or below a subtree root.
+fn in_root(format: TemplateFormat, record: &OwnedLeaf, root: &EntryRoot) -> bool {
+    match &root.entry {
+        Some(entry) => record.path == root.path && record.entry.as_ref() == Some(entry),
+        None => {
+            let root = segments(format, &root.path);
+            !root.is_empty() && segments(format, &record.path).starts_with(&root)
+        }
+    }
+}
+
+/// `owned` split into the records that lie in one of `roots` and the rest —
+/// what a caller withdrawing those entries passes to [`merge_withdrawing`]
+/// (the first) and keeps as the file's record afterwards (the second).
+pub fn records_in(
+    format: TemplateFormat,
+    owned: &[OwnedLeaf],
+    roots: &[EntryRoot],
+) -> (Vec<OwnedLeaf>, Vec<OwnedLeaf>) {
+    owned.iter().cloned().partition(|record| roots.iter().any(|root| in_root(format, record, root)))
+}
+
+/// The withdrawal step every format's merge starts with: `remove` takes each
+/// root out of `doc` and says whether it stood there. Returns the records
+/// that are left to settle by the ordinary rules, and what was removed.
+pub(crate) fn withdraw_from<D>(
+    format: TemplateFormat,
+    doc: &mut D,
+    prev_owned: &[OwnedLeaf],
+    roots: &[EntryRoot],
+    remove: impl Fn(&mut D, &EntryRoot) -> bool,
+) -> (Vec<OwnedLeaf>, Vec<bool>) {
+    let ours = |root: &EntryRoot| prev_owned.iter().any(|p| in_root(format, p, root));
+    let withdrawn: Vec<bool> = roots.iter().map(|root| ours(root) && remove(doc, root)).collect();
+    let left = prev_owned
+        .iter()
+        .filter(|p| !roots.iter().any(|root| in_root(format, p, root)))
+        .cloned()
+        .collect();
+    (left, withdrawn)
+}
+
+/// The entries a render holds that `base` does not: what ONE item of a
+/// template's list contributed, when `with` is the records of the render and
+/// `base` those of the same render with that item replaced by another of the
+/// same kind under a different name.
+///
+/// An entry of a keyed array `base` lacks is a root by its identity. For the
+/// leaves `base` lacks, a root is the highest subtree that holds some of them
+/// and nothing `base` holds: the other item keeps every container the two
+/// share (`mcpServers`) out of it. A root is never the whole file.
+pub fn entry_roots(format: TemplateFormat, with: &[OwnedLeaf], base: &[OwnedLeaf]) -> Vec<EntryRoot> {
+    let mut roots: Vec<EntryRoot> = with
+        .iter()
+        .filter(|w| w.entry.is_some())
+        .filter(|w| !base.iter().any(|b| b.path == w.path && b.entry == w.entry))
+        .map(|w| EntryRoot { path: w.path.clone(), entry: w.entry.clone() })
+        .collect();
+    let base_paths: Vec<Vec<&str>> = base.iter().map(|b| segments(format, &b.path)).collect();
+    let own: Vec<Vec<&str>> = with
+        .iter()
+        .filter(|w| w.entry.is_none())
+        .map(|w| segments(format, &w.path))
+        .filter(|path| !base_paths.contains(path))
+        .collect();
+    let mut found: Vec<Vec<&str>> = Vec::new();
+    exclusive_subtrees(&own.iter().collect::<Vec<_>>(), 0, &base_paths, &mut found);
+    roots.extend(found.iter().map(|path| EntryRoot { path: join_segments(format, path), entry: None }));
+    roots
+}
+
+/// `own` all share their first `depth` segments. That prefix is a root when
+/// `base` holds nothing at or below it; otherwise each child subtree is tried.
+fn exclusive_subtrees<'a>(own: &[&Vec<&'a str>], depth: usize, base: &[Vec<&str>], out: &mut Vec<Vec<&'a str>>) {
+    let Some(first) = own.first() else { return };
+    let prefix = &first[..depth];
+    if depth > 0 && !base.iter().any(|b| b.starts_with(prefix)) {
+        out.push(prefix.to_vec());
+        return;
+    }
+    let mut children: BTreeMap<&str, Vec<&Vec<&'a str>>> = BTreeMap::new();
+    for path in own {
+        // A path that IS the prefix has `base` leaves below it (the two
+        // renders give that key different shapes): no entry to name.
+        if let Some(next) = path.get(depth) {
+            children.entry(next).or_default().push(path);
+        }
+    }
+    for group in children.values() {
+        exclusive_subtrees(group, depth + 1, base, out);
+    }
+}
+
+/// Whether `live_hash` is the hash of the value the last run wrote at the
+/// leaf `path` — the one live value a paste-here placeholder may replace.
+pub(crate) fn is_what_we_wrote(prev_owned: &[OwnedLeaf], path: &str, live_hash: &str) -> bool {
+    prev_owned.iter().any(|p| p.entry.is_none() && p.path == path && p.value_hash == live_hash)
 }
 
 /// One entry of a keyed array, as each format's writer reads it.
@@ -77,10 +235,10 @@ pub(crate) trait KeyedEntry: Clone {
     fn entry_hash(&self) -> String;
     /// Replace the live entry of this identity with the rendered one: the
     /// entry is ours, so a field the render no longer carries goes with it (a
-    /// capability a model lost must not stay advertised). The one exception is
-    /// a paste sentinel the user filled in, which keeps their value — the rule
-    /// every leaf follows.
-    fn replace_with(&mut self, rendered: &Self);
+    /// capability a model lost must not stay advertised). The one exception,
+    /// under `keep_filled`, is a paste sentinel the user filled in, which
+    /// keeps their value — the rule every leaf follows.
+    fn replace_with(&mut self, rendered: &Self, keep_filled: bool);
 }
 
 /// A keyed array after the merge.
@@ -162,7 +320,17 @@ pub(crate) fn merge_entries<E: KeyedEntry>(
     let mut entries = existing;
     for (n, (entry, id)) in rendered.iter().zip(&ids).enumerate() {
         match position(&entries, id) {
-            Some(i) => entries[i].replace_with(entry),
+            Some(i) => {
+                // An entry still exactly as the last run wrote it holds
+                // nothing of the user's: a placeholder the render now puts in
+                // it stands, as it does at a leaf we wrote.
+                let as_written = prev_owned.iter().any(|p| {
+                    p.path == path
+                        && p.entry.as_ref().is_some_and(|e| e.key == key && e.id == *id)
+                        && p.value_hash == entries[i].entry_hash()
+                });
+                entries[i].replace_with(entry, !as_written);
+            }
             None => {
                 let before = ids[n + 1..].iter().find_map(|later| position(&entries, later));
                 entries.insert(before.unwrap_or(entries.len()), entry.clone());
@@ -247,7 +415,8 @@ pub(crate) fn unescape_token(token: &str) -> String {
 }
 
 /// Substitution sentinels the render leaves for the USER to fill in by hand
-/// (BYOK upstream API keys, BYOT MCP bearers — `<paste-your-…-here>`). When a
+/// (BYOK upstream API keys, the headers an MCP server's client sends itself —
+/// `<paste-your-…-here>`). When a
 /// re-render carries one of these and the live file already holds a different
 /// value, the user's pasted secret wins — overwriting it with the sentinel
 /// would silently break the tool.
@@ -780,6 +949,446 @@ mod tests {
         let pasted = first.contents.replace("<paste-your-upstream-api-key-here>", "real");
         let second = merge(TemplateFormat::Shell, Some(&pasted), rendered_env, &first.owned, &NONE).unwrap();
         assert!(second.contents.contains("UPSTREAM=real"));
+    }
+
+    /// A local MCP server's environment variable left to the developer is
+    /// written as a paste sentinel, in the shape each format's templates give
+    /// it. The value the developer pasted over it survives a rewrite that
+    /// changes the server's arguments — in a JSON map, a TOML sub-table and a
+    /// YAML mapping, and inside an entry of a keyed array. A TOML INLINE table
+    /// is one value, replaced whole: the control that shows why the templates
+    /// write the environment as a table of its own.
+    #[test]
+    fn a_pasted_local_mcp_variable_survives_a_rewrite_in_every_format() {
+        let sentinel = "<paste-your-fs-api_token-here>";
+        // (format, render with `ARG` and the sentinel, keyed arrays)
+        let cases: Vec<(TemplateFormat, String, BTreeMap<String, String>)> = vec![
+            (
+                TemplateFormat::Json,
+                format!(r#"{{"mcpServers": {{"fs": {{"command": "npx", "args": ["ARG"], "env": {{"MODE": "a", "API_TOKEN": "{sentinel}"}}}}}}}}"#),
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Toml,
+                format!("[mcp_servers.\"fs\"]\ncommand = \"npx\"\nargs = [\"ARG\"]\n\n[mcp_servers.\"fs\".env]\n\"MODE\" = \"a\"\n\"API_TOKEN\" = \"{sentinel}\"\n"),
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Toml,
+                format!("[[mcp_servers]]\nname = \"fs\"\ncommand = \"npx\"\nargs = [\"ARG\"]\n\n[mcp_servers.env]\n\"MODE\" = \"a\"\n\"API_TOKEN\" = \"{sentinel}\"\n"),
+                keyed(&[("/mcp_servers", "name")]),
+            ),
+            (
+                TemplateFormat::Yaml,
+                format!("extensions:\n  fs:\n    cmd: npx\n    args:\n      - ARG\n    envs:\n      MODE: a\n      API_TOKEN: \"{sentinel}\"\n"),
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Yaml,
+                format!("mcpServers:\n  - name: fs\n    command: npx\n    args:\n      - ARG\n    env:\n      MODE: a\n      API_TOKEN: \"{sentinel}\"\n"),
+                keyed(&[("/mcpServers", "name")]),
+            ),
+        ];
+        for (format, render, keyed_arrays) in &cases {
+            let first = merge(*format, None, &render.replace("ARG", "v1"), &[], keyed_arrays).unwrap();
+            assert!(first.contents.contains(sentinel), "{format:?}: {}", first.contents);
+            let pasted = first.contents.replace(sentinel, "my-secret");
+            let second =
+                merge(*format, Some(&pasted), &render.replace("ARG", "v2"), &first.owned, keyed_arrays).unwrap();
+            assert!(second.contents.contains("my-secret"), "{format:?} lost the pasted value:\n{}", second.contents);
+            assert!(!second.contents.contains(sentinel), "{format:?}:\n{}", second.contents);
+            assert!(second.contents.contains("v2") && !second.contents.contains("v1"), "{format:?}:\n{}", second.contents);
+            // A value the administrator sets is still theirs to change.
+            let third = merge(
+                *format,
+                Some(&second.contents),
+                &render.replace("ARG", "v2").replace("MODE: a", "MODE: b").replace("\"MODE\" = \"a\"", "\"MODE\" = \"b\"").replace("\"MODE\": \"a\"", "\"MODE\": \"b\""),
+                &second.owned,
+                keyed_arrays,
+            )
+            .unwrap();
+            assert!(third.contents.contains("my-secret"), "{format:?}:\n{}", third.contents);
+            assert!(third.contents.contains("b") && !third.contents.contains("MODE: a") && !third.contents.contains("\"a\""), "{format:?}:\n{}", third.contents);
+        }
+
+        let inline = format!("[mcp_servers.\"fs\"]\ncommand = \"npx\"\nenv = {{ \"API_TOKEN\" = \"{sentinel}\" }}\n");
+        let first = merge(TemplateFormat::Toml, None, &inline, &[], &NONE).unwrap();
+        let pasted = first.contents.replace(sentinel, "my-secret");
+        let second = merge(TemplateFormat::Toml, Some(&pasted), &inline, &first.owned, &NONE).unwrap();
+        assert!(!second.contents.contains("my-secret"), "an inline table is replaced whole:\n{}", second.contents);
+    }
+
+    fn parses(format: TemplateFormat, contents: &str) -> bool {
+        match format {
+            TemplateFormat::Json => json::parse_jsonc(contents).is_ok(),
+            TemplateFormat::Toml => contents.parse::<toml_edit::DocumentMut>().is_ok(),
+            TemplateFormat::Yaml => yaml_serde::from_str::<yaml_serde::Value>(contents).is_ok(),
+            _ => true,
+        }
+    }
+
+    /// A paste-here placeholder replaces the live value only when that value
+    /// is exactly what the last run wrote there — in every format, at a leaf
+    /// and inside an entry of a keyed array: a value an administrator set and
+    /// then left to the developer becomes the placeholder; a value the
+    /// developer wrote over ours, or pasted over the placeholder, is kept.
+    #[test]
+    fn a_placeholder_replaces_only_the_value_the_last_run_wrote() {
+        let sentinel = "<paste-your-fs-token-here>";
+        // (format, render with `VALUE` at the slot, keyed arrays)
+        let cases: Vec<(TemplateFormat, &str, BTreeMap<String, String>)> = vec![
+            (TemplateFormat::Json, r#"{"servers": {"fs": {"env": {"TOKEN": "VALUE"}}}}"#, keyed(&[])),
+            (TemplateFormat::Json, r#"{"servers": [{"name": "fs", "env": {"TOKEN": "VALUE"}}]}"#, keyed(&[("/servers", "name")])),
+            (TemplateFormat::Toml, "[servers.fs.env]\nTOKEN = \"VALUE\"\n", keyed(&[])),
+            (TemplateFormat::Toml, "[[servers]]\nname = \"fs\"\n\n[servers.env]\nTOKEN = \"VALUE\"\n", keyed(&[("/servers", "name")])),
+            (TemplateFormat::Yaml, "servers:\n  fs:\n    env:\n      TOKEN: \"VALUE\"\n", keyed(&[])),
+            (TemplateFormat::Yaml, "servers:\n  - name: fs\n    env:\n      TOKEN: \"VALUE\"\n", keyed(&[("/servers", "name")])),
+            (TemplateFormat::Shell, "TOKEN=VALUE\n", keyed(&[])),
+        ];
+        for (format, render, keyed_arrays) in &cases {
+            let set = render.replace("VALUE", "admin-set");
+            let left = render.replace("VALUE", sentinel);
+            let first = merge(*format, None, &set, &[], keyed_arrays).unwrap();
+            assert!(first.contents.contains("admin-set"), "{format:?}:\n{}", first.contents);
+
+            // Untouched since we wrote it: the placeholder takes its place.
+            let ours = merge(*format, Some(&first.contents), &left, &first.owned, keyed_arrays).unwrap();
+            assert!(ours.contents.contains(sentinel) && !ours.contents.contains("admin-set"), "{format:?}:\n{}", ours.contents);
+
+            // The developer's own value over ours: kept.
+            let edited = first.contents.replace("admin-set", "mine");
+            let theirs = merge(*format, Some(&edited), &left, &first.owned, keyed_arrays).unwrap();
+            assert!(theirs.contents.contains("mine") && !theirs.contents.contains(sentinel), "{format:?}:\n{}", theirs.contents);
+
+            // Pasted over the placeholder: kept by every later write.
+            let pasted = ours.contents.replace(sentinel, "pasted");
+            let again = merge(*format, Some(&pasted), &left, &ours.owned, keyed_arrays).unwrap();
+            assert!(again.contents.contains("pasted") && !again.contents.contains(sentinel), "{format:?}:\n{}", again.contents);
+
+            // A value that was there before any write of ours: kept.
+            let foreign = merge(*format, Some(&edited), &left, &[], keyed_arrays).unwrap();
+            assert!(foreign.contents.contains("mine"), "{format:?}:\n{}", foreign.contents);
+        }
+    }
+
+    /// The shapes a config entry of ours takes, as `(format, the file's own
+    /// content, a render of the entry `NAME` beside the gateway's, that render
+    /// without the entry, keyed arrays)`: a map entry, an entry of a keyed array of tables, and a name
+    /// in a list of strings — with the developer's own sibling beside each.
+    #[allow(clippy::type_complexity)]
+    fn entry_shapes() -> Vec<(TemplateFormat, &'static str, &'static str, &'static str, BTreeMap<String, String>)> {
+        let sentinel = "<paste-your-NAME-token-here>";
+        let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+        vec![
+            (
+                TemplateFormat::Json,
+                r#"{"theme": "dark", "mcpServers": {"mine": {"command": "my-server"}}}"#,
+                leak(format!(r#"{{"mcpServers": {{"gw": {{"url": "https://gw"}}, "NAME": {{"command": "npx", "args": ["-y"], "env": {{"MODE": "a", "TOKEN": "{sentinel}"}}}}}}}}"#)),
+                r#"{"mcpServers": {"gw": {"url": "https://gw"}}}"#,
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Json,
+                "{\n  // mine\n  \"theme\": \"dark\",\n  \"mcpServers\": {\n    \"mine\": {\"command\": \"my-server\"}, // keep\n  },\n}\n",
+                leak(format!(r#"{{"mcpServers": {{"gw": {{"url": "https://gw"}}, "NAME": {{"command": "npx", "args": ["-y"], "env": {{"MODE": "a", "TOKEN": "{sentinel}"}}}}}}}}"#)),
+                r#"{"mcpServers": {"gw": {"url": "https://gw"}}}"#,
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Json,
+                r#"{"theme": "dark", "enabled": ["mine"]}"#,
+                r#"{"enabled": ["gw", "NAME"]}"#,
+                r#"{"enabled": ["gw"]}"#,
+                keyed(&[("/enabled", STRING_ENTRIES)]),
+            ),
+            (
+                TemplateFormat::Json,
+                r#"{"theme": "dark", "servers": [{"name": "mine", "command": "my-server"}]}"#,
+                leak(format!(r#"{{"servers": [{{"name": "gw", "url": "https://gw"}}, {{"name": "NAME", "command": "npx", "env": {{"TOKEN": "{sentinel}"}}}}]}}"#)),
+                r#"{"servers": [{"name": "gw", "url": "https://gw"}]}"#,
+                keyed(&[("/servers", "name")]),
+            ),
+            (
+                TemplateFormat::Toml,
+                "theme = \"dark\"\n\n# mine\n[mcp_servers.mine]\ncommand = \"my-server\"\n",
+                leak(format!("[mcp_servers.gw]\nurl = \"https://gw\"\n\n[mcp_servers.NAME]\ncommand = \"npx\"\nargs = [\"-y\"]\n\n[mcp_servers.NAME.env]\nMODE = \"a\"\nTOKEN = \"{sentinel}\"\n")),
+                "[mcp_servers.gw]\nurl = \"https://gw\"\n",
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Toml,
+                "theme = \"dark\"\n\n[[mcp_servers]]\nname = \"mine\"\ncommand = \"my-server\"\n",
+                leak(format!("[[mcp_servers]]\nname = \"gw\"\nurl = \"https://gw\"\n\n[[mcp_servers]]\nname = \"NAME\"\ncommand = \"npx\"\n\n[mcp_servers.env]\nTOKEN = \"{sentinel}\"\n")),
+                "[[mcp_servers]]\nname = \"gw\"\nurl = \"https://gw\"\n",
+                keyed(&[("/mcp_servers", "name")]),
+            ),
+            (
+                TemplateFormat::Yaml,
+                "theme: dark\nextensions:\n  mine:\n    cmd: my-server\n",
+                leak(format!("extensions:\n  gw:\n    uri: https://gw\n  NAME:\n    cmd: npx\n    args:\n      - \"-y\"\n    envs:\n      MODE: a\n      TOKEN: \"{sentinel}\"\n")),
+                "extensions:\n  gw:\n    uri: https://gw\n",
+                keyed(&[]),
+            ),
+            (
+                TemplateFormat::Yaml,
+                "theme: dark\nmcpServers:\n  - name: mine\n    command: my-server\n",
+                leak(format!("mcpServers:\n  - name: gw\n    url: https://gw\n  - name: NAME\n    command: npx\n    env:\n      TOKEN: \"{sentinel}\"\n")),
+                "mcpServers:\n  - name: gw\n    url: https://gw\n",
+                keyed(&[("/mcpServers", "name")]),
+            ),
+        ]
+    }
+
+    /// An entry we created, withdrawn: it goes WHOLE in every format and
+    /// shape — the value the developer pasted into it, and a field they added
+    /// to it, included — while the gateway's entry, the developer's own
+    /// sibling and the rest of the file stay, and the file still parses. The
+    /// same file re-rendered WITHOUT naming the entry keeps what they wrote
+    /// and names it (the control: only the withdrawal takes their text).
+    #[test]
+    fn a_withdrawn_entry_goes_whole_with_what_the_developer_put_in_it() {
+        for (format, own, render, gateway_only, keyed_arrays) in entry_shapes() {
+            let with = render.replace("NAME", "fs");
+            let first = merge(format, Some(own), &with, &[], &keyed_arrays).unwrap();
+            let base = merge(format, None, &render.replace("NAME", "PROBE"), &[], &keyed_arrays).unwrap();
+            let roots = entry_roots(format, &first.owned, &base.owned);
+            assert_eq!(roots.len(), 1, "{format:?}: {roots:?}");
+            assert!(!holds(format, Some(own), &roots[0]).unwrap(), "{format:?}");
+            assert!(holds(format, Some(&first.contents), &roots[0]).unwrap(), "{format:?}");
+
+            let has_slot = first.contents.contains("<paste-your-fs-token-here>");
+            let edited = first.contents.replace("<paste-your-fs-token-here>", "my-secret").replace("npx", "/opt/npx");
+            let out = merge_withdrawing(format, Some(&edited), gateway_only, &first.owned, &keyed_arrays, &roots).unwrap();
+            assert_eq!(out.withdrawn, vec![true], "{format:?}");
+            assert!(out.kept_edited.is_empty(), "{format:?}: {:?}", out.kept_edited);
+            for gone in ["my-secret", "/opt/npx", "fs", "TOKEN", "MODE"] {
+                assert!(!out.contents.contains(gone), "{format:?} still holds {gone:?}:\n{}", out.contents);
+            }
+            for kept in ["dark", "mine", "gw"] {
+                assert!(out.contents.contains(kept), "{format:?} lost {kept:?}:\n{}", out.contents);
+            }
+            assert!(parses(format, &out.contents), "{format:?}:\n{}", out.contents);
+            if own.contains("// mine") {
+                assert!(out.contents.contains("// mine") && out.contents.contains("// keep"), "{}", out.contents);
+            }
+            // Withdrawn again: nothing stands there, nothing is removed.
+            let again = merge_withdrawing(format, Some(&out.contents), gateway_only, &out.owned, &keyed_arrays, &roots).unwrap();
+            assert_eq!((again.withdrawn, again.contents), (vec![false], out.contents.clone()), "{format:?}");
+
+            // The control: a re-render alone never takes what they wrote.
+            if has_slot {
+                let plain = merge(format, Some(&edited), gateway_only, &first.owned, &keyed_arrays).unwrap();
+                assert!(plain.contents.contains("my-secret"), "{format:?}:\n{}", plain.contents);
+                assert!(!plain.kept_edited.is_empty(), "{format:?}");
+            }
+        }
+    }
+
+    /// A root is honoured only while the records still place something of
+    /// ours in it: with no record under it (the file and the manifest no
+    /// longer agree), the developer's entry at that path stays. A root naming
+    /// the whole file is never honoured.
+    #[test]
+    fn a_withdrawal_never_removes_an_entry_the_records_do_not_place_there() {
+        let theirs = r#"{"mcpServers": {"fs": {"command": "my-fs"}}, "theme": "dark"}"#;
+        let root = EntryRoot { path: "/mcpServers/fs".into(), entry: None };
+        let unrelated = merge(TemplateFormat::Json, None, r#"{"model": "m"}"#, &[], &NONE).unwrap();
+        let out = merge_withdrawing(TemplateFormat::Json, Some(theirs), "{}", &unrelated.owned, &NONE, std::slice::from_ref(&root)).unwrap();
+        assert_eq!(out.withdrawn, vec![false]);
+        assert_eq!(json::parse_jsonc(&out.contents).unwrap(), json::parse_jsonc(theirs).unwrap());
+
+        let ours = merge(TemplateFormat::Json, Some(theirs), r#"{"mcpServers": {"gw": {"url": "u"}}}"#, &[], &NONE).unwrap();
+        for whole in [EntryRoot { path: String::new(), entry: None }, EntryRoot { path: "/".into(), entry: None }] {
+            let out = merge_withdrawing(TemplateFormat::Json, Some(&ours.contents), "{}", &ours.owned, &NONE, &[whole]).unwrap();
+            assert_eq!(out.withdrawn, vec![false]);
+            assert!(out.contents.contains("my-fs") && out.contents.contains("dark"), "{}", out.contents);
+        }
+        let toml_whole = EntryRoot { path: String::new(), entry: None };
+        let written = merge(TemplateFormat::Toml, Some("theme = \"dark\"\n"), "model = \"m\"\n", &[], &NONE).unwrap();
+        let out = merge_withdrawing(TemplateFormat::Toml, Some(&written.contents), "", &written.owned, &NONE, &[toml_whole]).unwrap();
+        assert_eq!(out.withdrawn, vec![false]);
+        assert!(out.contents.contains("dark"), "{}", out.contents);
+    }
+
+    /// Where an item's entry is: what the render holds that the render with
+    /// another item in its place does not.
+    #[test]
+    fn an_entry_root_is_the_highest_subtree_the_other_render_holds_nothing_of() {
+        let records = |render: &str| merge(TemplateFormat::Json, None, render, &[], &NONE).unwrap().owned;
+        let paths = |with: &str, base: &str| -> Vec<String> {
+            entry_roots(TemplateFormat::Json, &records(with), &records(base)).into_iter().map(|r| r.path).collect()
+        };
+        // The item is the only one of its kind: the probe holds the container.
+        assert_eq!(
+            paths(
+                r#"{"mcpServers": {"fs": {"command": "npx", "env": {"A": "1"}}}}"#,
+                r#"{"mcpServers": {"PROBE": {"command": "npx", "env": {"A": "1"}}}}"#
+            ),
+            vec!["/mcpServers/fs"]
+        );
+        // One leaf is still an entry of its own.
+        assert_eq!(paths(r#"{"servers": {"fs": "npx", "gw": "u"}}"#, r#"{"servers": {"PROBE": "npx", "gw": "u"}}"#), vec!["/servers/fs"]);
+        // Written in two places: one root each, never their shared parent.
+        assert_eq!(
+            paths(
+                r#"{"mcpServers": {"fs": {"command": "npx"}}, "allow": {"fs": true}, "model": "m"}"#,
+                r#"{"mcpServers": {"PROBE": {"command": "npx"}}, "allow": {"PROBE": true}, "model": "m"}"#
+            ),
+            vec!["/allow/fs", "/mcpServers/fs"]
+        );
+        // Nothing of its own (the two renders agree): no root.
+        assert!(paths(r#"{"model": "m"}"#, r#"{"model": "m"}"#).is_empty());
+        // A render the other holds nothing of: each top-level key is a root,
+        // never the file itself.
+        assert_eq!(paths(r#"{"a": {"x": 1}, "b": 2}"#, "{}"), vec!["/a", "/b"]);
+        // A key holding a `/` is one segment.
+        assert_eq!(
+            paths(r#"{"s": {"a/b": {"command": "npx"}}}"#, r#"{"s": {"PROBE": {"command": "npx"}}}"#),
+            vec!["/s/a~1b"]
+        );
+        // TOML paths are dotted.
+        let toml = |render: &str| merge(TemplateFormat::Toml, None, render, &[], &NONE).unwrap().owned;
+        let roots = entry_roots(
+            TemplateFormat::Toml,
+            &toml("[mcp_servers.fs]\ncommand = \"npx\"\n\n[mcp_servers.fs.env]\nA = \"1\"\n"),
+            &toml("[mcp_servers.PROBE]\ncommand = \"npx\"\n\n[mcp_servers.PROBE.env]\nA = \"1\"\n"),
+        );
+        assert_eq!(roots, vec![EntryRoot { path: "mcp_servers.fs".into(), entry: None }]);
+    }
+
+
+    /// A TOML sub-table and an inline table are the same data, and a
+    /// developer may hold as `env = { … }` what the render writes as a table
+    /// of its own (or the reverse). The two merge leaf by leaf, in a plain
+    /// table (Codex) and inside an entry of an array of tables (Vibe): the
+    /// value pasted in the other form survives a rewrite, the render's own
+    /// values still change, and the file keeps parsing. Each leaf is recorded
+    /// and compared by its value alone, so the rules above read the same
+    /// values in either form: a leaf that leaves the render goes while
+    /// unchanged and is kept and named once edited, and a placeholder
+    /// replaces a value the last run wrote.
+    #[test]
+    fn a_toml_inline_table_and_a_sub_table_merge_leaf_by_leaf() {
+        let sentinel = "<paste-your-fs-token-here>";
+        let read = |text: &str| -> toml_edit::DocumentMut { text.parse().unwrap() };
+        let token = |doc: &toml_edit::DocumentMut, keyed: bool| -> String {
+            let server = match keyed {
+                true => doc["mcp_servers"].as_array_of_tables().unwrap().get(0).unwrap().get("env").cloned(),
+                false => doc["mcp_servers"]["fs"].get("env").cloned(),
+            };
+            server.unwrap().as_table_like().unwrap().get("TOKEN").unwrap().as_str().unwrap().to_string()
+        };
+
+        // Codex: a table per server. The file holds `env` inline.
+        let render = |arg: &str, mode: &str, tok: &str| {
+            format!("[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"{arg}\"]\n\n[mcp_servers.fs.env]\nMODE = \"{mode}\"\nTOKEN = \"{tok}\"\n")
+        };
+        let first = merge(TemplateFormat::Toml, None, &render("v1", "a", sentinel), &[], &NONE).unwrap();
+        let inline = "theme = \"dark\"\n\n[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"v1\"]\nenv = { MODE = \"a\", TOKEN = \"ghp_mine\" } # mine\n";
+        let second = merge(TemplateFormat::Toml, Some(inline), &render("v2", "b", sentinel), &first.owned, &NONE).unwrap();
+        let doc = read(&second.contents);
+        assert_eq!(token(&doc, false), "ghp_mine", "{}", second.contents);
+        assert_eq!(doc["mcp_servers"]["fs"]["env"]["MODE"].as_str(), Some("b"), "{}", second.contents);
+        assert_eq!(doc["mcp_servers"]["fs"]["args"][0].as_str(), Some("v2"), "{}", second.contents);
+        // The form is the developer's: still inline, with their comment.
+        assert!(doc["mcp_servers"]["fs"]["env"].is_inline_table() && second.contents.contains("# mine"), "{}", second.contents);
+        assert!(!second.contents.contains(sentinel), "{}", second.contents);
+        // Leaving the render: the unchanged leaf goes, the pasted one is kept and named.
+        let gone = merge(TemplateFormat::Toml, Some(&second.contents), "", &second.owned, &NONE).unwrap();
+        assert_eq!(gone.kept_edited, vec!["mcp_servers.fs.env.TOKEN".to_string()], "{}", gone.contents);
+        assert!(gone.contents.contains("ghp_mine") && !gone.contents.contains("MODE"), "{}", gone.contents);
+        assert!(gone.contents.contains("dark"), "{}", gone.contents);
+        // A value the last run wrote, held inline and untouched, gives way to
+        // the placeholder; the developer's own does not.
+        let set = merge(TemplateFormat::Toml, None, &render("v1", "a", "admin-set"), &[], &NONE).unwrap();
+        for (live, kept) in [("admin-set", sentinel), ("mine", "mine")] {
+            let file = format!("[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"v1\"]\nenv = {{ MODE = \"a\", TOKEN = \"{live}\" }}\n");
+            let out = merge(TemplateFormat::Toml, Some(&file), &render("v1", "a", sentinel), &set.owned, &NONE).unwrap();
+            assert_eq!(token(&read(&out.contents), false), kept, "{}", out.contents);
+        }
+
+        // The reverse: the render writes `env` inline, the file as a table.
+        let inline_render = |arg: &str| {
+            format!("[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"{arg}\"]\nenv = {{ MODE = \"a\", TOKEN = \"{sentinel}\" }}\n")
+        };
+        let first = merge(TemplateFormat::Toml, None, &inline_render("v1"), &[], &NONE).unwrap();
+        let table = "[mcp_servers.fs]\ncommand = \"npx\"\nargs = [\"v1\"]\n\n[mcp_servers.fs.env]\nMODE = \"a\"\nTOKEN = \"ghp_mine\"\n";
+        let second = merge(TemplateFormat::Toml, Some(table), &inline_render("v2"), &first.owned, &NONE).unwrap();
+        let doc = read(&second.contents);
+        assert_eq!(token(&doc, false), "ghp_mine", "{}", second.contents);
+        assert_eq!(doc["mcp_servers"]["fs"]["args"][0].as_str(), Some("v2"), "{}", second.contents);
+
+        // Vibe: an entry of an array of tables, its `env` a table of the entry.
+        let keyed_arrays = keyed(&[("/mcp_servers", "name")]);
+        let entry = |arg: &str| {
+            format!("[[mcp_servers]]\nname = \"fs\"\ncommand = \"npx\"\nargs = [\"{arg}\"]\n\n[mcp_servers.env]\nMODE = \"a\"\nTOKEN = \"{sentinel}\"\n")
+        };
+        let first = merge(TemplateFormat::Toml, None, &entry("v1"), &[], &keyed_arrays).unwrap();
+        let inline = "[[mcp_servers]]\nname = \"mine\"\ncommand = \"my-server\"\n\n[[mcp_servers]]\nname = \"fs\"\ncommand = \"npx\"\nargs = [\"v1\"]\nenv = { MODE = \"a\", TOKEN = \"ghp_mine\" }\n";
+        let second = merge(TemplateFormat::Toml, Some(inline), &entry("v2"), &first.owned, &keyed_arrays).unwrap();
+        let doc = read(&second.contents);
+        let servers = doc["mcp_servers"].as_array_of_tables().unwrap();
+        assert_eq!(servers.len(), 2, "{}", second.contents);
+        let fs = servers.iter().find(|t| t["name"].as_str() == Some("fs")).unwrap();
+        assert_eq!(fs["env"].as_table_like().unwrap().get("TOKEN").unwrap().as_str(), Some("ghp_mine"), "{}", second.contents);
+        assert_eq!(fs["args"][0].as_str(), Some("v2"), "{}", second.contents);
+        assert!(!second.contents.contains(sentinel) && second.contents.contains("my-server"), "{}", second.contents);
+        let _ = token;
+    }
+
+    /// Under an inline table everything is a value: a rendered sub-table that
+    /// lands on a key holding something else there (a string where the table
+    /// goes), or on no key at all, is written as an inline table — the form
+    /// its parent can hold, not a table the printer must spell some other
+    /// way — and is in the file. The mirror, the same key under a `[table]`,
+    /// takes the table as it is.
+    #[test]
+    fn a_toml_table_rendered_under_an_inline_table_is_written_as_a_value() {
+        let render = "[mcp_servers.fs]\ncommand = \"npx\"\n\n[mcp_servers.fs.env]\nMODE = \"a\"\nTOKEN = \"t\"\n";
+        let read = |text: &str| -> toml_edit::DocumentMut { text.parse().unwrap() };
+        for live in [
+            // `env` holds a string, inside an inline table.
+            "[mcp_servers]\nfs = { command = \"old\", env = \"oops\" }\n",
+            // No `env` at all, inside an inline table.
+            "[mcp_servers]\nfs = { command = \"old\" }\n",
+            // Two levels of inline tables.
+            "mcp_servers = { fs = { command = \"old\", env = 1 } }\n",
+            // The mirror: the same key under a table of its own.
+            "[mcp_servers.fs]\ncommand = \"old\"\nenv = \"oops\"\n",
+        ] {
+            let out = merge(TemplateFormat::Toml, Some(live), render, &[], &NONE).unwrap();
+            let doc = read(&out.contents);
+            let env = doc["mcp_servers"]["fs"]["env"].as_table_like().unwrap_or_else(|| panic!("no env table:\n{}", out.contents));
+            assert_eq!(env.get("TOKEN").and_then(|i| i.as_str()), Some("t"), "{live}\n{}", out.contents);
+            assert_eq!(env.get("MODE").and_then(|i| i.as_str()), Some("a"), "{live}\n{}", out.contents);
+            assert_eq!(doc["mcp_servers"]["fs"]["command"].as_str(), Some("npx"), "{}", out.contents);
+            // In the form its parent holds: one inline table under an inline
+            // parent (never keys dotted into it), a table under a table.
+            let inline_parent = !live.starts_with("[mcp_servers.fs]");
+            assert_eq!(doc["mcp_servers"]["fs"]["env"].is_inline_table(), inline_parent, "{live}\n{}", out.contents);
+            assert_eq!(out.contents.contains("env = {"), inline_parent, "{live}\n{}", out.contents);
+            assert!(!out.contents.contains("env."), "{live}\n{}", out.contents);
+            assert_eq!(out.owned.len(), 3, "{:?}", out.owned.iter().map(|o| &o.path).collect::<Vec<_>>());
+            // What was recorded is what a later run finds: nothing kept, all removed.
+            let gone = merge(TemplateFormat::Toml, Some(&out.contents), "", &out.owned, &NONE).unwrap();
+            assert!(gone.kept_edited.is_empty() && !gone.contents.contains("TOKEN"), "{live}\n{}", gone.contents);
+        }
+    }
+
+    /// An entry of a TOML array of tables is hashed with the tables inside
+    /// it: one whose nested table the user edited is theirs — kept when it
+    /// leaves the render, and named — while an untouched one goes.
+    #[test]
+    fn a_toml_entry_edited_inside_a_nested_table_is_kept() {
+        let keyed_arrays = keyed(&[("/servers", "name")]);
+        let render = "[[servers]]\nname = \"fs\"\ncommand = \"npx\"\n\n[servers.env]\nMODE = \"a\"\n";
+        let first = merge(TemplateFormat::Toml, None, render, &[], &keyed_arrays).unwrap();
+        let gone = merge(TemplateFormat::Toml, Some(&first.contents), "", &first.owned, &keyed_arrays).unwrap();
+        assert!(gone.kept_edited.is_empty() && !gone.contents.contains("fs"), "{}", gone.contents);
+        let edited = first.contents.replace("MODE = \"a\"", "MODE = \"mine\"");
+        let kept = merge(TemplateFormat::Toml, Some(&edited), "", &first.owned, &keyed_arrays).unwrap();
+        assert_eq!(kept.kept_edited, vec!["servers[name=fs]".to_string()]);
+        assert!(kept.contents.contains("mine"), "{}", kept.contents);
     }
 
     // ----- keyed arrays -----

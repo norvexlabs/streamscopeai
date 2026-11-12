@@ -5,9 +5,9 @@
    * Pick one of your accessible virtual servers, run an `initialize` /
    * `tools/list` / `prompts/list` / `resources/list` round-trip against each
    * upstream the route fans into, and render the merged catalog. Mirrors the
-   * proxy's auth resolution so per-user OAuth upstreams the user hasn't
-   * connected yet surface a "needs_connection" hint instead of failing
-   * silently.
+   * proxy's auth resolution: an upstream the user hasn't connected yet
+   * surfaces "needs_connection", one waiting for a header only the client
+   * sends "needs_client_header", and a redirect is reported, never followed.
    */
   import { portalApi } from '#lib/portal-client.js';
   import { extractError, fetchAllPages } from '#lib/api-helpers.js';
@@ -68,10 +68,12 @@
         return { label: m.portal_comp_status_ok(), color: 'text-(--success) bg-(--success-bg)' };
       case 'needs_connection':
         return { label: m.portal_comp_needs_connection(), color: 'text-(--warning) bg-(--warning-bg)' };
-      case 'service_account_unavailable':
-        return { label: m.portal_comp_service_account_error(), color: 'text-(--error) bg-(--error)/10' };
-      case 'unsupported_byot':
-        return { label: m.portal_comp_byot_skipped(), color: 'text-(--text-secondary) bg-(--bg-primary)' };
+      case 'needs_client_header':
+        return { label: m.portal_comp_status_needs_client_header(), color: 'text-(--text-secondary) bg-(--bg-primary)' };
+      case 'unavailable':
+        return { label: m.portal_comp_status_unavailable(), color: 'text-(--error) bg-(--error)/10' };
+      case 'redirected':
+        return { label: m.portal_comp_status_redirected(), color: 'text-(--warning) bg-(--warning-bg)' };
       case 'http_error':
         return { label: m.portal_comp_http_error(), color: 'text-(--error) bg-(--error)/10' };
       case 'jsonrpc_error':
@@ -143,7 +145,7 @@
           <div class="flex items-center justify-between mb-2 gap-2 flex-wrap">
             <div class="flex items-center gap-2">
               <span class="text-sm font-semibold text-(--text-primary)">{r.upstream_name}</span>
-              <span class="text-[10px] font-medium px-1.5 py-0.5 rounded-sm {badge.color}">{badge.label}</span>
+              <span class="text-[10px] font-medium px-1.5 py-0.5 rounded-sm {badge.color}" data-testid="route-status" data-status={r.status}>{badge.label}</span>
               <code class="text-[10px] text-(--text-secondary) font-mono bg-(--bg-primary) px-1.5 py-0.5 rounded-sm">{r.auth_mode}</code>
               {#if r.prefix}
                 <code class="text-[10px] text-(--accent) font-mono bg-(--accent)/10 px-1.5 py-0.5 rounded-sm">{r.prefix}__</code>

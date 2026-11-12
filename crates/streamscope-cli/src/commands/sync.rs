@@ -4,6 +4,7 @@
 //! templates/placeholders moved, and re-mint + rewrite a group when its
 //! gateway key was revoked.
 
+use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{bail, Context, Result};
 use clap::Args;
 
@@ -94,6 +95,9 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
     // Auto-resolve the scope from the cwd: inside a provisioned project (one with
     // a `.streamscopeai/`) sync that project; otherwise the global set.
     let paths = Paths::for_scope(&resolve_scope(None, false, false)?)?;
+    // Whether this manifest is a project's: its clients with a project form
+    // are written at their project-local path.
+    let in_project = paths.project_root().is_some();
     let mut manifest = Manifest::load(&paths)?;
     // What a backup run of this sync restores the manifest to.
     let manifest_before = manifest.clone();
@@ -128,7 +132,6 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
             )
         })?;
     let others = manifest.files_of_other_hosts(&entry_key);
-    let records = crate::state::FileRecords { ws: &ws, others: &others };
     let workspace_id = ws
         .workspace_id
         .context("the local manifest records no workspace — run: ssai provision")?;
@@ -163,8 +166,39 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
     }
     let partial = selected.len() < ws.clients.len();
 
+    let run_stamp = crate::state::new_run_stamp("");
+
+    // ----- Local MCP servers the workspace no longer offers -----
+    // A server an administrator revoked, disabled or deleted is dropped from
+    // each synced client's selection HERE, before any bundle is asked for:
+    // the gateway refuses a bundle naming one. A list that cannot be read
+    // leaves what is offered UNKNOWN: the recorded servers are kept, nothing
+    // is withdrawn, and the sync goes on.
+    let has_local = ws.clients.iter().any(|c| selected.contains(&c.client_id) && !c.mcp_local_servers.is_empty());
+    let offered: Option<BTreeMap<uuid::Uuid, String>> = if !has_local {
+        Some(BTreeMap::new())
+    } else {
+        match api.mcp_local_servers(workspace_id).await {
+            Ok(list) => Some(list.into_iter().map(|s| (s.id, s.slug)).collect()),
+            Err(e) => {
+                crate::ui::warn(
+                    "",
+                    format_args!(
+                        "the local MCP servers of this workspace could not be read ({e:#}) — keeping the ones your tools have"
+                    ),
+                );
+                None
+            }
+        }
+    };
+    let kept_local = super::provision::split_offered_local(&ws.clients, &selected, offered.as_ref());
+    // Slugs by id, for the lines and the record: what is offered, and what
+    // was recorded.
+    let mut local_slugs: BTreeMap<uuid::Uuid, String> = offered.clone().unwrap_or_default();
+    local_slugs.extend(ws.clients.iter().flat_map(|c| c.mcp_local_servers.iter().map(|s| (s.id, s.slug.clone()))));
+
     // ----- Reconstruct the provision-time groups (mode × provider) -----
-    let plans: Vec<ClientPlan> = ws
+    let mut plans: Vec<ClientPlan> = ws
         .clients
         .iter()
         .map(|c| ClientPlan {
@@ -173,8 +207,84 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
             mode: Mode::from_manifest(&c.mode),
             provider_id: c.provider_id,
             mcp_server_ids: c.mcp_server_ids.clone(),
+            mcp_local_server_ids: kept_local.get(&c.client_id).cloned().unwrap_or_default(),
         })
         .collect();
+
+    // ----- The synced clients' templates -----
+    // Read once per run for a synced client that has a local server (does its
+    // setup still write one?) or has no server and no provider at all (is it
+    // a setup of MCP servers only, with nothing to write?). One whose
+    // template cannot be read keeps its selection, and its bundle answers.
+    let mut recorded_templates: BTreeMap<String, Vec<streamscope_client_templates::ClientProfileTemplate>> =
+        BTreeMap::new();
+    for c in ws.clients.iter().filter(|c| {
+        selected.contains(&c.client_id)
+            && (!c.mcp_local_servers.is_empty() || (c.mcp_server_ids.is_empty() && c.provider_id.is_none()))
+    }) {
+        if let Ok(profile) = api.client_profile(&c.client_id, workspace_id).await
+            && profile.templates.get(c.template_index).is_some()
+        {
+            recorded_templates.insert(c.client_id.clone(), profile.templates);
+        }
+    }
+
+    // ----- Local MCP servers that left a client's selection -----
+    // The rule `provision` applies, through the same function: a local server
+    // goes only to a template with a form for one. Each server that left —
+    // no longer offered, or its client's setup no longer writing local
+    // servers — is withdrawn from that client's files now, and the record
+    // saved at once: its own entry, nothing else, whatever becomes of the
+    // client's sync below.
+    let offered_ids: Option<BTreeSet<uuid::Uuid>> = offered.as_ref().map(|o| o.keys().copied().collect());
+    let mut withdraw_failed: Vec<String> = Vec::new();
+    let mut withdrew = false;
+    for plan in plans.iter_mut().filter(|p| selected.contains(&p.client_id)) {
+        let asked = plan.mcp_local_server_ids.len();
+        if recorded_templates.contains_key(&plan.client_id) {
+            super::provision::keep_local_where_writable(std::slice::from_mut(plan), &local_slugs, |id| {
+                recorded_templates.get(id).map(Vec::as_slice)
+            });
+        }
+        let lost_form = plan.mcp_local_server_ids.len() < asked;
+        let Some(client) = manifest
+            .hosts
+            .get_mut(&entry_key)
+            .and_then(|entry| entry.clients.iter_mut().find(|c| c.client_id == plan.client_id))
+        else {
+            continue;
+        };
+        let gone = super::provision::local_withdrawals(
+            &client.mcp_local_servers,
+            &plan.mcp_local_server_ids,
+            offered_ids.as_ref(),
+            lost_form,
+        );
+        match super::provision::withdraw_local_servers(client, &gone, &others, &run_stamp, &paths, false) {
+            Ok(changed) => withdrew |= changed,
+            Err(e) => {
+                eprintln!("{}: {e:#}", plan.client_id);
+                withdraw_failed.push(plan.client_id.clone());
+            }
+        }
+    }
+    if withdrew {
+        if let Err(e) = crate::state::backup_manifest_into_run(&paths, &run_stamp, &manifest_before) {
+            crate::ui::warn("  ", format_args!("the manifest was not backed up with this run ({e:#}) — `restore` cannot reconcile it"));
+        }
+        manifest.save(&paths)?;
+    }
+    // The record as it now stands is what the writes below merge against.
+    let ws = manifest.hosts.get(&entry_key).cloned().unwrap_or(ws);
+    let records = crate::state::FileRecords { ws: &ws, others: &others };
+    // A client on a setup of MCP servers only, left with none, has nothing to
+    // write: it is left alone below — no key settled, no config asked for.
+    let idle = |group: &super::provision::Group| {
+        let kind = group.indices.first().and_then(|&i| {
+            recorded_templates.get(&plans[i].client_id).and_then(|t| t.get(plans[i].template_index)).map(|t| t.kind)
+        });
+        super::provision::nothing_to_write(kind, group)
+    };
     let groups = group_plans(&plans);
 
     // ----- Key strategy (mirrors provision's precedence, per group) -----
@@ -212,14 +322,14 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
     };
 
     // ----- Per-group bundle + render -----
-    let run_stamp = crate::state::new_run_stamp("");
     let write_mode = WriteMode { dry_run: false, print: false, verbose: false };
-    let mut failures: Vec<String> = Vec::new();
+    // A client whose withdrawal failed is a failed client, whatever follows.
+    let mut failures: Vec<String> = withdraw_failed;
     // Written project configs (holding a key) that could not be git-ignored.
     let mut unignored: Vec<String> = Vec::new();
     let mut wrote_total = 0usize;
     let mut total_selected = 0usize;
-    let mut any_change = false;
+    let mut any_change = withdrew;
     // Every selected tool's key, settled BEFORE anything is written, so one
     // prompt covers the run and declining it changes nothing.
     let mut choices: std::collections::HashMap<String, KeyChoice> = std::collections::HashMap::new();
@@ -242,7 +352,7 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
     }
     if external_key.is_none() {
         for group in &groups {
-            if !group.indices.iter().any(|&i| selected.contains(&plans[i].client_id)) {
+            if !group.indices.iter().any(|&i| selected.contains(&plans[i].client_id)) || idle(group) {
                 continue;
             }
             let forward_auth = matches!(group.mode, Mode::Byok);
@@ -320,6 +430,10 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
             continue;
         }
         total_selected += selected_here.len();
+        if idle(group) {
+            println!("{}", super::provision::nothing_to_write_line(&group.client_id));
+            continue;
+        }
 
         // Key for this group.
         let mut reused_plaintext: Option<String> = None;
@@ -391,6 +505,11 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
                     .mcp_server_ids
                     .iter()
                     .map(|id| McpSelection { virtual_server_id: *id })
+                    .collect(),
+                mcp_local_servers: group
+                    .mcp_local_server_ids
+                    .iter()
+                    .map(|id| crate::api::McpLocalSelection { local_server_id: *id })
                     .collect(),
             })
             .await;
@@ -483,6 +602,18 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
                     m.provider_id = group.provider_id;
                     m.key_id = key_id;
                     m.mcp_server_ids = group.mcp_server_ids.clone();
+                    m.mcp_local_servers = super::provision::managed_local(
+                        &group.mcp_local_server_ids,
+                        &local_slugs,
+                        std::mem::take(&mut m.mcp_local_servers),
+                    );
+                    m.mcp_local_commands = super::provision::local_commands_written(cb, in_project);
+                    // The developer sees a launch an administrator added or
+                    // changed, as it is applied.
+                    let before = ws.clients.iter().find(|c| c.client_id == cb.client_id).map(|c| &c.mcp_local_commands);
+                    for line in super::provision::changed_local_command_lines(before, &m.mcp_local_commands) {
+                        println!("{}: {line}", cb.client_id);
+                    }
                     managed.push(m);
                     wrote_total += 1;
                 }
@@ -493,6 +624,7 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
                     group_failed = true;
                 }
             }
+            super::provision::print_mcp_warnings(cb, in_project);
         }
 
         // Record this group. The etag stamps only on a full, clean write of THIS
@@ -610,7 +742,7 @@ mod key_choice_tests {
     fn ws(opencode_key: &str, claude_key: &str) -> WorkspaceManifest {
         let client = |id: &str, k: &str| serde_json::json!({
             "client_id": id, "template_index": 0, "last_provisioned": "2026-10-09T12:00:00Z",
-            "mode": "gateway", "provider_id": null, "key_id": k, "mcp_server_ids": [], "files": [],
+            "mode": "gateway", "provider_id": null, "key_id": k, "mcp_server_ids": [], "mcp_local_servers": [], "mcp_local_commands": {}, "files": [],
             "launch_command": null
         });
         let mut keys = serde_json::Map::new();
@@ -630,6 +762,7 @@ mod key_choice_tests {
             mode: Mode::Gateway,
             provider_id: None,
             mcp_server_ids: vec![],
+            mcp_local_server_ids: vec![],
             indices: vec![0],
         }
     }

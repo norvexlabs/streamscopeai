@@ -128,6 +128,7 @@ async fn run_cycle(pool: &crate::db::Db, produce: bool) {
             produce_budget_crossings(&mut db, tenant_id).await;
             produce_expiring_credentials(&mut db, tenant_id).await;
             produce_guardrail_detections(&mut db, tenant_id).await;
+            produce_unusable_mcp_upstreams(&mut db, tenant_id).await;
         }
         dispatch_pending(&mut db, tenant_id).await;
         Ok(())
@@ -337,6 +338,82 @@ async fn produce_expiring_credentials(db: &mut TenantConn, tenant_id: Uuid) {
                 "expires_at": expires_at.to_rfc3339(),
                 "days_left": days_left,
             }),
+        };
+        let _ = crate::notifications::notify(db.conn(), tenant_id, n).await;
+    }
+}
+
+/// How long an edited MCP upstream is left to its administrator before the
+/// alert scan reports it unusable.
+const MCP_UNUSABLE_GRACE_MINUTES: i32 = 10;
+
+/// Notify once per enabled MCP upstream that every call fails on, whoever
+/// makes it ([`crate::routes::mcp::upstream_unusable`]: an administrator value
+/// missing or unreadable, an incomplete OAuth client). The dedup key carries
+/// the administrator-value version (`cred_version`, moved by every change of
+/// the declaration, an administrator value, the URL or the OAuth secret), so a
+/// change that leaves it unusable notifies again; an OAuth token URL or client
+/// ID is only ever set, never cleared, so filling one cannot break it again.
+/// An upstream edited in the last [`MCP_UNUSABLE_GRACE_MINUTES`] is not
+/// reported yet: an administrator who just adopted it is still filling it in.
+/// A built-in upstream carries no declared inputs and is skipped.
+async fn produce_unusable_mcp_upstreams(db: &mut TenantConn, tenant_id: Uuid) {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: Uuid,
+        name: String,
+        auth_mode: String,
+        cred_version: i64,
+        remote: sqlx::types::Json<streamscope_core::mcp::header_inputs::Remote>,
+        encrypted_admin_inputs: sqlx::types::Json<std::collections::HashMap<String, String>>,
+        oauth_token_url: Option<String>,
+        oauth_client_id: Option<String>,
+    }
+    let rows = match sqlx::query_as::<_, Row>(
+        "SELECT id, name, auth_mode, cred_version, remote, encrypted_admin_inputs, \
+                oauth_token_url, oauth_client_id \
+           FROM mcp_upstream_servers \
+          WHERE tenant_id = $1 AND enabled AND NOT built_in \
+            AND updated_at < NOW() - make_interval(mins => $2) \
+            AND NOT EXISTS (SELECT 1 FROM notifications n \
+                             WHERE n.tenant_id = mcp_upstream_servers.tenant_id \
+                               AND n.dedup_key = 'mcp_upstream_unusable:' || mcp_upstream_servers.id::text \
+                                                 || ':' || mcp_upstream_servers.cred_version::text)",
+    )
+    .bind(tenant_id)
+    .bind(MCP_UNUSABLE_GRACE_MINUTES)
+    .fetch_all(db.conn())
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(tenant_id = %tenant_id, "alert: mcp upstream scan failed: {e}");
+            return;
+        }
+    };
+    for r in rows {
+        let Err(reason) = crate::routes::mcp::upstream_unusable(
+            &r.remote.0,
+            &r.auth_mode,
+            &r.encrypted_admin_inputs.0,
+            r.oauth_token_url.as_deref(),
+            r.oauth_client_id.as_deref(),
+            crate::routes::mcp::Log::Quiet,
+        ) else {
+            continue;
+        };
+        let n = NewNotification {
+            workspace_id: None,
+            kind: NotificationKind::McpUpstreamUnusable,
+            dedup_key: format!("mcp_upstream_unusable:{}:{}", r.id, r.cred_version),
+            title: format!("MCP server cannot be called: {}", r.name),
+            summary: format!(
+                "Every call to the MCP server \"{}\" fails until an administrator fixes it: {reason}.",
+                r.name
+            ),
+            target_kind: Some("mcp_upstream_server"),
+            target_id: Some(r.id),
+            payload: serde_json::json!({ "reason": reason }),
         };
         let _ = crate::notifications::notify(db.conn(), tenant_id, n).await;
     }

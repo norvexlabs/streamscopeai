@@ -141,6 +141,20 @@
                 {#if v.sampling_intercept_enabled}
                   <span class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm font-medium bg-(--info-bg) text-(--info-text)" title="sampling/createMessage answered via the gateway LLM pipeline (auth, budgets, audit, transforms)">sampling intercept</span>
                 {/if}
+                {#if v.fwd_mount}
+                  <span
+                    data-testid="vs-fwd-mount"
+                    class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm font-medium bg-(--warning-bg) text-(--warning-text)"
+                    title="A client sends its own Authorization header to an upstream, so it connects to /fwd/<gateway-key>/mcp/{v.slug} with its gateway key in the path"
+                  >/fwd mount</span>
+                {/if}
+                {#if v.client_headers.length > 0}
+                  <span
+                    data-testid="vs-client-headers"
+                    class="inline-block px-1.5 py-0.5 text-[10px] rounded-sm font-mono bg-(--bg-primary) border border-(--border) text-(--text-secondary)"
+                    title="Headers the client sends on every request; each goes only to the upstream that declares it"
+                  >client: {v.client_headers.join(', ')}</span>
+                {/if}
                 <span class="text-xs text-(--text-secondary) font-mono">{vsRoutes.length} upstream{vsRoutes.length === 1 ? '' : 's'}</span>
               </div>
             </div>
@@ -162,6 +176,19 @@
           <!-- Expanded view: attached upstreams (routes) -->
           {#if isExpanded}
             <div class="mt-4 ml-7 bg-(--bg-primary) rounded-lg p-4">
+              {#if v.client_headers.length > 0}
+                <p class="mb-3 text-xs text-(--text-secondary)" data-testid="vs-client-note">
+                  Clients send
+                  {#each v.client_headers as h, hi}<code class="font-mono text-(--text-primary)">{h}</code>{hi < v.client_headers.length - 1 ? ', ' : ''}{/each}
+                  on every request and connect to
+                  {#if v.fwd_mount}
+                    <code class="font-mono text-(--text-primary)">/fwd/&lt;gateway-key&gt;/mcp/{v.slug}</code> — their own
+                    <code class="font-mono">Authorization</code> header goes to the upstream, so the gateway key rides the path.
+                  {:else}
+                    <code class="font-mono text-(--text-primary)">/mcp/{v.slug}</code> with their gateway key.
+                  {/if}
+                </p>
+              {/if}
               <div class="flex items-center justify-between mb-3">
                 <p class="text-xs font-medium text-(--text-secondary) uppercase tracking-wider">Attached upstreams ({vsRoutes.length})</p>
                 <button

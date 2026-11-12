@@ -46,6 +46,7 @@ use dashmap::DashMap;
 use futures::StreamExt;
 use streamscope_core::api::sse::SseDecoder;
 use streamscope_core::config::mcp::McpUpstreamServer;
+use streamscope_core::mcp::header_inputs::UpstreamAuth;
 use tokio::sync::oneshot;
 use tokio_util::codec::Decoder;
 use uuid::Uuid;
@@ -196,10 +197,10 @@ pub struct LegacySseSession {
     /// Discovered via the first `event: endpoint` SSE event. `None` until
     /// the upstream sends it; calls before discovery race-wait.
     messages_url: arc_swap::ArcSwap<Option<String>>,
-    /// Bearer for upstream auth — refreshed in place when per-user-OAuth
-    /// rotates, so reconnects pick up the new token without rebuilding the
-    /// session.
-    bearer: arc_swap::ArcSwap<Option<String>>,
+    /// The upstream's resolved headers — refreshed in place on every
+    /// request (a per-user OAuth rotation, a changed input), so reconnects
+    /// pick them up without rebuilding the session.
+    upstream_auth: arc_swap::ArcSwap<UpstreamAuth>,
     pending: Arc<PendingMap>,
     request_timeout: Duration,
     last_activity: Mutex<Instant>,
@@ -216,7 +217,7 @@ impl LegacySseSession {
     pub fn open(
         key: SessionKey,
         upstream: &McpUpstreamServer,
-        bearer: Option<String>,
+        upstream_auth: UpstreamAuth,
         request_timeout: Duration,
         reconnect_backoff: Duration,
         sink: Arc<dyn UpstreamEventSink>,
@@ -224,12 +225,12 @@ impl LegacySseSession {
         let pending = Arc::new(PendingMap::new());
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let messages_url = arc_swap::ArcSwap::new(Arc::new(None));
-        let bearer_slot = arc_swap::ArcSwap::new(Arc::new(bearer));
+        let auth_slot = arc_swap::ArcSwap::new(Arc::new(upstream_auth));
 
         let session = Arc::new(Self {
             key: key.clone(),
             messages_url,
-            bearer: bearer_slot,
+            upstream_auth: auth_slot,
             pending: pending.clone(),
             request_timeout,
             last_activity: Mutex::new(Instant::now()),
@@ -257,8 +258,8 @@ impl LegacySseSession {
         session
     }
 
-    pub fn refresh_bearer(&self, bearer: Option<String>) {
-        self.bearer.store(Arc::new(bearer));
+    pub fn refresh_auth(&self, upstream_auth: UpstreamAuth) {
+        self.upstream_auth.store(Arc::new(upstream_auth));
     }
 
     pub fn touch(&self) {
@@ -307,7 +308,7 @@ impl LegacySseSession {
         let messages_url = self.await_endpoint().await?;
 
         // `messages_url` is the server-controlled `endpoint` event — an absolute
-        // URL we POST the bearer to. Vet it for an internal IP-literal before
+        // URL we POST the credentials to. Vet it for an internal IP-literal before
         // sending; the guarded client additionally pins the resolved IP at DNS
         // time, so a hostname resolving internal is also refused at connect.
         if let Err(e) = streamscope_mcp_auth::ssrf::check_url_for(
@@ -321,16 +322,14 @@ impl LegacySseSession {
         self.pending.insert(id_key.clone(), tx);
 
         let body = serde_json::to_vec(request)?;
-        let bearer_snapshot = self.bearer.load_full();
-        let mut builder = client
+        let auth_snapshot = self.upstream_auth.load_full();
+        let builder = client
             .post(&messages_url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
             .timeout(self.request_timeout)
             .body(body);
-        if let Some(token) = bearer_snapshot.as_ref() {
-            builder = builder.header("Authorization", format!("Bearer {token}"));
-        }
+        let builder = auth_snapshot.apply(builder);
 
         let post_resp = match builder.send().await {
             Ok(r) => r,
@@ -346,7 +345,7 @@ impl LegacySseSession {
                 .await
                 .unwrap_or_default();
             let raw = String::from_utf8_lossy(&raw_bytes);
-            let redacted = redact_upstream_body(&raw, bearer_snapshot.as_deref());
+            let redacted = redact_upstream_body(&raw, &auth_snapshot);
             return Err(UpstreamError::Http {
                 status: status.as_u16(),
                 body: redacted,
@@ -433,11 +432,11 @@ async fn run_drain(
                 // The stream-shaped client: the request/response one's total
                 // timeout would cut the long-lived GET drain mid-stream.
                 let client = super::upstream::guarded_stream_client(super::upstream::MCP_EGRESS);
-                let bearer_snapshot = session.bearer.load_full();
+                let auth_snapshot = session.upstream_auth.load_full();
                 drain_once(
                     &client,
                     &upstream_url,
-                    bearer_snapshot.as_deref(),
+                    &auth_snapshot,
                     &session,
                     pending.as_ref(),
                     sink.as_ref(),
@@ -473,17 +472,16 @@ async fn run_drain(
 async fn drain_once(
     client: &reqwest::Client,
     upstream_url: &str,
-    bearer: Option<&str>,
+    upstream_auth: &UpstreamAuth,
     session: &Arc<LegacySseSession>,
     pending: &PendingMap,
     sink: &dyn UpstreamEventSink,
 ) -> Result<(), String> {
-    let mut builder = client
-        .get(upstream_url)
-        .header("Accept", "text/event-stream");
-    if let Some(token) = bearer {
-        builder = builder.header("Authorization", format!("Bearer {token}"));
-    }
+    let builder = upstream_auth.apply(
+        client
+            .get(upstream_url)
+            .header("Accept", "text/event-stream"),
+    );
     let resp = builder.send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {
@@ -528,8 +526,12 @@ fn handle_event(
     sink: &dyn UpstreamEventSink,
 ) {
     if ev.event_type.as_deref() == Some("endpoint") {
-        let resolved = resolve_endpoint(upstream_url, ev.data.trim());
-        session.messages_url.store(Arc::new(Some(resolved)));
+        match resolve_endpoint(upstream_url, ev.data.trim()) {
+            Some(resolved) => session.messages_url.store(Arc::new(Some(resolved))),
+            None => tracing::warn!(
+                "legacy SSE: the upstream named a message endpoint on another origin; ignored"
+            ),
+        }
         return;
     }
 
@@ -583,28 +585,36 @@ fn id_key_from_value(value: &serde_json::Value) -> Option<String> {
 /// Resolve the `endpoint` event payload against the upstream's GET URL.
 ///
 /// MCP servers commonly emit a path-relative URL (`/messages?session=…`).
-/// We support absolute URLs verbatim, root-relative paths joined onto the
-/// origin, and same-directory relatives joined onto the GET URL's parent.
-/// Falls back to the raw value when nothing parses — the POST will fail
-/// with a transport error which the caller already handles.
-fn resolve_endpoint(base: &str, raw: &str) -> String {
-    let raw = raw.trim();
+/// We support absolute URLs on the GET URL's own origin, root-relative paths
+/// joined onto the origin, and same-directory relatives joined onto the GET
+/// URL's parent. An absolute URL on another origin is `None`: every POST
+/// carries the upstream's declared headers, which must not reach a host
+/// nobody configured. Falls back to the raw value when the base does not
+/// parse — the POST will fail with a transport error which the caller
+/// already handles.
+fn resolve_endpoint(base: &str, raw: &str) -> Option<String> {
+    let resolved = join_endpoint(base, raw.trim())?;
+    // Whatever the form, the result stays on the GET URL's origin: a relative
+    // value can still name another host when joined onto a path-less base
+    // (`.evil.example/m`, `@evil.example/m`).
+    match (origin_of(&resolved), origin_of(base)) {
+        (Some(r), Some(b)) if !r.eq_ignore_ascii_case(b) => None,
+        _ => Some(resolved),
+    }
+}
+
+fn join_endpoint(base: &str, raw: &str) -> Option<String> {
     if raw.starts_with("http://") || raw.starts_with("https://") {
-        return raw.to_string();
+        return (origin_of(raw)?.eq_ignore_ascii_case(origin_of(base)?)).then(|| raw.to_string());
     }
     // Find scheme:// + authority in `base` so we can compute origin and
     // parent-dir. Without a `url` crate dep we walk by hand.
-    let scheme_end = match base.find("://") {
-        Some(i) => i + 3,
-        None => return raw.to_string(),
+    let Some(origin) = origin_of(base) else {
+        return Some(raw.to_string());
     };
-    let authority_end = base[scheme_end..]
-        .find('/')
-        .map(|i| scheme_end + i)
-        .unwrap_or(base.len());
-    let origin = &base[..authority_end];
+    let authority_end = origin.len();
     if let Some(stripped) = raw.strip_prefix('/') {
-        return format!("{origin}/{stripped}");
+        return Some(format!("{origin}/{stripped}"));
     }
     // Same-directory relative: drop the GET URL's last path segment.
     let path = &base[authority_end..];
@@ -613,7 +623,14 @@ fn resolve_endpoint(base: &str, raw: &str) -> String {
         .map(|i| authority_end + i + 1)
         .unwrap_or(authority_end);
     let parent = &base[..parent_end];
-    format!("{parent}{raw}")
+    Some(format!("{parent}{raw}"))
+}
+
+/// `scheme://authority` of an absolute URL.
+fn origin_of(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")? + 3;
+    let authority_end = url[scheme_end..].find(['/', '?', '#']).map_or(url.len(), |i| scheme_end + i);
+    Some(&url[..authority_end])
 }
 
 /// Per-process map of `(tenant, upstream, agent_session) → LegacySseSession`.
@@ -648,13 +665,13 @@ impl LegacySseSessionMap {
         self: &Arc<Self>,
         key: SessionKey,
         upstream: &McpUpstreamServer,
-        bearer: Option<String>,
+        upstream_auth: UpstreamAuth,
         request_timeout: Duration,
         reconnect_backoff: Duration,
         sink: Arc<dyn UpstreamEventSink>,
     ) -> Option<Arc<LegacySseSession>> {
         if let Some(existing) = self.inner.get(&key) {
-            existing.refresh_bearer(bearer);
+            existing.refresh_auth(upstream_auth);
             existing.touch();
             return Some(existing.clone());
         }
@@ -672,7 +689,7 @@ impl LegacySseSessionMap {
         let session = LegacySseSession::open(
             key.clone(),
             upstream,
-            bearer,
+            upstream_auth,
             request_timeout,
             reconnect_backoff,
             sink,
@@ -748,38 +765,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_endpoint_absolute() {
+    fn resolve_endpoint_absolute_only_on_the_same_origin() {
         assert_eq!(
-            resolve_endpoint("https://x.example/sse", "https://y.example/messages?s=1"),
-            "https://y.example/messages?s=1"
+            resolve_endpoint("https://x.example/sse", "https://x.example/messages?s=1").as_deref(),
+            Some("https://x.example/messages?s=1")
         );
+        // Another host, port or scheme would receive the declared headers.
+        for other in ["https://y.example/messages", "https://x.example:8443/m", "http://x.example/m"] {
+            assert_eq!(resolve_endpoint("https://x.example/sse", other), None, "{other}");
+        }
     }
 
     #[test]
     fn resolve_endpoint_root_relative() {
         assert_eq!(
-            resolve_endpoint("https://x.example/sse", "/messages?s=1"),
-            "https://x.example/messages?s=1"
+            resolve_endpoint("https://x.example/sse", "/messages?s=1").as_deref(),
+            Some("https://x.example/messages?s=1")
         );
     }
 
     #[test]
     fn resolve_endpoint_same_directory() {
         assert_eq!(
-            resolve_endpoint("https://x.example/api/sse", "messages?s=1"),
-            "https://x.example/api/messages?s=1"
+            resolve_endpoint("https://x.example/api/sse", "messages?s=1").as_deref(),
+            Some("https://x.example/api/messages?s=1")
         );
     }
 
     #[test]
     fn resolve_endpoint_root_path_no_trailing_slash() {
+        // Joined onto a path-less base, a relative value lands on another
+        // host: refused, like an absolute one on another origin.
+        assert_eq!(resolve_endpoint("https://x.example", "messages?s=1"), None);
+        assert_eq!(resolve_endpoint("https://x.example", ".evil.example/m"), None);
+        assert_eq!(resolve_endpoint("https://x.example", "@evil.example/m"), None);
+        // Positive control: the root-relative form on the same base is kept.
         assert_eq!(
-            resolve_endpoint("https://x.example", "messages?s=1"),
-            "https://x.examplemessages?s=1"
+            resolve_endpoint("https://x.example", "/messages").as_deref(),
+            Some("https://x.example/messages")
         );
-        // Weird, but the GET URL is malformed — the agent's deployment is
-        // misconfigured. Better to fall through to the POST and 4xx than
-        // silently rewrite.
     }
 
     struct CountingSink {
@@ -824,7 +848,7 @@ mod tests {
                 agent_session_id: "agent-1".into(),
             },
             messages_url: arc_swap::ArcSwap::new(Arc::new(None)),
-            bearer: arc_swap::ArcSwap::new(Arc::new(None)),
+            upstream_auth: arc_swap::ArcSwap::new(Arc::new(UpstreamAuth::none())),
             pending: Arc::new(PendingMap::new()),
             request_timeout: Duration::from_secs(5),
             last_activity: Mutex::new(Instant::now()),
@@ -862,7 +886,7 @@ mod tests {
                 agent_session_id: "agent-1".into(),
             },
             messages_url: arc_swap::ArcSwap::new(Arc::new(None)),
-            bearer: arc_swap::ArcSwap::new(Arc::new(None)),
+            upstream_auth: arc_swap::ArcSwap::new(Arc::new(UpstreamAuth::none())),
             pending: Arc::new(PendingMap::new()),
             request_timeout: Duration::from_secs(5),
             last_activity: Mutex::new(Instant::now()),

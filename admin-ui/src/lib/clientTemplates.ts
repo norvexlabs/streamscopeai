@@ -20,6 +20,8 @@ import type { McpAuthMode } from './api-types';
 
 /** The subset of a template this module decides on. */
 export interface TemplateChoice {
+  /** Where the template writes a server the member's machine runs. */
+  local_mcp?: 'none' | 'config' | 'project' | null;
   kind: string;
   protocol?: string | null;
   title: string;
@@ -152,4 +154,25 @@ export function offersOpenAiAndAnthropic<T extends TemplateChoice>(templates: re
     templates.filter((t) => isLlmConfig(t) && !!t.filename).map((t) => t.protocol ?? '')
   );
   return protocols.has('chat_completions') && protocols.has('anthropic_messages');
+}
+
+/**
+ * The template the Quickstart's "MCP servers only" setup opens: the client's
+ * MCP template that can write what the workspace offers. When the workspace
+ * offers local servers — ones the member's machine runs — that is the first
+ * MCP template writing one into the config the page renders
+ * (`local_mcp: config`): it takes gateway servers as well, so it serves a
+ * workspace offering both. Otherwise, with a gateway server to offer, the
+ * client's first MCP template. `-1` when none fits: nothing offered, or only
+ * local servers and no template that writes one here.
+ */
+export function mcpOnlyTemplateIndex<T extends TemplateChoice>(
+  templates: readonly T[],
+  offers: { gateway: boolean; local: boolean },
+): number {
+  if (offers.local) {
+    const writesLocal = templates.findIndex((t) => t.kind === 'mcp' && t.local_mcp === 'config');
+    if (writesLocal >= 0) return writesLocal;
+  }
+  return offers.gateway ? templates.findIndex((t) => t.kind === 'mcp') : -1;
 }

@@ -8,9 +8,9 @@
 //! for placeholders the caller has already rendered in the target format.
 //!
 //! Threat model: the rendered body never contains a freshly-minted plaintext
-//! API key. `{{api_key}}` and the per-server MCP key fields always resolve to
-//! literal placeholder strings (`<paste-your-api-key-here>` /
-//! `<paste-your-<slug>-mcp-key-here>`). The plaintext is shipped separately in
+//! API key. `{{api_key}}` and every MCP server's header values always resolve
+//! to literal placeholder strings (`<paste-your-api-key-here>`, or a
+//! client-sent header's `<paste-your-<slug>-<header>-here>`). The plaintext is shipped separately in
 //! `MintedSecrets` and substituted into the final payload by the consumer —
 //! the web UI at clipboard-copy time (never written to the DOM), the CLI at
 //! file-write time.
@@ -47,13 +47,112 @@ pub const API_KEY_PLACEHOLDER: &str = "<paste-your-api-key-here>";
 /// upstream.
 pub const UPSTREAM_API_KEY_PLACEHOLDER: &str = "<paste-your-upstream-api-key-here>";
 
-/// Per-MCP-server sentinel for the user's own upstream MCP bearer in BYOT
-/// templates. Same no-substitute contract as [`UPSTREAM_API_KEY_PLACEHOLDER`]
-/// — the consumer leaves it intact and the user fills it in. Keyed by `slug`
-/// so a multi-server BYOT render tells the user which server each blank
-/// belongs to.
-pub fn upstream_mcp_bearer_placeholder(slug: &str) -> String {
-    format!("<paste-your-{slug}-upstream-bearer-here>")
+/// Sentinel for a header an MCP server's client must send itself on every
+/// request (a client-filled header input). Same no-substitute contract as
+/// [`UPSTREAM_API_KEY_PLACEHOLDER`]: the consumer leaves it intact and the
+/// user fills it in. Keyed by `slug` and header so a multi-server render tells
+/// the user which blank belongs where.
+pub fn mcp_client_header_placeholder(slug: &str, header: &str) -> String {
+    format!("<paste-your-{slug}-{}-here>", header.to_ascii_lowercase())
+}
+
+/// One entry of an `mcp_servers[]` item's `headers` list: the header a
+/// client config sends to the gateway for that server. A template writes the
+/// list with `{{#each headers}}` inside `{{#each mcp_servers}}`, reading
+/// `{{name}}` and `{{value}}`; the item's `headers` is a [`Value::List`] of
+/// these.
+pub fn mcp_header_item(name: &str, value: String) -> BTreeMap<String, Value> {
+    let mut m = BTreeMap::new();
+    m.insert("name".to_string(), Value::String(name.to_string()));
+    m.insert("value".to_string(), Value::String(value));
+    m
+}
+
+/// A local MCP server's whole launch as a person reads it, and as a shell
+/// would read it back: each environment variable the administrator set as
+/// `NAME=value`, then the command and its arguments. A variable with no value
+/// (the developer's to fill) is not in it.
+///
+/// Pasted into a POSIX shell or zsh, the line splits into exactly those
+/// parts, and its first word that is not one of the `NAME=value` pairs is the
+/// command (locked by `a_local_command_line_splits_back_into_its_launch`).
+/// So every part holding a character outside `[A-Za-z0-9_@%+:,./-]`, or
+/// nothing, is single-quoted: a space, a quote, an operator, an expansion —
+/// and `=`, which unquoted would make a command or an argument read as an
+/// assignment (and, leading, as zsh's `=command` expansion), as would a
+/// leading `~` or `#`. An environment pair is `NAME=` followed by its value
+/// under the same rule. The ONE rendering: the admin and portal APIs return
+/// it, and the CLI prints and records the same string. Nothing runs it.
+pub fn local_command_line(command: &str, args: &[String], env: &[(String, Option<String>)]) -> String {
+    fn quoted(part: &str) -> String {
+        let safe = |c: char| c.is_ascii_alphanumeric() || "_@%+:,./-".contains(c);
+        if !part.is_empty() && part.chars().all(safe) {
+            part.to_string()
+        } else {
+            format!("'{}'", part.replace('\'', "'\\''"))
+        }
+    }
+    env.iter()
+        .filter_map(|(name, value)| value.as_ref().map(|v| format!("{name}={}", quoted(v))))
+        .chain(std::iter::once(quoted(command)))
+        .chain(args.iter().map(|a| quoted(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One `mcp_servers[]` item for a LOCAL MCP server: a server the developer's
+/// machine starts. A template that declares a local form
+/// ([`crate::types::LocalMcpForm`]) writes it as the client's stdio entry,
+/// branching on `{{#if local}}` inside its `{{#each mcp_servers}}` loop:
+/// `{{command}}`, `{{#each args}}{{value}}{{/each}}` and
+/// `{{#each env}}{{name}}` / `{{value}}{{/each}}`.
+///
+/// An `env` entry with no value is the developer's to fill: it is written as
+/// the same fill-in sentinel a client-sent header gets
+/// ([`mcp_client_header_placeholder`]), which the consumer leaves intact and a
+/// later write keeps the pasted value over. `headers` is an empty list and
+/// there is no `url`, so a part of a template that skips local items reads
+/// nothing from one. `command_line` is the whole launch as
+/// [`local_command_line`] renders it — what the CLI prints and records.
+pub fn mcp_local_server_item(
+    slug: &str,
+    name: &str,
+    description: Option<&str>,
+    command: &str,
+    args: &[String],
+    env: &[(String, Option<String>)],
+) -> BTreeMap<String, Value> {
+    let mut m: BTreeMap<String, Value> = BTreeMap::new();
+    m.insert("slug".into(), Value::String(slug.to_string()));
+    m.insert("name".into(), Value::String(name.to_string()));
+    if let Some(d) = description {
+        m.insert("description".into(), Value::String(d.to_string()));
+    }
+    m.insert("local".into(), Value::Bool(true));
+    m.insert("command".into(), Value::String(command.to_string()));
+    m.insert(
+        "args".into(),
+        Value::List(
+            args.iter()
+                .map(|a| BTreeMap::from([("value".to_string(), Value::String(a.clone()))]))
+                .collect(),
+        ),
+    );
+    m.insert(
+        "env".into(),
+        Value::List(
+            env.iter()
+                .map(|(name, value)| {
+                    let value = value.clone().unwrap_or_else(|| mcp_client_header_placeholder(slug, name));
+                    mcp_header_item(name, value)
+                })
+                .collect(),
+        ),
+    );
+    m.insert("headers".into(), Value::List(Vec::new()));
+    m.insert("transport_hint".into(), Value::String("stdio".into()));
+    m.insert("command_line".into(), Value::String(local_command_line(command, args, env)));
+    m
 }
 
 /// Boolean placeholder that is `true` only when the CLI writes a template at
@@ -157,6 +256,39 @@ pub enum RenderError {
 // that keeps the quotes. Build any value with a fixed prefix or suffix with it.
 handlebars_helper!(concat: |*args| args.iter().map(|v| v.render()).collect::<String>());
 
+/// The name of the YAML string helper: `{{quoted value}}`.
+pub const YAML_STRING_HELPER: &str = "quoted";
+
+/// `{{quoted value}}` — YAML only. Writes its argument as a double-quoted
+/// scalar, always: the position is a STRING by contract, whatever the text
+/// looks like. `{{value}}` cannot know that — the escaper is handed text, not
+/// a type, and leaves `8080` or `true` bare so a typed integer or boolean
+/// keeps its type. A value that is text someone chose — a local MCP server's
+/// command, each of its arguments and environment values, a server's slug, a
+/// header's value — is written with this helper, so `--port 8080` stays the
+/// string `"8080"` (locked by `a_string_comes_back_from_each_format_as_the_same_string`).
+/// It writes the quotes itself: never put it inside quotes.
+struct QuotedHelper;
+
+impl handlebars::HelperDef for QuotedHelper {
+    fn call<'reg: 'rc, 'rc>(
+        &self,
+        h: &handlebars::Helper<'rc>,
+        _: &'reg Handlebars<'reg>,
+        _: &'rc handlebars::Context,
+        _: &mut handlebars::RenderContext<'reg, 'rc>,
+        out: &mut dyn handlebars::Output,
+    ) -> handlebars::HelperResult {
+        let value = h
+            .param(0)
+            .ok_or_else(|| handlebars::RenderErrorReason::ParamNotFoundForIndex(YAML_STRING_HELPER, 0))?
+            .value();
+        // Written as it is: the helper's output does not pass the escaper.
+        out.write(&yaml_double_quoted(&value.render()))?;
+        Ok(())
+    }
+}
+
 fn make_engine(escape: fn(&str) -> String) -> Handlebars<'static> {
     let mut h = Handlebars::new();
     h.register_escape_fn(escape);
@@ -165,7 +297,11 @@ fn make_engine(escape: fn(&str) -> String) -> Handlebars<'static> {
 }
 
 static JSON_ENGINE: LazyLock<Handlebars<'static>> = LazyLock::new(|| make_engine(json_escape));
-static YAML_ENGINE: LazyLock<Handlebars<'static>> = LazyLock::new(|| make_engine(yaml_escape));
+static YAML_ENGINE: LazyLock<Handlebars<'static>> = LazyLock::new(|| {
+    let mut h = make_engine(yaml_escape);
+    h.register_helper(YAML_STRING_HELPER, Box::new(QuotedHelper));
+    h
+});
 static TOML_ENGINE: LazyLock<Handlebars<'static>> = LazyLock::new(|| make_engine(toml_escape));
 static SHELL_ENGINE: LazyLock<Handlebars<'static>> = LazyLock::new(|| make_engine(shell_escape));
 static TEXT_ENGINE: LazyLock<Handlebars<'static>> = LazyLock::new(|| make_engine(no_escape));
@@ -238,28 +374,41 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// YAML scalar escape. Returns either a bare scalar (when the content is
-/// simple — no special chars, no whitespace at the edges, not a YAML tag) or
-/// a double-quoted scalar with `\` and `"` escaped. Templates that splice
-/// values into pre-quoted positions (`apiKey: "{{api_key}}"`) get correct
-/// behaviour either way; templates that splice into bare positions
-/// (`apiKey: {{api_key}}`) get safe quoting on hostile input.
+/// YAML scalar escape, for a value spliced where a scalar stands on its own
+/// (`key: {{value}}`, `- {{value}}`, `[{{value}}]`).
+///
+/// The text of a typed integer or boolean stays bare, so the parser reads its
+/// type. Any other text is written bare only when it is plainly a word —
+/// ASCII letters, digits, `_ . / -` and single inner spaces, starting with a
+/// letter, `_` or `/`, and not one of YAML's own words — and double-quoted
+/// otherwise, so it comes back the same string.
+///
+/// NOT claimed: a STRING that reads as an integer or a boolean (`8080`,
+/// `true`) — handed text, not a type, this escaper cannot tell it from a typed
+/// one and leaves it bare; a position that is a string by contract uses
+/// `{{quoted value}}` ([`YAML_STRING_HELPER`]). Nor a value spliced inside a
+/// scalar the template already quoted, or after literal text
+/// (`model: openai/{{alias}}` — build it with `concat`).
 fn yaml_escape(s: &str) -> String {
-    // Booleans / integers from Handlebars come through here as their string
-    // representation. Don't quote those — leave them bare so the YAML parser
-    // sees them as the right scalar type.
     if s == "true" || s == "false" || s.parse::<i64>().is_ok() {
         return s.to_string();
     }
-    let needs_quoting = s.is_empty()
-        || s.chars().any(|c| matches!(c, ':' | '#' | '\'' | '"' | '&' | '*' | '?' | '|' | '<' | '>' | '=' | '!' | '%' | '@' | '\\' | '\n' | '\r' | '\t'))
-        || s.starts_with('-')
-        || s.starts_with(' ')
-        || s.ends_with(' ')
-        || matches!(s, "null" | "yes" | "no" | "on" | "off" | "~");
-    if !needs_quoting {
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-' | ' ');
+    let reserved = ["null", "true", "false", "yes", "no", "on", "off", "y", "n"];
+    let plain = s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '/')
+        && s.chars().all(word)
+        && !s.ends_with(' ')
+        && !s.contains("  ")
+        && !s.contains(" -")
+        && !reserved.iter().any(|r| s.eq_ignore_ascii_case(r));
+    if plain {
         return s.to_string();
     }
+    yaml_double_quoted(s)
+}
+
+/// `s` as a YAML double-quoted scalar: it reads back as exactly `s`.
+fn yaml_double_quoted(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -269,6 +418,14 @@ fn yaml_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // What a YAML reader takes for a line break, or refuses unescaped.
+            '\u{85}' => out.push_str("\\N"),
+            '\u{2028}' => out.push_str("\\L"),
+            '\u{2029}' => out.push_str("\\P"),
+            '\u{FEFF}' | '\u{FFFE}' | '\u{FFFF}' => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c if (c as u32) < 0x20 || (0x7F..0xA0).contains(&(c as u32)) => {
+                out.push_str(&format!("\\x{:02X}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -286,7 +443,7 @@ fn toml_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
+            c if (c as u32) < 0x20 || c == '\u{7F}' => {
                 out.push_str(&format!("\\u{:04X}", c as u32));
             }
             c => out.push(c),
@@ -473,14 +630,195 @@ mod tests {
     #[test]
     fn yaml_escape_keeps_simple_values_bare_and_quotes_dangerous_ones() {
         assert_eq!(yaml_escape("claude-sonnet-4-5"), "claude-sonnet-4-5");
+        assert_eq!(yaml_escape("two words"), "two words");
         assert_eq!(yaml_escape("https://gw.acme.io/v1"), "\"https://gw.acme.io/v1\"");
-        // Bare bool/int tokens emitted by handlebars stay unquoted so the
-        // YAML parser reads them as the right scalar type.
+        // The text of a typed boolean or integer stays bare, so the YAML
+        // parser reads its type.
         assert_eq!(yaml_escape("true"), "true");
         assert_eq!(yaml_escape("42"), "42");
-        // YAML reserved words still get quoted to force string scalar.
-        assert_eq!(yaml_escape("null"), "\"null\"");
-        assert_eq!(yaml_escape("yes"), "\"yes\"");
+        // Everything YAML would read as something else is quoted.
+        for s in ["null", "Null", "NULL", "yes", "No", "ON", "~", "True", "FALSE", "3.12", "1e5", "0x1F", ".5",
+                  "2026-11-11", "-lead", "?q", ":c", "#c", "&a", "*a", "!t", "|", ">", "%d", "@a", "{a}", "[x]",
+                  "a: b", "a #b", "", " lead", "trail ", "a  b", "a - b", "é"] {
+            assert_eq!(yaml_escape(s), format!("\"{s}\""), "{s:?}");
+        }
+    }
+
+    /// A typed value keeps its type through `{{value}}`; a position that is a
+    /// string by contract is written with `{{quoted value}}` and comes back a
+    /// string whatever it reads as. The same string through `{{value}}` reads
+    /// as a number or a boolean — the control that shows why the helper exists.
+    #[test]
+    fn yaml_keeps_a_typed_value_typed_and_a_quoted_string_a_string() {
+        let phs = ph([
+            ("port", "8080".into()),
+            ("flag", "true".into()),
+            ("version", "3.12".into()),
+            ("window", 200_000i64.into()),
+            ("vision", true.into()),
+        ]);
+        let out = render(
+            "port: {{quoted port}}\nflag: {{quoted flag}}\nversion: {{quoted version}}\nwindow: {{window}}\nvision: {{vision}}\nargs:\n  - {{quoted port}}\nbare_port: {{port}}\nbare_flag: {{flag}}\n",
+            TemplateFormat::Yaml,
+            &phs,
+        )
+        .unwrap();
+        let v: yaml_serde::Value = yaml_serde::from_str(&out).unwrap();
+        assert_eq!(v["port"].as_str(), Some("8080"), "{out}");
+        assert_eq!(v["flag"].as_str(), Some("true"), "{out}");
+        assert_eq!(v["version"].as_str(), Some("3.12"), "{out}");
+        assert_eq!(v["args"][0].as_str(), Some("8080"), "{out}");
+        assert_eq!(v["window"].as_i64(), Some(200_000), "{out}");
+        assert_eq!(v["vision"].as_bool(), Some(true), "{out}");
+        assert_eq!(v["bare_port"].as_i64(), Some(8080), "{out}");
+        assert_eq!(v["bare_flag"].as_bool(), Some(true), "{out}");
+        // The helper is YAML's: another format has its own quotes.
+        assert_matches!(
+            render("{\"port\": {{quoted port}}}", TemplateFormat::Json, &phs).unwrap_err(),
+            RenderError::Template(_)
+        );
+    }
+
+    mod escaper_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Whatever a string holds — short of a control character — it
+            /// comes back from the format's own parser as the same string,
+            /// written the way the seeds write a local MCP entry: through
+            /// `{{quoted …}}` in YAML (a mapping value, a mapping key, a block
+            /// list item, a flow list item), inside a basic string in TOML,
+            /// inside a string in JSON. In YAML the bare `{{value}}` path
+            /// holds the same for every string but one that reads as an
+            /// integer or a boolean, which it leaves typed.
+            ///
+            /// NOT a property, deliberately: that bare path for a string that
+            /// reads as an integer or a boolean (use the helper); a value
+            /// spliced inside a scalar the template already quoted in YAML,
+            /// or after literal text (`concat` builds those); the shell and
+            /// text formats, which have no parser to hold them to; a string
+            /// holding a control character.
+            #[test]
+            fn a_string_comes_back_from_each_format_as_the_same_string(s in any_text(24)) {
+                let phs = ph([("v", Value::String(s.clone()))]);
+
+                let yaml = render(
+                    "k: {{quoted v}}\nl:\n  - {{quoted v}}\nf: [{{quoted v}}]\nm:\n  {{quoted v}}: x\n",
+                    TemplateFormat::Yaml,
+                    &phs,
+                )
+                .unwrap();
+                let v: yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
+                prop_assert_eq!(v["k"].as_str(), Some(s.as_str()), "{:?}", yaml);
+                prop_assert_eq!(v["l"][0].as_str(), Some(s.as_str()), "{:?}", yaml);
+                prop_assert_eq!(v["f"][0].as_str(), Some(s.as_str()), "{:?}", yaml);
+                let key = v["m"].as_mapping().and_then(|m| m.keys().next()).and_then(|k| k.as_str());
+                prop_assert_eq!(key, Some(s.as_str()), "{:?}", yaml);
+
+                if !(s == "true" || s == "false" || s.parse::<i64>().is_ok()) {
+                    let bare = render("k: {{v}}\nl:\n  - {{v}}\nf: [{{v}}]\n", TemplateFormat::Yaml, &phs).unwrap();
+                    let v: yaml_serde::Value = yaml_serde::from_str(&bare).unwrap();
+                    prop_assert_eq!(v["k"].as_str(), Some(s.as_str()), "{:?}", bare);
+                    prop_assert_eq!(v["l"][0].as_str(), Some(s.as_str()), "{:?}", bare);
+                    prop_assert_eq!(v["f"][0].as_str(), Some(s.as_str()), "{:?}", bare);
+                }
+
+                let toml_text = render("k = \"{{v}}\"\na = [\"{{v}}\"]\n", TemplateFormat::Toml, &phs).unwrap();
+                let t: toml::Table = toml_text.parse().unwrap();
+                prop_assert_eq!(t["k"].as_str(), Some(s.as_str()), "{:?}", toml_text);
+                prop_assert_eq!(t["a"][0].as_str(), Some(s.as_str()), "{:?}", toml_text);
+
+                let json = render("{\"k\": \"{{v}}\", \"a\": [\"{{v}}\"]}", TemplateFormat::Json, &phs).unwrap();
+                let j: serde_json::Value = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(j["k"].as_str(), Some(s.as_str()), "{:?}", json);
+                prop_assert_eq!(j["a"][0].as_str(), Some(s.as_str()), "{:?}", json);
+            }
+
+            /// A rendered launch splits back, as a POSIX shell splits words,
+            /// into exactly its parts: one `NAME=value` word per variable the
+            /// administrator set, then the command, then each argument — and
+            /// the command is the first word a shell would not take for an
+            /// assignment. Not claimed: what the words do once run.
+            #[test]
+            fn a_local_command_line_splits_back_into_its_launch(
+                command in any_text(12).prop_filter("a command is not empty", |c| !c.is_empty()),
+                args in prop::collection::vec(any_text(12), 0..4),
+                env in prop::collection::vec(("[A-Za-z_][A-Za-z0-9_]{0,6}", prop::option::of(any_text(12))), 0..3),
+            ) {
+                let line = local_command_line(&command, &args, &env);
+                let words = shlex::split(&line).expect("the line is well-formed shell");
+                let mut want: Vec<String> = env
+                    .iter()
+                    .filter_map(|(name, value)| value.as_ref().map(|v| format!("{name}={v}")))
+                    .collect();
+                let assignments = want.len();
+                want.push(command.clone());
+                want.extend(args.iter().cloned());
+                prop_assert_eq!(&words, &want, "{}", line);
+
+                // As the shell reads the RAW line: a word is an assignment
+                // only while it starts with an unquoted `NAME=`. The first
+                // word that does not is the command.
+                let raw: Vec<&str> = raw_words(&line);
+                prop_assert_eq!(raw.len(), want.len(), "{}", line);
+                let is_assignment = |w: &str| {
+                    w.split_once('=').is_some_and(|(name, _)| {
+                        !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && !name.starts_with(|c: char| c.is_ascii_digit())
+                    })
+                };
+                prop_assert_eq!(raw.iter().position(|w| !is_assignment(w)), Some(assignments), "{}", line);
+                for word in &raw[assignments..] {
+                    prop_assert!(!is_assignment(word), "{} in {}", word, line);
+                    // Nothing zsh or a POSIX shell expands at the start of a word.
+                    prop_assert!(!word.starts_with(['=', '~', '#']), "{} in {}", word, line);
+                }
+            }
+        }
+
+        /// Text with no control character, weighted toward what breaks an
+        /// escaper: any Unicode; printable ASCII; short strings of digits and
+        /// of YAML and shell punctuation; and the words a format reads as
+        /// something other than a string.
+        fn any_text(max: usize) -> impl Strategy<Value = String> {
+            prop_oneof![
+                proptest::string::string_regex(&format!("[^\\p{{Cc}}]{{0,{max}}}")).expect("a regex"),
+                proptest::string::string_regex(&format!("[ -~]{{0,{max}}}")).expect("a regex"),
+                proptest::string::string_regex("[0-9eE.+-]{0,6}").expect("a regex"),
+                proptest::string::string_regex("[a-z0-9 :#~=&*!|>%@`'\"\\\\{}\\[\\],?$-]{0,8}").expect("a regex"),
+                prop::sample::select(vec![
+                    "true", "false", "True", "TRUE", "null", "Null", "~", "yes", "no", "on", "off", "8080", "-1",
+                    "3.12", "1e5", "0x1F", ".inf", "{a}", "[x]", "- a", "? a", ": a", "# a", "&a", "*a", "!a", "|", ">",
+                    "%a", "@a", "", " ", "a ", " a", "a: b", "a #b", "=a", "~/a", "a=b", "--x=y",
+                ])
+                .prop_map(str::to_string),
+            ]
+        }
+
+        /// The words of a rendered line as written, quotes kept: split on the
+        /// spaces outside single quotes.
+        fn raw_words(line: &str) -> Vec<&str> {
+            let mut words = Vec::new();
+            let (mut start, mut quoted, mut escaped) = (0, false, false);
+            for (i, c) in line.char_indices() {
+                match c {
+                    // Outside quotes a backslash takes the next character
+                    // literally (the `'\''` that writes a quote).
+                    _ if escaped => escaped = false,
+                    '\\' if !quoted => escaped = true,
+                    '\'' => quoted = !quoted,
+                    ' ' if !quoted => {
+                        words.push(&line[start..i]);
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            words.push(&line[start..]);
+            words
+        }
     }
 
     #[test]
@@ -592,4 +930,82 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a, "<paste-your-api-key-here>|true|200000|web|");
     }
+
+    /// The per-server header list renders inside the per-server loop in every
+    /// format, each value escaped for its format, the gateway key sentinel and
+    /// a client-header sentinel both intact.
+    #[test]
+    fn an_mcp_server_header_list_renders_nested_in_every_format() {
+        let server = |slug: &str| {
+            let mut m = BTreeMap::new();
+            m.insert("slug".to_string(), Value::String(slug.into()));
+            m.insert(
+                "headers".to_string(),
+                Value::List(vec![
+                    super::mcp_header_item("Authorization", format!("Bearer {API_KEY_PLACEHOLDER}")),
+                    super::mcp_header_item("X-Jira-Token", super::mcp_client_header_placeholder(slug, "X-Jira-Token")),
+                ]),
+            );
+            m
+        };
+        let phs = ph([("mcp_servers", Value::List(vec![server("jira"), server("wiki")]))]);
+        let bodies = [
+            (
+                TemplateFormat::Json,
+                r#"{"s": { {{#each mcp_servers}}"{{slug}}": { {{#each headers}}"{{name}}": "{{value}}"{{#unless @last}}, {{/unless}}{{/each}} }{{#unless @last}}, {{/unless}}{{/each}} } }"#,
+            ),
+            (
+                TemplateFormat::Yaml,
+                "s:\n{{#each mcp_servers}}  {{slug}}:\n{{#each headers}}    {{name}}: {{value}}\n{{/each}}{{/each}}",
+            ),
+            (
+                TemplateFormat::Toml,
+                "{{#each mcp_servers}}[s.{{slug}}.headers]\n{{#each headers}}\"{{name}}\" = \"{{value}}\"\n{{/each}}{{/each}}",
+            ),
+            (
+                TemplateFormat::Shell,
+                "{{#each mcp_servers}}{{#each headers}}echo {{value}}\n{{/each}}{{/each}}",
+            ),
+            (TemplateFormat::Text, "{{#each mcp_servers}}{{#each headers}}{{name}}={{value}};{{/each}}{{/each}}"),
+        ];
+        for (format, body) in bodies {
+            let out = render(body, format, &phs).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            for slug in ["jira", "wiki"] {
+                assert!(out.contains(&format!("<paste-your-{slug}-x-jira-token-here>")), "{format:?}:\n{out}");
+            }
+            assert_eq!(out.matches(API_KEY_PLACEHOLDER).count(), 2, "{format:?}:\n{out}");
+        }
+    }
+    /// The one command-line rendering: admin-set environment first, a variable
+    /// left to the developer absent, and every part a shell would split,
+    /// expand or read as an assignment single-quoted — on each side of the
+    /// safe set.
+    #[test]
+    fn a_local_command_line_is_the_whole_launch_and_shell_safe() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let env = |e: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+            e.iter().map(|(n, v)| (n.to_string(), v.map(str::to_string))).collect()
+        };
+        assert_eq!(local_command_line("npx", &args(&["-y", "@scope/pkg@1.0.0"]), &[]), "npx -y @scope/pkg@1.0.0");
+        assert_eq!(
+            local_command_line(
+                "npx",
+                &args(&["-y", "pkg@1.0.0"]),
+                &env(&[("LOG_LEVEL", Some("info")), ("API_TOKEN", None), ("NOTE", Some("two words")), ("EQ", Some("a=b"))]),
+            ),
+            "LOG_LEVEL=info NOTE='two words' EQ='a=b' npx -y pkg@1.0.0"
+        );
+        // Every safe character stays bare; each character outside the set quotes its part.
+        assert_eq!(local_command_line("a_b@c%d+e:g,h.i/j-k", &[], &[]), "a_b@c%d+e:g,h.i/j-k");
+        for unsafe_part in ["", "a b", "a;b", "$HOME", "`id`", "a|b", "a&b", "a>b", "a*b", "~", "~/x", "a\\b", "a\"b", "é",
+                            "a\tb", "#x", "(x)", "!x", "a?b", "{a,b}", "a=b", "=ls", "--port=8080", "pkg==1.0.0"] {
+            assert_eq!(local_command_line("cmd", &args(&[unsafe_part]), &[]), format!("cmd '{unsafe_part}'"), "{unsafe_part:?}");
+            // The command is quoted by the same rule: `FOO=bar` as a command
+            // never reads as an assignment.
+            assert_eq!(local_command_line(unsafe_part, &[], &[]), format!("'{unsafe_part}'"), "{unsafe_part:?}");
+        }
+        assert_eq!(local_command_line("cmd", &args(&["it's"]), &[]), "cmd 'it'\\''s'");
+        assert_eq!(local_command_line("/opt/my tool/run", &[], &env(&[("K", Some("$(id)"))])), "K='$(id)' '/opt/my tool/run'");
+    }
+
 }

@@ -27,6 +27,8 @@ pub mod keys;
 pub mod mcp;
 pub mod mcp_catalog;
 pub mod mcp_discovery;
+pub mod mcp_inputs;
+pub mod mcp_local;
 pub mod mcp_oauth;
 pub mod model_presets;
 pub mod model_fusion;
@@ -44,6 +46,7 @@ pub mod portal_manager;
 pub mod portal_mcp;
 pub mod portal_mcp_connections;
 pub mod portal_mcp_test;
+pub mod portal_pages;
 pub mod cli_dist;
 pub mod provision;
 pub mod quickstart;
@@ -816,7 +819,7 @@ pub enum ApiErrorCode {
     /// within its deadline. Sending it again may succeed. Append-only.
     RequestBodyIncomplete,
     /// The client is not offered to this workspace: the administrator has
-    /// disabled it under Client access. Append-only.
+    /// disabled it on the workspace's Portal & clients profile. Append-only.
     ClientDisabled,
     /// No destination list with that id in this tenant. Append-only.
     DestinationListNotFound,
@@ -827,9 +830,6 @@ pub enum ApiErrorCode {
     /// or a CIDR prefix with optional ports, or names every destination.
     /// Append-only.
     DestinationEntryInvalid,
-    /// The profile kind has only its tenant Default: no other profile of it
-    /// can be created, promoted or assigned to a workspace. Append-only.
-    ProfileKindDefaultOnly,
     /// The destination list is the built-in Web tool's only allowed list:
     /// deleting it would widen the Web tool to every public site. Detach it
     /// first. Append-only.
@@ -849,6 +849,57 @@ pub enum ApiErrorCode {
     /// A judge model the analysis agent could not call: no enabled text route
     /// serves it on a provider granted to the Agent workspace. Append-only.
     JudgeModelNotGranted,
+    /// A `server.json` document, a remote's header declaration, its fillers or
+    /// an input value break a rule (the message names it). Append-only.
+    McpRemoteInvalid,
+    /// A user tried to set an input the administrator fills. Append-only.
+    McpInputLocked,
+    /// An input id the upstream does not declare for this filler. Append-only.
+    McpInputUnknown,
+    /// A required input was left without a value. Append-only.
+    McpInputRequired,
+    /// Two upstreams routed on one virtual server would both read the same
+    /// client-sent header. Append-only.
+    McpClientHeaderCollision,
+    /// `Authorization` declared on a per-user OAuth upstream, whose token it
+    /// carries. Append-only.
+    McpInputReserved,
+    /// An upstream whose client fills `Authorization`, bound to a virtual
+    /// server that signs its clients in with OAuth (whose `Authorization`
+    /// carries the gateway's token): no client could ever reach it.
+    /// Append-only.
+    McpOauthClientAuthorization,
+    /// A choice the profile kind does not take: a client-access profile that
+    /// would be Layered or start blank, a workspace turned Off for client
+    /// access, or a client-access profile assigned to the Agent or Inline AI
+    /// workspace. Append-only.
+    ProfileChoiceUnsupported,
+    /// Two profiles of one kind were set as default at the same time, and the
+    /// other one won: reload and try again. Append-only.
+    ProfileDefaultChanged,
+    /// No local MCP server has this id (or the workspace is not granted it,
+    /// on the portal). Append-only.
+    McpLocalServerNotFound,
+    /// A local MCP server's slug is taken by another local server or by an
+    /// MCP endpoint. Append-only.
+    McpLocalServerSlugTaken,
+    /// A local MCP server's slug, name, description or command line breaks a
+    /// rule, or a package adopt carries a remote's fields (the message names
+    /// it). Append-only.
+    McpLocalServerInvalid,
+    /// One client config was asked for an MCP endpoint and a local MCP server
+    /// with the same slug: it holds one entry per slug. Append-only.
+    McpServerSlugClash,
+    /// A local MCP server granted to the Agent or the Inline AI workspace,
+    /// which have no developers to hand it to. Append-only.
+    McpLocalServerWorkspaceIneligible,
+    /// An edit naming another slug for a local MCP server: the slug is fixed
+    /// at creation. Append-only.
+    McpLocalServerSlugImmutable,
+    /// The portal page this route serves is hidden for the caller: every
+    /// workspace they belong to is on a Portal & clients profile that hides
+    /// it. Append-only.
+    PortalPageHidden,
 }
 
 /// Structured error response body matching the proxy's `ErrorResponse` format.
@@ -2570,6 +2621,12 @@ pub fn admin_router() -> Router<Arc<AdminState>> {
                 .patch(mcp::update_mcp_upstream_server)
                 .delete(mcp::delete_mcp_upstream_server),
         )
+        // Probe an upstream with the administrator's own values (no user, no
+        // client): the catalog it lists, or why it cannot be reached.
+        .route(
+            "/mcp/upstream-servers/{id}/actions/test",
+            post(mcp::test_mcp_upstream_server),
+        )
         .route(
             "/mcp/virtual-servers",
             get(mcp::list_mcp_virtual_servers).post(mcp::create_mcp_virtual_server),
@@ -2630,7 +2687,7 @@ pub fn admin_router() -> Router<Arc<AdminState>> {
             "/mcp/upstreams/{id}/connections/{user_id}",
             axum::routing::delete(mcp::delete_mcp_upstream_connection),
         )
-        // MCP server catalog — browse curated remote MCP servers + one-click adopt.
+        // MCP server catalog — browse `server.json` entries; adopt a remote or a package.
         .route(
             "/mcp/catalog",
             get(mcp_catalog::list_mcp_catalog).post(mcp_catalog::create_mcp_catalog_entry),
@@ -2651,6 +2708,17 @@ pub fn admin_router() -> Router<Arc<AdminState>> {
         .route(
             "/mcp/catalog/{id}/actions/adopt",
             post(mcp_catalog::adopt_mcp_catalog_entry),
+        )
+        // Local MCP servers — command lines a developer's machine starts.
+        .route(
+            "/mcp/local-servers",
+            get(mcp_local::list_mcp_local_servers).post(mcp_local::create_mcp_local_server),
+        )
+        .route(
+            "/mcp/local-servers/{id}",
+            get(mcp_local::get_mcp_local_server)
+                .patch(mcp_local::update_mcp_local_server)
+                .delete(mcp_local::delete_mcp_local_server),
         )
         // Tool Risk Rules — first-class CRUD over the per-tenant rule list.
         .route(
@@ -2842,6 +2910,18 @@ pub fn claim_exchange_router() -> Router<Arc<AdminState>> {
 }
 
 /// Portal API routes (user self-service — behind portal_auth middleware).
+///
+/// None of these is fenced by what a profile hides in the portal: each is on
+/// `portal_pages::NOT_FENCED_ROUTES`, read and judged not to answer with a
+/// session, a request or its content — `/stats`, `/workspaces/{id}/stats` and
+/// `/workspaces/{id}/my-limits` are aggregates, and `/home` leaves its recent
+/// sessions out itself. The activity routes are the four routers below, each
+/// carrying its fence. A route added here must be added to that list (locked
+/// by `every_portal_route_is_in_a_page_group_or_on_the_not_fenced_list`); one
+/// that returns per-session or per-request rows, or content, goes in the
+/// router of its group instead. Routes only: no router is nested or merged
+/// here (locked by
+/// `each_fenced_router_is_mounted_once_behind_its_own_fence_and_nothing_else_is_under_the_portal`).
 pub fn portal_router() -> Router<Arc<AdminState>> {
     Router::new()
         // Auth (me is behind middleware, login is handled separately)
@@ -2853,18 +2933,9 @@ pub fn portal_router() -> Router<Arc<AdminState>> {
         .route("/home", get(portal_home::home))
         // Stats
         .route("/stats", get(portal::my_stats))
-        // --- Self-service activity (member tier — own data only) ---
-        .route("/sessions", get(portal::my_sessions))
-        .route("/sessions/{id}/conversation", get(portal::my_session_conversation))
-        .route("/sessions/{id}/linked", get(portal::my_session_linked))
-        .route("/audit", get(portal::my_audit))
-        .route("/audit/filter-options", get(portal::my_audit_filter_options))
-        .route("/audit/media/{hash}", get(portal::my_media))
-        .route("/audit/tool-definitions/{hash}", get(portal::my_tool_definition_blob))
-        .route("/audit/{request_id}", get(portal::my_trace))
-        .route("/audit/{request_id}/web", get(portal::my_web_calls_for_request))
         // --- MCP self-service ---
         .route("/mcp/virtual-servers", get(portal_mcp::list_virtual_servers))
+        .route("/mcp/local-servers", get(portal_mcp::list_local_servers))
         // --- MCP per-user OAuth connections ---
         .route("/mcp/connections", get(portal_mcp_connections::list_connections))
         .route(
@@ -2874,6 +2945,10 @@ pub fn portal_router() -> Router<Arc<AdminState>> {
         .route(
             "/mcp/connections/{upstream_id}/actions/revoke",
             post(portal_mcp_connections::revoke_connection),
+        )
+        .route(
+            "/mcp/connections/{upstream_id}/inputs",
+            patch(portal_mcp_connections::update_inputs),
         )
         // --- MCP catalog smoke test ---
         .route(
@@ -2935,6 +3010,48 @@ pub fn portal_router() -> Router<Arc<AdminState>> {
             "/workspaces/{id}/automation-accounts/{said}/actions/revoke",
             post(portal_automation::revoke_automation_account),
         )
+}
+
+/// The Sessions page's own reads — refused while `sessions` is hidden for the
+/// caller. Like the three routers below, it carries its fence itself, as its
+/// last call, so it cannot be mounted without it; the fence reads what
+/// `portal_auth` resolved, so the router is mounted inside it.
+pub fn portal_sessions_router() -> Router<Arc<AdminState>> {
+    Router::new()
+        .route("/sessions", get(portal::my_sessions))
+        .route("/sessions/{id}/conversation", get(portal::my_session_conversation))
+        .route("/sessions/{id}/linked", get(portal::my_session_linked))
+        .route_layer(axum::middleware::from_fn(portal_pages::sessions_fence))
+}
+
+/// Conversation content, wherever it is opened from — a request's detail, its
+/// web calls, its media and its tool definitions: refused while `sessions` is
+/// hidden for the caller, whatever `requests` is. The browser's own loads (an
+/// `<img>`, a download link) reach these same routes through the console's
+/// proxy, so they are fenced with them.
+pub fn portal_content_router() -> Router<Arc<AdminState>> {
+    Router::new()
+        .route("/audit/media/{hash}", get(portal::my_media))
+        .route("/audit/tool-definitions/{hash}", get(portal::my_tool_definition_blob))
+        .route("/audit/{request_id}", get(portal::my_trace))
+        .route("/audit/{request_id}/web", get(portal::my_web_calls_for_request))
+        .route_layer(axum::middleware::from_fn(portal_pages::content_fence))
+}
+
+/// The Requests page's list — refused while `requests` is hidden for the
+/// caller; answered without content while `sessions` is.
+pub fn portal_requests_router() -> Router<Arc<AdminState>> {
+    Router::new()
+        .route("/audit", get(portal::my_audit))
+        .route_layer(axum::middleware::from_fn(portal_pages::requests_fence))
+}
+
+/// The filter options both activity pages read (configuration, no content) —
+/// refused only while both are hidden.
+pub fn portal_activity_options_router() -> Router<Arc<AdminState>> {
+    Router::new()
+        .route("/audit/filter-options", get(portal::my_audit_filter_options))
+        .route_layer(axum::middleware::from_fn(portal_pages::options_fence))
 }
 
 /// The admin plane's per-request session check. The browser tier calls it once

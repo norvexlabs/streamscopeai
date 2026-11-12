@@ -87,6 +87,38 @@ pub enum KeyDelivery {
     Environment,
 }
 
+/// Whether a template has a form for a LOCAL MCP server — one the developer's
+/// own machine starts from a command line, written as the client's stdio
+/// entry — and where it writes it. A declaration, never inferred from the
+/// body: the server merges local servers only into a template that declares a
+/// form, and says so for every other selected client instead of dropping them
+/// silently.
+///
+/// A local server is an `mcp_servers[]` item with `local = true`, appended
+/// after the gateway's: it carries `slug`, `name`, `command`, `args` (a list
+/// of `{value}`) and `env` (a list of `{name, value}`), and none of a gateway
+/// item's `url` / `headers`. A template with a form branches on
+/// `{{#if local}}` inside its `{{#each mcp_servers}}` loop.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LocalMcpForm {
+    /// No form: the template is never handed a local server.
+    #[default]
+    None,
+    /// The body, or a companion written in every scope, writes it.
+    Config,
+    /// Only a file written under a project scope writes it (Claude Code's
+    /// `.mcp.json`): the template's other parts skip a local item.
+    Project,
+}
+
+impl LocalMcpForm {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 /// A part of a template's configuration that is not its body: a credential
 /// the tool reads from its own secrets or `.env` file, a part of the config
 /// the tool reads from a file of its own (Claude Code's project MCP servers),
@@ -195,6 +227,10 @@ pub struct ClientProfileTemplate {
     /// Checked when the profile is saved. Omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keyed_arrays: BTreeMap<String, String>,
+    /// Whether, and where, this template writes a local MCP server — see
+    /// [`LocalMcpForm`]. Omitted from the wire when it has no form.
+    #[serde(default, skip_serializing_if = "LocalMcpForm::is_none")]
+    pub local_mcp: LocalMcpForm,
     pub body: String,
 }
 

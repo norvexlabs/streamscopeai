@@ -1,5 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import { attach, attachmentsChanged, detach, entriesFromText, unattached } from '#lib/destinationAttachments.js';
+import { attach, attachmentsChanged, detach, entriesFromText, unattached, useLabel } from '#lib/destinationAttachments.js';
+
+describe('useLabel', () => {
+  const names = new Map([['p-finance', 'Finance']]);
+
+  it('a sandbox use names its profile, and the Web tool has none', () => {
+    expect(useLabel({ consumer: 'sandbox', mode: 'allow', profile_id: 'p-finance' }, names)).toBe('Sandbox allow · Finance');
+    expect(useLabel({ consumer: 'sandbox', mode: 'block', profile_id: 'p-finance' }, names)).toBe('Sandbox block · Finance');
+    expect(useLabel({ consumer: 'web', mode: 'allow', profile_id: null }, names)).toBe('Web allow');
+  });
+
+  it('a profile whose name is not known is left unnamed', () => {
+    expect(useLabel({ consumer: 'sandbox', mode: 'allow', profile_id: 'p-other' }, names)).toBe('Sandbox allow');
+    expect(useLabel({ consumer: 'sandbox', mode: 'allow' }, names)).toBe('Sandbox allow');
+  });
+});
 
 describe('attach / detach', () => {
   it('attaches a list once, and re-attaching changes only its mode', () => {

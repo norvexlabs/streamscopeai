@@ -133,6 +133,7 @@ mod tests {
             key_delivery: KeyDelivery::default(),
             companions,
             keyed_arrays: Default::default(),
+            local_mcp: Default::default(),
             body: String::new(),
         }
     }

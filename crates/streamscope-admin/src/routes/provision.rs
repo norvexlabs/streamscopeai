@@ -27,10 +27,10 @@ use crate::AdminState;
 use crate::db::tenant::TenantConn;
 
 use super::portal_auth::PortalUser;
-use super::portal_manager::confine_to_key_workspace;
+use super::portal_manager::require_workspace_member;
 use super::quickstart::{
-    build_render_context, load_profiles, populate_template_placeholders, render_template_with,
-    template_needs_key, KeySpec, McpServerSelection, MintedKey, MintedSecrets, RouteCache,
+    build_render_context, load_local_selection, load_profiles, populate_template_placeholders, render_template_with,
+    template_needs_key, KeySpec, McpLocalServerSelection, McpSelections, RenderReader, McpServerSelection, McpServerWarning, MintedKey, MintedSecrets, RouteCache,
 };
 use super::{ApiError, ApiErrorCode, ApiErrorResponse};
 
@@ -60,6 +60,10 @@ pub struct ProvisionBundleRequest {
     /// MCP virtual servers to wire into every MCP-capable selected template.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerSelection>,
+    /// Local MCP servers (run on the developer's own machine) to write into
+    /// every selected template that has a form for one.
+    #[serde(default)]
+    pub mcp_local_servers: Vec<McpLocalServerSelection>,
 }
 
 /// The gateway key the bundle embeds (sans plaintext — that rides once in
@@ -90,6 +94,9 @@ pub struct ProvisionClientBundle {
     pub rendered_instructions: Option<String>,
     /// Command that launches the tool (e.g. `claude`). `None` for GUI clients.
     pub launch_command: Option<String>,
+    /// The selected MCP servers, virtual or local, this client's config leaves
+    /// out, each with why — the same list the Web Quickstart returns for the template.
+    pub warnings: Vec<McpServerWarning>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -133,9 +140,6 @@ pub async fn bundle(
     Extension(user): Extension<PortalUser>,
     Json(body): Json<ProvisionBundleRequest>,
 ) -> Result<Json<ProvisionBundleResponse>, ApiError> {
-    // A portal `ak-` key (CI service account) may only provision within its
-    // bound workspace — same confinement as the web quickstart render.
-    confine_to_key_workspace(&user, body.workspace_id)?;
     if body.clients.is_empty() {
         return Err(ApiError::bad_request("select at least one client")
             .code(ApiErrorCode::ValidationFailed));
@@ -147,10 +151,16 @@ pub async fn bundle(
         ApiError::internal("internal error")
     })?;
 
+    // Before anything is read for the workspace: a portal `ak-` key (CI service
+    // account) provisions only within its bound workspace, and the caller is a
+    // member — a refused client would otherwise tell a non-member what another
+    // team is offered. Same gate as the web quickstart render.
+    let member = require_workspace_member(&mut tx, &user, body.workspace_id).await?;
+
     // Resolve every selection against the tenant's profile snapshot up front
     // so a bad selection fails before any key is minted.
     let profiles = load_profiles(&mut tx).await?;
-    let access = super::client_access_profiles::effective_client_access(&mut tx, Some(body.workspace_id)).await?;
+    let access = super::client_access_profiles::effective_client_access(&mut tx, member).await?;
     let mut selected: Vec<(String, String, Option<String>, usize, ClientProfileTemplate)> =
         Vec::new();
     let mut seen: HashSet<(String, usize)> = HashSet::new();
@@ -204,7 +214,7 @@ pub async fn bundle(
         &state,
         tenant_uuid,
         &user,
-        body.workspace_id,
+        member,
         body.key.as_ref(),
         needs_key,
         &key_name_prefix,
@@ -217,13 +227,16 @@ pub async fn bundle(
     // same `llm_provider_id`, so the route join + catalog probe runs once, not
     // once per template.
     let mut route_cache = RouteCache::new();
+    // Read once for the whole bundle, like the routes: every selected client
+    // is handed the same local servers.
+    let local_servers = load_local_selection(&mut tx, &body.mcp_local_servers, member).await?;
     for (client_id, label, launch_command, template_index, template) in selected {
-        let placeholders = populate_template_placeholders(
+        let (placeholders, warnings) = populate_template_placeholders(
             &mut tx,
             &ctx,
             &template,
             body.llm_provider_id,
-            &body.mcp_servers,
+            McpSelections { servers: &body.mcp_servers, local: &local_servers, reader: RenderReader::Cli },
             body.workspace_id,
             &mut route_cache,
         )
@@ -239,6 +252,7 @@ pub async fn bundle(
             placeholders,
             rendered_body,
             rendered_instructions,
+            warnings,
         });
     }
 
@@ -323,22 +337,7 @@ pub async fn client_access(
     Extension(user): Extension<PortalUser>,
     axum::extract::Query(q): axum::extract::Query<ClientAccessQuery>,
 ) -> Result<Json<super::client_access_profiles::WorkspaceClientAccess>, ApiError> {
-    confine_to_key_workspace(&user, q.workspace_id)?;
-    let member: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
-    )
-    .bind(q.workspace_id)
-    .bind(user.user_id)
-    .fetch_one(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("client access membership: {e}");
-        ApiError::internal("internal error")
-    })?;
-    if !member {
-        return Err(ApiError::forbidden("you are not a member of this workspace")
-            .code(ApiErrorCode::WorkspaceMembershipRequired));
-    }
-    let access = super::client_access_profiles::effective_client_access(db.conn(), Some(q.workspace_id)).await?;
+    let member = require_workspace_member(db.conn(), &user, q.workspace_id).await?;
+    let access = super::client_access_profiles::effective_client_access(db.conn(), member).await?;
     Ok(Json(access.into_wire()))
 }

@@ -257,6 +257,29 @@ pub async fn discover_upstream_oauth(
     Ok(Json(resp))
 }
 
+/// Discover `upstream_url`'s OAuth endpoints (RFC 9728 → 8414) under the same
+/// deadline and with the same single generic refusal as the discover action —
+/// for a catalog adopt whose entry carries no OAuth hints. The caller refreshes
+/// the trusted-CA cache first.
+pub(crate) async fn discover_oauth_endpoints(upstream_url: &str) -> Result<DiscoverOauthResponse, ApiError> {
+    match tokio::time::timeout(
+        OVERALL_DEADLINE,
+        run_discovery(upstream_url, None, super::mcp::MCP_EGRESS),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => {
+            tracing::warn!(upstream = %upstream_url, "oauth discovery failed: {e}");
+            Err(discovery_failed())
+        }
+        Err(_elapsed) => {
+            tracing::warn!(upstream = %upstream_url, "oauth discovery exceeded deadline");
+            Err(discovery_failed())
+        }
+    }
+}
+
 /// RFC 7591 client name presented to upstream authorization servers.
 const DCR_CLIENT_NAME: &str = "Streamscope MCP Gateway";
 

@@ -456,9 +456,9 @@ export function resolvePortalWorkspace(list: PortalWorkspaceMembership[], rememb
 /** Lightweight profile identity for the per-kind workspace profile pickers. */
 export type ProfileLite = { id: string; name: string; is_default: boolean };
 
-export type ProfileListKind = 'tools' | 'guardrail' | 'transform' | 'expert';
+export type ProfileListKind = 'tools' | 'guardrail' | 'transform' | 'expert' | 'client_access';
 
-const PROFILE_LIST_KINDS: readonly ProfileListKind[] = ['tools', 'guardrail', 'transform', 'expert'];
+const PROFILE_LIST_KINDS: readonly ProfileListKind[] = ['tools', 'guardrail', 'transform', 'expert', 'client_access'];
 
 /** A read of one profile list: its order among that kind's reads, and the
  *  tenant it asked for. */
@@ -478,14 +478,16 @@ class ProfileLists {
         guardrail: new TenantHeld<ProfileLite[]>([]),
         transform: new TenantHeld<ProfileLite[]>([]),
         expert: new TenantHeld<ProfileLite[]>([]),
+        client_access: new TenantHeld<ProfileLite[]>([]),
     };
-    readonly #reads: Record<ProfileListKind, number> = { tools: 0, guardrail: 0, transform: 0, expert: 0 };
-    readonly #landed: Record<ProfileListKind, number> = { tools: 0, guardrail: 0, transform: 0, expert: 0 };
+    readonly #reads: Record<ProfileListKind, number> = { tools: 0, guardrail: 0, transform: 0, expert: 0, client_access: 0 };
+    readonly #landed: Record<ProfileListKind, number> = { tools: 0, guardrail: 0, transform: 0, expert: 0, client_access: 0 };
 
     get tools(): ProfileLite[] { return this.#lists.tools.value; }
     get guardrail(): ProfileLite[] { return this.#lists.guardrail.value; }
     get transform(): ProfileLite[] { return this.#lists.transform.value; }
     get expert(): ProfileLite[] { return this.#lists.expert.value; }
+    get clientAccess(): ProfileLite[] { return this.#lists.client_access.value; }
 
     begin(kind: ProfileListKind): ProfileRead {
         return { kind, n: ++this.#reads[kind], tenant: tenantSlug() };

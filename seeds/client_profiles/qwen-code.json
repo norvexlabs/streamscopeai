@@ -15,16 +15,17 @@
       "format": "shell",
       "title": "Qwen Code · ~/.qwen/.env",
       "instructions": "Qwen Code reads its provider config from OpenAI-compatible environment variables (it auto-loads ~/.qwen/.env). With these set, `qwen` talks to the gateway in OpenAI wire format; the gateway translates to whatever the upstream natively speaks. `QWEN_CODE_MAX_OUTPUT_TOKENS` caps each reply. If you'd rather not use the file, export the same variables in your shell.",
-      "body": "OPENAI_API_KEY={{api_key}}\nOPENAI_BASE_URL={{base_url}}\nOPENAI_MODEL={{model_alias}}\n{{#if max_output_tokens}}QWEN_CODE_MAX_OUTPUT_TOKENS={{max_output_tokens}}\n{{/if}}",
       "companions": [
         {
           "path": "~/.qwen/settings.json",
           "format": "json",
           "title": "Qwen Code · ~/.qwen/settings.json",
           "instructions": "Merge these keys into your existing ~/.qwen/settings.json — keep everything else in it. `selectedType: openai` makes Qwen Code use the variables above even if you signed in another way before (a project's own `.qwen/settings.json`, or a later `/auth`, still overrides it).{{#if context_window}} `contextWindowSize` tells Qwen Code the model's real context window, so it fits each reply in the room left and compacts the conversation in time; otherwise it assumes 200 000 tokens.{{/if}} Usage statistics and the update check are off (`privacy.usageStatisticsEnabled`, `general.enableAutoUpdate`); an admin who wants them back can edit this template.",
-          "body": "{\"privacy\": {\"usageStatisticsEnabled\": false}, \"general\": {\"enableAutoUpdate\": false}, \"security\": {\"auth\": {\"selectedType\": \"openai\"}}{{#if context_window}}, \"model\": {\"generationConfig\": {\"contextWindowSize\": {{context_window}}}}{{/if}}{{#if mcp_servers}}, \"mcpServers\": { {{#each mcp_servers}}\"{{slug}}\": {\"httpUrl\": \"{{url}}\", \"headers\": {\"Authorization\": \"Bearer {{api_key}}\"} }{{#unless @last}}, {{/unless}}{{/each}} }{{/if}} }"
+          "body": "{\"privacy\": {\"usageStatisticsEnabled\": false}, \"general\": {\"enableAutoUpdate\": false}, \"security\": {\"auth\": {\"selectedType\": \"openai\"}}{{#if context_window}}, \"model\": {\"generationConfig\": {\"contextWindowSize\": {{context_window}}}}{{/if}}{{#if mcp_servers}}, \"mcpServers\": { {{#each mcp_servers}}\"{{slug}}\": {{#if local}}{\"command\": \"{{command}}\", \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}}, \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}} }{{else}}{\"httpUrl\": \"{{url}}\"{{#if headers}}, \"headers\": { {{#each headers}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}} }{{/if}}{{#unless @last}}, {{/unless}}{{/each}} }{{/if}} }"
         }
-      ]
+      ],
+      "local_mcp": "config",
+      "body": "OPENAI_API_KEY={{api_key}}\nOPENAI_BASE_URL={{base_url}}\nOPENAI_MODEL={{model_alias}}\n{{#if max_output_tokens}}QWEN_CODE_MAX_OUTPUT_TOKENS={{max_output_tokens}}\n{{/if}}"
     }
   ]
 }

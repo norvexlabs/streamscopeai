@@ -410,3 +410,63 @@
   package: zlib
   reason: "zlib 1.3.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as zlib 1.4-r0, not yet in the image; re-checked 2026-11-07: no rebuild yet. Reached by inflating compressed input: the schema installs no extension that inflates (pg_trgm and btree_gin; no pgcrypto), and a restore's pg_restore inflates the backup archive the operator names, which only a writer of the backup destination can plant"
   expires: 2027-01-01
+- id: CVE-2026-107778
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-112314
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-112320
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-112321
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-112322
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-112323
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-119079
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-40355
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-40356
+  artifact: postgres
+  package: krb5-libs
+  reason: "krb5-libs 1.22.2-r1 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as krb5-libs 1.22.3-r0, not yet in the image (18.6-alpine, 18-alpine and 18.6-alpine3.24 all still name this digest; the Debian 18.6-trixie build carries fixable zlib1g highs of its own); re-checked 2026-11-11: no rebuild yet. Reached through GSSAPI/Kerberos authentication only: the deployment adds no gss line to the image's default pg_hba (scram-sha-256), and the gateway's own clients connect with a Rust driver that links no Kerberos"
+  expires: 2026-12-12
+- id: CVE-2026-125350
+  artifact: postgres
+  package: libxslt
+  reason: "libxslt 1.1.43-r3 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as libxslt 1.1.43-r4, not yet in the image; re-checked 2026-11-11: no rebuild yet. Reached only through the xml2 contrib extension's xslt_process(); the schema installs pg_trgm and btree_gin only"
+  expires: 2026-12-12
+- id: CVE-2026-87636
+  artifact: postgres
+  package: libxslt
+  reason: "libxslt 1.1.43-r3 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as libxslt 1.1.43-r4, not yet in the image; re-checked 2026-11-11: no rebuild yet. Reached only through the xml2 contrib extension's xslt_process(); the schema installs pg_trgm and btree_gin only"
+  expires: 2026-12-12
+- id: CVE-2026-9947
+  artifact: postgres
+  package: libxslt
+  reason: "libxslt 1.1.43-r3 in the official postgres:18.6-alpine3.24 image (built 2026-11-05); Alpine 3.24 ships the fix as libxslt 1.1.43-r4, not yet in the image; re-checked 2026-11-11: no rebuild yet. Reached only through the xml2 contrib extension's xslt_process(); the schema installs pg_trgm and btree_gin only"
+  expires: 2026-12-12

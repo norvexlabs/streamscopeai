@@ -1,17 +1,28 @@
 //! Client access — the CONTENT adapter for the `client_access` profile kind:
 //! which client profiles a workspace is offered (`client_access_members`), the
 //! destination lists its developers' sandbox attaches as allow or block
-//! (`client_access_destinations`), and its sandbox settings
-//! (`client_access_sandbox`).
+//! (`client_access_destinations`), its sandbox settings
+//! (`client_access_sandbox`), and what it hides in the portal from its
+//! workspaces' members (`client_access_portal`).
 //!
-//! The kind has only its tenant **Default**: every workspace resolves to it
-//! ([`effective_client_access`]). Its membership is seeded once — when the
-//! profile is created, for a new tenant or an existing one — and never on
+//! Every profile of the kind is **Standalone**: it owns its whole content, and
+//! an edit to the Default reaches no other profile (a destination list is
+//! attached by id, so its entries are shared). A workspace resolves to the
+//! profile assigned to it, else to the tenant's Default
+//! ([`effective_client_access`], or [`offered_clients`] for the client set
+//! alone); the Agent and Inline AI workspaces always resolve to the Default —
+//! a rule the resolution itself holds, beside the assignment's refusal.
+//!
+//! A profile's membership is written once — the Default's when the tenant gets
+//! it, another's when it is created from a copy or the seed — and never on
 //! restart, so a trim survives a reconcile; a client added later (a new
-//! release's builtin) is not offered until an admin enables it.
+//! release's builtin) is not offered on a profile until an admin enables it
+//! there.
 //!
-//! Read admin-side only — by the portal quickstart and the provision bundle —
-//! and never shipped in a config body (`ProfileKind::on_edge`).
+//! Read admin-side only — by the portal quickstart, the provision bundle and
+//! `portal_auth`, which resolves what the portal hides for each caller
+//! ([`hidden_pages`]) — and never shipped in a config
+//! body (`ProfileKind::on_edge`).
 
 use axum::extract::Path;
 use axum::Json;
@@ -21,6 +32,9 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::destination_lists::DestinationMode;
+use super::portal_auth::PortalUser;
+use super::portal_manager::MemberOf;
+use super::portal_pages::{HiddenPages, PortalPage};
 use super::{ActionResponse, ApiError, ApiErrorCode, ApiErrorResponse};
 use crate::db::tenant::{Scoped, TenantConn};
 use crate::middleware::AuditDiffSink;
@@ -77,6 +91,11 @@ pub struct ClientAccessResponse {
     pub clients: Vec<ClientAccessClient>,
     pub destinations: Vec<AttachedDestinationList>,
     pub settings: SandboxSettings,
+    /// What the portal hides from the members of the workspaces on this
+    /// profile, `sessions` before `requests`: `sessions` is the Sessions page
+    /// and every conversation's content, `requests` the Requests page. Hidden
+    /// for a member only when every workspace they belong to hides it.
+    pub hidden_pages: Vec<PortalPage>,
 }
 
 /// `PATCH /api/v1/admin/profiles/{id}/client-access`. Each section absent =
@@ -91,6 +110,11 @@ pub struct UpdateClientAccessRequest {
     pub destinations: Option<Vec<DestinationAttachment>>,
     #[serde(default)]
     pub settings: Option<SandboxSettingsPatch>,
+    /// What the portal hides for the profile's workspaces: the whole set — a
+    /// key left out is shown again. A key that is not a portal page is refused
+    /// (422) and nothing is written.
+    #[serde(default)]
+    pub hidden_pages: Option<Vec<PortalPage>>,
 }
 
 /// The sandbox settings to change; a field absent is unchanged.
@@ -182,10 +206,14 @@ pub async fn get_profile_client_access(
         (status = 200, description = "The updated content", body = ClientAccessResponse),
         (status = 400, description = "Unknown client or list, or a list attached twice", body = ApiErrorResponse),
         (status = 404, description = "Profile not found / not a client-access profile", body = ApiErrorResponse),
+        (status = 422, description = "The body does not parse — a `hidden_pages` key that is not a portal page among them (`validation_failed`); nothing is written", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
+/// Replace the sections sent — the clients offered, the destination lists, the
+/// sandbox settings, the hidden portal pages — and leave the others as they
+/// are.
 pub async fn update_profile_client_access(
     mut db: TenantConn,
     axum::Extension(audit_sink): axum::Extension<AuditDiffSink>,
@@ -193,13 +221,13 @@ pub async fn update_profile_client_access(
     Json(body): Json<UpdateClientAccessRequest>,
 ) -> Result<Json<ClientAccessResponse>, ApiError> {
     let tenant_id = db.tenant_uuid();
-    let is_default = ensure_client_access_profile(db.conn(), id).await?;
-    let before = load_content(db.conn(), id, is_default).await?;
 
     let mut tx = db.conn().begin().await.map_err(|e| {
         tracing::error!("update client access (begin): {e}");
         ApiError::internal("failed to update client access")
     })?;
+    let is_default = ensure_client_access_profile(&mut tx, id).await?;
+    let before = load_content(&mut tx, id, is_default).await?;
     if let Some(clients) = &body.clients {
         let mut keys = clients.clone();
         keys.sort_unstable();
@@ -221,7 +249,8 @@ pub async fn update_profile_client_access(
             .map_err(write_failed("clear clients"))?;
         sqlx::query(
             "INSERT INTO client_access_members (tenant_id, profile_id, client_profile_id) \
-             SELECT $1, $2, c FROM unnest($3::uuid[]) AS c",
+             SELECT $1, $2, c FROM unnest($3::uuid[]) AS c \
+             ON CONFLICT DO NOTHING",
         )
         .bind(tenant_id)
         .bind(id)
@@ -272,9 +301,30 @@ pub async fn update_profile_client_access(
         .await
         .map_err(write_failed("write sandbox settings"))?;
     }
+    // One row, written whole by one statement: of two concurrent saves the
+    // later one stands — never a mix of the two.
+    if let Some(pages) = &body.hidden_pages {
+        let hidden = HiddenPages::from_pages(pages);
+        sqlx::query(
+            "INSERT INTO client_access_portal (tenant_id, profile_id, hide_sessions, hide_requests) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (tenant_id, profile_id) DO UPDATE SET \
+               hide_sessions = EXCLUDED.hide_sessions, hide_requests = EXCLUDED.hide_requests, \
+               updated_at = now()",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(hidden.hides(PortalPage::Sessions))
+        .bind(hidden.hides(PortalPage::Requests))
+        .execute(&mut *tx)
+        .await
+        .map_err(write_failed("write hidden pages"))?;
+    }
+    // Read before the commit: the audited "after" is what this request wrote,
+    // not what a later writer left.
+    let after = load_content(&mut tx, id, is_default).await?;
     tx.commit().await.map_err(write_failed("commit"))?;
 
-    let after = load_content(db.conn(), id, is_default).await?;
     audit_sink.record(Some(&before), Some(&after));
     Ok(Json(after))
 }
@@ -303,6 +353,10 @@ pub async fn attach_developer_defaults(
     let tenant_id = db.tenant_uuid();
     let is_default = ensure_client_access_profile(db.conn(), id).await?;
     let before = load_content(db.conn(), id, is_default).await?;
+    let mut tx = db.conn().begin().await.map_err(|e| {
+        tracing::error!("attach developer defaults (begin): {e}");
+        ApiError::internal("failed to update client access")
+    })?;
     let (keys, modes): (Vec<String>, Vec<&str>) = SeedLoader::new()
         .load_destination_lists()
         .into_iter()
@@ -318,11 +372,13 @@ pub async fn attach_developer_defaults(
     .bind(id)
     .bind(&keys)
     .bind(&modes)
-    .execute(db.conn())
+    .execute(&mut *tx)
     .await
     .map_err(write_failed("attach developer defaults"))?
     .rows_affected();
-    let after = load_content(db.conn(), id, is_default).await?;
+    // Read before the commit: the audited "after" is what this request wrote.
+    let after = load_content(&mut tx, id, is_default).await?;
+    tx.commit().await.map_err(write_failed("attach developer defaults (commit)"))?;
     audit_sink.record(Some(&before), Some(&after));
     Ok(Json(ActionResponse::ok().with_message(format!("{attached} destination lists attached."))))
 }
@@ -331,32 +387,125 @@ pub async fn attach_developer_defaults(
 // Resolution
 // ---------------------------------------------------------------------------
 
-/// What a workspace is offered (`None`: a caller with no workspace — a person
-/// across their workspaces). Client-access profiles are not assigned per
-/// workspace, so every workspace resolves to the tenant's Default; a tenant
-/// without one is offered nothing.
-pub(crate) async fn effective_client_access(
-    conn: &mut Scoped,
-    _workspace_id: Option<Uuid>,
-) -> Result<ClientAccess, ApiError> {
-    let profile: Option<Uuid> =
-        sqlx::query_scalar("SELECT id FROM profiles WHERE kind = 'client_access' AND is_default")
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(read_failed("resolve client-access profile"))?;
-    let Some(profile) = profile else {
-        tracing::warn!("no Default client-access profile: no client is offered");
-        return Ok(ClientAccess { clients: Default::default(), sandbox: policy(Vec::new(), Vec::new(), SandboxSettings::default()) });
+/// The profile the workspace `$workspace` (a SQL expression for its id)
+/// resolves to, as a SQL expression: the client-access profile assigned to it,
+/// else the tenant's Default. Two joins narrow the assignment, so the rule
+/// holds whatever wrote the row:
+/// - the profile must be of the kind — a row pointing at another kind's
+///   profile resolves to the Default, not to that profile's (absent) content;
+/// - the workspace must not be the Agent or the Inline AI one — both always
+///   resolve to the Default.
+///
+/// The one spelling of the resolution: a workspace's clients and sandbox
+/// ([`RESOLVE_PROFILE_SQL`]) and a caller's hidden pages ([`HIDDEN_PAGES_SQL`])
+/// both read it.
+macro_rules! resolved_profile_sql {
+    ($workspace:literal) => {
+        concat!(
+            "COALESCE( \
+               (SELECT p.id FROM workspace_profile_assignments a \
+                JOIN profiles p ON p.id = a.profile_id AND p.kind = 'client_access' \
+                JOIN workspaces w ON w.id = a.workspace_id AND w.role NOT IN ('agent', 'inline') \
+                WHERE a.workspace_id = ",
+            $workspace,
+            " AND a.kind = 'client_access'), \
+               (SELECT id FROM profiles WHERE kind = 'client_access' AND is_default))"
+        )
     };
+}
+
+/// The profile workspace `$1` resolves to.
+const RESOLVE_PROFILE_SQL: &str = concat!("SELECT ", resolved_profile_sql!("$1"));
+
+/// What the portal hides for a caller (`$1` the user, `$2` the workspace an
+/// `ak-` key is bound to, or NULL): what the profile of EVERY workspace the
+/// caller acts in hides — a person's memberships, a key's one workspace. A
+/// caller in no workspace follows the Default. Each workspace is one row of
+/// `effective`; a profile without a row hides nothing.
+const HIDDEN_PAGES_SQL: &str = concat!(
+    "WITH mine AS ( \
+       SELECT wm.workspace_id AS id FROM workspace_members wm \
+       WHERE wm.user_id = $1 AND $2::uuid IS NULL \
+       UNION ALL \
+       SELECT w.id FROM workspaces w WHERE w.id = $2), \
+     effective AS ( \
+       SELECT ",
+    resolved_profile_sql!("mine.id"),
+    " AS profile_id FROM mine \
+       UNION ALL \
+       SELECT id FROM profiles \
+       WHERE kind = 'client_access' AND is_default AND NOT EXISTS (SELECT 1 FROM mine)) \
+     SELECT COALESCE(bool_and(COALESCE(h.hide_sessions, false)), false), \
+            COALESCE(bool_and(COALESCE(h.hide_requests, false)), false) \
+     FROM effective e \
+     LEFT JOIN client_access_portal h ON h.profile_id = e.profile_id"
+);
+
+/// What the portal hides for `user` — the ONE reader of that rule. Called
+/// once per portal request, by `portal_auth`, which attaches the answer to the
+/// request: the page fences, the request list, the Home and
+/// `GET /portal/auth/me` read it there. One statement, never cached, so an
+/// administrator's change holds from the caller's next request.
+pub(crate) async fn hidden_pages(conn: &mut Scoped, user: &PortalUser) -> Result<HiddenPages, sqlx::Error> {
+    let (sessions, requests): (bool, bool) = sqlx::query_as(HIDDEN_PAGES_SQL)
+        .bind(user.user_id)
+        .bind(user.key_workspace_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(HiddenPages::new(sessions, requests))
+}
+
+/// The one resolution behind [`offered_clients`] and
+/// [`effective_client_access`]; `None` for a tenant without a Default.
+async fn resolve_profile(conn: &mut Scoped, workspace_id: Uuid) -> Result<Option<Uuid>, ApiError> {
+    let profile: Option<Uuid> = sqlx::query_scalar(RESOLVE_PROFILE_SQL)
+        .bind(workspace_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(read_failed("resolve client-access profile"))?;
+    if profile.is_none() {
+        tracing::warn!("no Default client-access profile: no client is offered");
+    }
+    Ok(profile)
+}
+
+/// The ids of the live clients `profile_id` offers.
+async fn profile_clients(conn: &mut Scoped, profile_id: Uuid) -> Result<std::collections::BTreeSet<String>, ApiError> {
     let clients: Vec<String> = sqlx::query_scalar(
         "SELECT c.profile_key FROM client_access_members m \
          JOIN client_profiles c ON c.id = m.client_profile_id AND NOT c.suppressed \
          WHERE m.profile_id = $1",
     )
-    .bind(profile)
+    .bind(profile_id)
     .fetch_all(&mut *conn)
     .await
     .map_err(read_failed("load offered clients"))?;
+    Ok(clients.into_iter().collect())
+}
+
+/// The ids of the clients the member's workspace is offered, and nothing else
+/// — for a reader that only asks "is this client offered" (the quickstart's
+/// list, its client read and its render). The resolution of
+/// [`effective_client_access`], without the sandbox policy.
+pub(crate) async fn offered_clients(
+    conn: &mut Scoped,
+    member: MemberOf,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    match resolve_profile(conn, member.workspace_id()).await? {
+        Some(profile) => profile_clients(conn, profile).await,
+        None => Ok(Default::default()),
+    }
+}
+
+/// What the member's workspace is offered: the content of the client-access
+/// profile assigned to it, else of the tenant's Default; a tenant without a
+/// Default is offered nothing. It takes a [`MemberOf`], so it answers only a
+/// caller that passed the membership gate for that workspace.
+pub(crate) async fn effective_client_access(conn: &mut Scoped, member: MemberOf) -> Result<ClientAccess, ApiError> {
+    let Some(profile) = resolve_profile(conn, member.workspace_id()).await? else {
+        return Ok(ClientAccess { clients: Default::default(), sandbox: policy(Vec::new(), Vec::new(), SandboxSettings::default()) });
+    };
+    let clients = profile_clients(conn, profile).await?;
     let lists: Vec<(String, serde_json::Value)> = sqlx::query_as(
         "SELECT d.mode, l.entries FROM client_access_destinations d \
          JOIN destination_lists l ON l.id = d.list_id AND NOT l.suppressed \
@@ -368,7 +517,7 @@ pub(crate) async fn effective_client_access(
     .map_err(read_failed("load sandbox destinations"))?;
     let flat = super::destination_lists::Flattened::from_rows(lists);
     let settings = load_settings(conn, profile).await?;
-    Ok(ClientAccess { clients: clients.into_iter().collect(), sandbox: policy(flat.allow, flat.block, settings) })
+    Ok(ClientAccess { clients, sandbox: policy(flat.allow, flat.block, settings) })
 }
 
 fn policy(allow: Vec<String>, block: Vec<String>, settings: SandboxSettings) -> SandboxPolicy {
@@ -454,21 +603,119 @@ async fn load_content(conn: &mut Scoped, id: Uuid, is_default: bool) -> Result<C
             })
             .collect(),
         settings: load_settings(conn, id).await?,
+        hidden_pages: load_hidden_pages(conn, id).await?,
     })
 }
 
+/// What `profile_id` hides, `sessions` before `requests`.
+async fn load_hidden_pages(conn: &mut Scoped, profile_id: Uuid) -> Result<Vec<PortalPage>, ApiError> {
+    let row: Option<(bool, bool)> =
+        sqlx::query_as("SELECT hide_sessions, hide_requests FROM client_access_portal WHERE profile_id = $1")
+            .bind(profile_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(read_failed("load hidden portal pages"))?;
+    let (sessions, requests) = row.unwrap_or_default();
+    Ok(HiddenPages::new(sessions, requests).into_vec())
+}
+
 /// Seed a profile's content: every live client offered, no destination list
-/// attached, the settings at their defaults (the seed adapter — reset-to-seed).
+/// attached, the settings at their defaults, no portal page hidden (the seed
+/// adapter — create-from-seed and reset-to-seed).
 /// Returns the number of clients offered.
 pub(crate) async fn apply_seed(conn: &mut Scoped, tenant_id: Uuid, profile_id: Uuid) -> Result<i64, ApiError> {
     for clear in [
         "DELETE FROM client_access_members WHERE profile_id = $1",
         "DELETE FROM client_access_destinations WHERE profile_id = $1",
         "DELETE FROM client_access_sandbox WHERE profile_id = $1",
+        "DELETE FROM client_access_portal WHERE profile_id = $1",
     ] {
         sqlx::query(clear).bind(profile_id).execute(&mut *conn).await.map_err(write_failed("clear for seed"))?;
     }
     seed_members(conn, tenant_id, profile_id).await.map_err(write_failed("seed clients"))
+}
+
+/// Copy `source_id`'s whole content onto `dest_id`, a profile with none yet
+/// (the copy adapter — create-from-copy): the clients offered, the attached
+/// destination lists with their modes, the hidden portal pages, and the
+/// sandbox settings as stored (an unset one stays unset). Returns the number of
+/// live clients offered.
+///
+/// ONE statement: its four inserts read the source under one snapshot, so the
+/// copy is one state of it — never the clients from before an edit and the
+/// sandbox from after. It copies what is live: a client or a destination list
+/// already removed (or hidden) is left out rather than copied as a reference to
+/// nothing.
+pub(crate) async fn copy_content(
+    conn: &mut Scoped,
+    tenant_id: Uuid,
+    source_id: Uuid,
+    dest_id: Uuid,
+) -> Result<i64, ApiError> {
+    sqlx::query(
+        "WITH members AS ( \
+           INSERT INTO client_access_members (tenant_id, profile_id, client_profile_id) \
+           SELECT $1, $3, m.client_profile_id FROM client_access_members m \
+           JOIN client_profiles c ON c.tenant_id = m.tenant_id AND c.id = m.client_profile_id AND NOT c.suppressed \
+           WHERE m.tenant_id = $1 AND m.profile_id = $2), \
+         destinations AS ( \
+           INSERT INTO client_access_destinations (tenant_id, profile_id, list_id, mode) \
+           SELECT $1, $3, d.list_id, d.mode FROM client_access_destinations d \
+           JOIN destination_lists l ON l.tenant_id = d.tenant_id AND l.id = d.list_id AND NOT l.suppressed \
+           WHERE d.tenant_id = $1 AND d.profile_id = $2), \
+         hidden AS ( \
+           INSERT INTO client_access_portal (tenant_id, profile_id, hide_sessions, hide_requests) \
+           SELECT $1, $3, hide_sessions, hide_requests FROM client_access_portal \
+           WHERE tenant_id = $1 AND profile_id = $2) \
+         INSERT INTO client_access_sandbox (tenant_id, profile_id, require_sandbox, docker_tier) \
+         SELECT $1, $3, require_sandbox, docker_tier FROM client_access_sandbox \
+         WHERE tenant_id = $1 AND profile_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(source_id)
+    .bind(dest_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(write_failed("copy profile content"))?;
+    member_count(conn, dest_id).await
+}
+
+/// Whether `profile_id` is the tenant's Default client-access profile, read
+/// for a workspace assignment about to be written in the caller's transaction;
+/// 404 when it is no client-access profile of this tenant.
+///
+/// INVARIANT: no client-access assignment row names the Default profile — the
+/// assignment stores "the Default" as no row, and a promotion deletes the rows
+/// naming the profile it promotes ([`release_assignments`]). The read is
+/// `FOR SHARE` so the two cannot cross: the assignment takes its share lock
+/// before it writes its row, and the promotion, which updates that profile row
+/// before it deletes, takes no workspace or share lock of its own.
+pub(crate) async fn is_default_for_assignment(conn: &mut Scoped, profile_id: Uuid) -> Result<bool, ApiError> {
+    let is_default: Option<bool> =
+        sqlx::query_scalar("SELECT is_default FROM profiles WHERE id = $1 AND kind = 'client_access' FOR SHARE")
+            .bind(profile_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(read_failed("read the profile to assign"))?;
+    is_default.ok_or_else(|| ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound))
+}
+
+/// Remove the assignments naming `profile_id`, the profile just promoted to
+/// Default: its workspaces now reach it by inheriting. Left in place, a row
+/// would pin its workspace to this profile after a later promotion of another,
+/// with no matching choice in the workspace's picker. Runs after the
+/// promotion's update of the profile row ([`is_default_for_assignment`]).
+pub(crate) async fn release_assignments(conn: &mut Scoped, tenant_id: Uuid, profile_id: Uuid) -> Result<(), ApiError> {
+    sqlx::query(
+        "DELETE FROM workspace_profile_assignments \
+         WHERE tenant_id = $1 AND kind = 'client_access' AND profile_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(profile_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(write_failed("release assignments of the promoted profile"))?;
+    Ok(())
 }
 
 /// Offer every live client on `profile_id`. Returns the number added.
@@ -485,7 +732,10 @@ pub(crate) async fn seed_members(conn: &mut Scoped, tenant_id: Uuid, profile_id:
     Ok(res.rows_affected() as i64)
 }
 
-/// Offer one client on the tenant's Default (a client an admin created).
+/// Offer one client an admin created on the tenant's Default as it is when
+/// the client is created. Every other profile — one promoted to Default at
+/// that moment included — shows it as new, not offered, for its admin to
+/// enable.
 pub(crate) async fn offer_on_default(conn: &mut Scoped, tenant_id: Uuid, profile_key: &str) -> Result<(), ApiError> {
     sqlx::query(
         "INSERT INTO client_access_members (tenant_id, profile_id, client_profile_id) \
@@ -522,7 +772,7 @@ pub(crate) async fn create_default_profile(conn: &mut Scoped, tenant_id: Uuid) -
     let profile_id: Uuid = sqlx::query_scalar(
         "INSERT INTO profiles (tenant_id, kind, name, description, is_default, standalone) \
          VALUES ($1, 'client_access', 'Default', \
-                 'The tenant default client access — the clients every workspace is offered and what its developers'' sandbox may reach.', \
+                 'The tenant default — the clients offered to every workspace with no profile of its own, and what their developers'' sandbox may reach.', \
                  true, true) \
          RETURNING id",
     )

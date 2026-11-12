@@ -8,6 +8,7 @@
   import { adminApi } from '#lib/api-client.js';
   import { portalApi } from '#lib/portal-client.js';
   import { isSelfScoped, portalWorkspace, sessionHref, workspaceQuery } from '#lib/selfScoped.js';
+  import { pageHidden } from '#lib/portalPages.svelte.js';
   import { formatTokens, formatBytes, formatPrice, formatCount, formatDuration, appName } from '#lib/formatters.js';
   import { rateUnitLabel } from '#lib/rates.js';
   import { type InjectionBlock } from '#lib/diff-utils.js';
@@ -427,7 +428,7 @@
       <Icon name="chat" size="sm" color="var(--accent)" />
       {showTrace ? m.audit_detail_hide_content() : m.audit_detail_view_content()}
     </button>
-    {#if row.conversation_session_id}
+    {#if row.conversation_session_id && !pageHidden('sessions', page.data)}
       <a
         href={sessionHref(slug, page.url.pathname, row.conversation_session_id, viewedWorkspace())}
         class="inline-flex items-center gap-1.5 px-3 py-1.5 border border-(--accent) rounded-lg text-xs font-medium text-(--accent) hover:bg-(--accent)/10 transition-colors"
@@ -510,7 +511,11 @@
         <div class="flex items-center gap-2 mb-3">
           {#if trace.session_id}
             <span class="text-xs text-(--text-secondary)">{m.audit_detail_session_label()}</span>
-            <a href={sessionHref(slug, page.url.pathname, trace.session_id, viewedWorkspace())} class="text-xs font-mono text-(--accent) hover:underline">{trace.session_id.substring(0, 8)}...</a>
+            {#if pageHidden('sessions', page.data)}
+              <span class="text-xs font-mono text-(--text-secondary)">{trace.session_id.substring(0, 8)}...</span>
+            {:else}
+              <a href={sessionHref(slug, page.url.pathname, trace.session_id, viewedWorkspace())} class="text-xs font-mono text-(--accent) hover:underline">{trace.session_id.substring(0, 8)}...</a>
+            {/if}
             <span class="text-xs text-(--text-secondary)">{m.audit_detail_turn({ n: (trace.turn_number || 0) + 1 })}</span>
           {/if}
           {#if trace.events}

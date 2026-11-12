@@ -210,6 +210,7 @@ mod tests {
                 mcp_virtual_servers: vec![],
                 mcp_virtual_routes: vec![],
                 mcp_user_credentials: vec![],
+                mcp_user_inputs: vec![],
                 mcp_revoked_jtis: vec![],
                 mcp_jwks: vec![],
                 a2a_agents: vec![],

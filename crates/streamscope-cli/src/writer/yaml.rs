@@ -17,15 +17,17 @@ use yaml_serde::{Mapping, Value};
 use streamscope_client_templates::{composite_identity, scalar_identity, string_entry_identity, STRING_ENTRIES};
 
 use super::{
-    escape_token, is_keyed_record, keyed_jobs, merge_entries, unescape_token, KeyedEntry, MergeOutcome,
+    escape_token, is_keyed_record, is_what_we_wrote, keyed_jobs, merge_entries, unescape_token, withdraw_from,
+    KeyedEntry, MergeOutcome,
 };
-use crate::state::{sha256_hex, OwnedLeaf};
+use crate::state::{sha256_hex, EntryRoot, OwnedLeaf};
 
 pub fn merge(
     existing: Option<&str>,
     rendered: &str,
     prev_owned: &[OwnedLeaf],
     keyed_arrays: &BTreeMap<String, String>,
+    withdraw: &[EntryRoot],
 ) -> Result<MergeOutcome> {
     let mut rendered_v: Value =
         yaml_serde::from_str(rendered).context("rendered config is not valid YAML")?;
@@ -41,6 +43,9 @@ pub fn merge(
     if !doc.is_mapping() {
         bail!("the existing config file is not a YAML mapping");
     }
+    let (prev_owned, withdrawn) =
+        withdraw_from(streamscope_client_templates::TemplateFormat::Yaml, &mut doc, prev_owned, withdraw, remove_root);
+    let prev_owned = prev_owned.as_slice();
 
     // A keyed sequence leaves the render before the leaf merge, exactly as in
     // the JSON writer.
@@ -64,7 +69,7 @@ pub fn merge(
     let mut owned: Vec<OwnedLeaf> = Vec::new();
     collect_leaves("", &rendered_v, &mut owned);
 
-    merge_value(&mut doc, &rendered_v);
+    merge_value(&mut doc, &rendered_v, "", prev_owned);
 
     let mut kept_edited = Vec::new();
     for prev in prev_owned {
@@ -118,7 +123,39 @@ pub fn merge(
         contents,
         owned,
         kept_edited,
+        withdrawn,
     })
+}
+
+/// Take the entry at `root` out of `doc`; `false` when nothing stood there.
+/// A keyed sequence emptied by it goes too — same contract as the JSON
+/// writer's.
+fn remove_root(doc: &mut Value, root: &EntryRoot) -> bool {
+    let Some(entry) = &root.entry else {
+        if lookup(doc, &root.path).is_none() {
+            return false;
+        }
+        remove_pointer(doc, &root.path);
+        return true;
+    };
+    let Some(Value::Sequence(entries)) = lookup(doc, &root.path) else { return false };
+    let Some(i) = entries.iter().position(|e| e.identity(&entry.key).as_deref() == Some(entry.id.as_str())) else {
+        return false;
+    };
+    let mut entries = entries.clone();
+    entries.remove(i);
+    if entries.is_empty() {
+        remove_pointer(doc, &root.path);
+    } else {
+        set_pointer(doc, &root.path, Value::Sequence(entries));
+    }
+    true
+}
+
+/// Whether something stands at `root` in the file `existing`.
+pub(super) fn holds(existing: &str, root: &EntryRoot) -> Result<bool> {
+    let mut doc: Value = yaml_serde::from_str(existing).context("the existing config file is not valid YAML")?;
+    Ok(remove_root(&mut doc, root))
 }
 
 impl KeyedEntry for Value {
@@ -136,9 +173,11 @@ impl KeyedEntry for Value {
         value_hash(self)
     }
 
-    fn replace_with(&mut self, rendered: &Self) {
+    fn replace_with(&mut self, rendered: &Self, keep_filled: bool) {
         let live = std::mem::replace(self, rendered.clone());
-        keep_filled_sentinels(self, &live);
+        if keep_filled {
+            keep_filled_sentinels(self, &live);
+        }
     }
 }
 
@@ -195,16 +234,19 @@ fn collect_leaves(prefix: &str, v: &Value, out: &mut Vec<OwnedLeaf>) {
 /// String-keyed mappings merge recursively; everything else (scalars,
 /// sequences, null, exotic mappings) replaces the existing value wholesale —
 /// EXCEPT a paste-me sentinel, which never overwrites a value the user
-/// already filled in.
-fn merge_value(dst: &mut Value, src: &Value) {
+/// already filled in: it replaces only the value `prev_owned` records the
+/// last run wrote at that path (`prefix` is the pointer of `dst`).
+fn merge_value(dst: &mut Value, src: &Value, prefix: &str, prev_owned: &[OwnedLeaf]) {
     match (dst, src) {
         (Value::Mapping(d), Value::Mapping(s)) if string_keyed(s) => {
             for (k, sv) in s {
+                let path = format!("{prefix}/{}", escape_token(k.as_str().unwrap_or_default()));
                 match d.get_mut(k) {
-                    Some(dv) if mergeable(dv) && mergeable(sv) => merge_value(dv, sv),
+                    Some(dv) if mergeable(dv) && mergeable(sv) => merge_value(dv, sv, &path, prev_owned),
                     Some(dv)
                         if matches!(sv, Value::String(s) if super::is_paste_sentinel(s))
-                            && dv != sv => {}
+                            && dv != sv
+                            && !is_what_we_wrote(prev_owned, &path, &value_hash(dv)) => {}
                     // Don't introduce an empty mapping the target lacks — it would
                     // linger untracked (`collect_leaves` records no leaf for it),
                     // mirroring the JSON writer's empty-object guard.

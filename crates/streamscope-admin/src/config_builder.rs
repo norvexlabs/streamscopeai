@@ -20,7 +20,7 @@ use crate::db::tenant::Scoped;
 use crate::db::tenant::TenantId;
 use streamscope_edge_api::config::{
     ConfigResponse, EdgeA2aAgent, EdgeApiKey, EdgeMcpUpstreamServer, EdgeMcpUserCredential,
-    EdgeMcpVirtualRoute, EdgeMcpVirtualServer, EdgeModelMapping, EdgeTransformProgram,
+    EdgeMcpUserInputs, EdgeMcpVirtualRoute, EdgeMcpVirtualServer, EdgeModelMapping, EdgeTransformProgram,
 };
 
 /// Every table [`build_tenant_body`] reads, the shared loaders it calls
@@ -37,6 +37,7 @@ pub const BODY_TABLES: &[&str] = &[
     "guardrail_policies",
     "mcp_upstream_servers",
     "mcp_user_credentials",
+    "mcp_user_inputs",
     "mcp_virtual_routes",
     "mcp_virtual_servers",
     "model_catalog",
@@ -826,6 +827,9 @@ pub async fn build_tenant_body(
                   -- BYTEA holds the base64 ciphertext as UTF-8 bytes;
                   -- convert::TEXT to round-trip through the tenant body.
                   convert_from(encrypted_credential, 'UTF8') AS encrypted_credential,
+                  -- The adopted remote (declared headers + fillers) and the
+                  -- admin-filled inputs, each value its own ciphertext.
+                  remote, encrypted_admin_inputs,
                   -- OAuth client config. Endpoint URLs are plaintext;
                   -- the client secret is BYTEA holding base64-encoded ciphertext.
                   oauth_issuer_url,
@@ -853,6 +857,16 @@ pub async fn build_tenant_body(
                   convert_from(encrypted_refresh_token, 'UTF8') AS encrypted_refresh_token,
                   expires_at, scope
            FROM mcp_user_credentials
+           WHERE tenant_id = $1"#,
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *conn)
+    .await?;
+
+    // Users' filled header inputs, one ciphertext per input id.
+    let mcp_user_inputs = sqlx::query_as::<_, EdgeMcpUserInputs>(
+        r#"SELECT tenant_id, user_id, upstream_server_id, encrypted_values
+           FROM mcp_user_inputs
            WHERE tenant_id = $1"#,
     )
     .bind(tenant_id)
@@ -991,6 +1005,7 @@ pub async fn build_tenant_body(
         mcp_virtual_servers = mcp_virtual_servers.len(),
         mcp_virtual_routes = mcp_virtual_routes.len(),
         mcp_user_credentials = mcp_user_credentials.len(),
+        mcp_user_inputs = mcp_user_inputs.len(),
         a2a_agents = a2a_agents.len(),
         proxy_public_url = ?proxy_public_url,
         admin_public_url = ?admin_public_url,
@@ -1008,6 +1023,7 @@ pub async fn build_tenant_body(
         mcp_virtual_servers,
         mcp_virtual_routes,
         mcp_user_credentials,
+        mcp_user_inputs,
         mcp_revoked_jtis,
         mcp_jwks,
         a2a_agents,

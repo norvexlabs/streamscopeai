@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
-use super::config::{DockerConfig, ImageSource};
+use super::config::{DockerConfig, ImageSource, Lifecycle};
 
 /// The label naming the base image an agent layer was built on.
 pub const BASE_LABEL: &str = "ai.streamscope.sandbox-base";
@@ -28,6 +28,11 @@ pub struct Prepared {
     pub env: Vec<(String, String)>,
     /// The container's root for that user, as the sweep sees it.
     pub container_root: super::sweep::Root,
+    /// The base image's id: what the create commands last ran on.
+    pub base: String,
+    /// The lifecycle commands and environment: the image's metadata, then
+    /// the project's.
+    pub lifecycle: Lifecycle,
 }
 
 /// The agent user inside the image.
@@ -47,20 +52,44 @@ pub fn prepare(root: &Path, config: &DockerConfig, command: &str, npm: Option<&s
     // rather than in `USER` (which stays root for its build steps). As the Dev
     // Container merge has it: a `remoteUser` (the project's, then the image's)
     // before a `containerUser` (the same), then `USER`.
-    let (meta_remote, meta_container) = metadata_users(&inspect(&base, "{{index .Config.Labels \"devcontainer.metadata\"}}")?);
+    let entries = metadata_entries(&inspect(&base, "{{index .Config.Labels \"devcontainer.metadata\"}}")?);
+    let (meta_remote, meta_container) = metadata_users(&entries);
     let user = match [&config.remote_user, &meta_remote, &config.container_user, &meta_container].into_iter().flatten().next() {
         Some(u) => u.clone(),
         None => inspect(&base, "{{.Config.User}}")?,
     };
     // No user named: the image's root, by id (a name needs a passwd to read).
     let user = agent_user(&base_id, if user.is_empty() { "0" } else { &user })?;
+    // The home (a volume) or the project over the prefix a client is
+    // installed in would hide it, and every later install there. Refused
+    // before the client is installed.
+    if npm.is_some() {
+        let workspace = super::workspace(config, root);
+        let fixes = [
+            ("the agent's home", &user.home, "run as another image user (`remoteUser` / `containerUser`) or use another image"),
+            ("the workspace path", &workspace, "set a `workspaceFolder` elsewhere"),
+        ];
+        for (what, path, fix) in fixes {
+            if super::config::overlaps(path, AGENT_PREFIX) {
+                bail!("{what} {path} overlaps {AGENT_PREFIX}, where the sandbox installs {command} — {fix}");
+            }
+        }
+    }
+    let workspace = super::workspace(config, root);
+    // The image's own entries first. One this parser cannot read is the
+    // image's, which the developer cannot fix: skipped whole, and said.
+    // An image built here with `features` carries the project's own entry.
+    let lifecycle = label_lifecycle(&entries, !config.has_features, &|text| super::config::expand_lenient(text, root, &workspace), &|i, e| {
+        eprintln!("ssai: entry {i} of the image {}'s devcontainer.metadata is skipped — {e:#}", config.source_name())
+    })
+    .then(config.lifecycle.clone());
     let image = match npm {
-        Some(package) => agent_layer(&base_id, command, package, force)?,
-        None => base_id,
+        Some(package) => agent_layer(&base_id, package, force)?,
+        None => base_id.clone(),
     };
     let env = image_env(&inspect(&image, "{{json .Config.Env}}")?);
     let container_root = super::sweep::Root::for_agent(user.uid, user.gid);
-    Ok(Prepared { image, user, env, container_root })
+    Ok(Prepared { image, user, env, container_root, base: base_id, lifecycle })
 }
 
 /// Where the image source a project's last run used is recorded: its
@@ -153,16 +182,55 @@ fn confined(root: &Path, path: &Path, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// The users a `devcontainer.metadata` label (a JSON array of metadata
-/// entries, a later one overriding an earlier) names: its last `remoteUser`
-/// and its last `containerUser`.
-fn metadata_users(label: &str) -> (Option<String>, Option<String>) {
-    // An array of entries, or one entry on its own.
-    let entries = match serde_json::from_str::<serde_json::Value>(label.trim()) {
+/// The entries of a `devcontainer.metadata` label: a JSON array of them (a
+/// later one overriding an earlier), or one entry on its own.
+fn metadata_entries(label: &str) -> Vec<serde_json::Value> {
+    match serde_json::from_str::<serde_json::Value>(label.trim()) {
         Ok(serde_json::Value::Array(entries)) => entries,
         Ok(one @ serde_json::Value::Object(_)) => vec![one],
-        _ => return (None, None),
-    };
+        _ => Vec::new(),
+    }
+}
+
+/// The lifecycle of an image's metadata entries: the variables of every
+/// entry, the commands of a feature's only (an entry with an `id`). An entry
+/// without one is the `devcontainer.json` the image was built from — the
+/// project's own, for an image built from it, which runs its commands
+/// itself; `say_own` names the commands left out (an image this project did
+/// not build). One this parser cannot read is passed to `skipped` and left out.
+fn label_lifecycle(
+    entries: &[serde_json::Value],
+    say_own: bool,
+    expand: &dyn Fn(&str) -> Result<String>,
+    skipped: &dyn Fn(usize, anyhow::Error),
+) -> Lifecycle {
+    let mut lifecycle = Lifecycle::default();
+    for (i, entry) in entries.iter().enumerate() {
+        let theirs = entry.as_object().context("not an object").and_then(|entry| {
+            let theirs = super::config::lifecycle_of(entry, &|key, text| expand(text).with_context(|| format!("`{key}`")))?;
+            if entry.contains_key("id") || (theirs.create.is_empty() && theirs.start.is_empty()) {
+                return Ok(theirs);
+            }
+            if say_own {
+                let hooks: Vec<&str> = theirs.create.iter().chain(&theirs.start).map(|s| s.hook.as_str()).collect();
+                eprintln!(
+                    "ssai: the image's own devcontainer.json commands ({}) are not run — only its features' are",
+                    hooks.join(", ")
+                );
+            }
+            Ok(theirs.env_only())
+        });
+        match theirs {
+            Ok(theirs) => lifecycle = lifecycle.then(theirs),
+            Err(e) => skipped(i, e),
+        }
+    }
+    lifecycle
+}
+
+/// The users metadata entries name: the last `remoteUser` and the last
+/// `containerUser`.
+fn metadata_users(entries: &[serde_json::Value]) -> (Option<String>, Option<String>) {
     let last = |key: &str| entries.iter().rev().find_map(|e| e.get(key)?.as_str().filter(|u| !u.is_empty()).map(str::to_string));
     (last("remoteUser"), last("containerUser"))
 }
@@ -192,7 +260,9 @@ fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String>
             // before any guard: a reference changed since the last run (the
             // agent can edit it) is pulled only after a `prepare`.
             let source = format!("image:{reference}");
-            if force || !exists(reference)? {
+            // A `localhost/` image exists only on this machine: no registry
+            // serves it, so a `prepare` uses it as it is.
+            if (force && !local_only(reference)) || !exists(reference)? {
                 changed_since_last_build(root, &source, force)?;
                 eprintln!("ssai: pulling {reference} for the docker sandbox");
                 podman(&["pull", reference]).with_context(|| format!("pull {reference}"))?;
@@ -254,25 +324,44 @@ fn build_with_devcontainer_cli(root: &Path, config: &DockerConfig, tag: &str) ->
     }
 }
 
-/// What a build is built from: the devcontainer.json and Dockerfile text
-/// (the context's other files are not followed — `ssai sandbox prepare`
-/// rebuilds after a change to them).
+/// What a build is built from (the context's other files are not followed —
+/// `ssai sandbox prepare` rebuilds after a change to them). With `features`,
+/// the whole devcontainer.json: the Dev Container CLI reads all of it, and
+/// writes its lifecycle commands into the image's metadata. Without, what
+/// `podman build` is given — the Dockerfile's text, its context, target and
+/// args — so a change to a lifecycle command or the environment needs no
+/// rebuild.
 fn build_hash(root: &Path, config: &DockerConfig) -> Result<String> {
     let mut h = Sha256::new();
     h.update(root.as_os_str().as_encoded_bytes());
-    if let Some(dc) = &config.devcontainer {
+    if config.has_features
+        && let Some(dc) = &config.devcontainer
+    {
         h.update(std::fs::read(dc).with_context(|| format!("read {}", dc.display()))?);
     }
-    if let ImageSource::Build { dockerfile, .. } = &config.source {
+    if let ImageSource::Build { dockerfile, context, target, args } = &config.source {
         h.update(std::fs::read(dockerfile).with_context(|| format!("read {}", dockerfile.display()))?);
+        // Each part length-prefixed: no two recipes hash alike.
+        let mut part = |b: &[u8]| {
+            h.update((b.len() as u64).to_le_bytes());
+            h.update(b);
+        };
+        part(dockerfile.as_os_str().as_encoded_bytes());
+        part(context.as_os_str().as_encoded_bytes());
+        part(target.as_deref().unwrap_or("\0").as_bytes());
+        for (k, v) in args {
+            part(k.as_bytes());
+            part(v.as_bytes());
+        }
     }
     Ok(hex::encode(&h.finalize()[..12]))
 }
 
 /// The agent layer: `package` installed on the base, tagged by the base's
 /// id, built when absent (or `force`).
-fn agent_layer(base_id: &str, command: &str, package: &str, force: bool) -> Result<String> {
-    let tag = layer_tag(command, base_id);
+fn agent_layer(base_id: &str, package: &str, force: bool) -> Result<String> {
+    let recipe = layer_dockerfile(base_id, package);
+    let tag = layer_tag(package, base_id, &recipe);
     if !force && exists(&tag)? {
         return Ok(tag);
     }
@@ -304,7 +393,7 @@ fn agent_layer(base_id: &str, command: &str, package: &str, force: bool) -> Resu
             .stdin
             .take()
             .context("podman build stdin")
-            .and_then(|mut s| Ok(std::io::Write::write_all(&mut s, layer_dockerfile(base_id, command, package).as_bytes())?));
+            .and_then(|mut s| Ok(std::io::Write::write_all(&mut s, recipe.as_bytes())?));
         let status = child.wait()?;
         if !status.success() {
             bail!("could not install {package} into the image ({status})");
@@ -315,17 +404,33 @@ fn agent_layer(base_id: &str, command: &str, package: &str, force: bool) -> Resu
     built.map(|()| tag)
 }
 
-/// `localhost/ssai-agent-<command>:<base id, 12 hex>`.
-fn layer_tag(command: &str, base_id: &str) -> String {
-    let name: String = command.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+/// `localhost/ssai-agent-<package>:<base id, 12 hex>-<recipe, 8 hex>`: named
+/// by the package, which `run` and `sandbox prepare` resolve alike whatever
+/// name the client is launched by; the recipe is in the tag, so a layer an
+/// earlier `ssai` built another way is never taken for this one.
+fn layer_tag(package: &str, base_id: &str, recipe: &str) -> String {
+    let name: String = package.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    // A reference component may not start or end with a separator.
+    let name = name.trim_matches('-');
     let id = base_id.trim_start_matches("sha256:");
-    format!("localhost/ssai-agent-{name}:{}", &id[..id.len().min(12)])
+    let recipe = hex::encode(Sha256::digest(recipe.as_bytes()));
+    format!("localhost/ssai-agent-{name}:{}-{}", &id[..id.len().min(12)], &recipe[..8])
 }
 
-fn layer_dockerfile(base_id: &str, command: &str, package: &str) -> String {
+/// Where the agent layer installs the client, first on the agent's `PATH`.
+/// Never the image's own npm prefix: that may lie under the agent's home,
+/// which the home volume covers from the first run on, hiding every later
+/// install there.
+pub const AGENT_PREFIX: &str = "/opt/ssai-agent";
+
+/// The layer's recipe: `package` and the base alone, so every name the client
+/// is launched by builds (and finds) the same layer.
+fn layer_dockerfile(base_id: &str, package: &str) -> String {
     format!(
         "FROM {base_id}\nUSER root\nRUN command -v npm >/dev/null 2>&1 || {{ echo \"ssai: the image has no npm — add \
-         Node.js to it to run {command} in the docker sandbox\" >&2; exit 1; }}; npm install -g {package}@latest\n"
+         Node.js to it to run {package} in the docker sandbox\" >&2; exit 1; }}; \
+         npm install -g --prefix {AGENT_PREFIX} {package}@latest\n\
+         ENV PATH={AGENT_PREFIX}/bin:${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\n"
     )
 }
 
@@ -412,6 +517,12 @@ fn lookup(passwd: &str, group_file: &str, user: &str) -> Result<AgentUser> {
     Ok(AgentUser { uid, gid, home })
 }
 
+/// Whether `reference` names an image only this machine holds (podman's
+/// `localhost/` namespace), which no pull can fetch.
+fn local_only(reference: &str) -> bool {
+    reference.starts_with("localhost/")
+}
+
 fn exists(image: &str) -> Result<bool> {
     let status = Command::new("podman")
         .args(["image", "exists", image])
@@ -492,26 +603,88 @@ mod tests {
     }
 
     #[test]
+    fn only_a_localhost_reference_is_local_only() {
+        assert!(local_only("localhost/ssai-smoke:node-1"));
+        for pulled in ["docker.io/library/ubuntu:24.04", "mcr.microsoft.com/devcontainers/base:ubuntu", "localhost:5000/x", "ghcr.io/localhost/x"] {
+            assert!(!local_only(pulled), "{pulled}");
+        }
+    }
+
+    #[test]
+    fn a_build_is_rebuilt_for_what_podman_builds_from_not_for_a_lifecycle_command() {
+        let root = std::env::temp_dir().join(format!("ssai-build-hash-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::write(root.join(".devcontainer/Dockerfile"), "FROM a\n").unwrap();
+        let hash = |dc: &str| {
+            std::fs::write(root.join(".devcontainer/devcontainer.json"), dc).unwrap();
+            let entry = r#"{"devcontainer": ".devcontainer/devcontainer.json"}"#;
+            let config = super::super::config::resolve(&root, &super::super::config::example(entry), &|p| {
+                Ok(std::fs::read_to_string(p)?)
+            })
+            .unwrap();
+            build_hash(&root, &config).unwrap()
+        };
+        let base = hash(r#"{"build": {"dockerfile": "Dockerfile"}, "postCreateCommand": "a"}"#);
+        assert_eq!(base, hash(r#"{"build": {"dockerfile": "Dockerfile"}, "postCreateCommand": "b", "remoteEnv": {"A": "1"}}"#));
+        for other in [
+            r#"{"build": {"dockerfile": "Dockerfile", "target": "dev"}, "postCreateCommand": "a"}"#,
+            r#"{"build": {"dockerfile": "Dockerfile", "args": {"V": "1"}}, "postCreateCommand": "a"}"#,
+            r#"{"build": {"dockerfile": "Dockerfile", "context": ".."}, "postCreateCommand": "a"}"#,
+        ] {
+            assert_ne!(base, hash(other), "{other}");
+        }
+        std::fs::write(root.join(".devcontainer/Dockerfile"), "FROM b\n").unwrap();
+        assert_ne!(base, hash(r#"{"build": {"dockerfile": "Dockerfile"}, "postCreateCommand": "a"}"#), "the Dockerfile's text");
+        // With features the Dev Container CLI reads the whole file, its commands into the image's metadata.
+        let f = r#"{"build": {"dockerfile": "Dockerfile"}, "features": {"ghcr.io/x/y:1": {}}, "postCreateCommand": "a"}"#;
+        assert_ne!(hash(f), hash(&f.replace(r#""a""#, r#""b""#)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn the_agent_layer_is_tagged_by_its_base_and_installs_the_latest_package() {
-        assert_eq!(layer_tag("claude", "sha256:0123456789abcdef0123"), "localhost/ssai-agent-claude:0123456789ab");
-        assert_eq!(layer_tag("Qwen.Code", "abc"), "localhost/ssai-agent-qwen-code:abc");
-        let df = layer_dockerfile("sha256:aa", "claude", "@anthropic-ai/claude-code");
+        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", "@anthropic-ai/claude-code");
+        let tag = layer_tag("@anthropic-ai/claude-code", "sha256:0123456789abcdef0123", &recipe);
+        let named = "localhost/ssai-agent-anthropic-ai-claude-code:0123456789ab-";
+        assert!(tag.starts_with(named) && tag.len() == named.len() + 8, "{tag}");
+        assert!(layer_tag("Qwen.Code", "abc", "r").starts_with("localhost/ssai-agent-qwen-code:abc-"));
+        assert!(layer_tag("@scope/tool.", "abc", "r").starts_with("localhost/ssai-agent-scope-tool:abc-"));
+        // Another recipe on the same base is another layer.
+        assert_ne!(layer_tag("@anthropic-ai/claude-code", "sha256:0123456789abcdef0123", "FROM x\n"), tag);
+        let df = layer_dockerfile("sha256:aa", "@anthropic-ai/claude-code");
         assert!(df.starts_with("FROM sha256:aa\nUSER root\n"), "{df}");
-        assert!(df.contains("npm install -g @anthropic-ai/claude-code@latest"), "{df}");
+        assert!(df.contains("npm install -g --prefix /opt/ssai-agent @anthropic-ai/claude-code@latest"), "{df}");
+        // First on PATH, and never an empty entry (the working directory) when the image sets none.
+        assert!(df.ends_with("\nENV PATH=/opt/ssai-agent/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}\n"), "{df}");
         assert!(df.contains("has no npm"), "{df}");
     }
 
 
     #[test]
+    fn an_images_metadata_runs_its_features_commands_and_every_entrys_variables() {
+        let label = r#"[{"id": "ghcr.io/x/f:1", "postCreateCommand": "feature", "containerEnv": {"F": "1"}},
+            7,
+            {"id": "ghcr.io/x/bad:1", "postCreateCommand": 7},
+            {"postCreateCommand": "the project's copy", "remoteEnv": {"R": "2"}}]"#;
+        let skipped = std::cell::RefCell::new(Vec::new());
+        let l = label_lifecycle(&metadata_entries(label), false, &|t| Ok(t.to_string()), &|i, _| skipped.borrow_mut().push(i));
+        let argv: Vec<&str> = l.create.iter().map(|s| s.argv[2].as_str()).collect();
+        assert_eq!(argv, ["feature"], "the entry without an id runs no command");
+        assert_eq!(l.container_env, [("F".to_string(), "1".to_string())]);
+        assert_eq!(l.remote_env, [("R".to_string(), "2".to_string())], "its variables apply");
+        assert_eq!(*skipped.borrow(), [1, 2], "an entry it cannot read is skipped, and said");
+    }
+
+    #[test]
     fn a_prebuilt_images_metadata_names_its_user() {
         let label = r#"[{"id":"ghcr.io/devcontainers/features/common-utils:2"},{"remoteUser":"vscode"},{"containerUser":"node"}]"#;
-        assert_eq!(metadata_users(label), (Some("vscode".into()), Some("node".into())));
-        assert_eq!(metadata_users(r#"[{"remoteUser":"a"},{"remoteUser":"b"}]"#).0.as_deref(), Some("b"), "a later entry overrides");
-        assert_eq!(metadata_users(r#"[{"containerUser":"node"}]"#), (None, Some("node".into())));
-        assert_eq!(metadata_users(r#"{"remoteUser":"node"}"#).0.as_deref(), Some("node"), "one entry on its own");
+        assert_eq!(metadata_users(&metadata_entries(label)), (Some("vscode".into()), Some("node".into())));
+        assert_eq!(metadata_users(&metadata_entries(r#"[{"remoteUser":"a"},{"remoteUser":"b"}]"#)).0.as_deref(), Some("b"), "a later entry overrides");
+        assert_eq!(metadata_users(&metadata_entries(r#"[{"containerUser":"node"}]"#)), (None, Some("node".into())));
+        assert_eq!(metadata_users(&metadata_entries(r#"{"remoteUser":"node"}"#)).0.as_deref(), Some("node"), "one entry on its own");
         // No label (podman prints `<no value>`), an empty user, no user: the image's `USER` decides.
         for none in ["<no value>", "", r#"[{"remoteUser":""}]"#, r#"[{"id":"x"}]"#, "{}", "7"] {
-            assert_eq!(metadata_users(none), (None, None), "{none:?}");
+            assert_eq!(metadata_users(&metadata_entries(none)), (None, None), "{none:?}");
         }
     }
 

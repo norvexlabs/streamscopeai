@@ -16,6 +16,7 @@
 
 import type { IconName } from './icons';
 import { m } from './paraglide/messages.js';
+import type { PortalPage } from './portalPages.svelte.js';
 
 export type NavLeaf = {
 	kind: 'leaf';
@@ -28,6 +29,9 @@ export type NavLeaf = {
 	applianceOnly?: boolean;
 	/** Portal: only render for a manager (of any of their workspaces). */
 	managerOnly?: boolean;
+	/** Portal: the page an administrator can hide for the viewer's workspaces
+	 *  (a Portal & clients profile) — left out while it is hidden. */
+	portalPage?: PortalPage;
 };
 
 export type NavSubtree = {
@@ -66,9 +70,8 @@ export function buildPortalNav(): NavCluster[] {
 			kind: 'cluster',
 			label: m.nav_portal_cluster_activity(),
 			items: [
-				{ kind: 'leaf', href: '/portal/sessions', label: m.nav_portal_sessions(), icon: 'chat' },
-				{ kind: 'leaf', href: '/portal/audit', label: m.nav_portal_requests(), icon: 'requests' },
-				{ kind: 'leaf', href: '/portal/usage', label: m.nav_portal_usage(), icon: 'trendingUp' },
+				{ kind: 'leaf', href: '/portal/sessions', label: m.nav_portal_sessions(), icon: 'chat', portalPage: 'sessions' },
+				{ kind: 'leaf', href: '/portal/audit', label: m.nav_portal_requests(), icon: 'requests', portalPage: 'requests' },
 			],
 		},
 		{
@@ -165,7 +168,7 @@ export const adminNav: NavCluster[] = [
 			{ kind: 'leaf', href: '/guardrail', label: 'Guardrail', icon: 'shield', hideForSystem: true },
 			{ kind: 'leaf', href: '/transforms', label: 'Transforms', icon: 'bolt', hideForSystem: true },
 			{ kind: 'leaf', href: '/experts', label: 'Experts', icon: 'lightbulb', hideForSystem: true },
-			{ kind: 'leaf', href: '/client-access', label: 'Client access', icon: 'clipboardCheck', hideForSystem: true },
+			{ kind: 'leaf', href: '/client-access', label: 'Portal & clients', icon: 'clipboardCheck', hideForSystem: true },
 			{ kind: 'leaf', href: '/destinations', label: 'Destinations', icon: 'compass', hideForSystem: true },
 		],
 	},
@@ -193,10 +196,18 @@ export const adminNav: NavCluster[] = [
  *  empty clusters auto-hide. Returns a new array — never mutates input. */
 export function filterNavForViewer(
 	nav: NavCluster[],
-	ctx: { isSystemTenant: boolean; isSuperAdmin: boolean; isAppliance?: boolean; isManager?: boolean },
+	ctx: {
+		isSystemTenant: boolean;
+		isSuperAdmin: boolean;
+		isAppliance?: boolean;
+		isManager?: boolean;
+		/** Portal: the pages hidden for the viewer's workspaces. */
+		hiddenPages?: readonly PortalPage[];
+	},
 ): NavCluster[] {
 	const visible = (item: NavLeaf | NavSubtree): boolean => {
 		if ('managerOnly' in item && item.managerOnly && !ctx.isManager) return false;
+		if ('portalPage' in item && item.portalPage && ctx.hiddenPages?.includes(item.portalPage)) return false;
 		if (item.superAdminOnly && !ctx.isSuperAdmin) return false;
 		if (item.hideForSystem && ctx.isSystemTenant) return false;
 		if (item.applianceOnly && !ctx.isAppliance) return false;

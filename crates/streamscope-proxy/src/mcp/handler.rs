@@ -3,7 +3,8 @@
 //! - Real authentication: requires a valid proxy-issued `sk-*` Bearer token
 //!   (or a spec-OAuth JWT). The route layer uses
 //!   [`streamscope_core::auth::authenticate_proxy`]; a `vk-*` forward-auth key
-//!   on this mount is rejected with a generic 401. No anonymous SYSTEM fallback.
+//!   on this mount is rejected with a generic 401 (it is accepted on
+//!   `/fwd/{key}/mcp/<slug>`). No anonymous SYSTEM fallback.
 //! - Workspace gating: the slug resolves to a virtual server, and the handler
 //!   rejects the request (403) when the key's workspace allowlist doesn't
 //!   permit that server.
@@ -25,12 +26,12 @@
 //!       passthrough).
 //! - Emits one `McpAuditRecord` per HTTP request.
 //!
-//! BYOK (`vk-*`) keys via `/fwd/{key}/mcp/<slug>`: the fwd handler
-//! requires `forward_auth=true` on the resolved key, requires the bound
-//! virtual server to have exactly one route to a `byot` upstream, and forwards
-//! the client's `Authorization` / `x-api-key` / `x-goog-api-key` header
-//! verbatim to the upstream as the bearer. The capability cache is bypassed
-//! because BYOT bearers are per-user.
+//! Client-filled header inputs: each routed upstream declares which headers
+//! the calling client supplies (`super::upstream_auth`). Both mounts forward
+//! exactly those declared names and nothing else. `/fwd/{key}/mcp/<slug>`
+//! takes the gateway key in the path (any gateway key) and is required only
+//! when a routed upstream takes the client's own `Authorization` header, which
+//! on `/mcp/<slug>` carries the gateway credential.
 
 use std::debug_assert_matches;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ use super::modern::{self, ModernError, ProtocolEra, RequestMeta};
 use super::oauth::{self, OauthState, RotationSink};
 use super::session::McpSessionMap;
 use super::upstream::{self, UpstreamError, UpstreamReply};
+use streamscope_core::mcp::header_inputs::UpstreamAuth;
 use super::virtualize;
 
 pub struct McpAppState {
@@ -361,6 +363,18 @@ pub struct AuthCtx {
     /// The gateway's `serverInfo` for this mount, stamped into an
     /// `InputRequiredResult` relayed from an upstream.
     pub server_info: serde_json::Value,
+    /// The inbound headers the routed upstreams declare as client-filled —
+    /// only those names, minus any two upstreams both claim
+    /// ([`super::upstream_auth::capture_client_inputs`]). Held for this
+    /// request only; never stored.
+    pub client_inputs: HeaderMap,
+    /// The upstreams' stored input values this request decrypted, so each is
+    /// decrypted once however often the request resolves its upstream.
+    pub inputs_memo: super::upstream_auth::InputsMemo,
+    /// The portal page where the caller fills their values and signs in to
+    /// upstreams ([`portal_sign_ins_url`]); `None` when the tenant's console
+    /// URL is unknown.
+    pub sign_ins_url: Option<String>,
 }
 
 impl AuthCtx {
@@ -375,15 +389,26 @@ impl AuthCtx {
     }
 }
 
+/// The tenant's portal page listing the caller's MCP sign-ins and values:
+/// `<console>/portal/t/<tenant>/mcp/connections`, or `None` when the console
+/// URL or the tenant slug is unknown.
+pub(crate) fn portal_sign_ins_url(cfg: &streamscope_core::config::TenantConfig) -> Option<String> {
+    let base = cfg.admin_public_url.as_deref()?.trim_end_matches('/');
+    (!base.is_empty() && !cfg.tenant_slug.is_empty())
+        .then(|| format!("{base}/portal/t/{}/mcp/connections", cfg.tenant_slug))
+}
+
 /// Map an `UpstreamError` to its `(code, message)` JSON-RPC pair. Pulled out
 /// of the inline match so the audit emitter and the response builder use
 /// exactly the same code for the same error.
-pub(crate) fn upstream_error_to_jsonrpc(err: &UpstreamError) -> (i32, String) {
+pub(crate) fn upstream_error_to_jsonrpc(err: &UpstreamError, sign_ins_url: Option<&str>) -> (i32, String) {
+    // Where the user acts on a missing value or sign-in: the exact portal
+    // page when the console URL is known, else the portal by name.
+    let where_to = |verb: &str| match sign_ins_url {
+        Some(url) => format!("{verb} in the portal's MCP sign-ins page: {url}"),
+        None => format!("{verb} in the portal's MCP sign-ins page"),
+    };
     match err {
-        UpstreamError::AuthModeUnsupported(_) => (
-            super::jsonrpc::MCP_UPSTREAM_CONFIG_UNSUPPORTED,
-            "upstream auth_mode not yet supported".to_string(),
-        ),
         UpstreamError::TransportUnsupported(t) => (
             super::jsonrpc::MCP_UPSTREAM_CONFIG_UNSUPPORTED,
             format!("upstream transport not supported: {t}"),
@@ -447,15 +472,32 @@ pub(crate) fn upstream_error_to_jsonrpc(err: &UpstreamError) -> (i32, String) {
         ),
         UpstreamError::CredentialUnavailable => (
             UPSTREAM_CREDENTIAL_UNAVAILABLE,
-            "upstream service-account credential is not configured".to_string(),
+            "upstream credential is not configured".to_string(),
+        ),
+        UpstreamError::UserInputsMissing => (
+            MCP_USER_CREDENTIAL_MISSING,
+            format!(
+                "this MCP server needs values only you can enter — {}",
+                where_to("enter them")
+            ),
+        ),
+        UpstreamError::ClientHeaderMissing(headers) => (
+            AUTH_REQUIRED,
+            format!(
+                "this upstream needs a valid {headers} header from the client: it was not sent, or \
+                 its value is not one the server accepts"
+            ),
         ),
         UpstreamError::UserCredentialMissing => (
             MCP_USER_CREDENTIAL_MISSING,
-            "user has not authorized this upstream — connect via the portal".to_string(),
+            format!("this MCP server needs you to sign in first — {}", where_to("sign in")),
         ),
         UpstreamError::UserCredentialExpired => (
             MCP_USER_CREDENTIAL_EXPIRED,
-            "stored credential expired and refresh failed — reconnect via the portal".to_string(),
+            format!(
+                "your sign-in to this MCP server expired and could not be renewed — {}",
+                where_to("sign in again")
+            ),
         ),
         UpstreamError::UserOauthRefreshFailed(detail) => (
             MCP_USER_OAUTH_REFRESH_FAILED,
@@ -559,17 +601,18 @@ async fn resolve_identity_with_jwt(
 }
 
 /// Resolve identity from a bearer/path key for the addressed `slug`.
-/// `forward_auth` selects the mount: `false` for proxy-issued `sk-*` keys on
-/// `/mcp/<slug>`, `true` for BYOK `vk-*` keys on `/fwd/{key}/mcp/<slug>`.
+/// `fwd_mount` selects the mount: `false` for `/mcp/<slug>`, which takes
+/// proxy-issued `sk-*` keys only; `true` for `/fwd/{key}/mcp/<slug>`, which
+/// takes any gateway key in its path.
 async fn resolve_identity_from_token(
     state: &AppState,
     token: String,
     slug: &str,
-    forward_auth: bool,
+    fwd_mount: bool,
 ) -> Result<Identity, AppError> {
     let registry = state.tenant_registry.load();
-    let ctx = if forward_auth {
-        streamscope_core::auth::authenticate_forward(&token, &registry)?
+    let ctx = if fwd_mount {
+        streamscope_core::auth::authenticate(&token, &registry)?
     } else {
         streamscope_core::auth::authenticate_proxy(&token, &registry)?
     };
@@ -933,6 +976,38 @@ pub async fn mcp_get_handler(
     State(state): State<McpRouterState>,
     req: Request<Body>,
 ) -> Response<Body> {
+    serve_get_channel(slug, state, req, None).await
+}
+
+/// Axum entry — `GET /fwd/{key}/mcp/{slug}`: the same channel, the gateway
+/// key read from the path (a server whose client sends its own
+/// `Authorization` is reachable only on this mount).
+pub async fn mcp_fwd_get_handler(
+    Path((key, slug)): Path<(String, String)>,
+    State(state): State<McpRouterState>,
+    req: Request<Body>,
+) -> Response<Body> {
+    serve_get_channel(slug, state, req, Some(key)).await
+}
+
+/// Axum entry — `DELETE /fwd/{key}/mcp/{slug}`: answered like `/mcp/{slug}`.
+pub async fn mcp_fwd_delete_handler(
+    Path((_key, slug)): Path<(String, String)>,
+    state: State<McpRouterState>,
+    req: Request<Body>,
+) -> Response<Body> {
+    mcp_delete_handler(Path(slug), state, req).await
+}
+
+/// The `GET` notification channel; `path_key` is the gateway key of the
+/// `/fwd/{key}/…` mount, `None` on `/mcp/{slug}` (the key or token is then in
+/// `Authorization`).
+async fn serve_get_channel(
+    slug: String,
+    state: McpRouterState,
+    req: Request<Body>,
+    path_key: Option<String>,
+) -> Response<Body> {
     let started = Instant::now();
     let request_id = streamscope_core::ids::mint_request_id();
     let headers = req.headers().clone();
@@ -968,12 +1043,17 @@ pub async fn mcp_get_handler(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let identity = match resolve_identity_with_jwt(&state.app, &headers, &slug).await {
+    let resolved = match path_key.clone() {
+        Some(key) => resolve_identity_from_token(&state.app, key, &slug, true).await,
+        None => resolve_identity_with_jwt(&state.app, &headers, &slug).await,
+    };
+    let identity = match resolved {
         Ok(id) => id,
         Err(e) => {
             let (status, wire_message, audit_detail) = auth_error_for_response(&e);
             let mut resp = error_response(status, RpcId::Null, AUTH_REQUIRED, wire_message);
-            if status == StatusCode::UNAUTHORIZED
+            if path_key.is_none()
+                && status == StatusCode::UNAUTHORIZED
                 && super::spec_oauth::slug_has_oauth_enabled(&state.app, &slug)
             {
                 super::spec_oauth::add_www_authenticate(&mut resp, &state.app, &slug);
@@ -997,8 +1077,8 @@ pub async fn mcp_get_handler(
     // mirroring the POST handler's bind invariant. Resolution is via the
     // tenant config the key authenticated against — same path the POST
     // handler uses.
-    match identity.config.mcp.lookup_by_slug(&slug) {
-        Some((vs, _)) if vs.id == identity.virtual_server_id => {}
+    let routes = match identity.config.mcp.lookup_by_slug(&slug) {
+        Some((vs, routes)) if vs.id == identity.virtual_server_id => routes,
         Some(_) | None => {
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -1007,6 +1087,23 @@ pub async fn mcp_get_handler(
                 "key not bound to this virtual server",
             );
         }
+    };
+    // The channel follows the POST path's mount rules: a server whose client
+    // sends its own Authorization is reached on `/fwd` only, and a
+    // pass-through key listens only where it may call.
+    let upstreams: Vec<streamscope_core::config::mcp::McpUpstreamServer> = routes
+        .iter()
+        .filter_map(|r| identity.config.mcp.upstream_servers.get(&r.upstream_server_id).cloned())
+        .collect();
+    let refusal = if path_key.is_none() && super::upstream_auth::requires_fwd_mount(&upstreams) {
+        Some(fwd_mount_required_message(&slug))
+    } else if identity.user.forward_auth && !super::upstream_auth::pass_through_only(&upstreams) {
+        Some(pass_through_refusal_message().to_string())
+    } else {
+        None
+    };
+    if let Some(message) = refusal {
+        return error_response(StatusCode::BAD_REQUEST, RpcId::Null, AUTH_REQUIRED, message);
     }
 
     // The push channel is not method-scoped, so a narrow token must not open
@@ -1251,9 +1348,9 @@ pub async fn mcp_get_handler(
 
 /// Axum entry — `POST /mcp/{slug}` (and GET for the compatibility surface).
 ///
-/// Requires a valid proxy-issued `sk-*` Bearer token (`forward_auth=false`).
-/// `vk-*` forward-auth keys are rejected with a generic 401 and must use the
-/// `/fwd/{key}/mcp/<slug>` mount point.
+/// Requires a valid proxy-issued `sk-*` Bearer token (`forward_auth=false`)
+/// or a spec-OAuth JWT. `vk-*` forward-auth keys are rejected with a generic
+/// 401 and must use the `/fwd/{key}/mcp/<slug>` mount point.
 pub async fn mcp_handler(
     Path(slug): Path<String>,
     State(state): State<McpRouterState>,
@@ -1323,20 +1420,18 @@ pub async fn mcp_handler(
     };
 
     handle_authenticated_request(
-        state, slug, req, identity, request_id, started, user_agent, mcp_session_id, None, era,
+        state, slug, req, identity, request_id, started, user_agent, mcp_session_id, false, era,
     )
     .await
 }
 
-/// Axum entry for `POST /fwd/{key}/mcp/{slug}` (BYOT).
+/// Axum entry for `POST /fwd/{key}/mcp/{slug}`.
 ///
-/// The path key authenticates the user (`vk-*` forward-auth keys only —
-/// `forward_auth=true`). The client's `Authorization` / `x-api-key` /
-/// `x-goog-api-key` header is captured and forwarded verbatim to the bound
-/// virtual server's single `byot` upstream as the bearer. Proxy-issued `sk-*`
-/// keys are rejected here with a generic 401; `vk-*` keys used on `/mcp/<slug>`
-/// (without `/fwd/`) are likewise rejected. The capability cache is bypassed
-/// because BYOT bearers are per-user.
+/// The path key authenticates the user — any gateway key (`sk-*` or
+/// `vk-*`). The request's own headers are then free to carry the client's
+/// `Authorization` for an upstream that declares it client-filled, which is
+/// the one case this mount is required for; every other virtual server is
+/// reachable here and on `/mcp/<slug>` alike.
 pub async fn mcp_fwd_handler(
     Path((key, slug)): Path<(String, String)>,
     State(state): State<McpRouterState>,
@@ -1375,9 +1470,23 @@ pub async fn mcp_fwd_handler(
             .map(str::to_string)
     };
 
-    // Authenticate the path key first — `vk-*` only (forward_auth=true).
-    // Same generic 401 as `/mcp/<slug>` so a probing client can't tell a
-    // wrong-mount key from a non-existent one.
+    // The request's `Authorization` is the client's own credential here, and
+    // may be forwarded to the upstream as a client-filled input — never when
+    // it carries the gateway key of the path (a client still set up for
+    // `/mcp/<slug>`): that key would reach a third party. Dropped, the header
+    // then reads as not sent.
+    let mut req = req;
+    if req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains(key.as_str()))
+    {
+        req.headers_mut().remove(axum::http::header::AUTHORIZATION);
+    }
+
+    // Authenticate the path key first. Same generic 401 as `/mcp/<slug>` so
+    // a probing client can't tell a wrong key from a non-existent one.
     let identity = match resolve_identity_from_token(&state.app, key, &slug, true).await {
         Ok(id) => id,
         Err(e) => {
@@ -1397,92 +1506,17 @@ pub async fn mcp_fwd_handler(
         }
     };
 
-    // Capture the client's bearer for forwarding. BYOK `vk-*` keys are useless
-    // without one (the proxy holds no upstream credential to fall back on),
-    // so a missing/empty header surfaces as `-32401` AUTH_REQUIRED.
-    let bearer_override = match extract_forward_auth_bearer(&headers) {
-        Some(b) => b,
-        None => {
-            let resp = error_response(
-                StatusCode::UNAUTHORIZED,
-                RpcId::Null,
-                AUTH_REQUIRED,
-                "BYOT requires a client-supplied bearer in the Authorization, x-api-key, or x-goog-api-key header",
-            );
-            emit_audit(
-                &state,
-                &identity,
-                request_id,
-                &slug,
-                None,
-                None,
-                "<no-bearer>".to_string(),
-                None,
-                None,
-                None,
-                Some(AUTH_REQUIRED),
-                Some("byot client bearer missing".to_string()),
-                started,
-                Instant::now(),
-                0,
-                0,
-                user_agent.clone(),
-                mcp_session_id.clone(),
-                StatusCode::UNAUTHORIZED,
-                None,
-            )
-            .await;
-            return resp;
-        }
-    };
-
     handle_authenticated_request(
-        state, slug, req, identity, request_id, started, user_agent, mcp_session_id, Some(bearer_override), era,
+        state, slug, req, identity, request_id, started, user_agent, mcp_session_id, true, era,
     )
     .await
 }
 
-/// Extract the client's bearer from `Authorization: Bearer ...` /
-/// `x-api-key` / `x-goog-api-key`. Mirrors the LLM forward-auth helper but
-/// returns just the token (the MCP outbound call always uses the
-/// `Authorization: Bearer ...` shape regardless of the inbound header name).
-///
-/// All three fallbacks are trimmed of surrounding whitespace — clients that
-/// stuff the bearer into `x-api-key` sometimes ship a stray newline, and
-/// forwarding it verbatim to the upstream causes a 400 the operator can't
-/// debug from outside.
-fn extract_forward_auth_bearer(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        let trimmed = value.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("Bearer ")
-            .or_else(|| trimmed.strip_prefix("bearer "))
-        {
-            let token = rest.trim().to_string();
-            if !token.is_empty() {
-                return Some(token);
-            }
-        }
-    }
-    if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    if let Some(value) = headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()) {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    None
-}
-
-/// Shared body for both `/mcp/<slug>` (sk-*) and `/fwd/{key}/mcp/<slug>`
-/// (vk-*) — handles request read, parse, slug resolve, slug binding,
-/// rate limiting, dispatch, and audit emit. The two callers differ only in
-/// auth resolution + the `bearer_override` value.
+/// Shared body for both `/mcp/<slug>` and `/fwd/{key}/mcp/<slug>` — handles
+/// request read, parse, slug resolve, slug binding, rate limiting, dispatch,
+/// and audit emit. The two callers differ only in where the gateway key is
+/// read (`fwd_mount`), which decides whether the request's `Authorization`
+/// may be a client-filled input.
 #[allow(clippy::too_many_arguments)]
 async fn handle_authenticated_request(
     state: McpRouterState,
@@ -1493,7 +1527,7 @@ async fn handle_authenticated_request(
     started: Instant,
     user_agent: Option<String>,
     mcp_session_id: Option<String>,
-    bearer_override: Option<String>,
+    fwd_mount: bool,
     era: ProtocolEra,
 ) -> Response<Body> {
     // Keep a copy of the request headers for attribution after the body has
@@ -1764,54 +1798,66 @@ async fn handle_authenticated_request(
         .filter_map(|r| tenant_cfg.mcp.upstream_servers.get(&r.upstream_server_id).cloned())
         .collect();
 
-    // BYOT — defense-in-depth runtime check. Admin/portal validation
-    // gates `vk-*` keys to single-route + byot-upstream virtual servers, but
-    // a stale snapshot or a config drift could leave us with a fwd-auth key
-    // pointed at a multi-route VS. Reject here before the bearer forwards
-    // to a wrong upstream.
-    if bearer_override.is_some() {
-        use streamscope_core::config::mcp::McpAuthMode;
-        let is_byot = upstreams.len() == 1
-            && upstreams.first().map(|u| u.auth_mode == McpAuthMode::Byot).unwrap_or(false);
-        if !is_byot {
-            let resp = error_response(
-                StatusCode::UNAUTHORIZED,
-                request.id.clone().unwrap_or(RpcId::Null),
-                AUTH_REQUIRED,
-                "BYOT requires a virtual server with a single byot upstream",
-            );
-            emit_audit(
-                &state,
-                &identity,
-                request_id,
-                &slug,
-                Some(virtual_server.id),
-                None,
-                request.method.clone(),
-                None,
-                None,
-                None,
-                Some(AUTH_REQUIRED),
-                Some("byot virtual server invariant violated".to_string()),
-                started,
-                Instant::now(),
-                request_bytes,
-                0,
-                user_agent.clone(),
-                mcp_session_id.clone(),
-                StatusCode::UNAUTHORIZED,
-                None,
-            )
-            .await;
-            return resp;
-        }
+    // A routed upstream that takes the client's own `Authorization` header
+    // cannot be reached on `/mcp/<slug>`, where that header is the gateway
+    // credential: forwarding it would hand the upstream our key, and
+    // dropping it would call the upstream without the one input it needs.
+    // The key DID authenticate, so this is a 400, not a 401: an MCP client
+    // reads a 401 as an OAuth challenge and would start a sign-in instead of
+    // showing the message that names the `/fwd` address.
+    //
+    // A pass-through (`vk-`) key carries no credential of the gateway's: on
+    // MCP it reaches only a virtual server whose every route carries just
+    // what the client sends (`pass_through_only`) — never one the gateway
+    // would stamp an admin's or a user's stored value on.
+    let needs_fwd = super::upstream_auth::requires_fwd_mount(&upstreams);
+    let refusal = if !fwd_mount && needs_fwd {
+        Some(fwd_mount_required_message(&slug))
+    } else if identity.user.forward_auth && !super::upstream_auth::pass_through_only(&upstreams) {
+        Some(pass_through_refusal_message().to_string())
+    } else {
+        None
+    };
+    if let Some(message) = refusal {
+        let resp = error_response(
+            StatusCode::BAD_REQUEST,
+            request.id.clone().unwrap_or(RpcId::Null),
+            AUTH_REQUIRED,
+            message.clone(),
+        );
+        emit_audit(
+            &state,
+            &identity,
+            request_id,
+            &slug,
+            Some(virtual_server.id),
+            None,
+            request.method.clone(),
+            None,
+            None,
+            None,
+            Some(AUTH_REQUIRED),
+            Some(message),
+            started,
+            Instant::now(),
+            request_bytes,
+            0,
+            user_agent.clone(),
+            mcp_session_id.clone(),
+            StatusCode::BAD_REQUEST,
+            None,
+        )
+        .await;
+        return resp;
     }
+    let client_inputs =
+        super::upstream_auth::capture_client_inputs(&req_headers_for_attribution, &upstreams);
 
     // Response and Notification variants reach this point with all
-    // gates passed (slug binding, BYOT invariant, rate-limit, budget). They
+    // gates passed (slug binding, mount, rate-limit, budget). They
     // skip the policy + dispatch flow below and route to their dedicated
-    // handlers, which re-resolve the bearer through the same auth_ctx the
-    // dispatch path uses (so per-user-OAuth tokens stay fresh).
+    // handlers, which re-resolve the upstream's headers through the same
+    // auth_ctx the dispatch path uses (so per-user-OAuth tokens stay fresh).
     let auth_ctx_for_reverse = AuthCtx {
         tenant_id: identity.tenant_id,
         workspace_id: identity.user.workspace_id,
@@ -1848,6 +1894,9 @@ async fn handle_authenticated_request(
             request.params.as_ref(),
         ),
         server_info: gateway_server_info(&virtual_server),
+        client_inputs: client_inputs.clone(),
+        inputs_memo: Default::default(),
+        sign_ins_url: portal_sign_ins_url(&tenant_cfg),
     };
     match inbound {
         InboundMessage::Response(resp_body) => {
@@ -1863,7 +1912,6 @@ async fn handle_authenticated_request(
                 request_bytes,
                 user_agent,
                 mcp_session_id,
-                bearer_override,
             )
             .await;
         }
@@ -2001,7 +2049,6 @@ async fn handle_authenticated_request(
                     &upstreams,
                     &auth_ctx_for_reverse,
                     &request,
-                    bearer_override.as_deref(),
                     started,
                     request_bytes,
                     user_agent,
@@ -2019,7 +2066,6 @@ async fn handle_authenticated_request(
                     &upstreams,
                     &auth_ctx_for_reverse,
                     &request,
-                    bearer_override.as_deref(),
                     started,
                     request_bytes,
                     user_agent,
@@ -2175,6 +2221,9 @@ async fn handle_authenticated_request(
             request.params.as_ref(),
         ),
         server_info: gateway_server_info(&virtual_server),
+        client_inputs,
+        inputs_memo: Default::default(),
+        sign_ins_url: portal_sign_ins_url(&tenant_cfg),
     };
 
     // `tools/call` and `prompts/get` are the two scopes whose upstream may
@@ -2198,7 +2247,6 @@ async fn handle_authenticated_request(
             &upstreams,
             &auth_ctx,
             mcp_session_id,
-            bearer_override,
             started,
             dispatch_started,
             request_bytes,
@@ -2217,7 +2265,6 @@ async fn handle_authenticated_request(
         &upstreams,
         &request,
         mcp_session_id.as_deref(),
-        bearer_override.as_deref(),
     )
     .await;
     let dispatch_finished = Instant::now();
@@ -2229,6 +2276,7 @@ async fn handle_authenticated_request(
                 request.id.clone().unwrap_or(RpcId::Null),
                 &e,
                 &era,
+                auth_ctx.sign_ins_url.as_deref(),
             );
             emit_audit(
                 &state,
@@ -2382,7 +2430,7 @@ async fn handle_authenticated_request(
 /// Resolves the namespace prefix to a single upstream, applies the route
 /// filter (tools_filter for `tools/call`, prompts_filter for `prompts/get`),
 /// rewrites `params.name` to the unprefixed form, and calls
-/// [`upstream::call_with_bearer_for_streaming`]. Branches:
+/// [`upstream::call_with_auth_for_streaming`]. Branches:
 ///
 /// - Upstream replied with `application/json` → emit one audit row + return
 ///   the JSON body. Behaviourally identical to the synchronous path.
@@ -2408,7 +2456,6 @@ async fn handle_method_streaming(
     upstreams: &[streamscope_core::config::mcp::McpUpstreamServer],
     auth: &AuthCtx,
     mcp_session_id: Option<String>,
-    bearer_override: Option<String>,
     started: Instant,
     dispatch_started: Instant,
     request_bytes: i32,
@@ -2550,91 +2597,26 @@ async fn handle_method_streaming(
         obj.insert("name".into(), serde_json::Value::String(suffix.clone()));
     }
 
-    // ── Bearer resolution ─────────────────────────────────────────────────
-    use streamscope_core::config::mcp::McpAuthMode;
-    let bearer = if let Some(b) = bearer_override.as_deref() {
-        Some(b.to_string())
-    } else {
-        match upstream.auth_mode {
-            McpAuthMode::NoAuth => None,
-            McpAuthMode::ServiceAccount => {
-                match decrypt_service_account_inline(&upstream) {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        let (code, msg) = upstream_error_to_jsonrpc(&e);
-                        let resp = error_response(StatusCode::OK, rpc_id, code, msg.clone());
-                        let (tid, pid, rid) = make_audit_ids(&name);
-                        emit_audit_with_policy(
-                            &state, &identity, request_id, &slug,
-                            Some(virtual_server_id), Some(upstream.id), method.clone(),
-                            tid, pid, rid,
-                            Some(code), Some(msg),
-                            started, Instant::now(), request_bytes, 0,
-                            user_agent, mcp_session_id, StatusCode::OK,
-                            policy_classification, policy_app_id,
-                            policy_detection_method.clone(),
-                            request.params.clone(), None,
-                            None, // limit_bucket
-                        ).await;
-                        return resp;
-                    }
-                }
-            }
-            McpAuthMode::PerUserOauth => {
-                let snapshot = auth.mcp_config.user_credential(auth.user_id, upstream.id);
-                match oauth::resolve_user_bearer(
-                    &auth.oauth_state,
-                    auth.tenant_id,
-                    auth.user_id,
-                    &upstream,
-                    snapshot,
-                    auth.rotation_sink.as_ref(),
-                )
-                .await
-                {
-                    Ok(t) => Some(t),
-                    Err(e) => {
-                        let (code, msg) = upstream_error_to_jsonrpc(&e);
-                        let resp = error_response(StatusCode::OK, rpc_id, code, msg.clone());
-                        let (tid, pid, rid) = make_audit_ids(&name);
-                        emit_audit_with_policy(
-                            &state, &identity, request_id, &slug,
-                            Some(virtual_server_id), Some(upstream.id), method.clone(),
-                            tid, pid, rid,
-                            Some(code), Some(msg),
-                            started, Instant::now(), request_bytes, 0,
-                            user_agent, mcp_session_id, StatusCode::OK,
-                            policy_classification, policy_app_id,
-                            policy_detection_method.clone(),
-                            request.params.clone(), None,
-                            None, // limit_bucket
-                        ).await;
-                        return resp;
-                    }
-                }
-            }
-            McpAuthMode::Byot => {
-                let resp = error_response(
-                    StatusCode::OK, rpc_id,
-                    super::jsonrpc::MCP_UPSTREAM_CONFIG_UNSUPPORTED,
-                    "BYOT upstream requires the /fwd/{key}/mcp/<slug> mount",
-                );
-                let (tid, pid, rid) = make_audit_ids(&name);
-                emit_audit_with_policy(
-                    &state, &identity, request_id, &slug,
-                    Some(virtual_server_id), Some(upstream.id), method.clone(),
-                    tid, pid, rid,
-                    Some(super::jsonrpc::MCP_UPSTREAM_CONFIG_UNSUPPORTED),
-                    Some("BYOT requires fwd path".into()),
-                    started, Instant::now(), request_bytes, 0,
-                    user_agent, mcp_session_id, StatusCode::OK,
-                    policy_classification, policy_app_id,
-                    policy_detection_method.clone(),
-                    request.params.clone(), None,
-                    None, // limit_bucket
-                ).await;
-                return resp;
-            }
+    // ── Header resolution ─────────────────────────────────────────────────
+    let upstream_auth = match resolve_upstream_auth(auth, &upstream).await {
+        Ok(a) => a,
+        Err(e) => {
+            let (code, msg) = upstream_error_to_jsonrpc(&e, auth.sign_ins_url.as_deref());
+            let resp = error_response(StatusCode::OK, rpc_id, code, msg.clone());
+            let (tid, pid, rid) = make_audit_ids(&name);
+            emit_audit_with_policy(
+                &state, &identity, request_id, &slug,
+                Some(virtual_server_id), Some(upstream.id), method.clone(),
+                tid, pid, rid,
+                Some(code), Some(msg),
+                started, Instant::now(), request_bytes, 0,
+                user_agent, mcp_session_id, StatusCode::OK,
+                policy_classification, policy_app_id,
+                policy_detection_method.clone(),
+                request.params.clone(), None,
+                None, // limit_bucket
+            ).await;
+            return resp;
         }
     };
 
@@ -2652,7 +2634,6 @@ async fn handle_method_streaming(
         match streamed_upstream_preflight(
             auth,
             &upstream,
-            bearer_override.as_deref(),
         )
         .await
         {
@@ -2662,6 +2643,7 @@ async fn handle_method_streaming(
                     request.id.clone().unwrap_or(RpcId::Null),
                     &e,
                     &auth.era,
+                    auth.sign_ins_url.as_deref(),
                 );
                 let (tid, pid, rid) = make_audit_ids(&name);
                 emit_audit_with_policy(
@@ -2768,7 +2750,7 @@ async fn handle_method_streaming(
         match dispatch_legacy_sse(
             auth,
             &upstream,
-            bearer.clone(),
+            upstream_auth.clone(),
             &rewritten,
             effective_sid,
             &route.prefix,
@@ -2779,9 +2761,9 @@ async fn handle_method_streaming(
             Err(e) => Err(e),
         }
     } else {
-        upstream::call_with_bearer_for_streaming(
+        upstream::call_with_auth_for_streaming(
             &upstream,
-            bearer.clone(),
+            &upstream_auth,
             &rewritten,
             effective_sid,
             negotiated_version.as_deref(),
@@ -2796,6 +2778,7 @@ async fn handle_method_streaming(
                 request.id.clone().unwrap_or(RpcId::Null),
                 &e,
                 &auth.era,
+                auth.sign_ins_url.as_deref(),
             );
             let (tid, pid, rid) = make_audit_ids(&name);
             emit_audit_with_policy(
@@ -2978,7 +2961,7 @@ async fn handle_method_streaming(
                 // session — without this the bridge would find no channel to
                 // deliver the client's input on and fail every retry.
                 mcp_session_id.or(upstream_sid_owned),
-                bearer,
+                upstream_auth,
                 request,
                 Some(name),
                 policy_classification,
@@ -3174,7 +3157,7 @@ async fn mrtr_bridge(
     ev: &streamscope_core::api::sse::SseEvent,
     mrtr: &mut ModernStreamCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer: Option<&str>,
+    upstream_auth: &UpstreamAuth,
     upstream_session_id: Option<&str>,
 ) -> MrtrOutcome {
     if !mrtr.era.is_modern() {
@@ -3213,7 +3196,7 @@ async fn mrtr_bridge(
             Some(sid) => {
                 if let Err(e) = upstream::forward_client_response(
                     &upstream.upstream_url,
-                    bearer,
+                    upstream_auth,
                     &payload,
                     sid,
                     upstream.request_timeout_ms,
@@ -3409,7 +3392,7 @@ fn stream_method_response(
     upstream_resp: reqwest::Response,
     response_session_id: Option<String>,
     inbound_session_id: Option<String>,
-    bearer: Option<String>,
+    upstream_auth: UpstreamAuth,
     original_request: JsonRpcRequest,
     resolved_name: Option<String>,
     policy_classification: Option<streamscope_core::config::tool_rules::RiskResult>,
@@ -3488,7 +3471,7 @@ fn stream_method_response(
             upstream: &streamscope_core::config::mcp::McpUpstreamServer,
             route_prefix: &str,
             session_for_audit: Option<String>,
-            bearer: Option<&str>,
+            upstream_auth: &UpstreamAuth,
             counters: &mut (u32, u32, u32, u32, u32),
             response_bytes_out: &mut i32,
             mrtr: Option<&mut ModernStreamCtx>,
@@ -3509,7 +3492,7 @@ fn stream_method_response(
                 virtual_server_id,
                 upstream,
                 session_for_audit.as_deref(),
-                bearer,
+                upstream_auth,
             )
             .await
             .is_some()
@@ -3548,7 +3531,7 @@ fn stream_method_response(
                     &ev,
                     mrtr,
                     upstream,
-                    bearer,
+                    upstream_auth,
                     session_for_audit.as_deref(),
                 )
                 .await
@@ -3911,7 +3894,7 @@ fn stream_method_response(
                             &upstream,
                             &route_prefix,
                             session_for_audit,
-                            bearer.as_deref(),
+                            &upstream_auth,
                             &mut counters,
                             &mut response_bytes_out,
                             mrtr.as_mut(),
@@ -3973,7 +3956,7 @@ fn stream_method_response(
                 &upstream,
                 &route_prefix,
                 session_for_audit,
-                bearer.as_deref(),
+                &upstream_auth,
                 &mut counters,
                 &mut response_bytes_out,
                 mrtr.as_mut(),
@@ -4264,7 +4247,7 @@ async fn maybe_intercept_sampling(
     virtual_server_id: Uuid,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
     session_for_audit: Option<&str>,
-    bearer: Option<&str>,
+    upstream_auth: &UpstreamAuth,
 ) -> Option<()> {
     // Whether the virtual server intercepts sampling, read from the config the
     // request authenticated against — the one `upstream` came from.
@@ -4300,7 +4283,7 @@ async fn maybe_intercept_sampling(
     if let Some(sid) = session_for_audit {
         let post_result = super::upstream::forward_client_response(
             &upstream.upstream_url,
-            bearer,
+            upstream_auth,
             &outcome.upstream_payload,
             sid,
             // Generous timeout: the upstream just needs to ack 202.
@@ -4645,9 +4628,9 @@ async fn emit_elicitation_complete_audit_to(
 ///   `virtual_server_id`. Defense-in-depth — the identity check above is
 ///   strictly stronger, but the VS check stays trip-wired for future
 ///   Identity-minting changes.
-/// - Bearer is **always re-resolved** from the upstream's current credential
-///   state (service-account decrypt / per-user-OAuth lookup) so per-user-
-///   OAuth tokens that rotated since the original `tools/call` are refreshed.
+/// - The upstream's headers are **always re-resolved** from its current
+///   state (declared inputs, per-user-OAuth lookup) so per-user-OAuth tokens
+///   that rotated since the original `tools/call` are refreshed.
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_response(
     state: &McpRouterState,
@@ -4661,7 +4644,6 @@ async fn handle_client_response(
     request_bytes: i32,
     user_agent: Option<String>,
     mcp_session_id: Option<String>,
-    bearer_override: Option<String>,
 ) -> Response<Body> {
     if mcp_session_id.is_none() {
         let resp = error_response(
@@ -4868,53 +4850,36 @@ async fn handle_client_response(
     // it minted, not our virtualized token.
     response.id = rpc_id_from_value(decoded.original_id.clone());
 
-    // Re-resolve the bearer freshly from the upstream's current state so
+    // Re-resolve the upstream's headers freshly from its current state so
     // per-user-OAuth tokens that rotated since the original `tools/call` are
-    // refreshed, and service-account credentials picked up after a rotation
-    // take effect immediately. BYOT path uses the agent's forwarded header.
-    let bearer: Option<String> = if let Some(b) = bearer_override.as_deref() {
-        Some(b.to_string())
-    } else {
-        use streamscope_core::config::mcp::McpAuthMode;
-        match upstream.auth_mode {
-            McpAuthMode::NoAuth => None,
-            McpAuthMode::ServiceAccount => decrypt_service_account_inline(upstream).ok(),
-            McpAuthMode::PerUserOauth => {
-                let snapshot = auth.mcp_config.user_credential(auth.user_id, upstream.id);
-                oauth::resolve_user_bearer(
-                    &auth.oauth_state,
-                    auth.tenant_id,
-                    auth.user_id,
-                    upstream,
-                    snapshot,
-                    auth.rotation_sink.as_ref(),
-                )
-                .await
-                .ok()
-            }
-            McpAuthMode::Byot => None,
-        }
-    };
+    // refreshed, and a changed admin or user input takes effect immediately.
+    // A caller who can no longer reach the upstream gets that error rather
+    // than a reply posted without its credentials.
     let body_value = serde_json::to_value(&response).unwrap_or_else(|_| serde_json::json!({}));
     let dispatch_started = Instant::now();
-    let result = upstream::forward_client_response(
-        &upstream.upstream_url,
-        bearer.as_deref(),
-        &body_value,
-        // Use the upstream's session id from the decoded token, not the
-        // agent-supplied header — they should match, but the token is the
-        // authoritative source.
-        decoded.upstream_session_id.as_str(),
-        // Use a generous default timeout — the upstream just needs to ack 202.
-        15_000,
-    )
-    .await;
+    let result = match resolve_upstream_auth(auth, upstream).await {
+        Ok(upstream_auth) => {
+            upstream::forward_client_response(
+                &upstream.upstream_url,
+                &upstream_auth,
+                &body_value,
+                // Use the upstream's session id from the decoded token, not the
+                // agent-supplied header — they should match, but the token is the
+                // authoritative source.
+                decoded.upstream_session_id.as_str(),
+                // Use a generous default timeout — the upstream just needs to ack 202.
+                15_000,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
     let dispatch_finished = Instant::now();
 
     let (status, error_code, error_message) = match result {
         Ok(_status) => (StatusCode::ACCEPTED, None, None),
         Err(e) => {
-            let (code, msg) = upstream_error_to_jsonrpc(&e);
+            let (code, msg) = upstream_error_to_jsonrpc(&e, auth.sign_ins_url.as_deref());
             (StatusCode::OK, Some(code), Some(msg))
         }
     };
@@ -5143,11 +5108,6 @@ fn resolved_completion_target(req: &JsonRpcRequest) -> (Option<String>, Option<S
 /// Returns `(response_value, mcp_session_id, upstream_server_id_used, error_tuple)`.
 /// `error_tuple` is `Some((code, message))` if the JSON-RPC response carried
 /// an `error` field — surfaces in the audit row.
-///
-/// `bearer_override` (BYOT): forwarded to every `call_cached`
-/// invocation. The fwd-auth handler enforces single-route + `byot` upstream
-/// before invoking dispatch, so the override applies uniformly to every
-/// scope (initialize, tools/list, tools/call, …).
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     cache: &Arc<super::cache::CapabilityCache>,
@@ -5157,13 +5117,35 @@ async fn dispatch(
     upstreams: &[streamscope_core::config::mcp::McpUpstreamServer],
     request: &JsonRpcRequest,
     mcp_session_id: Option<&str>,
-    bearer_override: Option<&str>,
 ) -> Result<
     (JsonRpcResponse, Option<String>, Option<Uuid>, Option<(i32, String)>),
     UpstreamError,
 > {
     let scope = classify_method(&request.method);
     let request_id = request.id.clone().unwrap_or(RpcId::Null);
+
+    // An aggregated list hides an upstream the caller lacks inputs for — but
+    // when that leaves nothing callable, hiding a missing client header would
+    // answer an empty catalog to a misconfigured client, so the first missing
+    // client header is named instead (a missing user input keeps hiding: the
+    // portal shows the user what to connect).
+    if matches!(
+        scope,
+        McpScope::ToolList | McpScope::PromptList | McpScope::ResourceList | McpScope::ResourceTemplatesList
+    ) && !some_route_is_callable(auth, routes, upstreams)
+    {
+        for route in routes {
+            if let Some(upstream) = upstreams.iter().find(|u| u.id == route.upstream_server_id)
+                && let Err(e @ UpstreamError::ClientHeaderMissing(_)) = auth.inputs_memo.resolve_quiet(
+                    upstream,
+                    auth.mcp_config.user_inputs(auth.user_id, upstream.id),
+                    &auth.client_inputs,
+                )
+            {
+                return Err(e);
+            }
+        }
+    }
 
     match scope {
         McpScope::Initialize => {
@@ -5179,12 +5161,19 @@ async fn dispatch(
             let mut per_upstream_sids: Vec<(Uuid, String)> = Vec::new();
             let mut per_instructions: Vec<String> = Vec::new();
 
+            // Every route is initialized, the first as the leader, and each one
+            // that answers gets its own upstream session id mapped to the
+            // downstream one. A leader the caller cannot call yet fails the
+            // initialize, naming what is missing; a secondary route it cannot
+            // call yet is left without a session of its own until the client
+            // initializes again.
             for (idx, route) in routes.iter().enumerate() {
                 let upstream = match upstreams.iter().find(|u| u.id == route.upstream_server_id) {
                     Some(u) => u,
                     None => continue,
                 };
-                match call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await {
+                let is_leader = idx == 0;
+                match call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await {
                     Ok((resp, sid)) => {
                         if let Some(s) = sid.as_deref()
                             && !s.is_empty()
@@ -5220,11 +5209,11 @@ async fn dispatch(
                         }
                     }
                     Err(e) => {
-                        // First upstream failure is fatal — initialize is
+                        // The leader's failure is fatal — initialize is
                         // routed to the leader so the agent gets a stable
                         // protocolVersion. If a secondary upstream errors,
                         // continue and just skip its capabilities.
-                        if idx == 0 {
+                        if is_leader {
                             return Err(e);
                         }
                         tracing::warn!(error = %e, route = %route.id, "initialize: secondary upstream failed");
@@ -5328,7 +5317,7 @@ async fn dispatch(
                 } else {
                     route.prompts_filter.as_ref()
                 };
-                match call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await {
+                match call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await {
                     Ok((resp, sid)) => {
                         if response_session_id.is_none() {
                             response_session_id = sid;
@@ -5370,7 +5359,7 @@ async fn dispatch(
                 if !user_has_credential_for(auth, upstream) {
                     continue;
                 }
-                match call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await {
+                match call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await {
                     Ok((resp, sid)) => {
                         if response_session_id.is_none() {
                             response_session_id = sid;
@@ -5471,7 +5460,7 @@ async fn dispatch(
                 obj.insert("uri".into(), serde_json::Value::String(original_uri));
             }
             let (mut resp, sid) =
-                call_cached(cache, auth, upstream, &request, mcp_session_id, bearer_override, &route.prefix).await?;
+                call_cached(cache, auth, upstream, &request, mcp_session_id, &route.prefix).await?;
             // Rewrite the response's resource URIs so the agent sees the same
             // `stsmcp://<route_prefix>/<b64>` envelope it just sent: agents
             // round-trip URIs and we already enforce the envelope on the
@@ -5548,7 +5537,7 @@ async fn dispatch(
                 obj.insert("uri".into(), serde_json::Value::String(original_uri));
             }
             let (resp, sid) =
-                call_cached(cache, auth, upstream, &request, mcp_session_id, bearer_override, &route.prefix).await?;
+                call_cached(cache, auth, upstream, &request, mcp_session_id, &route.prefix).await?;
             let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
@@ -5705,7 +5694,7 @@ async fn dispatch(
                 obj.insert("ref".into(), rewritten_ref);
             }
             let (resp, sid) =
-                call_cached(cache, auth, upstream, &request, mcp_session_id, bearer_override, &route.prefix).await?;
+                call_cached(cache, auth, upstream, &request, mcp_session_id, &route.prefix).await?;
             let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
@@ -5728,7 +5717,7 @@ async fn dispatch(
                 if !user_has_credential_for(auth, upstream) {
                     continue;
                 }
-                match call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await {
+                match call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await {
                     Ok((resp, sid)) => {
                         if response_session_id.is_none() {
                             response_session_id = sid;
@@ -5784,7 +5773,7 @@ async fn dispatch(
                 if !user_has_credential_for(auth, upstream) {
                     continue;
                 }
-                match call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await {
+                match call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await {
                     Ok((resp, sid)) => {
                         if response_session_id.is_none() {
                             response_session_id = sid;
@@ -5861,7 +5850,7 @@ async fn dispatch(
                 }
             };
             if let Some(upstream) = upstreams.iter().find(|u| u.id == route.upstream_server_id) {
-                let _ = call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await;
+                let _ = call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await;
             }
             Ok((JsonRpcResponse::ok(request_id, serde_json::json!({})), None, None, None))
         }
@@ -5893,7 +5882,7 @@ async fn dispatch(
                 }
             };
             let (resp, sid) =
-                call_cached(cache, auth, upstream, request, mcp_session_id, bearer_override, &route.prefix).await?;
+                call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await?;
             let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
@@ -6006,8 +5995,9 @@ fn upstream_error_relay(
     id: RpcId,
     err: &UpstreamError,
     era: &ProtocolEra,
+    sign_ins_url: Option<&str>,
 ) -> (Response<Body>, i32, String) {
-    let (code, message) = upstream_error_to_jsonrpc(err);
+    let (code, message) = upstream_error_to_jsonrpc(err, sign_ins_url);
     let resp = match relayed_error_data(err, code, era) {
         Some(data) => {
             era_error_response_with_data(StatusCode::OK, id, code, message.clone(), data, era)
@@ -6122,38 +6112,13 @@ fn resource_not_found(id: RpcId, uri: &str) -> JsonRpcResponse {
     )
 }
 
-/// Map an `AppError` from `resolve_identity` to a `(status, wire_message,
-/// audit_detail)` triple. The wire message is intentionally generic
-/// ("unauthorized") for every failure mode so a probing client can't
-/// distinguish "key exists but wrong family" from "invalid key" /
-/// "revoked" / "expired" / "missing header"; the fine-grained reason is
-/// captured separately on the audit row.
-/// Auth + cache aware wrapper around [`upstream::call`].
-///
-/// 1. Resolves the bearer token for this `(auth_mode, user)` pair —
-///    `NoAuth` / `ServiceAccount` / `PerUserOauth` (refresh single-flight).
-/// 2. For cacheable upstreams + methods, returns a cached response if any.
-/// 3. Otherwise, makes the outbound HTTP call with the resolved bearer.
-///
-/// `PerUserOauth` upstreams are explicitly NOT cacheable (per
-/// `cache::is_cacheable`) — caching one user's response would leak across
-/// users. `NoAuth` and `ServiceAccount` cache as before, with `cred_version`
-/// invalidating on rotation.
-/// Make an outbound call with cache-aware bearer resolution.
-///
-/// `bearer_override` (BYOT): when `Some`, the bearer comes from the
-/// client's forwarded header instead of the upstream's stored credential.
-/// That path also bypasses the capability cache because BYOT bearers are
-/// per-user (caching one user's response would leak across users — the same
-/// hazard `is_cacheable` already locks out for `PerUserOauth`).
-#[allow(clippy::too_many_arguments)]
 /// The freshness hint to attach to a modern result, or `None` when the method
 /// is not a `CacheableResult`.
 ///
 /// The positive hint is the gateway's own capability-cache TTL, because that
 /// is literally how long we would hand the client the same bytes back. It is
-/// advertised only when the answer really would come from that cache: a
-/// per-user-OAuth or BYOT upstream is never cached, so its catalog can change
+/// advertised only when the answer really would come from that cache: an
+/// upstream with a per-caller input or OAuth token is never cached, so its catalog can change
 /// between one call and the next and a non-zero hint would be a promise we
 /// cannot keep. One uncacheable route makes the whole aggregate uncacheable —
 /// the client sees a single merged list and cannot cache half of it.
@@ -6226,18 +6191,28 @@ async fn merge_modern_upstream_capabilities(
     auth: &AuthCtx,
     routes: &[streamscope_core::config::mcp::McpVirtualRoute],
     upstreams: &[streamscope_core::config::mcp::McpUpstreamServer],
-    bearer_override: Option<&str>,
 ) -> Result<UpstreamCapabilityView, UpstreamError> {
     let mut per_caps: Vec<serde_json::Value> = Vec::new();
     let mut per_upstream: Vec<(Uuid, serde_json::Value)> = Vec::new();
     let mut instructions: Vec<String> = Vec::new();
     let mut complete = true;
+    // The leader is the first route the caller can call: with several routes,
+    // one lacking the caller's inputs is skipped rather than made fatal (a
+    // modern client holds no session per route, so skipping costs nothing).
+    let mut leader_pending = true;
+    let skip_uncallable = some_route_is_callable(auth, routes, upstreams);
 
-    for (idx, route) in routes.iter().enumerate() {
+    for route in routes {
         let Some(upstream) = upstreams.iter().find(|u| u.id == route.upstream_server_id) else {
             continue;
         };
-        match ensure_upstream_connection(auth, upstream, bearer_override).await {
+        if skip_uncallable && !user_has_credential_for(auth, upstream) {
+            // The answer leaves this route out for this caller only.
+            complete = false;
+            continue;
+        }
+        let is_leader = std::mem::replace(&mut leader_pending, false);
+        match ensure_upstream_connection(auth, upstream).await {
             Ok(h) => {
                 per_caps.push(h.capabilities.clone());
                 per_upstream.push((upstream.id, h.capabilities.clone()));
@@ -6259,7 +6234,7 @@ async fn merge_modern_upstream_capabilities(
                 // secondary route that is down degrades the capability set
                 // rather than the whole call — but the caller is told, so it
                 // does not hand the client a partial answer to cache.
-                if idx == 0 {
+                if is_leader {
                     return Err(e);
                 }
                 complete = false;
@@ -6298,7 +6273,6 @@ async fn handle_modern_discover(
     upstreams: &[streamscope_core::config::mcp::McpUpstreamServer],
     auth: &AuthCtx,
     request: &JsonRpcRequest,
-    bearer_override: Option<&str>,
     started: Instant,
     request_bytes: i32,
     user_agent: Option<String>,
@@ -6308,13 +6282,12 @@ async fn handle_modern_discover(
         auth,
         routes,
         upstreams,
-        bearer_override,
     )
     .await
     {
         Ok(v) => v,
         Err(e) => {
-            let (code, message) = upstream_error_to_jsonrpc(&e);
+            let (code, message) = upstream_error_to_jsonrpc(&e, auth.sign_ins_url.as_deref());
             let resp = error_response(StatusCode::OK, rpc_id, code, message.clone());
             emit_audit(
                 state,
@@ -6507,7 +6480,6 @@ async fn handle_modern_subscriptions_listen(
     upstreams: &[streamscope_core::config::mcp::McpUpstreamServer],
     auth: &AuthCtx,
     request: &JsonRpcRequest,
-    bearer_override: Option<&str>,
     started: Instant,
     request_bytes: i32,
     user_agent: Option<String>,
@@ -6526,13 +6498,12 @@ async fn handle_modern_subscriptions_listen(
         auth,
         routes,
         upstreams,
-        bearer_override,
     )
     .await
     {
         Ok(v) => v,
         Err(e) => {
-            let (code, message) = upstream_error_to_jsonrpc(&e);
+            let (code, message) = upstream_error_to_jsonrpc(&e, auth.sign_ins_url.as_deref());
             return error_response(StatusCode::OK, rpc_id, code, message);
         }
     };
@@ -6555,7 +6526,6 @@ async fn handle_modern_subscriptions_listen(
             upstream,
             &route.prefix,
             &per_route,
-            bearer_override,
         )
         .await
         {
@@ -6606,7 +6576,6 @@ async fn handle_modern_subscriptions_listen(
             upstreams,
             &sub,
             None,
-            bearer_override,
         )
         .await
         {
@@ -6785,53 +6754,41 @@ async fn handle_modern_subscriptions_listen(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Resolve the bearer to present to `upstream` for this caller.
-///
-/// `bearer_override` is the BYOT path: the client's own credential, forwarded
-/// verbatim, and it wins over anything the operator configured. Otherwise the
-/// upstream's `auth_mode` decides — including a per-user OAuth refresh, which
-/// is why this is `async`.
+/// Resolve the headers to present to `upstream` for this caller: its
+/// declared inputs (admin values, the caller's own, the client's captured
+/// headers) and, on a `per_user_oauth` upstream, the user's OAuth token as
+/// `Authorization: Bearer` — refreshed if needed, which is why this is
+/// `async`.
 ///
 /// Split out of [`call_cached`] because the gateway also opens upstream
 /// connections **on its own initiative** (see [`ensure_upstream_connection`]),
 /// and that path must resolve credentials by exactly the same rules. Two
 /// copies of this would drift, and the drift would be a request reaching an
 /// upstream with the wrong user's token.
-async fn resolve_upstream_bearer(
+async fn resolve_upstream_auth(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
-) -> Result<Option<String>, upstream::UpstreamError> {
+) -> Result<UpstreamAuth, upstream::UpstreamError> {
     use streamscope_core::config::mcp::McpAuthMode;
-    if let Some(b) = bearer_override {
-        return Ok(Some(b.to_string()));
+    let mut upstream_auth = auth.inputs_memo.resolve(
+        upstream,
+        auth.mcp_config.user_inputs(auth.user_id, upstream.id),
+        &auth.client_inputs,
+    )?;
+    if upstream.auth_mode == McpAuthMode::PerUserOauth {
+        let snapshot = auth.mcp_config.user_credential(auth.user_id, upstream.id);
+        let token = oauth::resolve_user_bearer(
+            &auth.oauth_state,
+            auth.tenant_id,
+            auth.user_id,
+            upstream,
+            snapshot,
+            auth.rotation_sink.as_ref(),
+        )
+        .await?;
+        super::upstream_auth::push_oauth_token(&mut upstream_auth, upstream, &token)?;
     }
-    Ok(match upstream.auth_mode {
-        McpAuthMode::NoAuth => None,
-        McpAuthMode::ServiceAccount => Some(decrypt_service_account_inline(upstream)?),
-        McpAuthMode::PerUserOauth => {
-            let snapshot = auth.mcp_config.user_credential(auth.user_id, upstream.id);
-            Some(
-                oauth::resolve_user_bearer(
-                    &auth.oauth_state,
-                    auth.tenant_id,
-                    auth.user_id,
-                    upstream,
-                    snapshot,
-                    auth.rotation_sink.as_ref(),
-                )
-                .await?,
-            )
-        }
-        McpAuthMode::Byot => {
-            // BYOT auth_mode without a forwarded bearer means the route was
-            // reached on `/mcp/<slug>` (operator-key path) instead of
-            // `/fwd/{key}/mcp/<slug>`. The handler should have rejected it
-            // already — surface the same JSON-RPC code if it slips through
-            // (defense in depth).
-            return Err(UpstreamError::AuthModeUnsupported(upstream.auth_mode));
-        }
-    })
+    Ok(upstream_auth)
 }
 
 /// The capabilities the gateway declares when it opens a **legacy** upstream
@@ -6949,9 +6906,8 @@ fn status_answers_nothing_about_era(status: u16) -> bool {
 async fn discover_upstream(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
 ) -> Result<DiscoverOutcome, upstream::UpstreamError> {
-    let bearer = resolve_upstream_bearer(auth, upstream, bearer_override).await?;
+    let upstream_auth = resolve_upstream_auth(auth, upstream).await?;
     let probe = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id: Some(RpcId::String(format!("sts-discover-{}", Uuid::new_v4()))),
@@ -6964,9 +6920,9 @@ async fn discover_upstream(
         )),
     };
 
-    match upstream::call_with_bearer(
+    match upstream::call_with_auth(
         upstream,
-        bearer,
+        &upstream_auth,
         &probe,
         None,
         Some(modern::MODERN_PROTOCOL_VERSION),
@@ -7071,7 +7027,6 @@ async fn discover_upstream(
 async fn resolve_upstream_support(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
 ) -> Result<modern::UpstreamEraSupport, upstream::UpstreamError> {
     use streamscope_core::config::mcp::McpTransport;
     if super::virtual_servers::is_internal(upstream)
@@ -7086,7 +7041,7 @@ async fn resolve_upstream_support(
         return Ok(support);
     }
 
-    let support = match discover_upstream(auth, upstream, bearer_override).await? {
+    let support = match discover_upstream(auth, upstream).await? {
         DiscoverOutcome::Discovered(result) if modern::offers_modern_era(&result) => {
             // The probe's answer IS the modern connection — there is no
             // handshake behind it — so record it now rather than repeat the
@@ -7095,6 +7050,7 @@ async fn resolve_upstream_support(
                 auth.tenant_id,
                 auth.user_id,
                 upstream.id,
+                inputs_key(auth, upstream),
                 super::session::UpstreamHandshake::modern(
                     result
                         .get("capabilities")
@@ -7107,7 +7063,7 @@ async fn resolve_upstream_support(
                         .map(str::to_string),
                 ),
             );
-            match legacy_handshake(auth, upstream, bearer_override).await {
+            match legacy_handshake(auth, upstream).await {
                 Ok(_) => {
                     tracing::info!(
                         upstream_id = %upstream.id,
@@ -7165,10 +7121,23 @@ async fn resolve_upstream_support(
 async fn resolve_upstream_era(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
 ) -> Result<modern::UpstreamEra, upstream::UpstreamError> {
-    let support = resolve_upstream_support(auth, upstream, bearer_override).await?;
+    let support = resolve_upstream_support(auth, upstream).await?;
     Ok(modern::era_for_request(auth.era.is_modern(), support))
+}
+
+/// The inputs a gateway-owned handshake with `upstream` is opened under: the
+/// stored admin and user values, the user's OAuth credential and the client's
+/// values for its client-filled headers. A cached handshake opened under other inputs (an admin rotation,
+/// the user's changed values, another client's token) is not found, so a
+/// caller never rides an upstream session another credential opened.
+fn inputs_key(auth: &AuthCtx, upstream: &streamscope_core::config::mcp::McpUpstreamServer) -> u64 {
+    super::upstream_auth::inputs_fingerprint(
+        upstream,
+        auth.mcp_config.user_inputs(auth.user_id, upstream.id),
+        auth.mcp_config.user_credential(auth.user_id, upstream.id),
+        &auth.client_inputs,
+    )
 }
 
 /// Open — or reuse — the gateway's own connection to `upstream`, in the era
@@ -7182,14 +7151,14 @@ async fn resolve_upstream_era(
 /// `server/discover` already told us everything a handshake would have.
 ///
 /// Cached per `(tenant, user, upstream, era)` — keyed on the authenticated
-/// user, never on anything from the wire — and reused until the idle TTL
+/// user, never on anything from the wire — holding the inputs it was opened
+/// under ([`inputs_key`]), and reused until the idle TTL
 /// lapses or an upstream tells us the session is gone. **The era is in the key
 /// because a dual-era upstream carries both legs at once**, one per client
 /// generation, and they share no state.
 async fn ensure_upstream_connection(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
 ) -> Result<super::session::UpstreamHandshake, upstream::UpstreamError> {
     // The built-in virtual servers (`internal://…`) are dispatched in-process
     // and hold no session state, so there is nothing to hand-shake. Record an
@@ -7200,6 +7169,7 @@ async fn ensure_upstream_connection(
             auth.tenant_id,
             auth.user_id,
             upstream.id,
+            inputs_key(auth, upstream),
             modern::UpstreamEra::Legacy,
         ) {
             return Ok(h);
@@ -7226,6 +7196,7 @@ async fn ensure_upstream_connection(
             auth.tenant_id,
             auth.user_id,
             upstream.id,
+            inputs_key(auth, upstream),
             super::session::UpstreamHandshake::legacy(
                 None,
                 caps,
@@ -7239,20 +7210,21 @@ async fn ensure_upstream_connection(
     // modern-capable upstream fills the modern slot as a side effect of
     // answering — so looking before resolving would miss it and pay for a
     // second `server/discover`.
-    let era = resolve_upstream_era(auth, upstream, bearer_override).await?;
+    let era = resolve_upstream_era(auth, upstream).await?;
     if let Some(h) = auth
         .session_map
-        .handshake(auth.tenant_id, auth.user_id, upstream.id, era)
+        .handshake(auth.tenant_id, auth.user_id, upstream.id, inputs_key(auth, upstream), era)
     {
         return Ok(h);
     }
 
     if era.is_modern() {
-        return match discover_upstream(auth, upstream, bearer_override).await? {
+        return match discover_upstream(auth, upstream).await? {
             DiscoverOutcome::Discovered(result) => Ok(auth.session_map.set_handshake(
                 auth.tenant_id,
                 auth.user_id,
                 upstream.id,
+                inputs_key(auth, upstream),
                 super::session::UpstreamHandshake::modern(
                     result
                         .get("capabilities")
@@ -7290,7 +7262,7 @@ async fn ensure_upstream_connection(
                 );
                 auth.session_map
                     .forget_upstream_era(auth.tenant_id, upstream.id);
-                legacy_handshake(auth, upstream, bearer_override).await
+                legacy_handshake(auth, upstream).await
             }
         };
     }
@@ -7304,7 +7276,7 @@ async fn ensure_upstream_connection(
     // *answered* refusal counts — a transport failure is the upstream being
     // down, not the support being wrong, and forgetting on one would re-probe
     // on every blip.
-    match legacy_handshake(auth, upstream, bearer_override).await {
+    match legacy_handshake(auth, upstream).await {
         Ok(h) => Ok(h),
         Err(e) => {
             if matches!(e, upstream::UpstreamError::Http { .. }) {
@@ -7325,9 +7297,8 @@ async fn ensure_upstream_connection(
 async fn legacy_handshake(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
 ) -> Result<super::session::UpstreamHandshake, upstream::UpstreamError> {
-    let bearer = resolve_upstream_bearer(auth, upstream, bearer_override).await?;
+    let upstream_auth = resolve_upstream_auth(auth, upstream).await?;
 
     let init = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
@@ -7351,14 +7322,14 @@ async fn legacy_handshake(
         dispatch_legacy_sse(
             auth,
             upstream,
-            bearer.clone(),
+            upstream_auth.clone(),
             &init,
             Some(&modern_upstream_channel_key(auth)),
             "",
         )
         .await?
     } else {
-        upstream::call_with_bearer(upstream, bearer.clone(), &init, None, None).await?
+        upstream::call_with_auth(upstream, &upstream_auth, &init, None, None).await?
     };
 
     if let Some(err) = &resp.error {
@@ -7404,7 +7375,7 @@ async fn legacy_handshake(
         });
         if let Err(e) = upstream::forward_client_response(
             &upstream.upstream_url,
-            bearer.as_deref(),
+            &upstream_auth,
             &initialized,
             sid.as_deref().unwrap_or(""),
             upstream.request_timeout_ms,
@@ -7433,6 +7404,7 @@ async fn legacy_handshake(
         auth.tenant_id,
         auth.user_id,
         upstream.id,
+        inputs_key(auth, upstream),
         super::session::UpstreamHandshake::legacy(sid, capabilities, negotiated, instructions),
     ))
 }
@@ -7459,13 +7431,12 @@ fn modern_upstream_channel_key(auth: &AuthCtx) -> String {
 async fn streamed_upstream_preflight(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer_override: Option<&str>,
 ) -> Result<(bool, Option<super::session::UpstreamHandshake>), upstream::UpstreamError> {
-    let modern_upstream = resolve_upstream_era(auth, upstream, bearer_override)
+    let modern_upstream = resolve_upstream_era(auth, upstream)
         .await?
         .is_modern();
     let handshake = if auth.era.is_modern() && !modern_upstream {
-        Some(ensure_upstream_connection(auth, upstream, bearer_override).await?)
+        Some(ensure_upstream_connection(auth, upstream).await?)
     } else {
         None
     };
@@ -7741,12 +7712,11 @@ async fn call_modern_upstream(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
     request: &JsonRpcRequest,
-    bearer_override: Option<&str>,
 ) -> Result<(JsonRpcResponse, Option<String>), upstream::UpstreamError> {
     let rpc_id = request.id.clone().unwrap_or(RpcId::Null);
     match modern::modern_upstream_action(&request.method) {
         modern::ModernUpstreamAction::FromDiscovery => {
-            let conn = ensure_upstream_connection(auth, upstream, bearer_override).await?;
+            let conn = ensure_upstream_connection(auth, upstream).await?;
             // Negotiated from the request BODY. `auth.era` came off
             // `MCP-Protocol-Version`, which a legacy client is not required
             // to send on the handshake itself — using it here would answer
@@ -7788,12 +7758,11 @@ async fn call_modern_upstream(
             None,
         )),
         modern::ModernUpstreamAction::Forward => {
-            let bearer = resolve_upstream_bearer(auth, upstream, bearer_override).await?;
+            let upstream_auth = resolve_upstream_auth(auth, upstream).await?;
             let outbound = modern_outbound_request(auth, upstream, request);
             let relay = ModernUpstreamRelay::from_auth(auth, upstream, &request.method);
 
-            let cacheable = bearer_override.is_none()
-                && super::cache::is_cacheable(upstream)
+            let cacheable = super::cache::is_cacheable(upstream)
                 && super::cache::is_cacheable_method(&request.method);
             let cache_key = cacheable.then(|| super::cache::CacheKey {
                 tenant_id: auth.tenant_id,
@@ -7816,9 +7785,9 @@ async fn call_modern_upstream(
                 return Ok((cached, None));
             }
 
-            let (mut resp, _) = upstream::call_with_bearer(
+            let (mut resp, _) = upstream::call_with_auth(
                 upstream,
-                bearer,
+                &upstream_auth,
                 &outbound,
                 // A modern server neither mints nor accepts a session id.
                 None,
@@ -7884,18 +7853,17 @@ async fn call_cached(
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
     request: &JsonRpcRequest,
     mcp_session_id: Option<&str>,
-    bearer_override: Option<&str>,
     route_prefix: &str,
 ) -> Result<(JsonRpcResponse, Option<String>), upstream::UpstreamError> {
     // Which era THIS upstream speaks — independent of the client's. Resolved
     // first because it decides the shape of everything below: a modern
     // upstream takes the `_meta` envelope a legacy one must be spared, holds
     // no session, and answers a different set of methods.
-    if resolve_upstream_era(auth, upstream, bearer_override)
+    if resolve_upstream_era(auth, upstream)
         .await?
         .is_modern()
     {
-        return call_modern_upstream(cache, auth, upstream, request, bearer_override).await;
+        return call_modern_upstream(cache, auth, upstream, request).await;
     }
 
     // A modern client's request carries a `_meta` envelope and the MRTR retry
@@ -7929,12 +7897,12 @@ async fn call_cached(
     // land. Doing it here rather than at the handler makes it impossible to
     // reach an upstream un-handshaken by adding a new dispatch arm.
     let modern_handshake = if auth.era.is_modern() {
-        Some(ensure_upstream_connection(auth, upstream, bearer_override).await?)
+        Some(ensure_upstream_connection(auth, upstream).await?)
     } else {
         None
     };
 
-    let bearer = resolve_upstream_bearer(auth, upstream, bearer_override).await?;
+    let upstream_auth = resolve_upstream_auth(auth, upstream).await?;
 
     // Legacy SSE upstreams bypass the capability cache: the cache key is
     // `(upstream_id, cred_version, method)`, but the persistent SSE channel
@@ -7958,7 +7926,7 @@ async fn call_cached(
         return dispatch_legacy_sse(
             auth,
             upstream,
-            bearer,
+            upstream_auth,
             request,
             sse_channel_key.as_deref(),
             route_prefix,
@@ -8004,9 +7972,9 @@ async fn call_cached(
     };
     let effective_sid = upstream_sid_owned.as_deref();
 
-    // BYOT bearers (the override path) are never cached — see field doc.
-    let cacheable = bearer_override.is_none()
-        && super::cache::is_cacheable(upstream)
+    // An upstream with a per-caller input or OAuth token is never cached —
+    // see `cache::is_cacheable`.
+    let cacheable = super::cache::is_cacheable(upstream)
         && super::cache::is_cacheable_method(&request.method);
     if cacheable {
         let cache_key = super::cache::CacheKey {
@@ -8022,7 +7990,7 @@ async fn call_cached(
             return Ok((cached, None));
         }
         let (resp, sid) =
-            upstream::call_with_bearer(upstream, bearer, request, effective_sid, negotiated_version.as_deref())
+            upstream::call_with_auth(upstream, &upstream_auth, request, effective_sid, negotiated_version.as_deref())
                 .await?;
         if resp.error.is_none() && resp.result.is_some() {
             cache.insert(cache_key, resp.clone());
@@ -8033,7 +8001,7 @@ async fn call_cached(
     }
 
     let (resp, sid) =
-        upstream::call_with_bearer(upstream, bearer, request, effective_sid, negotiated_version.as_deref())
+        upstream::call_with_auth(upstream, &upstream_auth, request, effective_sid, negotiated_version.as_deref())
             .await?;
     record_upstream_session(auth, upstream, mcp_session_id, sid.as_deref(), &modern_handshake);
     note_lost_upstream_session(auth, upstream, &resp, &modern_handshake);
@@ -8069,6 +8037,7 @@ fn record_upstream_session(
                 auth.tenant_id,
                 auth.user_id,
                 upstream.id,
+                inputs_key(auth, upstream),
                 super::session::UpstreamHandshake::legacy(
                     Some(new_sid.to_string()),
                     h.capabilities.clone(),
@@ -8138,7 +8107,7 @@ fn note_lost_upstream_session(
 async fn dispatch_legacy_sse(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-    bearer: Option<String>,
+    upstream_auth: UpstreamAuth,
     request: &JsonRpcRequest,
     mcp_session_id: Option<&str>,
     route_prefix: &str,
@@ -8200,7 +8169,7 @@ async fn dispatch_legacy_sse(
     let session = match auth.legacy_sse_map.get_or_open(
         key,
         upstream,
-        bearer,
+        upstream_auth,
         request_timeout,
         reconnect_backoff,
         sink,
@@ -8238,16 +8207,16 @@ async fn dispatch_legacy_sse(
 /// failing the caller's `subscriptions/listen`, because a listener is an
 /// *improvement* to delivery and not the delivery itself.
 ///
-/// Two shapes are skipped. A legacy-SSE upstream already keeps a long-lived
+/// Three shapes are skipped. A legacy-SSE upstream already keeps a long-lived
 /// channel of its own (`LegacySseSessionMap`), so a second would duplicate
 /// every event onto the bus. An `internal://` virtual server is dispatched
-/// in-process and pushes nothing.
+/// in-process and pushes nothing. An upstream with a client-filled input
+/// cannot be reached without the client's request.
 async fn ensure_upstream_listener(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
     route_prefix: &str,
     want: &modern::SubscriptionFilter,
-    bearer_override: Option<&str>,
 ) -> bool {
     use streamscope_core::config::mcp::McpTransport;
     // Neither needs one, and neither is a failure: an `internal://` virtual
@@ -8260,9 +8229,17 @@ async fn ensure_upstream_listener(
         return true;
     }
 
-    let Ok(era) = resolve_upstream_era(auth, upstream, bearer_override).await else {
+    let Ok(era) = resolve_upstream_era(auth, upstream).await else {
         return false;
     };
+    // An upstream with a client-filled input is reachable only with a client
+    // request behind it: a listener would reconnect long after that request,
+    // holding the client's value past it. It gets no listener, so its
+    // notifications reach only a request in flight — which a legacy route
+    // delivers in-band and a modern one cannot.
+    if super::upstream_auth::has_client_inputs(upstream) {
+        return !era.is_modern();
+    }
     // A LEGACY route can source notifications whether or not this listener
     // comes up: events also reach the bus in-band, riding an in-flight
     // `tools/call` / `prompts/get` response, exactly as they did before
@@ -8273,7 +8250,7 @@ async fn ensure_upstream_listener(
     // path: it deleted `resources/subscribe`, and its notifications exist
     // only on a `subscriptions/listen` stream.
     let sourceable_without_listener = !era.is_modern();
-    let Ok(bearer) = resolve_upstream_bearer(auth, upstream, bearer_override).await else {
+    let Ok(upstream_auth) = resolve_upstream_auth(auth, upstream).await else {
         return sourceable_without_listener;
     };
 
@@ -8290,7 +8267,7 @@ async fn ensure_upstream_listener(
         // A legacy stream is scoped to a session, and the only one the gateway
         // owns is its own — a downstream client's id names a session on the
         // gateway, not on this upstream.
-        let Ok(conn) = ensure_upstream_connection(auth, upstream, bearer_override).await
+        let Ok(conn) = ensure_upstream_connection(auth, upstream).await
         else {
             return sourceable_without_listener;
         };
@@ -8329,7 +8306,8 @@ async fn ensure_upstream_listener(
                 route_prefix: route_prefix.to_string(),
             },
             upstream_url: upstream.upstream_url.clone(),
-            bearer,
+            upstream_auth,
+            inputs_fingerprint: inputs_key(auth, upstream),
             transport,
             filter: want.clone(),
         },
@@ -8642,17 +8620,26 @@ impl BusAuditEventSink {
     }
 }
 
-/// True if the user can call this upstream right now — `NoAuth` and
-/// `ServiceAccount` are universally callable; `PerUserOauth` requires the
-/// user to have a stored (non-empty) credential. Used by the catalog filter
-/// so tools/prompts from unauthorized upstreams never appear in `tools/list`.
+/// True if the caller can call this upstream right now: every required user
+/// input is filled and every required client header was sent on this request,
+/// and on a `per_user_oauth` upstream the user holds a stored credential.
+/// Used by the aggregated calls (`tools/list` fan-out and its siblings) to
+/// hide such an upstream, so its tools never appear broken; a direct call to
+/// it reports what is missing instead.
 fn user_has_credential_for(
     auth: &AuthCtx,
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
 ) -> bool {
     use streamscope_core::config::mcp::McpAuthMode;
+    if auth.inputs_memo.lacks_caller_inputs(
+        upstream,
+        auth.mcp_config.user_inputs(auth.user_id, upstream.id),
+        &auth.client_inputs,
+    ) {
+        return false;
+    }
     match upstream.auth_mode {
-        McpAuthMode::NoAuth | McpAuthMode::ServiceAccount => true,
+        McpAuthMode::Headers => true,
         McpAuthMode::PerUserOauth => auth
             .oauth_state
             .lookup(
@@ -8662,29 +8649,48 @@ fn user_has_credential_for(
                 auth.mcp_config.user_credential(auth.user_id, upstream.id),
             )
             .is_some(),
-        // Byot is single-route by design (key forward-auth); tools/list filter doesn't
-        // apply because the bearer header is forwarded from the agent verbatim.
-        McpAuthMode::Byot => true,
     }
 }
 
-/// Inline service-account decrypt — same logic as `upstream::decrypt_service_account`
-/// but kept here so the bearer-resolution lives in one place.
-fn decrypt_service_account_inline(
-    upstream: &streamscope_core::config::mcp::McpUpstreamServer,
-) -> Result<String, UpstreamError> {
-    let ciphertext = upstream
-        .encrypted_credential
-        .as_deref()
-        .ok_or(UpstreamError::CredentialUnavailable)?;
-    let key = streamscope_core::crypto::get_encryption_key()
-        .ok_or(UpstreamError::CredentialUnavailable)?;
-    streamscope_core::crypto::decrypt(ciphertext, &key).map_err(|e| {
-        tracing::error!(upstream = %upstream.id, "decrypt service-account credential: {e}");
-        UpstreamError::CredentialUnavailable
+/// Whether the caller can call at least one of `routes` — the condition for
+/// modern discovery to skip the routes it cannot, and for an aggregated list
+/// to hide them: when none is callable, the error (connect in the portal, send
+/// the header) reaches the client instead of an empty answer.
+fn some_route_is_callable(
+    auth: &AuthCtx,
+    routes: &[streamscope_core::config::mcp::McpVirtualRoute],
+    upstreams: &[streamscope_core::config::mcp::McpUpstreamServer],
+) -> bool {
+    routes.iter().any(|r| {
+        upstreams
+            .iter()
+            .find(|u| u.id == r.upstream_server_id)
+            .is_some_and(|u| user_has_credential_for(auth, u))
     })
 }
 
+/// The refusal for a pass-through (`vk-`) key on a virtual server it may not
+/// reach ([`super::upstream_auth::pass_through_only`]).
+fn pass_through_refusal_message() -> &'static str {
+    "a pass-through key reaches only a virtual server whose every upstream takes just the client's \
+     own Authorization header; use a gateway key"
+}
+
+/// The `-32401` message for a virtual server reached on `/mcp/<slug>` whose
+/// routed upstream takes the client's own `Authorization` header.
+fn fwd_mount_required_message(slug: &str) -> String {
+    format!(
+        "this virtual server forwards the client's own Authorization header to its upstream: \
+         call it at /fwd/<gateway-key>/mcp/{slug}"
+    )
+}
+
+/// Map an `AppError` from `resolve_identity` to a `(status, wire_message,
+/// audit_detail)` triple. The wire message is intentionally generic
+/// ("unauthorized") for every failure mode so a probing client can't
+/// distinguish "key exists but wrong family" from "invalid key" /
+/// "revoked" / "expired" / "missing header"; the fine-grained reason is
+/// captured separately on the audit row.
 fn auth_error_for_response(e: &AppError) -> (StatusCode, &'static str, String) {
     // Workspace-allowlist denials are a genuine 403 (the server exists, this
     // workspace just can't reach it); everything else stays a generic 401 so a
@@ -9608,6 +9614,7 @@ mod tests {
             RpcId::Number(1.into()),
             &err,
             &ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string()),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(code, modern::MISSING_REQUIRED_CLIENT_CAPABILITY);
@@ -9636,6 +9643,7 @@ mod tests {
             RpcId::Number(1.into()),
             &err,
             &ProtocolEra::Legacy("2025-11-25".into()),
+            None,
         );
         assert_eq!(resp.status(), StatusCode::OK);
         let body = error_body(resp).await;
@@ -9660,12 +9668,60 @@ mod tests {
             http_error(400, Some(modern::MISSING_REQUIRED_CLIENT_CAPABILITY), None),
         ] {
             let (resp, _, _) =
-                upstream_error_relay(RpcId::Number(1.into()), &err, &modern_era);
+                upstream_error_relay(RpcId::Number(1.into()), &err, &modern_era, None);
             let body = error_body(resp).await;
             assert!(
                 body["error"]["data"].get("requiredCapabilities").is_none(),
                 "{body}"
             );
         }
+    }
+
+    /// Each way an upstream's headers fail to resolve reaches the client as
+    /// its own code: the user connects (-32501), the client sends a header it
+    /// is told the name of (-32401), or the admin fixes the upstream (-32500).
+    /// A missing value or sign-in tells the user where to act: the tenant's
+    /// portal sign-ins page when the console URL is known, the portal by name
+    /// otherwise; an error the user cannot fix names no page.
+    #[test]
+    fn a_missing_value_or_sign_in_names_the_portal_sign_ins_page() {
+        let url = "https://console.example/portal/t/acme/mcp/connections";
+        for err in [
+            UpstreamError::UserInputsMissing,
+            UpstreamError::UserCredentialMissing,
+            UpstreamError::UserCredentialExpired,
+        ] {
+            let (_, with) = upstream_error_to_jsonrpc(&err, Some(url));
+            assert!(with.ends_with(&format!("sign-ins page: {url}")), "{with}");
+            let (_, without) = upstream_error_to_jsonrpc(&err, None);
+            assert!(without.ends_with("sign-ins page") && !without.contains("https://"), "{without}");
+        }
+        let (_, other) = upstream_error_to_jsonrpc(&UpstreamError::CredentialUnavailable, Some(url));
+        assert!(!other.contains(url), "{other}");
+
+        let mut cfg = streamscope_core::config::TenantConfig::default();
+        assert_eq!(portal_sign_ins_url(&cfg), None);
+        cfg.admin_public_url = Some("https://console.example/".into());
+        assert_eq!(portal_sign_ins_url(&cfg), None, "no tenant slug, no page");
+        cfg.tenant_slug = "acme".into();
+        assert_eq!(portal_sign_ins_url(&cfg).as_deref(), Some(url));
+    }
+
+    #[test]
+    fn each_input_failure_maps_to_who_can_fix_it() {
+        assert_eq!(upstream_error_to_jsonrpc(&UpstreamError::UserInputsMissing, None).0, MCP_USER_CREDENTIAL_MISSING);
+        let (code, msg) = upstream_error_to_jsonrpc(&UpstreamError::ClientHeaderMissing("X-Token".into()), None);
+        assert_eq!(code, AUTH_REQUIRED);
+        assert!(msg.contains("X-Token"), "{msg}");
+        assert_eq!(
+            upstream_error_to_jsonrpc(&UpstreamError::CredentialUnavailable, None).0,
+            UPSTREAM_CREDENTIAL_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn the_fwd_refusal_names_the_mount_to_use() {
+        let msg = fwd_mount_required_message("jira");
+        assert!(msg.contains("/fwd/<gateway-key>/mcp/jira"), "{msg}");
     }
 }

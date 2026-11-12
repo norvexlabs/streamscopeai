@@ -6,7 +6,9 @@
 //! PID 1 has no default action for a signal it does not handle); start the
 //! relay (`127.0.0.1:<port>` → the guard's socket — the container's only
 //! way out); with an engine inside, give it its own cgroup and start
-//! `dockerd`; start the agent as the image's user; then reap every child
+//! `dockerd`; run the project's lifecycle commands as the image's user (the
+//! create ones only when this home has not run them on this image); start
+//! the agent as that user; then reap every child
 //! until the agent exits, and exit with its status, written to the exit file
 //! first (podman's own failures share exit codes 125–127 with the agent's).
 //!
@@ -26,6 +28,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::config::Step;
+
 /// What init starts, written by the launcher to the run dir.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Start {
@@ -33,6 +37,15 @@ pub struct Start {
     pub argv: Vec<String>,
     /// Laid over the image's environment (init's own), last entry winning.
     pub env: Vec<(String, String)>,
+    /// Where the project is mounted: where the lifecycle commands run.
+    pub workspace: String,
+    /// Run before the agent when the home has no marker for `create_key`,
+    /// which they write once they all succeed.
+    pub create_steps: Vec<Step>,
+    /// Run before the agent on every run, after the create ones.
+    pub start_steps: Vec<Step>,
+    /// What the create commands are run for: the base image and the commands.
+    pub create_key: String,
     pub uid: u32,
     pub gid: u32,
     pub home: String,
@@ -73,7 +86,16 @@ pub fn main(path: &Path) -> Result<()> {
     let mut engine = if start.engine { Some(start_engine(&start)?) } else { None };
     // An engine that started is stopped on every way out: its cache is a
     // volume the next run starts from.
-    let agent = match spawn_agent(&start) {
+    let agent = match prepare_home(&start)
+        .and_then(|()| {
+            if Path::new(&start.cwd).is_dir() { Ok(()) } else { bail!("the working directory {} is not in the sandbox", start.cwd) }
+        })
+        .and_then(|()| lifecycle(&start, &signals, &mut engine))
+        .and_then(|()| {
+            if signals.stop_pending(&mut engine) { bail!("the run was stopped before the agent started") } else { Ok(()) }
+        })
+        .and_then(|()| spawn_agent(&start))
+    {
         Ok(agent) => agent,
         Err(e) => {
             if let Some(engine) = engine {
@@ -113,6 +135,9 @@ fn write_exit(path: &str, code: i32) {
 struct SignalSet {
     set: libc::sigset_t,
     tty: bool,
+    /// A stop (SIGTERM, SIGHUP, SIGINT) arrived: no lifecycle command after
+    /// it, nor the agent, is started.
+    stopping: std::cell::Cell<bool>,
 }
 
 impl SignalSet {
@@ -128,7 +153,25 @@ impl SignalSet {
             if libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) != 0 {
                 bail!("block init's signals");
             }
-            Ok(Self { set, tty })
+            Ok(Self { set, tty, stopping: std::cell::Cell::new(false) })
+        }
+    }
+
+    /// Whether a stop arrived and waits, unread: one that came while no
+    /// command ran (the engine starting, between two commands) would
+    /// otherwise reach only the next one, after it started. An exited
+    /// child read here is reaped.
+    fn stop_pending(&self, engine: &mut Option<libc::pid_t>) -> bool {
+        let none = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        loop {
+            // SAFETY: sigtimedwait on the blocked set, a zero timeout.
+            match unsafe { libc::sigtimedwait(&self.set, std::ptr::null_mut(), &none) } {
+                libc::SIGCHLD => {
+                    let _ = reap(0, engine);
+                }
+                sig if sig > 0 => self.stopping.set(true),
+                _ => return self.stopping.get(),
+            }
         }
     }
 
@@ -141,6 +184,9 @@ impl SignalSet {
             // SAFETY: sigwait on a set of blocked signals.
             if unsafe { libc::sigwait(&self.set, &mut sig) } != 0 {
                 continue;
+            }
+            if sig != libc::SIGCHLD {
+                self.stopping.set(true);
             }
             match sig {
                 libc::SIGCHLD => {
@@ -351,11 +397,9 @@ fn real_dirs_down(home: &str, dir: &str) -> bool {
         })
 }
 
-/// Start the agent as `uid:gid`, with the groups its image gives it, in
-/// `cwd` (entered as the agent, so one it cannot enter fails here), with the
-/// image's environment overlaid by the start file's.
-fn spawn_agent(start: &Start) -> Result<libc::pid_t> {
-    let Some((program, args)) = start.argv.split_first() else { bail!("the start file names no command") };
+/// The agent's home, and the directories the runtime created in it, the
+/// agent's own.
+fn prepare_home(start: &Start) -> Result<()> {
     // A home volume the image had no directory for starts as root's: the
     // agent's own from here (its top only — what the image put below is the
     // image's).
@@ -372,12 +416,166 @@ fn spawn_agent(start: &Start) -> Result<libc::pid_t> {
                 .with_context(|| format!("give {dir} to the agent user"))?;
         }
     }
+    Ok(())
+}
+
+/// The marker a home holds once the create commands ran for `key`.
+fn create_marker(home: &str, key: &str) -> (String, String) {
+    let dir = format!("{}/.ssai", home.trim_end_matches('/'));
+    let file = format!("{dir}/create-{key}");
+    (dir, file)
+}
+
+/// Run the lifecycle commands, one after another, as the agent in the
+/// workspace, each to its end. The create commands run when the home has no
+/// marker for `create_key`, written once they all succeeded, under a lock on
+/// the workspace (two runs on one project would otherwise install into it at
+/// once); the start commands after them, unlocked, so one that never ends
+/// holds only its own run. A command that fails stops the run before the
+/// agent starts.
+fn lifecycle(start: &Start, signals: &SignalSet, engine: &mut Option<libc::pid_t>) -> Result<()> {
+    let (dir, marker) = create_marker(&start.home, &start.create_key);
+    let created = || std::fs::symlink_metadata(&marker).is_ok();
+    if !start.create_steps.is_empty() && !created() {
+        let lock = std::fs::File::open(&start.workspace).with_context(|| format!("open {}", start.workspace))?;
+        lock_workspace(&lock, signals, engine)?;
+        // Another run on this home may have run them while this one waited.
+        if !created() {
+            for step in &start.create_steps {
+                run_step(start, step, signals, engine)?;
+            }
+            // Unrecorded, they run again next time: a home the agent broke
+            // (`~/.ssai` made a file) costs time, never the run.
+            if let Err(e) = write_marker(start, &dir, &marker) {
+                eprintln!("ssai: could not record that the create commands ran ({e:#}) — they run again next time");
+            }
+        }
+    }
+    for step in &start.start_steps {
+        run_step(start, step, signals, engine)?;
+    }
+    Ok(())
+}
+
+/// Take `lock` (the workspace) exclusively, waiting for another run's create
+/// commands; SIGTERM, SIGHUP or SIGINT (Ctrl-C) while waiting stops the run.
+fn lock_workspace(lock: &std::fs::File, signals: &SignalSet, engine: &mut Option<libc::pid_t>) -> Result<()> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(lock);
+    let mut said = false;
+    loop {
+        // SAFETY: flock(2) on a descriptor we own.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        // A filesystem without flock (some NFS and FUSE mounts): unlocked.
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            eprintln!("ssai: the project's folder cannot be locked ({err}) — its create commands run unlocked");
+            return Ok(());
+        }
+        if !said {
+            eprintln!("ssai: waiting for another sandbox run's create commands on this project");
+            said = true;
+        }
+        let wait = libc::timespec { tv_sec: 0, tv_nsec: 200_000_000 };
+        // SAFETY: sigtimedwait on the blocked set, a local timeout.
+        match unsafe { libc::sigtimedwait(&signals.set, std::ptr::null_mut(), &wait) } {
+            libc::SIGCHLD => {
+                let _ = reap(0, engine);
+            }
+            libc::SIGTERM | libc::SIGHUP | libc::SIGINT => bail!("stopped while waiting for the workspace"),
+            _ => {}
+        }
+    }
+}
+
+/// One lifecycle command, as the agent in the workspace, waited on through
+/// the signal loop (a signal reaches it as it would the agent).
+fn run_step(start: &Start, step: &Step, signals: &SignalSet, engine: &mut Option<libc::pid_t>) -> Result<()> {
+    if signals.stop_pending(engine) {
+        bail!("the run was stopped before the devcontainer's `{}` — the agent was not started", step.hook);
+    }
+    eprintln!("ssai: running {} in the sandbox", step.hook);
+    let mut cmd = agent_command(start, &step.argv, &start.workspace)?;
+    cmd.stdin(std::process::Stdio::null());
+    let child = cmd.spawn().map_err(|e| spawn_error(e, &step.argv[0], &start.workspace))?;
+    let code = signals.wait_for(child.id() as libc::pid_t, engine);
+    // A stop passed on to the command is the run's too, whatever it exited with.
+    if signals.stopping.get() {
+        bail!("the run was stopped during the devcontainer's `{}` — the agent was not started", step.hook);
+    }
+    if code != 0 {
+        bail!("the devcontainer's `{}` failed (exit {code}) — the agent was not started", step.hook);
+    }
+    Ok(())
+}
+
+/// The marker, created as the agent's: never through a symlink the agent
+/// left in its home (a process a lifecycle command left running may still
+/// change it), so the directory is held open, refusing a symlink, and the
+/// file created in it.
+fn write_marker(start: &Start, dir: &str, marker: &str) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)
+        .with_context(|| format!("{dir} is not a directory"))?;
+    std::os::unix::fs::fchown(&held, Some(start.uid), Some(start.gid))?;
+    let name = Path::new(marker).file_name().context("the marker has no name")?;
+    let name = std::ffi::CString::new(name.as_encoded_bytes()).context("the marker's name holds a NUL")?;
+    // SAFETY: openat(2) on a directory we hold, a valid C name.
+    let fd = unsafe {
+        libc::openat(held.as_raw_fd(), name.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC, 0o644)
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("create the marker");
+    }
+    // SAFETY: a descriptor openat just returned, owned from here.
+    let file = unsafe { OwnedFd::from_raw_fd(fd) };
+    std::os::unix::fs::fchown(&file, Some(start.uid), Some(start.gid))?;
+    Ok(())
+}
+
+fn spawn_error(e: std::io::Error, program: &str, cwd: &str) -> anyhow::Error {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => anyhow::anyhow!(
+            "`{program}`, or the interpreter its first line names, is not in the sandbox's image — add it to the \
+             image (its Dockerfile or devcontainer.json)"
+        ),
+        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
+            "the agent user cannot enter {cwd} or run `{program}` — check their owner and mode in the project"
+        ),
+        _ => anyhow::Error::new(e).context(format!("start {program} in the sandbox")),
+    }
+}
+
+/// Start the agent as `uid:gid`, with the groups its image gives it, in
+/// `cwd` (entered as the agent, so one it cannot enter fails here), with the
+/// image's environment overlaid by the start file's.
+fn spawn_agent(start: &Start) -> Result<libc::pid_t> {
+    let mut cmd = agent_command(start, &start.argv, &start.cwd)?;
+    let child = cmd.spawn().map_err(|e| spawn_error(e, &start.argv[0], &start.cwd))?;
+    Ok(child.id() as libc::pid_t)
+}
+
+/// `argv` as the agent user, in `cwd`, with the agent's environment.
+fn agent_command(start: &Start, argv: &[String], cwd: &str) -> Result<std::process::Command> {
+    let Some((program, args)) = argv.split_first() else { bail!("the start file names an empty command") };
     let mut cmd = std::process::Command::new(program);
     cmd.args(args).env("HOME", &start.home);
-    let cwd = std::ffi::CString::new(start.cwd.as_bytes()).context("the working directory holds a NUL")?;
     for (k, v) in &start.env {
         cmd.env(k, v);
     }
+    // Where it starts, as a shell would say it.
+    cmd.env("PWD", cwd);
+    let cwd = std::ffi::CString::new(cwd.as_bytes()).context("the working directory holds a NUL")?;
     let (uid, gid) = (start.uid, start.gid);
     // The agent user's groups as the image lists them, read before the fork.
     let read = |f: &str| std::fs::read_to_string(f).unwrap_or_default();
@@ -396,21 +594,7 @@ fn spawn_agent(start: &Start) -> Result<libc::pid_t> {
             Ok(())
         });
     }
-    if !Path::new(&start.cwd).is_dir() {
-        bail!("the working directory {} is not in the sandbox", start.cwd);
-    }
-    let child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => anyhow::anyhow!(
-            "`{program}`, or the interpreter its first line names, is not in the sandbox's image — add it to the \
-             image (its Dockerfile or devcontainer.json)"
-        ),
-        std::io::ErrorKind::PermissionDenied => anyhow::anyhow!(
-            "the agent user cannot enter {} or run `{program}` — check their owner and mode in the project",
-            start.cwd
-        ),
-        _ => anyhow::Error::new(e).context(format!("start {program} in the sandbox")),
-    })?;
-    Ok(child.id() as libc::pid_t)
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -422,6 +606,10 @@ mod tests {
         let s = Start {
             argv: vec!["claude".into()],
             env: vec![("HTTPS_PROXY".into(), "http://127.0.0.1:3128".into())],
+            workspace: "/workspaces/app".into(),
+            create_steps: vec![Step { hook: "postCreateCommand".into(), argv: vec!["/bin/sh".into(), "-c".into(), "npm ci".into()] }],
+            start_steps: vec![],
+            create_key: "0123456789ab".into(),
             uid: 1000,
             gid: 1000,
             home: "/home/vscode".into(),
@@ -506,6 +694,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+
+    #[test]
+    fn the_create_marker_is_never_written_through_a_symlink_nor_over_a_file() {
+        let home = std::env::temp_dir().join(format!("ssai-marker-{}-{}", std::process::id(), rand::random::<u32>()));
+        let elsewhere = home.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let h = home.to_string_lossy().into_owned();
+        // SAFETY: getuid/getgid cannot fail; the test chowns to its own ids.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let start = Start {
+            argv: vec!["a".into()],
+            env: vec![],
+            workspace: h.clone(),
+            create_steps: vec![],
+            start_steps: vec![],
+            create_key: "k".into(),
+            uid,
+            gid,
+            home: h.clone(),
+            home_dirs: vec![],
+            cwd: h.clone(),
+            guard_socket: String::new(),
+            relay_port: 0,
+            engine: false,
+            exit_file: String::new(),
+            tty: false,
+        };
+        let (dir, marker) = create_marker(&h, "k");
+        // `~/.ssai` a symlink the agent left: refused, its target untouched.
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert!(write_marker(&start, &dir, &marker).is_err());
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none(), "nothing written through the symlink");
+        // A real directory: the marker is made (the positive control), and never made twice.
+        std::fs::remove_file(&dir).unwrap();
+        write_marker(&start, &dir, &marker).unwrap();
+        assert!(std::fs::symlink_metadata(&marker).unwrap().is_file());
+        assert!(write_marker(&start, &dir, &marker).is_err(), "an existing marker is not opened again");
+        // The marker itself a symlink: not followed.
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("planted"), &marker).unwrap();
+        assert!(write_marker(&start, &dir, &marker).is_err());
+        assert!(!elsewhere.join("planted").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn a_home_dir_under_a_symlink_is_not_given_to_the_agent() {

@@ -1220,10 +1220,17 @@ async fn insert_audit_jsonb(
 /// arrives to correct it. Hence the `FIRST_VALUE` over the full partition,
 /// ordered so attributed calls sort ahead of unattributed ones: it yields the
 /// earliest call that names a workspace, or nil when none does.
+///
+/// A session with a call this delivery inserted (`fresh`, the `(tenant_id,
+/// request_id)` pairs [`insert_gateway_audit_jsonb_fresh`] returned) takes this
+/// transaction's id as `landed_xid`, so the expert agent reads it again; a
+/// redelivered call leaves the stamp where it was.
 async fn upsert_gateway_only_sessions(
     conn: &mut IngestConn,
     payload: &serde_json::Value,
+    fresh: &[(uuid::Uuid, uuid::Uuid)],
 ) -> Result<(), sqlx::Error> {
+    let (fresh_tenants, fresh_requests): (Vec<uuid::Uuid>, Vec<uuid::Uuid>) = fresh.iter().copied().unzip();
     sqlx::query(
         // `session_id` is the hashed session UUID — typed on the wire, so it
         // always casts — and absent on untracked traffic (an admin test call).
@@ -1234,7 +1241,7 @@ async fn upsert_gateway_only_sessions(
         // to the LLM upsert, the only writer that adds spend.
         "INSERT INTO sessions (session_id, tenant_id, user_id, user_email, source, key_id, \
                                workspace_id, turn_count, cost_currency, cost_currency_count, \
-                               created_at, updated_at) \
+                               created_at, updated_at, landed_xid) \
          SELECT DISTINCT ON (tid, sid) \
                 sid, tid, uid, \
                 (SELECT email FROM users WHERE tenant_id = tid AND id = uid), \
@@ -1246,7 +1253,9 @@ async fn upsert_gateway_only_sessions(
                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING \
                 ), 0, NULL, 0, \
                 MIN(ts) OVER (PARTITION BY tid, sid), \
-                MAX(ts) OVER (PARTITION BY tid, sid) \
+                MAX(ts) OVER (PARTITION BY tid, sid), \
+                CASE WHEN bool_or(fresh) OVER (PARTITION BY tid, sid) \
+                     THEN pg_current_xact_id()::text::bigint END \
          FROM ( \
              SELECT (j->>'session_id')::uuid      AS sid, \
                     (j->>'tenant_id')::uuid       AS tid, \
@@ -1254,7 +1263,9 @@ async fn upsert_gateway_only_sessions(
                     (j->>'key_id')::uuid          AS kid, \
                     COALESCE((j->>'workspace_id')::uuid, \
                              '00000000-0000-0000-0000-000000000000'::uuid) AS wid, \
-                    (j->>'timestamp')::timestamptz AS ts \
+                    (j->>'timestamp')::timestamptz AS ts, \
+                    ((j->>'tenant_id')::uuid, (j->>'request_id')::uuid) IN \
+                        (SELECT f.t, f.r FROM unnest($3::uuid[], $4::uuid[]) AS f(t, r)) AS fresh \
              FROM jsonb_array_elements($1) AS j \
              WHERE j->>'session_id' IS NOT NULL \
                AND j->>'tenant_id' IS NOT NULL \
@@ -1265,12 +1276,15 @@ async fn upsert_gateway_only_sessions(
          ON CONFLICT (tenant_id, session_id) DO UPDATE SET \
              created_at = LEAST(sessions.created_at, EXCLUDED.created_at), \
              updated_at = GREATEST(sessions.updated_at, EXCLUDED.updated_at), \
+             landed_xid = COALESCE(EXCLUDED.landed_xid, sessions.landed_xid), \
              workspace_id = COALESCE( \
                  NULLIF(sessions.workspace_id, '00000000-0000-0000-0000-000000000000'::uuid), \
                  EXCLUDED.workspace_id)",
     )
     .bind(payload)
     .bind(crate::agent::AGENT_EMAIL)
+    .bind(&fresh_tenants)
+    .bind(&fresh_requests)
     .execute(&mut *conn)
     .await
     .map_err(|e| {
@@ -1280,64 +1294,92 @@ async fn upsert_gateway_only_sessions(
     Ok(())
 }
 
+/// The parent `gateway_audit` insert for every record in the JSONB array (`$1`),
+/// `$2` the kind discriminator (`"llm"`, `"mcp"`, `"web"`, `"a2a"`) — one writer
+/// serves every protocol. `$3` is the agent's email.
+///
+/// `source` is stamped here, once, from the row's user identity: the built-in
+/// expert agent's own traffic ('agent') vs everything else ('user'). Reads
+/// filter `source <> 'agent'` as a constant predicate instead of resolving the
+/// agent user_id per query. `users(email, tenant_id)` is unique-indexed; this is
+/// the async/batched ingest path, not a request-latency path.
+macro_rules! gateway_audit_insert {
+    () => {
+        "INSERT INTO gateway_audit (
+        request_id, timestamp, tenant_id, workspace_id, user_id, key_id, app_id, session_id,
+        user_agent, ip, client_ip, end_user, end_user_groups, detection_method, kind, source,
+        latency_total_ms, status_code, error_category, error_detail, limit_bucket
+    )
+    SELECT
+        (j->>'request_id')::uuid,
+        (j->>'timestamp')::timestamptz,
+        (j->>'tenant_id')::uuid,
+        COALESCE((j->>'workspace_id')::uuid, '00000000-0000-0000-0000-000000000000'::uuid),
+        (j->>'user_id')::uuid,
+        (j->>'key_id')::uuid,
+        j->>'app_id',
+        (j->>'session_id')::uuid,
+        j->>'user_agent',
+        j->>'ip',
+        j->>'client_ip',
+        j->>'end_user',
+        ARRAY(SELECT jsonb_array_elements_text(COALESCE(j->'end_user_groups', '[]'::jsonb))),
+        j->>'detection_method',
+        $2::text,
+        CASE WHEN (j->>'user_id')::uuid = (
+                 SELECT u.id FROM users u
+                  WHERE u.email = $3 AND u.tenant_id = (j->>'tenant_id')::uuid
+             ) THEN 'agent' ELSE 'user' END,
+        COALESCE((j->>'latency_total_ms')::bigint, 0),
+        (j->>'status_code')::smallint,
+        j->>'error_category',
+        j->>'error_detail',
+        j->>'limit_bucket'
+    FROM jsonb_array_elements($1) AS j
+    ON CONFLICT (tenant_id, request_id, timestamp) DO NOTHING"
+    };
+}
+const GATEWAY_AUDIT_INSERT: &str = gateway_audit_insert!();
+/// [`GATEWAY_AUDIT_INSERT`], returning each row it inserted.
+const GATEWAY_AUDIT_INSERT_RETURNING: &str = concat!(gateway_audit_insert!(), " RETURNING tenant_id, request_id");
+
 /// Insert the parent `gateway_audit` row for every record in the JSONB array.
-/// `kind` is the discriminator (`"llm"`, `"mcp"`, `"web"`, `"a2a"`) — one writer
-/// serves every protocol.
 async fn insert_gateway_audit_jsonb(
     conn: &mut IngestConn,
     payload: &serde_json::Value,
     kind: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        // `source` is stamped here, once, from the row's user identity: the
-        // built-in expert agent's own traffic ('agent') vs everything else
-        // ('user'). Reads filter `source <> 'agent'` as a constant predicate
-        // instead of resolving the agent user_id per query. `users(email,
-        // tenant_id)` is unique-indexed; this is the async/batched ingest path,
-        // not a request-latency path.
-        "INSERT INTO gateway_audit (
-            request_id, timestamp, tenant_id, workspace_id, user_id, key_id, app_id, session_id,
-            user_agent, ip, client_ip, end_user, end_user_groups, detection_method, kind, source,
-            latency_total_ms, status_code, error_category, error_detail, limit_bucket
-        )
-        SELECT
-            (j->>'request_id')::uuid,
-            (j->>'timestamp')::timestamptz,
-            (j->>'tenant_id')::uuid,
-            COALESCE((j->>'workspace_id')::uuid, '00000000-0000-0000-0000-000000000000'::uuid),
-            (j->>'user_id')::uuid,
-            (j->>'key_id')::uuid,
-            j->>'app_id',
-            (j->>'session_id')::uuid,
-            j->>'user_agent',
-            j->>'ip',
-            j->>'client_ip',
-            j->>'end_user',
-            ARRAY(SELECT jsonb_array_elements_text(COALESCE(j->'end_user_groups', '[]'::jsonb))),
-            j->>'detection_method',
-            $2::text,
-            CASE WHEN (j->>'user_id')::uuid = (
-                     SELECT u.id FROM users u
-                      WHERE u.email = $3 AND u.tenant_id = (j->>'tenant_id')::uuid
-                 ) THEN 'agent' ELSE 'user' END,
-            COALESCE((j->>'latency_total_ms')::bigint, 0),
-            (j->>'status_code')::smallint,
-            j->>'error_category',
-            j->>'error_detail',
-            j->>'limit_bucket'
-        FROM jsonb_array_elements($1) AS j
-        ON CONFLICT (tenant_id, request_id, timestamp) DO NOTHING",
-    )
-    .bind(payload)
-    .bind(kind)
-    .bind(crate::agent::AGENT_EMAIL)
-    .execute(&mut *conn)
-    .await
-    .map_err(|e| {
-        tracing::debug!("bulk insert gateway_audit via jsonb: {e}");
-        e
-    })?;
+    sqlx::query(GATEWAY_AUDIT_INSERT)
+        .bind(payload)
+        .bind(kind)
+        .bind(crate::agent::AGENT_EMAIL)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::debug!("bulk insert gateway_audit via jsonb: {e}");
+            e
+        })?;
     Ok(())
+}
+
+/// [`insert_gateway_audit_jsonb`], returning the `(tenant_id, request_id)` of
+/// each row it inserted (a row already stored is not among them) — what a
+/// gateway-only session upsert stamps by.
+async fn insert_gateway_audit_jsonb_fresh(
+    conn: &mut IngestConn,
+    payload: &serde_json::Value,
+    kind: &str,
+) -> Result<Vec<(uuid::Uuid, uuid::Uuid)>, sqlx::Error> {
+    sqlx::query_as(GATEWAY_AUDIT_INSERT_RETURNING)
+        .bind(payload)
+        .bind(kind)
+        .bind(crate::agent::AGENT_EMAIL)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::debug!("bulk insert gateway_audit via jsonb: {e}");
+            e
+        })
 }
 
 /// MCP audit batch — writes both `gateway_audit` (kind='mcp') and `mcp_audit`
@@ -1367,8 +1409,8 @@ pub async fn insert_mcp_audit_jsonb(
     conn: &mut IngestConn,
     payload: &serde_json::Value,
 ) -> Result<Vec<uuid::Uuid>, sqlx::Error> {
-    insert_gateway_audit_jsonb(conn, payload, "mcp").await?;
-    upsert_gateway_only_sessions(&mut *conn, payload).await?;
+    let fresh = insert_gateway_audit_jsonb_fresh(conn, payload, "mcp").await?;
+    upsert_gateway_only_sessions(&mut *conn, payload, &fresh).await?;
 
     let inserted: Vec<(uuid::Uuid,)> = sqlx::query_as(
         // Cross-instance protocol_version recovery happens in two layers:
@@ -1560,8 +1602,8 @@ pub async fn insert_a2a_audit_jsonb(
     conn: &mut IngestConn,
     payload: &serde_json::Value,
 ) -> Result<(), sqlx::Error> {
-    insert_gateway_audit_jsonb(conn, payload, "a2a").await?;
-    upsert_gateway_only_sessions(&mut *conn, payload).await?;
+    let fresh = insert_gateway_audit_jsonb_fresh(conn, payload, "a2a").await?;
+    upsert_gateway_only_sessions(&mut *conn, payload, &fresh).await?;
 
     sqlx::query(
         "INSERT INTO a2a_audit (
@@ -1905,7 +1947,9 @@ async fn bulk_insert_media_turns(
     .await
 }
 
-/// UPSERT the materialized `sessions` row for a turn (chat or media).
+/// UPSERT the materialized `sessions` row for a turn (chat or media). Runs only
+/// for a turn this delivery inserted, so its `landed_xid` — this transaction's
+/// id, the order the expert agent reads sessions in — moves once per new turn.
 ///
 /// Aggregative (turn_count+1, token/cost sums), so it stays per-record —
 /// batching aggregation across records is complex and the common case is
@@ -2005,14 +2049,16 @@ const SESSION_TURN_UPSERT: &str = concat!(
          turn_count, total_prompt_tokens, total_completion_tokens, \
          total_cache_creation_tokens, total_cache_read_tokens, total_reasoning_tokens, \
          total_cost, cost_currency, cost_currency_count, \
-         first_user_prompt, created_at, updated_at, last_latency_ms, last_llm_at, first_prompt_at) \
+         first_user_prompt, created_at, updated_at, last_latency_ms, last_llm_at, first_prompt_at, landed_xid) \
          VALUES ($1, $2, $3, (SELECT email FROM users WHERE tenant_id = $2 AND id = $3), \
                  CASE WHEN (SELECT email FROM users WHERE tenant_id = $2 AND id = $3) = $16 THEN 'agent' ELSE 'user' END, \
                  $14, $17, $4, $5, \
                  1, $6, $7, $12, $13, $15, $8, $18, 1, $9, $10::timestamptz, $10::timestamptz, $11, \
-                 $10::timestamptz, CASE WHEN $9::text IS NULL THEN NULL ELSE $10::timestamptz END) \
+                 $10::timestamptz, CASE WHEN $9::text IS NULL THEN NULL ELSE $10::timestamptz END, \
+                 pg_current_xact_id()::text::bigint) \
          ON CONFLICT (tenant_id, session_id) DO UPDATE SET \
-             turn_count = sessions.turn_count + 1, ",
+             turn_count = sessions.turn_count + 1, \
+             landed_xid = EXCLUDED.landed_xid, ",
         session_spend_currency_update!(),
         "total_prompt_tokens = sessions.total_prompt_tokens + EXCLUDED.total_prompt_tokens, \
              total_completion_tokens = sessions.total_completion_tokens + EXCLUDED.total_completion_tokens, \

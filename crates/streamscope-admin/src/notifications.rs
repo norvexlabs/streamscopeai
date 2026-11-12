@@ -52,6 +52,12 @@ pub enum NotificationKind {
     /// could never be stored, and holding them would stall the channel).
     /// Deduped per sync channel per day; the admin-api log names each row.
     EdgeSyncRowsDropped,
+    /// An enabled MCP upstream every call fails on, whoever makes it: a
+    /// required administrator value missing or unreadable, a declaration that
+    /// no longer validates, or an incomplete OAuth client. Deduped per
+    /// upstream and administrator-value version, so a fix that fails again
+    /// re-notifies.
+    McpUpstreamUnusable,
 }
 
 impl NotificationKind {
@@ -67,6 +73,7 @@ impl NotificationKind {
             NotificationKind::ApplianceUpgradeAvailable => "appliance_upgrade_available",
             NotificationKind::AgentAnalysisFailing => "agent_analysis_failing",
             NotificationKind::EdgeSyncRowsDropped => "edge_sync_rows_dropped",
+            NotificationKind::McpUpstreamUnusable => "mcp_upstream_unusable",
         }
     }
 
@@ -80,7 +87,8 @@ impl NotificationKind {
             | NotificationKind::UpstreamUnhealthy
             | NotificationKind::ApplianceUpgradeAvailable
             | NotificationKind::AgentAnalysisFailing
-            | NotificationKind::EdgeSyncRowsDropped => 1,
+            | NotificationKind::EdgeSyncRowsDropped
+            | NotificationKind::McpUpstreamUnusable => 1,
             NotificationKind::UpstreamRecovered => 0,
         }
     }

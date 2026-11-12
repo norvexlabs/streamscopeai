@@ -20,13 +20,13 @@ use crate::api::{
 };
 use crate::state::{
     ensure_gitignored, expand_tilde, gateway_bundle_file, gateway_ca_file, resolve_scope,
-    ManagedClient, ManagedFile, Manifest, ManifestKey, ManifestScope, Paths, ToolKeys,
-    WorkspaceManifest,
+    LocalMcpEntry, ManagedClient, ManagedFile, ManagedLocalMcp, Manifest, ManifestKey, ManifestScope, Paths,
+    ToolKeys, WorkspaceManifest,
 };
 use crate::writer;
 use crate::PartialWrite;
 
-use super::session::{self, confirm_no, pick, pick_many, Choice};
+use super::session::{self, confirm_no, pick, pick_many, pick_many_ticked, Choice};
 
 #[derive(Args)]
 pub struct ProvisionArgs {
@@ -50,17 +50,31 @@ pub struct ProvisionArgs {
     #[arg(long = "mode")]
     pub mode: Vec<String>,
     /// MCP virtual server slug(s) to wire into MCP-capable clients. Repeatable.
-    /// When omitted in an interactive run, the reachable servers are proposed;
-    /// with `--yes` and no `--mcp`/`--all-mcp`, none are wired.
+    /// When omitted, a client keeps the servers it was last provisioned with;
+    /// an interactive run proposes the reachable ones, those ticked. A client
+    /// provisioned for the first time with `--yes` and no `--mcp`/`--all-mcp`
+    /// gets none.
     #[arg(long = "mcp", conflicts_with_all = ["all_mcp", "no_mcp"])]
     pub mcp: Vec<String>,
     /// Wire every MCP virtual server your workspace can reach (non-interactive
     /// equivalent of selecting all in the prompt).
     #[arg(long = "all-mcp", conflicts_with = "no_mcp")]
     pub all_mcp: bool,
-    /// Wire no MCP servers — skip the proposal entirely.
+    /// Wire no MCP servers, gateway or local — skip the proposals entirely.
     #[arg(long = "no-mcp")]
     pub no_mcp: bool,
+    /// Local MCP server slug(s) to add to the clients that can start one: a
+    /// server this machine runs, from a command line your administrator set.
+    /// Repeatable. When omitted, a client keeps the local servers it was last
+    /// provisioned with; an interactive run proposes the ones your workspace
+    /// is handed, those ticked, when a selected client can be given one. A
+    /// client provisioned for the first time with `--yes` gets none.
+    #[arg(long = "local-mcp", conflicts_with_all = ["no_mcp", "no_local_mcp"])]
+    pub local_mcp: Vec<String>,
+    /// Add no local MCP server, and take out the ones a client was
+    /// provisioned with. Its gateway MCP servers are kept.
+    #[arg(long = "no-local-mcp")]
+    pub no_local_mcp: bool,
     /// Override a client's template pick by variant name:
     /// --template opencode=anthropic (chat, responses, anthropic, gemini, mcp,
     /// instructions; `-oauth` for an MCP spec-OAuth variant)
@@ -161,7 +175,14 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
     let me = api.me_for_workspace(workspace.id).await?;
 
     // ----- Clients -----
-    let catalog = api.quickstart_clients().await?;
+    // What this workspace is offered: each workspace has its own client set.
+    let catalog = api.quickstart_clients(workspace.id).await?;
+    if catalog.clients.is_empty() {
+        bail!(
+            "the workspace {:?} is offered no client — ask your administrator to offer one on its Portal & clients profile",
+            workspace.name
+        );
+    }
     // Clients ticked in the prompt (pre-ticked by detection). In a project run a
     // global-only client is written to its home config only when `--client`
     // names it, or — for one ticked here — when the user confirms it.
@@ -217,7 +238,8 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
         for c in &args.clients {
             let Some(summary) = catalog.clients.iter().find(|x| &x.id == c) else {
                 bail!(
-                    "unknown client {c:?} — available: {}",
+                    "the workspace {:?} is offered no client {c:?} — available: {}",
+                    workspace.name,
                     catalog.clients.iter().map(|x| x.id.clone()).collect::<Vec<_>>().join(", ")
                 );
             };
@@ -235,30 +257,50 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
     // check below and the template pick further down.
     let mut profiles: BTreeMap<String, ClientProfileWire> = BTreeMap::new();
     for client_id in &chosen_ids {
-        profiles.insert(client_id.clone(), api.client_profile(client_id).await?);
+        profiles.insert(client_id.clone(), api.client_profile(client_id, workspace.id).await?);
     }
     let any_client_supports_mcp = profiles
         .values()
         .any(|p| p.templates.iter().any(|t| matches!(t.kind, TemplateKind::Mcp | TemplateKind::Combined)));
 
-    // ----- MCP servers (shared across every group) -----
-    // Resolved before templates because it gates the MCP-only template choice.
-    // Web quickstart and this CLI both propose which MCP servers to include and
-    // both surface the per-user-OAuth "connect first" state — keep them in sync.
-    let mcp_servers = resolve_mcp_servers(api, &args, any_client_supports_mcp).await?;
-    let mcp_server_ids: Vec<uuid::Uuid> = {
-        // Sorted and deduped once, here: the selection is a SET, and every
-        // reader downstream (the group key, the signature, the manifest record)
-        // compares it as one.
-        let mut ids: Vec<uuid::Uuid> =
-            mcp_servers.iter().map(|m| m.virtual_server_id).collect();
-        ids.sort();
-        ids.dedup();
-        ids
+    // What each chosen client was last provisioned with, read from the
+    // manifests this run can land in before its scope is settled (the scope's
+    // own first): a client keeps the template it is on, and the proposals
+    // below open with what the clients already have.
+    let recorded_before: BTreeMap<String, ManagedClient> = {
+        let mut scopes: Vec<ManifestScope> =
+            resolve_scope(args.dir.as_deref(), args.local, args.global).ok().into_iter().collect();
+        scopes.push(ManifestScope::Global);
+        let mut seen: BTreeMap<String, ManagedClient> = BTreeMap::new();
+        for client in scopes
+            .iter()
+            .filter_map(|scope| Paths::for_scope(scope).ok())
+            .filter_map(|paths| Manifest::load(&paths).ok())
+            .flat_map(|manifest| manifest.hosts.get(&session.key).map(|ws| ws.clients.clone()).unwrap_or_default())
+            .filter(|c| chosen_ids.contains(&c.client_id))
+        {
+            seen.entry(client.client_id.clone()).or_insert(client);
+        }
+        seen
     };
 
-    // Whether this run will wire MCP servers — gates MCP-only template choice.
-    let has_mcp = !mcp_servers.is_empty();
+    // ----- Gateway MCP servers -----
+    // Resolved before templates because, for a client provisioned for the
+    // first time, it gates the MCP-only template choice. Web quickstart and
+    // this CLI both propose which MCP servers to include and both surface the
+    // per-user-OAuth "connect first" state — keep them in sync.
+    let recorded_gateway: BTreeSet<uuid::Uuid> =
+        recorded_before.values().flat_map(|c| c.mcp_server_ids.iter().copied()).collect();
+    let mcp_choice =
+        resolve_mcp_servers(api, workspace.id, &args, any_client_supports_mcp, &recorded_gateway).await?;
+
+    // Whether this run names gateway MCP servers — gates the MCP-only template
+    // choice of a client with no record. A local server never moves a client
+    // onto an MCP-only template that cannot write it: it only breaks the tie
+    // for a client with no LLM template at all, toward the MCP template that
+    // has a form for one.
+    let has_mcp = mcp_choice.chosen.as_ref().is_some_and(|ids| !ids.is_empty());
+    let wants_local = !args.no_mcp && !args.no_local_mcp && !args.local_mcp.is_empty();
 
     // ----- Templates -----
     let overrides = parse_template_overrides(&args.template_overrides)?;
@@ -267,7 +309,14 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
         let profile = &profiles[client_id];
         let index = match overrides.get(client_id) {
             Some(name) => template_index_by_name(client_id, &profile.templates, name)?,
-            None => match default_template_index(&profile.templates, has_mcp) {
+            // A client stays on the template it was provisioned with — never
+            // one of another kind — unless `--template` names another.
+            None => match recorded_before
+                .get(client_id)
+                .map(|c| c.template_index)
+                .filter(|i| *i < profile.templates.len())
+                .or_else(|| default_template_index(&profile.templates, has_mcp, wants_local))
+            {
                 Some(i) => i,
                 // A client with only MCP templates and no `--mcp` selected (e.g.
                 // Cursor in an LLM-only run) has nothing to provision here —
@@ -337,7 +386,9 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                 template_index: *idx,
                 mode: Mode::Gateway,
                 provider_id: None,
-                mcp_server_ids: mcp_server_ids.clone(),
+                // Both settled below, once the scope's manifest is read.
+                mcp_server_ids: Vec::new(),
+                mcp_local_server_ids: Vec::new(),
             });
             continue;
         }
@@ -377,7 +428,8 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
             template_index: *idx,
             mode,
             provider_id: Some(provider_id),
-            mcp_server_ids: mcp_server_ids.clone(),
+            mcp_server_ids: Vec::new(),
+            mcp_local_server_ids: Vec::new(),
         });
     }
 
@@ -406,6 +458,9 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
         manifest_before: Manifest,
         plans: Vec<ClientPlan>,
         is_project: bool,
+        /// The local MCP servers this run withdraws, per client, each with
+        /// why ([`withdraw_local_servers`]).
+        withdrawing: Vec<(String, Vec<(uuid::Uuid, WithdrawReason)>)>,
     }
     // A preview run records keys but never replaces an unreadable manifest.
     let writes = !args.dry_run && !args.print;
@@ -413,7 +468,7 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
         ManifestScope::Global => {
             let paths = Paths::for_scope(&scope)?;
             let manifest = Manifest::load_for_provision(&paths, writes)?;
-            vec![ScopeJob { paths, manifest_before: manifest.clone(), manifest, plans, is_project: false }]
+            vec![ScopeJob { paths, manifest_before: manifest.clone(), manifest, plans, is_project: false, withdrawing: Vec::new() }]
         }
         ManifestScope::Project(_) => {
             let (global_plans, project_plans): (Vec<ClientPlan>, Vec<ClientPlan>) = plans
@@ -453,22 +508,16 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
             if !project_plans.is_empty() {
                 let paths = Paths::for_scope(&scope)?;
                 let manifest = Manifest::load_for_provision(&paths, writes)?;
-                jobs.push(ScopeJob { paths, manifest_before: manifest.clone(), manifest, plans: project_plans, is_project: true });
+                jobs.push(ScopeJob { paths, manifest_before: manifest.clone(), manifest, plans: project_plans, is_project: true, withdrawing: Vec::new() });
             }
             if !global_plans.is_empty() {
                 let paths = Paths::for_scope(&ManifestScope::Global)?;
                 let manifest = Manifest::load_for_provision(&paths, writes)?;
-                jobs.push(ScopeJob { paths, manifest_before: manifest.clone(), manifest, plans: global_plans, is_project: false });
+                jobs.push(ScopeJob { paths, manifest_before: manifest.clone(), manifest, plans: global_plans, is_project: false, withdrawing: Vec::new() });
             }
             jobs
         }
     };
-
-    // Run-level grouping over the plans this run WRITES (a project run's skipped
-    // global-only clients are gone by now) validates an out-of-band key and
-    // decides whether `--key-name` names the one key; each scope job re-groups
-    // its own subset below.
-    let all_groups: Vec<Group> = scope_jobs.iter().flat_map(|j| group_plans(&j.plans)).collect();
 
     // ----- Variants: an installation keeps the one it was provisioned with -----
     // Re-provisioning a managed client without `--template` keeps its recorded
@@ -480,6 +529,86 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                 profiles.get(id).map(|p| p.templates.as_slice())
             });
         }
+    }
+
+    // ----- MCP servers, per client -----
+    // Settled after the scope's manifest is read: what a client was
+    // provisioned with — gateway servers and local ones alike — is what it
+    // keeps unless this run says otherwise, so provisioning again never takes
+    // a server out by omission.
+    let recorded_client = |job: &ScopeJob, client_id: &str| -> Option<ManagedClient> {
+        job.manifest
+            .hosts
+            .get(&session.key)
+            .and_then(|ws| ws.clients.iter().find(|c| c.client_id == client_id))
+            .cloned()
+    };
+    let recorded_ids: BTreeSet<uuid::Uuid> = scope_jobs
+        .iter()
+        .flat_map(|j| j.plans.iter().filter_map(|p| recorded_client(j, &p.client_id)))
+        .flat_map(|c| c.mcp_local_servers.into_iter().map(|s| s.id))
+        .collect();
+    // The clients a picked selection is written to: one pick serves the run.
+    let local_targets: Vec<String> = scope_jobs
+        .iter()
+        .flat_map(|j| &j.plans)
+        .filter(|p| {
+            profiles
+                .get(p.client_id.as_str())
+                .and_then(|profile| profile.templates.get(p.template_index))
+                .is_some_and(|t| !t.local_mcp.is_none())
+        })
+        .map(|p| p.client_id.clone())
+        .collect();
+    let local_choice = resolve_local_mcp_servers(api, &args, workspace.id, &local_targets, &recorded_ids).await?;
+    let mut local_slugs: BTreeMap<uuid::Uuid, String> =
+        local_choice.offered.iter().map(|s| (s.id, s.slug.clone())).collect();
+    let offered_local: Option<BTreeSet<uuid::Uuid>> =
+        local_choice.offered_read.then(|| local_choice.offered.iter().map(|s| s.id).collect());
+    for job in &mut scope_jobs {
+        for i in 0..job.plans.len() {
+            let recorded = recorded_client(job, &job.plans[i].client_id);
+            let recorded_local = recorded.as_ref().map(|c| c.mcp_local_servers.as_slice()).unwrap_or(&[]);
+            let recorded_gateway = recorded.as_ref().map(|c| c.mcp_server_ids.as_slice()).unwrap_or(&[]);
+            let plan = &mut job.plans[i];
+            let (gateway, gone) = mcp_choice.for_client(recorded_gateway);
+            if gone > 0 {
+                println!(
+                    "{}: {gone} MCP server(s) it was provisioned with are no longer offered to this workspace — left out",
+                    plan.client_id
+                );
+            }
+            plan.mcp_server_ids = gateway;
+            plan.mcp_local_server_ids = local_choice.for_client(&plan.client_id, recorded_local);
+            // A local server goes only to a client whose template — the one
+            // it ends up with — has a form for one. A client asked for one it
+            // cannot be given is told so; one that HAD it has it withdrawn
+            // below, which says why.
+            let asked = plan.mcp_local_server_ids.len();
+            let lines = keep_local_where_writable(std::slice::from_mut(plan), &local_slugs, |id| {
+                profiles.get(id).map(|p| p.templates.as_slice())
+            });
+            let lost_form = plan.mcp_local_server_ids.len() < asked;
+            if recorded_local.is_empty() {
+                for line in lines {
+                    eprintln!("{line}");
+                }
+            }
+            let gone = local_withdrawals(recorded_local, &plan.mcp_local_server_ids, offered_local.as_ref(), lost_form);
+            if !gone.is_empty() {
+                job.withdrawing.push((plan.client_id.clone(), gone));
+            }
+            local_slugs.extend(recorded_local.iter().map(|s| (s.id, s.slug.clone())));
+        }
+    }
+
+    // Run-level grouping over the plans this run WRITES (a project run's skipped
+    // global-only clients are gone by now) validates an out-of-band key and
+    // decides whether `--key-name` names the one key; each scope job re-groups
+    // its own subset below.
+    let all_groups: Vec<Group> = scope_jobs.iter().flat_map(|j| group_plans(&j.plans)).collect();
+
+    for job in &scope_jobs {
         for plan in &job.plans {
             let templates = &profiles[plan.client_id.as_str()].templates;
             // stderr: `--print` output on stdout is a config a user redirects.
@@ -489,6 +618,16 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                 eprintln!("{hint}");
             }
         }
+    }
+    // The developer sees what will run on this machine before anything is written.
+    let added: Vec<crate::api::McpLocalServer> = local_choice
+        .offered
+        .iter()
+        .filter(|s| scope_jobs.iter().flat_map(|j| &j.plans).any(|p| p.mcp_local_server_ids.contains(&s.id)))
+        .cloned()
+        .collect();
+    for line in local_server_notice_lines(&added, cfg!(windows)) {
+        println!("{line}");
     }
 
     // ----- Key strategy -----
@@ -504,7 +643,7 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
              provision them in separate runs (one mode per run)"
         );
     }
-    if let Some(ext) = &external_key {
+    if let Some(ext) = external_key.as_ref().filter(|_| !all_groups.is_empty()) {
         // The supplied key's kind must match the (single) group's mode — an
         // sk- can't drive a BYOK group and a vk- can't drive a gateway group.
         let want_vk = all_groups.iter().any(|g| matches!(g.mode, Mode::Byok));
@@ -579,8 +718,37 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                 "Writing global-only tools to your home directory (no project-local config form)."
             );
         }
-        let prev_ws = job.manifest.hosts.get(&session.key).cloned().unwrap_or_default();
+        // Withdrawals first, and recorded at once: a local server that left a
+        // client's selection is taken out of that client's files — its own
+        // entry, nothing else — whatever happens to the client afterwards.
         let others = job.manifest.files_of_other_hosts(&session.key);
+        let mut withdrew = false;
+        for (client_id, gone) in std::mem::take(&mut job.withdrawing) {
+            let Some(client) = job
+                .manifest
+                .hosts
+                .get_mut(&session.key)
+                .and_then(|ws| ws.clients.iter_mut().find(|c| c.client_id == client_id))
+            else {
+                continue;
+            };
+            let preview = args.dry_run || args.print;
+            match withdraw_local_servers(client, &gone, &others, &run_stamp, &job.paths, preview) {
+                Ok(changed) => withdrew |= changed,
+                Err(e) => {
+                    eprintln!("{client_id}: {e:#}");
+                    failures.push(client_id);
+                }
+            }
+        }
+        if withdrew {
+            wrote_any = true;
+            if let Err(e) = crate::state::backup_manifest_into_run(&job.paths, &run_stamp, &job.manifest_before) {
+                crate::ui::warn("  ", format_args!("the manifest was not backed up with this run ({e:#}) — `restore` cannot reconcile it"));
+            }
+            job.manifest.save(&job.paths)?;
+        }
+        let prev_ws = job.manifest.hosts.get(&session.key).cloned().unwrap_or_default();
         let records = crate::state::FileRecords { ws: &prev_ws, others: &others };
         let groups = group_plans(&job.plans);
         let mut group_results: Vec<GroupResult> = Vec::new();
@@ -594,6 +762,15 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
             let forward_auth = matches!(group.mode, Mode::Byok);
             let group_clients: Vec<&ClientPlan> = group.indices.iter().map(|&i| &job.plans[i]).collect();
             let group_sig = group.signature();
+            // A client with nothing to render is left alone: no config is
+            // asked for, nothing is written, and it is not a failure.
+            let kind = group_clients.first().and_then(|p| {
+                profiles.get(p.client_id.as_str()).and_then(|profile| profile.templates.get(p.template_index)).map(|t| t.kind)
+            });
+            if nothing_to_write(kind, group) {
+                println!("{}", nothing_to_write_line(&group.client_id));
+                continue;
+            }
 
             let mut reused_plaintext: Option<String> = None;
             // Minted by this run: the only key recorded as the tool's device key
@@ -648,9 +825,24 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                         .iter()
                         .map(|id| McpSelection { virtual_server_id: *id })
                         .collect(),
+                    mcp_local_servers: group
+                        .mcp_local_server_ids
+                        .iter()
+                        .map(|id| crate::api::McpLocalSelection { local_server_id: *id })
+                        .collect(),
                 })
-                .await
-                .map_err(|e| disabled_by_admin(e, &group.client_id))?;
+                .await;
+            // One group's bundle is one gateway call, and a refusal is about
+            // that group's client: it fails alone, its files untouched, and
+            // the groups already written are recorded below.
+            let bundle = match bundle {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    eprintln!("{}: {:#}", group.client_id, disabled_by_admin(e, &group.client_id));
+                    failures.push(group.client_id.clone());
+                    continue;
+                }
+            };
             client_access = Some(bundle.client_access.clone());
 
             let plaintext = resolve_bundle_plaintext(
@@ -687,6 +879,12 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                         m.provider_id = group.provider_id;
                         m.key_id = key_id;
                         m.mcp_server_ids = group.mcp_server_ids.clone();
+                        m.mcp_local_servers = managed_local(
+                            &group.mcp_local_server_ids,
+                            &local_slugs,
+                            std::mem::take(&mut m.mcp_local_servers),
+                        );
+                        m.mcp_local_commands = local_commands_written(cb, job.is_project);
                         managed.push(m);
                     }
                     Ok(None) => {}
@@ -695,6 +893,7 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
                         failures.push(cb.client_id.clone());
                     }
                 }
+                print_mcp_warnings(cb, job.is_project);
             }
 
             group_results.push(GroupResult {
@@ -802,9 +1001,10 @@ pub(crate) fn unignored_failure(unignored: &[String]) -> Result<()> {
 /// (`API_KEY_PLACEHOLDER`) into the minted plaintext. EVERY file the
 /// provisioner writes — the template body and every quirk companion file —
 /// goes through here, so there is exactly one place placeholders become
-/// values. `UPSTREAM_API_KEY_PLACEHOLDER` and the per-server MCP bearer
-/// sentinel are deliberately left intact: in BYOK the user supplies their own
-/// upstream credential, so those survive into the written file by design.
+/// values. `UPSTREAM_API_KEY_PLACEHOLDER` and the MCP client-header sentinels
+/// (`mcp_client_header_placeholder`) are deliberately left intact: the user
+/// supplies those values themselves, so they survive into the written file by
+/// design.
 fn splice_key(content: &str, plaintext: Option<&str>) -> String {
     match plaintext {
         Some(p) => content.replace(API_KEY_PLACEHOLDER, p),
@@ -918,13 +1118,10 @@ pub(crate) fn provision_one(
         resolved
     };
 
-    let prev_files: &[ManagedFile] = records
-        .ws
-        .clients
-        .iter()
-        .find(|c| c.client_id == cb.client_id)
-        .map(|c| c.files.as_slice())
-        .unwrap_or(&[]);
+    let prev_client = records.ws.clients.iter().find(|c| c.client_id == cb.client_id);
+    let prev_files: &[ManagedFile] = prev_client.map(|c| c.files.as_slice()).unwrap_or(&[]);
+    let prev_local: &[ManagedLocalMcp] = prev_client.map(|c| c.mcp_local_servers.as_slice()).unwrap_or(&[]);
+    let written_local = local_commands_written(cb, paths.project_root().is_some());
 
     // Every file is merged before any is written, so a merge the writer
     // refuses (a user config that is not valid JSON, say) leaves all of the
@@ -944,7 +1141,14 @@ pub(crate) fn provision_one(
     let mut steps = Vec::new();
     for extra in spliced_companions(cb, &placeholders, plaintext, paths)? {
         match &extra.path {
-            Some(path) => pending.push(plan_managed(path, extra.format, &extra.contents, &BTreeMap::new(), prev_files, others)?),
+            Some(path) => pending.push(plan_managed(
+                path,
+                extra.format,
+                &extra.contents,
+                &BTreeMap::new(),
+                prev_files,
+                others,
+            )?),
             None => steps.push(extra),
         }
     }
@@ -980,6 +1184,8 @@ pub(crate) fn provision_one(
         print_steps(&steps);
         return Ok(None);
     }
+    let local_entries =
+        local_entries_written(cb, &placeholders, plaintext, paths, &pending, prev_local, &written_local)?;
     let mut files: Vec<ManagedFile> = Vec::new();
     for p in pending {
         files.push(p.write(run_stamp, paths.base())?);
@@ -1015,24 +1221,6 @@ pub(crate) fn provision_one(
         // client whose new files are already written.
         // Its `.gitignore` line stays: what is left may still hold a secret
         // (the user's own provider key, a BYOK key they pasted).
-        // Only a file of THIS scope: under the project root for a project job,
-        // a home-directory (`~/`) path for the global one. A manifest copied
-        // with a project names the original project's files, which are not
-        // this run's to strip.
-        let Ok(old_path) = expand_tilde(&prev.path) else { continue };
-        if !old_path.is_absolute() {
-            crate::ui::note("  ", format_args!("{} is recorded relative to an earlier working directory — check it for gateway entries yourself", prev.path));
-            continue;
-        }
-        // Compared by real path, so a root recorded through a symlink still
-        // matches the canonical one.
-        let in_scope = match paths.project_root() {
-            Some(root) => dunce::canonicalize(&old_path).unwrap_or_else(|_| old_path.clone()).starts_with(root),
-            None => prev.path.starts_with("~/"),
-        };
-        if !in_scope {
-            continue;
-        }
         if let Err(e) = retire_file(prev, others, run_stamp, paths.base()) {
             crate::ui::warn("  ", format_args!("{} is no longer used, but our entries could not be removed: {e:#}", prev.path));
         }
@@ -1095,10 +1283,533 @@ pub(crate) fn provision_one(
         provider_id: None,
         key_id: None,
         mcp_server_ids: Vec::new(),
+        // Each written local server's entries, by slug; the orchestrator
+        // stamps the ids ([`managed_local`]).
+        mcp_local_servers: local_entries,
+        mcp_local_commands: BTreeMap::new(),
         files,
         last_provisioned: chrono::Utc::now(),
         launch_command: cb.launch_command.clone(),
     }))
+}
+
+/// A slug no local MCP server is stored under (a slug holds no uppercase
+/// letter), standing in for one server while its entry is located.
+const ENTRY_PROBE_SLUG: &str = "SSAI-ENTRY-PROBE";
+
+/// `placeholders` with the local MCP server `slug` renamed to
+/// [`ENTRY_PROBE_SLUG`]: the same render, less that server's entry, with
+/// every container the entry sits in still held by another one.
+fn with_probe_in_place_of(placeholders: &BTreeMap<String, Value>, slug: &str) -> Option<BTreeMap<String, Value>> {
+    let mut base = placeholders.clone();
+    let Some(Value::List(servers)) = base.get_mut("mcp_servers") else { return None };
+    let item = servers.iter_mut().find(|item| {
+        matches!(item.get("local"), Some(Value::Bool(true)))
+            && matches!(item.get("slug"), Some(Value::String(s)) if s == slug)
+    })?;
+    for field in ["slug", "name"] {
+        item.insert(field.to_string(), Value::String(ENTRY_PROBE_SLUG.to_string()));
+    }
+    Some(base)
+}
+
+/// Where each local MCP server of `written` stands in the files about to be
+/// written (`pending`): for each server, the entries its render holds that
+/// the same render with another server in its place does not
+/// ([`writer::entry_roots`]). Located again on every write, so a record always
+/// names the entry the ownership records of the same write describe.
+///
+/// `created` is decided once, when a server's entry first appears at a root:
+/// from the file as it stands before this write. A later write keeps what
+/// `prev_local` recorded for the same file and root.
+fn local_entries_written(
+    cb: &ClientBundle,
+    placeholders: &BTreeMap<String, Value>,
+    plaintext: Option<&str>,
+    paths: &Paths,
+    pending: &[PendingWrite],
+    prev_local: &[ManagedLocalMcp],
+    written: &BTreeMap<String, String>,
+) -> Result<Vec<ManagedLocalMcp>> {
+    let mut out = Vec::new();
+    for slug in written.keys() {
+        let mut entries = Vec::new();
+        if let Some(base) = with_probe_in_place_of(placeholders, slug) {
+            let body = render(&cb.template.body, cb.template.format, &base).context("local render failed")?;
+            let mut base_files: Vec<(String, String)> = Vec::new();
+            if let Some(first) = pending.first() {
+                base_files.push((first.filename.clone(), splice_key(&body, plaintext)));
+            }
+            for extra in spliced_companions(cb, &base, plaintext, paths)? {
+                if let Some(path) = extra.path {
+                    base_files.push((path, extra.contents));
+                }
+            }
+            let recorded = prev_local.iter().find(|s| s.slug == *slug);
+            for p in pending {
+                let Some((_, base_contents)) = base_files.iter().find(|(name, _)| *name == p.filename) else {
+                    continue;
+                };
+                if !matches!(p.format, TemplateFormat::Json | TemplateFormat::Toml | TemplateFormat::Yaml) {
+                    continue;
+                }
+                let base_owned = writer::merge(p.format, None, base_contents, &[], &p.keyed_arrays)
+                    .with_context(|| format!("locate the entry of local MCP server '{slug}' in {}", p.filename))?
+                    .owned;
+                for root in writer::entry_roots(p.format, &p.outcome.owned, &base_owned) {
+                    let created = match recorded
+                        .and_then(|s| s.entries.iter().find(|e| p.is_file(&e.file) && e.root == root))
+                    {
+                        Some(e) => e.created,
+                        None => !writer::holds(p.format, p.existing.as_deref(), &root)?,
+                    };
+                    entries.push(LocalMcpEntry { file: p.filename.clone(), root, created });
+                }
+            }
+        }
+        out.push(ManagedLocalMcp { id: uuid::Uuid::nil(), slug: slug.clone(), entries });
+    }
+    Ok(out)
+}
+
+/// One stderr line per MCP server the gateway left out of a client's config,
+/// in the gateway's own words.
+///
+/// `project_write`: this client's config is written at its project-local
+/// path. The gateway renders the config outside a project, so it reports a
+/// local server a template writes only in a project's own file as left out
+/// every time; a project write carries it, and that line is dropped.
+pub(crate) fn mcp_warning_lines(
+    client_id: &str,
+    warnings: &[crate::api::McpServerWarning],
+    project_write: bool,
+) -> Vec<String> {
+    warnings
+        .iter()
+        .filter(|w| !(project_write && w.reason == crate::api::LOCAL_SERVER_PROJECT_ONLY))
+        .map(|w| format!("warning: {client_id}: {}", w.message))
+        .collect()
+}
+
+/// Whether `cb`'s config lands at its project-local path under a job of this
+/// scope — the condition [`provision_one`] renders the project form on.
+fn is_project_write(cb: &ClientBundle, in_project: bool) -> bool {
+    in_project && cb.template.project_filename.is_some()
+}
+
+/// Print a bundle client's [`mcp_warning_lines`] on stderr.
+pub(crate) fn print_mcp_warnings(cb: &ClientBundle, in_project: bool) {
+    for line in mcp_warning_lines(&cb.client_id, &cb.warnings, is_project_write(cb, in_project)) {
+        eprintln!("{line}");
+    }
+}
+
+/// The local MCP servers `cb`'s written config carries, slug → whole launch
+/// line, read from the bundle's own `mcp_servers` items (the ones marked
+/// `local`, each carrying the gateway's `command_line`): what the template was
+/// rendered with is what is recorded. Empty when the template writes a local
+/// server only in a project's own file and this write is not one.
+pub(crate) fn local_commands_written(cb: &ClientBundle, in_project: bool) -> BTreeMap<String, String> {
+    use streamscope_client_templates::LocalMcpForm;
+    let written = match cb.template.local_mcp {
+        LocalMcpForm::None => false,
+        LocalMcpForm::Config => true,
+        LocalMcpForm::Project => is_project_write(cb, in_project),
+    };
+    let mut out = BTreeMap::new();
+    let Some(Value::List(servers)) = cb.placeholders.get("mcp_servers") else {
+        return out;
+    };
+    if !written {
+        return out;
+    }
+    for item in servers {
+        if !matches!(item.get("local"), Some(Value::Bool(true))) {
+            continue;
+        }
+        if let (Some(Value::String(slug)), Some(Value::String(line))) = (item.get("slug"), item.get("command_line")) {
+            out.insert(slug.clone(), line.clone());
+        }
+    }
+    out
+}
+
+/// One line per local MCP server whose launch is new or differs from the one
+/// last written (`before`) — its command, an argument, or an environment
+/// value the administrator set: what `sync` prints as it applies it.
+pub(crate) fn changed_local_command_lines(
+    before: Option<&BTreeMap<String, String>>,
+    now: &BTreeMap<String, String>,
+) -> Vec<String> {
+    now.iter()
+        .filter(|(slug, line)| before.and_then(|b| b.get(*slug)) != Some(*line))
+        .map(|(slug, line)| format!("local MCP server '{slug}' now runs: {line}"))
+        .collect()
+}
+
+/// A selection as the manifest records it: each id with its slug (`slugs`: the
+/// servers the workspace is handed) and the entries [`provision_one`] wrote it
+/// as (`written`, by slug — none for a server the config does not carry). An
+/// id with no slug there is not recorded.
+pub(crate) fn managed_local(
+    ids: &[uuid::Uuid],
+    slugs: &BTreeMap<uuid::Uuid, String>,
+    written: Vec<ManagedLocalMcp>,
+) -> Vec<ManagedLocalMcp> {
+    ids.iter()
+        .filter_map(|id| {
+            slugs.get(id).map(|slug| ManagedLocalMcp {
+                id: *id,
+                slug: slug.clone(),
+                entries: written.iter().find(|w| w.slug == *slug).map(|w| w.entries.clone()).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// For the clients a `sync` covers (`selected`): the local MCP servers of each
+/// one's recorded selection that the workspace is still handed (`offered`),
+/// sorted. `offered` is `None` when what the workspace hands out could not be
+/// read: every recorded server is then kept — an unknown is never a
+/// withdrawal. A client outside `selected` keeps its selection as recorded:
+/// its config is not rewritten by this run.
+pub(crate) fn split_offered_local(
+    clients: &[ManagedClient],
+    selected: &HashSet<String>,
+    offered: Option<&BTreeMap<uuid::Uuid, String>>,
+) -> BTreeMap<String, Vec<uuid::Uuid>> {
+    clients
+        .iter()
+        .map(|c| {
+            let mut ids: Vec<uuid::Uuid> = c
+                .mcp_local_servers
+                .iter()
+                .filter(|s| !selected.contains(&c.client_id) || offered.is_none_or(|o| o.contains_key(&s.id)))
+                .map(|s| s.id)
+                .collect();
+            ids.sort();
+            ids.dedup();
+            (c.client_id.clone(), ids)
+        })
+        .collect()
+}
+
+/// Whether there is nothing to write for a group's client: its template is
+/// MCP-only (`kind`; `None` when the template could not be read) and its
+/// selection, gateway and local, is empty. Such a client is LEFT ALONE by
+/// `provision` and `sync` alike — no config is asked for, nothing of its is
+/// removed, it stays recorded, and it is not a failure. Any other plan is
+/// rendered, and a refusal of it is that client's failure.
+pub(crate) fn nothing_to_write(kind: Option<TemplateKind>, group: &Group) -> bool {
+    matches!(kind, Some(TemplateKind::Mcp))
+        && group.mcp_server_ids.is_empty()
+        && group.mcp_local_server_ids.is_empty()
+}
+
+/// What a run says of a client it leaves alone ([`nothing_to_write`]).
+pub(crate) fn nothing_to_write_line(client_id: &str) -> String {
+    format!("{client_id}: no MCP server is selected for it — nothing to write")
+}
+
+/// Why a local MCP server leaves a client's selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WithdrawReason {
+    /// The workspace is no longer handed it: revoked, disabled or deleted.
+    NotOffered,
+    /// The client's setup no longer has a form for a local server.
+    NoForm,
+    /// This run took it out: a flag, or unticked in the prompt.
+    Deselected,
+}
+
+impl WithdrawReason {
+    fn text(self) -> &'static str {
+        match self {
+            WithdrawReason::NotOffered => "it is no longer offered to this workspace",
+            WithdrawReason::NoForm => "this client setup no longer writes local servers",
+            WithdrawReason::Deselected => "it is no longer selected for this client",
+        }
+    }
+}
+
+/// The local MCP servers a client was recorded with (`recorded`) that its
+/// selection no longer holds (`keeping`), each with why: no longer offered
+/// (`offered`: what the workspace hands out, `None` when that is not known —
+/// then nothing is called "no longer offered"), else lost with the template's
+/// form (`lost_form`), else taken out by this run.
+pub(crate) fn local_withdrawals(
+    recorded: &[ManagedLocalMcp],
+    keeping: &[uuid::Uuid],
+    offered: Option<&BTreeSet<uuid::Uuid>>,
+    lost_form: bool,
+) -> Vec<(uuid::Uuid, WithdrawReason)> {
+    recorded
+        .iter()
+        .filter(|s| !keeping.contains(&s.id))
+        .map(|s| {
+            let reason = if offered.is_some_and(|o| !o.contains(&s.id)) {
+                WithdrawReason::NotOffered
+            } else if lost_form {
+                WithdrawReason::NoForm
+            } else {
+                WithdrawReason::Deselected
+            };
+            (s.id, reason)
+        })
+        .collect()
+}
+
+/// Whether `path` — a recorded file, expanded — is one this job may rewrite:
+/// under the project root for a project job, a home-directory (`~/`) path
+/// for the global one. A manifest copied with a project names the original
+/// project's files, and a path recorded relative to an earlier working
+/// directory names no file reliably: neither is this run's to touch.
+fn in_job_scope(recorded: &str, path: &Path, project_root: Option<&Path>) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    match project_root {
+        // Compared by real path, so a root recorded through a symlink still
+        // matches the canonical one.
+        Some(root) => dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()).starts_with(root),
+        None => recorded.starts_with("~/"),
+    }
+}
+
+/// The format a managed file was recorded with, and that format's empty
+/// document — `None` for one the structured writer does not merge.
+fn recorded_format(format: &str) -> Option<(TemplateFormat, &'static str)> {
+    match format {
+        "json" => Some((TemplateFormat::Json, "{}")),
+        "yaml" => Some((TemplateFormat::Yaml, "{}")),
+        "toml" => Some((TemplateFormat::Toml, "")),
+        "shell" => Some((TemplateFormat::Shell, "")),
+        _ => None,
+    }
+}
+
+/// WITHDRAW local MCP servers from one client: the one operation that takes
+/// a local server out of a client's files, shared by `provision` and `sync`.
+/// It needs no rendered config — it works on each file as it stands — and
+/// touches exactly the withdrawn servers' recorded entries:
+///
+/// - an entry we created (`created`) is removed whole, with whatever the
+///   developer pasted into it;
+/// - an entry the file already had loses only the leaves we wrote that are
+///   unchanged; the rest stays and is named;
+/// - nothing else in the file, and no other file, is read as ours to change:
+///   the provider, the key, the model, gateway servers and the developer's
+///   own entries are not part of the merge at all;
+/// - only a file of this job's scope ([`in_job_scope`]) is rewritten, matched
+///   by [`is_recorded_file`]; any other is named and left.
+///
+/// The client's record then drops those servers, their entries and the
+/// ownership records under them — the client itself stays. One line per
+/// server and file says what was done and why. `preview`: say it, change
+/// nothing. Returns whether the record changed, so the caller saves the
+/// manifest at once and files and records never disagree.
+pub(crate) fn withdraw_local_servers(
+    client: &mut ManagedClient,
+    gone: &[(uuid::Uuid, WithdrawReason)],
+    others: &[ManagedFile],
+    run_stamp: &str,
+    paths: &Paths,
+    preview: bool,
+) -> Result<bool> {
+    let withdrawn: Vec<(ManagedLocalMcp, WithdrawReason)> = client
+        .mcp_local_servers
+        .iter()
+        .filter_map(|s| gone.iter().find(|(id, _)| *id == s.id).map(|(_, why)| (s.clone(), *why)))
+        .collect();
+    if withdrawn.is_empty() {
+        return Ok(false);
+    }
+    let would = if preview { "would be " } else { "" };
+    let mut said: BTreeSet<String> = BTreeSet::new();
+    for file in &mut client.files {
+        let Ok(path) = expand_tilde(&file.path) else { continue };
+        let entries: Vec<(&ManagedLocalMcp, &LocalMcpEntry, WithdrawReason)> = withdrawn
+            .iter()
+            .flat_map(|(server, why)| {
+                server
+                    .entries
+                    .iter()
+                    .filter(|e| is_recorded_file(&e.file, &file.path, &path))
+                    .map(move |e| (server, e, *why))
+            })
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        said.extend(entries.iter().map(|(server, _, _)| server.slug.clone()));
+        let Some((format, empty)) = recorded_format(&file.format).filter(|_| in_job_scope(&file.path, &path, paths.project_root()))
+        else {
+            for (server, _, why) in &entries {
+                crate::ui::note(
+                    "  ",
+                    format_args!(
+                        "{} is not this run's to rewrite — take local MCP server '{}' out of it yourself ({})",
+                        file.path,
+                        server.slug,
+                        why.text()
+                    ),
+                );
+            }
+            continue;
+        };
+        let existing = match std::fs::read_to_string(&path) {
+            Ok(existing) => existing,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        let roots: Vec<crate::state::EntryRoot> = entries.iter().map(|(_, e, _)| e.root.clone()).collect();
+        let created: Vec<crate::state::EntryRoot> =
+            entries.iter().filter(|(_, e, _)| e.created).map(|(_, e, _)| e.root.clone()).collect();
+        let (inside, outside) = writer::records_in(format, &file.owned, &roots);
+        let inside = crate::state::owned_alone(&inside, &path, others);
+        // An empty render over the records of these entries alone: what we
+        // created goes whole, what we only wrote into loses our unchanged
+        // leaves, and nothing outside them is in the merge.
+        let outcome = writer::merge_withdrawing(format, Some(&existing), empty, &inside, &BTreeMap::new(), &created)
+            .with_context(|| format!("take a local MCP server out of {}", path.display()))?;
+        let mut removed = outcome.withdrawn.iter();
+        for (server, entry, why) in &entries {
+            let at = match &entry.root.entry {
+                Some(e) => format!("{}[{}]", entry.root.path, e.id),
+                None => entry.root.path.clone(),
+            };
+            if !entry.created {
+                println!(
+                    "  {} — local MCP server '{}' {would}taken out of `{at}`, which this file already had: \
+                     only what was written for it and you did not change is removed ({})",
+                    file.path,
+                    server.slug,
+                    why.text()
+                );
+            } else if removed.next() == Some(&true) {
+                println!(
+                    "  {} — local MCP server '{}' {would}removed: its whole entry, with anything you pasted into it ({})",
+                    file.path,
+                    server.slug,
+                    why.text()
+                );
+            }
+        }
+        for kept in &outcome.kept_edited {
+            println!("  {} — you edited `{kept}` after we wrote it; keeping your value", file.path);
+        }
+        if preview {
+            continue;
+        }
+        if outcome.contents != existing {
+            file.file_hash = writer::write_atomic(&path, &outcome.contents, Some((paths.base(), run_stamp)))?;
+        }
+        file.owned = outside;
+    }
+    // A server no file of this client carried still leaves its selection.
+    for (server, why) in withdrawn.iter().filter(|(server, _)| !said.contains(&server.slug)) {
+        println!("  {}: local MCP server '{}' {would}taken out of its selection ({})", client.client_id, server.slug, why.text());
+    }
+    if preview {
+        return Ok(false);
+    }
+    client.mcp_local_servers.retain(|s| !withdrawn.iter().any(|(gone, _)| gone.id == s.id));
+    for (server, _) in &withdrawn {
+        client.mcp_local_commands.remove(&server.slug);
+    }
+    Ok(true)
+}
+
+/// Leave a plan its local MCP servers only where its template has a form for
+/// one, and say so for every other: one line per client naming the servers it
+/// is provisioned without. Run on the plans as they will be rendered.
+pub(crate) fn keep_local_where_writable<'a>(
+    plans: &mut [ClientPlan],
+    slugs: &BTreeMap<uuid::Uuid, String>,
+    templates_of: impl Fn(&str) -> Option<&'a [ClientProfileTemplate]>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for plan in plans.iter_mut() {
+        if plan.mcp_local_server_ids.is_empty() {
+            continue;
+        }
+        let template = templates_of(&plan.client_id).and_then(|t| t.get(plan.template_index));
+        if template.is_some_and(|t| !t.local_mcp.is_none()) {
+            continue;
+        }
+        let names: Vec<String> = plan
+            .mcp_local_server_ids
+            .iter()
+            .filter_map(|id| slugs.get(id))
+            .map(|slug| format!("local MCP server '{slug}'"))
+            .collect();
+        plan.mcp_local_server_ids.clear();
+        let setup = template.map(|t| t.title.as_str()).unwrap_or("its setup");
+        lines.push(format!(
+            "warning: {}: {} not added — {setup} has no form for a server that runs on this machine",
+            plan.client_id,
+            names.join(", ")
+        ));
+    }
+    lines
+}
+
+/// What `provision` prints for the local MCP servers a run adds: each one's
+/// whole launch, the variables the developer must fill, and what a sandboxed
+/// run (or Windows, `windows`) changes for that kind of command.
+pub(crate) fn local_server_notice_lines(servers: &[crate::api::McpLocalServer], windows: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for s in servers {
+        lines.push(format!("local MCP server '{}' runs: {}", s.slug, s.command_line));
+        let to_fill: Vec<&str> =
+            s.launch.env.iter().filter(|e| e.value.is_none()).map(|e| e.name.as_str()).collect();
+        if !to_fill.is_empty() {
+            lines.push(format!(
+                "  '{}' reads {} from you: replace the <paste-your-…-here> placeholder in the written config with your value",
+                s.slug,
+                to_fill.join(", ")
+            ));
+        }
+        for note in local_command_notes(&s.launch.command, windows) {
+            lines.push(format!("  '{}': {note}", s.slug));
+        }
+    }
+    lines
+}
+
+/// What a developer should know about a local MCP server started by
+/// `command`, by the kind of command it is — each note only where it is true:
+/// - a package runner (`npx`, `uvx`): it must be installed; under the native
+///   sandbox its download needs the registry's destination list; the
+///   container image must hold it; on Windows a client may need it wrapped;
+/// - a container engine: no sandbox tier confines what the engine starts;
+/// - a path: it does not exist inside the container sandbox;
+/// - any other program: it must be installed, and in the image.
+pub(crate) fn local_command_notes(command: &str, windows: bool) -> Vec<&'static str> {
+    let program = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let program = program.strip_suffix(".exe").unwrap_or(program);
+    if matches!(program, "docker" | "podman" | "nerdctl") {
+        return vec![
+            "it is started through a container engine, so `ssai run`'s sandbox does not confine it — the engine runs it, not the client",
+        ];
+    }
+    if command.contains(['/', '\\']) {
+        return vec![
+            "under the container sandbox a path on this machine does not exist — it runs only where the image holds it",
+        ];
+    }
+    if matches!(program, "npx" | "uvx") {
+        let mut notes = vec![
+            "its runner must be installed on this machine (npx comes with Node.js, uvx with uv)",
+            "under `ssai run --sandbox native` it is confined with its client, and fetching its package needs the npm / PyPI destination list your administrator attaches",
+            "under the container sandbox its runner must exist in the image (uvx is not there by default)",
+        ];
+        if windows {
+            notes.push("on Windows a client may need the runner wrapped: set the command to `cmd` with `/c` before it (cmd /c npx …) in the written config");
+        }
+        return notes;
+    }
+    vec!["the program must be installed on this machine, and exist in the image under the container sandbox"]
 }
 
 /// A bundle refused because the administrator disabled `client`, said so;
@@ -1131,11 +1842,25 @@ struct PendingWrite {
     filename: String,
     path: PathBuf,
     format: TemplateFormat,
+    keyed_arrays: BTreeMap<String, String>,
+    /// The file as it stood before this write (None = absent).
+    existing: Option<String>,
     outcome: writer::MergeOutcome,
     notes: Vec<String>,
 }
 
+/// Whether `recorded` — a file as a manifest names it — is the file at
+/// `path`, written this run as `filename`: however its path was spelled when
+/// recorded (a relative or symlinked project root names the same file).
+fn is_recorded_file(recorded: &str, filename: &str, path: &Path) -> bool {
+    recorded == filename || expand_tilde(recorded).is_ok_and(|p| crate::state::same_file(&p, path))
+}
+
 impl PendingWrite {
+    fn is_file(&self, recorded: &str) -> bool {
+        is_recorded_file(recorded, &self.filename, &self.path)
+    }
+
     fn print_notes(&self) {
         for note in &self.notes {
             crate::ui::note("  ", note);
@@ -1172,9 +1897,7 @@ fn plan_managed(
     // relative or symlinked project root names the same file).
     let prev_owned = prev_files
         .iter()
-        .find(|f| {
-            f.path == filename || expand_tilde(&f.path).is_ok_and(|p| crate::state::same_file(&p, &path))
-        })
+        .find(|f| is_recorded_file(&f.path, filename, &path))
         .map(|f| crate::state::owned_alone(&f.owned, &path, others))
         .unwrap_or_default();
 
@@ -1192,7 +1915,15 @@ fn plan_managed(
         notes.push(format!("{filename} — you edited `{kept}` after we wrote it; keeping your value"));
     }
 
-    Ok(PendingWrite { filename: filename.to_string(), path, format, outcome, notes })
+    Ok(PendingWrite {
+        filename: filename.to_string(),
+        path,
+        format,
+        keyed_arrays: keyed_arrays.clone(),
+        existing,
+        outcome,
+        notes,
+    })
 }
 
 /// `paths` relative to `root`, for those under it.
@@ -1214,7 +1945,9 @@ fn slash_separated(rel: &Path) -> String {
 /// last time's ownership removes exactly those — a keyed-array entry is found
 /// by the identity its record carries, so no template's keyed arrays are
 /// needed), backing the file up first; delete it when nothing of the user's is
-/// left. A file already gone is fine.
+/// left. A value or an entry of ours the user edited stays, and is named. A
+/// file already gone is fine. Used for one thing: a file a client's template
+/// no longer writes.
 fn retire_file(prev: &ManagedFile, others: &[ManagedFile], run_stamp: &str, backup_base: &Path) -> Result<()> {
     let path = expand_tilde(&prev.path)?;
     // A relative path names no file reliably (the caller notes it and never
@@ -1224,19 +1957,16 @@ fn retire_file(prev: &ManagedFile, others: &[ManagedFile], run_stamp: &str, back
         return Ok(());
     }
     let Ok(existing) = std::fs::read_to_string(&path) else { return Ok(()) };
-    let (format, empty) = match prev.format.as_str() {
-        "json" => (TemplateFormat::Json, "{}"),
-        "yaml" => (TemplateFormat::Yaml, "{}"),
-        "toml" => (TemplateFormat::Toml, ""),
-        "shell" => (TemplateFormat::Shell, ""),
-        _ => return Ok(()),
-    };
+    let Some((format, empty)) = recorded_format(&prev.format) else { return Ok(()) };
     let owned = crate::state::owned_alone(&prev.owned, &path, others);
     let outcome = writer::merge(format, Some(&existing), empty, &owned, &BTreeMap::new())
         .with_context(|| format!("remove our entries from {}", path.display()))?;
     // Whitespace aside: a file edited in place keeps its own layout, so an
     // empty object can span lines. A comment left in it is the user's, and
     // keeps the file.
+    for kept in &outcome.kept_edited {
+        println!("  {} — you edited `{kept}` after we wrote it; keeping your value", prev.path);
+    }
     let left: String = outcome.contents.chars().filter(|c| !c.is_whitespace()).collect();
     if left.is_empty() || left == "{}" {
         crate::state::backup_file(backup_base, run_stamp, &path)?;
@@ -1451,6 +2181,7 @@ impl Mode {
 }
 
 /// One client's resolved integration plan.
+#[derive(Clone)]
 pub(crate) struct ClientPlan {
     pub(crate) client_id: String,
     pub(crate) template_index: usize,
@@ -1463,6 +2194,9 @@ pub(crate) struct ClientPlan {
     /// and the same set written in a different order must not split one call
     /// into two.
     pub(crate) mcp_server_ids: Vec<uuid::Uuid>,
+    /// The local MCP servers selected for this client, SORTED, for the same
+    /// reason.
+    pub(crate) mcp_local_server_ids: Vec<uuid::Uuid>,
 }
 
 /// One bundle call: ONE client, with its mode, provider and MCP servers. Every
@@ -1475,6 +2209,7 @@ pub(crate) struct Group {
     pub(crate) mode: Mode,
     pub(crate) provider_id: Option<uuid::Uuid>,
     pub(crate) mcp_server_ids: Vec<uuid::Uuid>,
+    pub(crate) mcp_local_server_ids: Vec<uuid::Uuid>,
     pub(crate) indices: Vec<usize>,
 }
 
@@ -1485,14 +2220,12 @@ impl Group {
             Mode::Gateway => "gateway",
             Mode::Byok => "byok",
         };
+        let ids = |ids: &[uuid::Uuid]| ids.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(",");
         format!(
-            "{mode}:{}:mcp={}:client={}",
+            "{mode}:{}:mcp={}:local={}:client={}",
             self.provider_id.map(|u| u.to_string()).unwrap_or_default(),
-            self.mcp_server_ids
-                .iter()
-                .map(|u| u.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
+            ids(&self.mcp_server_ids),
+            ids(&self.mcp_local_server_ids),
             self.client_id
         )
     }
@@ -1535,6 +2268,7 @@ pub(crate) fn prune_unused_etags(ws: &mut crate::state::WorkspaceManifest) {
             mode: Mode::from_manifest(&c.mode),
             provider_id: c.provider_id,
             mcp_server_ids: c.mcp_server_ids.clone(),
+            mcp_local_server_ids: c.mcp_local_servers.iter().map(|s| s.id).collect(),
         })
         .collect();
     let live: std::collections::HashSet<String> =
@@ -1546,18 +2280,24 @@ pub(crate) fn prune_unused_etags(ws: &mut crate::state::WorkspaceManifest) {
 /// [`Group`]). Gateway groups come first.
 pub(crate) fn group_plans(plans: &[ClientPlan]) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
-    let mut index: BTreeMap<(String, bool, String, Vec<uuid::Uuid>), usize> = BTreeMap::new();
+    // (client, byok, provider, MCP servers, local MCP servers)
+    type GroupKey = (String, bool, String, Vec<uuid::Uuid>, Vec<uuid::Uuid>);
+    let mut index: BTreeMap<GroupKey, usize> = BTreeMap::new();
     for (i, p) in plans.iter().enumerate() {
         // Sorted here too: a plan read back from a stored manifest carries
         // whatever order the run that wrote it used.
         let mut servers = p.mcp_server_ids.clone();
         servers.sort();
         servers.dedup();
+        let mut local_servers = p.mcp_local_server_ids.clone();
+        local_servers.sort();
+        local_servers.dedup();
         let gk = (
             p.client_id.clone(),
             p.mode == Mode::Byok,
             p.provider_id.map(|u| u.to_string()).unwrap_or_default(),
             servers.clone(),
+            local_servers.clone(),
         );
         match index.get(&gk) {
             Some(&gi) => groups[gi].indices.push(i),
@@ -1568,6 +2308,7 @@ pub(crate) fn group_plans(plans: &[ClientPlan]) -> Vec<Group> {
                     mode: p.mode,
                     provider_id: p.provider_id,
                     mcp_server_ids: servers,
+                    mcp_local_server_ids: local_servers,
                     indices: vec![i],
                 });
             }
@@ -2021,28 +2762,62 @@ fn template_index_by_name(
     )
 }
 
-/// Resolve which MCP virtual servers to wire into MCP-capable clients.
+/// The gateway MCP servers a run gives its clients.
+pub(crate) struct McpChoice {
+    /// What the workspace offers — `None` when the run did not need to read it.
+    pub(crate) offered: Option<BTreeSet<uuid::Uuid>>,
+    /// `Some`: this set for every client (named with `--mcp`, `--all-mcp`,
+    /// ticked in the prompt, or none with `--no-mcp`). `None`: each client
+    /// keeps the ones it was provisioned with.
+    pub(crate) chosen: Option<Vec<uuid::Uuid>>,
+}
+
+impl McpChoice {
+    /// The ids for a client recorded with `recorded` (sorted, a set), and how
+    /// many of the recorded ones the workspace no longer offers.
+    pub(crate) fn for_client(&self, recorded: &[uuid::Uuid]) -> (Vec<uuid::Uuid>, usize) {
+        let offered = |id: &uuid::Uuid| self.offered.as_ref().is_none_or(|o| o.contains(id));
+        let mut ids: Vec<uuid::Uuid> = match &self.chosen {
+            Some(ids) => ids.clone(),
+            None => recorded.iter().copied().filter(offered).collect(),
+        };
+        ids.sort();
+        ids.dedup();
+        let gone = match &self.chosen {
+            Some(_) => 0,
+            None => recorded.iter().filter(|id| !offered(id)).count(),
+        };
+        (ids, gone)
+    }
+}
+
+/// Resolve which MCP virtual servers the MCP-capable clients get.
 ///
 /// Precedence: `--no-mcp` → none; `--mcp <slug>…` → exactly those (validated);
-/// `--all-mcp` → every reachable server; otherwise, in an interactive run where
-/// at least one selected client can consume MCP, propose the reachable servers
-/// (multi-select); a non-interactive run (`--yes`/CI) with no explicit flag
-/// wires none. Any chosen `per_user_oauth` server the current user hasn't linked
-/// yet prints a "connect in the portal first" note — the config is still
-/// written and goes live once the user connects.
+/// `--all-mcp` → every reachable server; otherwise an interactive run where a
+/// selected client can consume MCP proposes the reachable servers — ticked:
+/// the ones a selected client was provisioned with (`recorded`), or all of
+/// them when none was. Any other run with no flag changes nothing: each
+/// client keeps the ones it was provisioned with (those still offered), and a
+/// client provisioned for the first time gets none. Any chosen
+/// `per_user_oauth` server the current user hasn't linked yet prints a
+/// "connect in the portal first" note — the config is still written and goes
+/// live once the user connects.
 async fn resolve_mcp_servers(
     api: &ApiClient,
+    workspace_id: uuid::Uuid,
     args: &ProvisionArgs,
     any_client_supports_mcp: bool,
-) -> Result<Vec<McpSelection>> {
+    recorded: &BTreeSet<uuid::Uuid>,
+) -> Result<McpChoice> {
     if args.no_mcp {
-        return Ok(Vec::new());
+        return Ok(McpChoice { offered: None, chosen: Some(Vec::new()) });
     }
 
     // An explicit `--mcp <slug>` list always wins (validated against the
     // reachable set), even for a client that has no MCP template.
     if !args.mcp.is_empty() {
-        let available = api.mcp_virtual_servers().await?;
+        let available = api.mcp_virtual_servers(workspace_id).await?;
         let selected: Vec<McpVirtualServer> = args
             .mcp
             .iter()
@@ -2060,30 +2835,27 @@ async fn resolve_mcp_servers(
             })
             .collect::<Result<_>>()?;
         warn_connect_first(&selected);
-        return Ok(selected.iter().map(|s| McpSelection { virtual_server_id: s.id }).collect());
+        return Ok(McpChoice { offered: None, chosen: Some(selected.iter().map(|s| s.id).collect()) });
     }
 
     // `--all-mcp` is an explicit request, like `--mcp <slug>` — honour it
     // regardless of whether a selected client can consume MCP.
     if args.all_mcp {
-        let available = api.mcp_virtual_servers().await?;
+        let available = api.mcp_virtual_servers(workspace_id).await?;
         warn_connect_first(&available);
-        return Ok(available.iter().map(|s| McpSelection { virtual_server_id: s.id }).collect());
+        return Ok(McpChoice { offered: None, chosen: Some(available.iter().map(|s| s.id).collect()) });
     }
 
-    // No selected client can consume MCP → nothing to wire, no prompt.
-    if !any_client_supports_mcp {
-        return Ok(Vec::new());
+    // Nothing to keep and nobody to ask: nothing is read.
+    let asks = any_client_supports_mcp && !args.yes;
+    if recorded.is_empty() && !asks {
+        return Ok(McpChoice { offered: None, chosen: None });
     }
 
-    let available = api.mcp_virtual_servers().await?;
-    if available.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Non-interactive with no explicit selection → wire none (documented).
-    if args.yes {
-        return Ok(Vec::new());
+    let available = api.mcp_virtual_servers(workspace_id).await?;
+    let offered: BTreeSet<uuid::Uuid> = available.iter().map(|s| s.id).collect();
+    if !asks || available.is_empty() {
+        return Ok(McpChoice { offered: Some(offered), chosen: None });
     }
 
     // Interactive proposal — each line shows `name (slug)` plus a connect-first
@@ -2094,24 +2866,180 @@ async fn resolve_mcp_servers(
             let choice = Choice::new(format!("{} ({})", s.name, s.slug));
             if s.connection_status == "needs_connection" {
                 choice.hint("connect in portal first")
+            } else if !s.client_headers.is_empty() {
+                choice.hint(format!("your client sends {}", s.client_headers.join(", ")))
             } else {
                 choice
             }
         })
         .collect();
-    let picks = pick_many("Which MCP servers should I wire into MCP-capable clients?", &labels, 0)?;
+    let ticked: Vec<usize> =
+        (0..available.len()).filter(|&i| recorded.is_empty() || recorded.contains(&available[i].id)).collect();
+    let picks = pick_many_ticked("Which MCP servers should I wire into MCP-capable clients?", &labels, 0, &ticked)?;
     let selected: Vec<McpVirtualServer> = picks.into_iter().map(|i| available[i].clone()).collect();
     warn_connect_first(&selected);
-    Ok(selected.iter().map(|s| McpSelection { virtual_server_id: s.id }).collect())
+    Ok(McpChoice { offered: Some(offered), chosen: Some(selected.iter().map(|s| s.id).collect()) })
 }
 
-/// Print a "connect in the portal first" note for every chosen per-user-OAuth
-/// server the current user hasn't linked yet. The config is written regardless;
-/// requests through the server succeed once the user connects.
+/// The local MCP servers a run gives its clients.
+pub(crate) struct LocalChoice {
+    /// What the workspace is handed — empty when the run did not need to read it.
+    pub(crate) offered: Vec<crate::api::McpLocalServer>,
+    /// Whether `offered` was read: only then does a recorded server missing
+    /// from it mean "no longer offered".
+    pub(crate) offered_read: bool,
+    /// `Some`: this set (named with `--local-mcp`, ticked in the prompt, or
+    /// none). `None`: each client keeps the ones it was provisioned with.
+    pub(crate) chosen: Option<Vec<uuid::Uuid>>,
+    /// The clients a set ticked in the prompt was asked for — the ones the
+    /// question named. `None`: the set is for every client (flags).
+    pub(crate) picked_for: Option<Vec<String>>,
+}
+
+impl LocalChoice {
+    /// The ids for `client_id`, recorded with `recorded` (sorted, a set). A
+    /// set picked in the prompt goes only to the clients the prompt named:
+    /// another client gets none of it, and no warning about it.
+    pub(crate) fn for_client(&self, client_id: &str, recorded: &[ManagedLocalMcp]) -> Vec<uuid::Uuid> {
+        let offered = |id: &uuid::Uuid| !self.offered_read || self.offered.iter().any(|s| s.id == *id);
+        let named = self.picked_for.as_ref().is_none_or(|clients| clients.iter().any(|c| c == client_id));
+        let mut ids: Vec<uuid::Uuid> = match &self.chosen {
+            Some(ids) if named => ids.clone(),
+            Some(_) => Vec::new(),
+            None => recorded.iter().filter(|s| offered(&s.id)).map(|s| s.id).collect(),
+        };
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+}
+
+/// Resolve which local MCP servers (started by this machine) the clients that
+/// have a form for one get.
+///
+/// Precedence: `--no-mcp` / `--no-local-mcp` → none; `--local-mcp <slug>…` →
+/// exactly those (validated against what the workspace is handed); otherwise
+/// an interactive run where a selected client can start one (`targets`)
+/// proposes them, each with its command line ([`local_pick`]): ONE selection,
+/// written to every one of those clients. Any other run
+/// with no flag changes nothing: each client keeps the ones it was provisioned
+/// with, a client provisioned for the first time gets none.
+///
+/// A run that would keep recorded servers must know which are still handed to
+/// the workspace, so that read failing fails the run; with nothing recorded
+/// the prompt is a convenience and a failed read only skips it.
+async fn resolve_local_mcp_servers(
+    api: &ApiClient,
+    args: &ProvisionArgs,
+    workspace_id: uuid::Uuid,
+    targets: &[String],
+    recorded: &BTreeSet<uuid::Uuid>,
+) -> Result<LocalChoice> {
+    let none = LocalChoice { offered: Vec::new(), offered_read: false, chosen: Some(Vec::new()), picked_for: None };
+    if args.no_mcp || args.no_local_mcp {
+        return Ok(none);
+    }
+    if !args.local_mcp.is_empty() {
+        let offered = api.mcp_local_servers(workspace_id).await?;
+        let chosen = args
+            .local_mcp
+            .iter()
+            .map(|slug| {
+                offered.iter().find(|s| &s.slug == slug).map(|s| s.id).with_context(|| {
+                    format!(
+                        "no local MCP server with slug {slug:?} — available: {}",
+                        offered.iter().map(|s| s.slug.clone()).collect::<Vec<_>>().join(", ")
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(LocalChoice { offered, offered_read: true, chosen: Some(chosen), picked_for: None });
+    }
+    let asks = !targets.is_empty() && !args.yes;
+    let offered = if !recorded.is_empty() {
+        api.mcp_local_servers(workspace_id).await?
+    } else if asks {
+        let (offered, warning) = proposal_or_none(api.mcp_local_servers(workspace_id).await);
+        if let Some(warning) = warning {
+            crate::ui::warn("", format_args!("{warning}"));
+        }
+        offered
+    } else {
+        return Ok(none);
+    };
+    if !asks || offered.is_empty() {
+        return Ok(LocalChoice { offered, offered_read: true, chosen: None, picked_for: None });
+    }
+    let labels: Vec<Choice> = offered
+        .iter()
+        .map(|s| {
+            Choice::new(format!("{} ({})", s.name, s.slug))
+                .hint(format!("runs: {}", s.command_line))
+        })
+        .collect();
+    let (question, ticked) = local_pick(&offered, recorded, targets);
+    let picks = pick_many_ticked(&question, &labels, 0, &ticked)?;
+    let chosen = picks.into_iter().map(|i| offered[i].id).collect();
+    Ok(LocalChoice { offered, offered_read: true, chosen: Some(chosen), picked_for: Some(targets.to_vec()) })
+}
+
+/// The interactive pick of local MCP servers: its question and the entries
+/// ticked to start. The pick is one selection for the run, so the question
+/// names the clients it is written to when there are several (`targets`), and
+/// what is ticked is every server recorded for at least one selected client
+/// (`recorded`) — all of them when none is recorded.
+fn local_pick(
+    offered: &[crate::api::McpLocalServer],
+    recorded: &BTreeSet<uuid::Uuid>,
+    targets: &[String],
+) -> (String, Vec<usize>) {
+    let ticked = (0..offered.len())
+        .filter(|&i| recorded.is_empty() || recorded.contains(&offered[i].id))
+        .collect();
+    let question = match targets {
+        [] | [_] => "Which local MCP servers (started on this machine) should I add?".to_string(),
+        several => format!(
+            "Which local MCP servers (started on this machine) should I add? One selection, for: {}",
+            several.join(", ")
+        ),
+    };
+    (question, ticked)
+}
+
+/// What an interactive run proposes when nobody asked for a local server: the
+/// list as read, or — when the gateway could not answer — none, with the line
+/// that says so. The proposal is a convenience; failing to read it never
+/// stops the run. (A `--local-mcp <slug>` the developer asked for is another
+/// matter: that read failing fails the run.)
+fn proposal_or_none(
+    read: Result<Vec<crate::api::McpLocalServer>>,
+) -> (Vec<crate::api::McpLocalServer>, Option<String>) {
+    match read {
+        Ok(available) => (available, None),
+        Err(e) => (
+            Vec::new(),
+            Some(format!(
+                "the local MCP servers of this workspace could not be read ({e:#}) — continuing without any"
+            )),
+        ),
+    }
+}
+
+/// Print what each chosen server still needs: a "connect in the portal first"
+/// note for one the current user hasn't connected yet, the headers their MCP
+/// client must send itself (the config holds a placeholder for each), and
+/// that a client set up for sign-in leaves out a server on the `/fwd` mount.
+/// The config is written regardless.
 fn warn_connect_first(servers: &[McpVirtualServer]) {
     for s in servers {
         if s.connection_status == "needs_connection" {
             crate::ui::note("  ", format_args!("connect '{}' in the portal first (Portal → MCP Connections) — the config is written now and works once linked", s.name));
+        }
+        if !s.client_headers.is_empty() {
+            crate::ui::note("  ", format_args!("'{}' reads {} from your MCP client: replace the <paste-your-…-here> placeholder in the written config with your value", s.name, s.client_headers.join(", ")));
+        }
+        if s.fwd_mount {
+            crate::ui::note("  ", format_args!("'{}' takes your client's own Authorization header, so a client set up to sign in with OAuth leaves it out", s.name));
         }
     }
 }
@@ -2124,12 +3052,21 @@ fn warn_connect_first(servers: &[McpVirtualServer]) {
 /// UI-setup guide) so the run still does something useful. An MCP-only client
 /// in an LLM-only run yields `None`, so the caller skips it gracefully rather
 /// than rendering an MCP template that needs servers it won't get.
-fn default_template_index(templates: &[ClientProfileTemplate], has_mcp: bool) -> Option<usize> {
+///
+/// A local MCP server (`wants_local`) changes the pick only for a client with
+/// no LLM template in a run that wires no gateway server: its MCP template
+/// that has a form for a local server, if it has one — never an MCP template
+/// that could not write it.
+fn default_template_index(templates: &[ClientProfileTemplate], has_mcp: bool, wants_local: bool) -> Option<usize> {
     let llm = default_llm_template_index(templates, None);
     let mcp = || templates.iter().position(|t| matches!(t.kind, TemplateKind::Mcp));
+    let local_mcp =
+        || templates.iter().position(|t| matches!(t.kind, TemplateKind::Mcp) && !t.local_mcp.is_none());
     let instr = || templates.iter().position(|t| matches!(t.kind, TemplateKind::Instructions));
     if has_mcp {
         llm.or_else(mcp).or_else(instr)
+    } else if wants_local {
+        llm.or_else(local_mcp).or_else(instr)
     } else {
         llm.or_else(instr)
     }
@@ -2489,6 +3426,7 @@ mod scope_split_tests {
             key_delivery: Default::default(),
             companions: Vec::new(),
             keyed_arrays: Default::default(),
+            local_mcp: Default::default(),
             body: String::new(),
         }
     }
@@ -2529,6 +3467,7 @@ mod scope_split_tests {
             mode,
             provider_id: None,
             mcp_server_ids: Vec::new(),
+            mcp_local_server_ids: Vec::new(),
         }
     }
 
@@ -2539,7 +3478,7 @@ mod scope_split_tests {
             "mode": mode,
             "provider_id": null,
             "key_id": null,
-            "mcp_server_ids": [],
+            "mcp_server_ids": [], "mcp_local_servers": [], "mcp_local_commands": {},
             "files": [],
             "last_provisioned": "2026-10-01T00:00:00Z",
             "launch_command": null,
@@ -2697,6 +3636,637 @@ mod splice_tests {
         ClientProfileTemplate, TemplateFormat, TemplateKind, UPSTREAM_API_KEY_PLACEHOLDER,
     };
 
+    /// A bundle client carries the warnings the gateway sends; `warnings` is
+    /// part of the bundle's shape, so a bundle without it is refused.
+    #[test]
+    fn a_bundle_client_carries_its_warnings() {
+        let mut client = serde_json::json!({
+            "client_id": "cursor",
+            "label": "Cursor",
+            "template_index": 0,
+            "template": {"kind": "mcp", "format": "json", "title": "Cursor", "body": "{}"},
+            "placeholders": {},
+            "rendered_body": "{}",
+            "rendered_instructions": null,
+            "launch_command": null,
+        });
+        assert!(serde_json::from_value::<crate::api::ClientBundle>(client.clone()).is_err());
+        client["warnings"] = serde_json::json!([]);
+        let cb: crate::api::ClientBundle = serde_json::from_value(client.clone()).expect("parses with no warnings");
+        assert!(cb.warnings.is_empty());
+        client["warnings"] = serde_json::json!([{"slug": "gh", "reason": "sign_in_cannot_reach_fwd", "message": "m"}]);
+        let cb: crate::api::ClientBundle = serde_json::from_value(client).expect("parses with warnings");
+        assert_eq!(cb.warnings.len(), 1);
+    }
+
+    /// Each MCP server the gateway left out is one line naming the client and
+    /// carrying the gateway's message; none left out prints nothing.
+    #[test]
+    fn every_left_out_mcp_server_is_one_warning_line() {
+        let warnings: Vec<crate::api::McpServerWarning> = serde_json::from_value(serde_json::json!([
+            {"virtual_server_id": "00000000-0000-0000-0000-000000000001", "slug": "gh",
+             "reason": "sign_in_cannot_reach_fwd", "message": "MCP server 'gh' was left out: …"},
+            {"virtual_server_id": "00000000-0000-0000-0000-000000000002", "slug": "jira",
+             "reason": "pass_through_key_not_accepted", "message": "MCP server 'jira' was left out: …"},
+            {"virtual_server_id": null, "local_server_id": "00000000-0000-0000-0000-000000000003", "slug": "fs",
+             "reason": "local_server_project_only", "message": "local MCP server 'fs' is not in this config: …"},
+        ]))
+        .expect("the server's shape deserializes");
+        let all = vec![
+            "warning: claude-code: MCP server 'gh' was left out: …".to_string(),
+            "warning: claude-code: MCP server 'jira' was left out: …".to_string(),
+            "warning: claude-code: local MCP server 'fs' is not in this config: …".to_string(),
+        ];
+        assert_eq!(super::mcp_warning_lines("claude-code", &warnings, false), all);
+        // A project write carries the local server: only that line goes.
+        assert_eq!(super::mcp_warning_lines("claude-code", &warnings, true), all[..2].to_vec());
+        assert!(super::mcp_warning_lines("claude-code", &[], false).is_empty());
+    }
+
+    fn local_bundle(form: &str, project_filename: Option<&str>) -> ClientBundle {
+        use streamscope_client_templates::mcp_local_server_item;
+        let local = mcp_local_server_item(
+            "fs",
+            "Files",
+            None,
+            "npx",
+            &["-y".to_string(), "pkg@1.0.0".to_string(), "two words".to_string()],
+            &[("LOG".to_string(), Some("info".to_string())), ("TOKEN".to_string(), None)],
+        );
+        let remote = BTreeMap::from([("slug".to_string(), Value::String("web".into()))]);
+        let mut template = serde_json::json!({
+            "kind": "mcp", "format": "json", "title": "T", "body": "{}", "local_mcp": form,
+        });
+        if let Some(p) = project_filename {
+            template["filename"] = "~/.c.json".into();
+            template["project_filename"] = p.into();
+        }
+        serde_json::from_value(serde_json::json!({
+            "client_id": "c", "label": "C", "template_index": 0,
+            "template": template,
+            "placeholders": {"mcp_servers": Value::List(vec![remote, local])},
+            "rendered_body": "{}", "rendered_instructions": null, "launch_command": null, "warnings": [],
+        }))
+        .expect("a bundle client")
+    }
+
+    /// A project whose client config is written through [`provision_one`]:
+    /// the template writes each MCP server under `mcpServers`, a local one as
+    /// its command line, and names it in the `enabled` list (string entries).
+    struct LocalProject {
+        dir: PathBuf,
+        paths: Paths,
+    }
+
+    const LOCAL_BODY: &str = r#"{
+  "provider": {"key": "sk-fixed", "model": "m"},
+  "mcpServers": {
+{{#each mcp_servers}}    "{{slug}}": {{#if local}}{"command": "{{command}}", "args": [{{#each args}}"{{value}}"{{#unless @last}}, {{/unless}}{{/each}}], "env": { {{#each env}}"{{name}}": "{{value}}"{{#unless @last}}, {{/unless}}{{/each}} }}{{else}}{"url": "https://gw/{{slug}}"}{{/if}}{{#unless @last}},{{/unless}}
+{{/each}}  },
+  "enabled": [{{#each mcp_servers}}"{{slug}}"{{#unless @last}}, {{/unless}}{{/each}}]
+}
+"#;
+
+    impl LocalProject {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("ss-local-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = dunce::canonicalize(&dir).unwrap();
+            let paths = Paths::for_scope(&ManifestScope::Project(dir.clone())).unwrap();
+            paths.ensure().unwrap();
+            Self { dir, paths }
+        }
+
+        fn config(&self) -> PathBuf {
+            self.dir.join(".c.json")
+        }
+
+        fn read(&self) -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(self.config()).unwrap()).unwrap()
+        }
+
+        /// A bundle client carrying the gateway server `web` and the local
+        /// servers `local` (slugs).
+        fn bundle(&self, local: &[&str]) -> ClientBundle {
+            use streamscope_client_templates::mcp_local_server_item;
+            let mut servers = vec![BTreeMap::from([("slug".to_string(), Value::String("web".into()))])];
+            for slug in local {
+                servers.push(mcp_local_server_item(
+                    slug,
+                    slug,
+                    None,
+                    "npx",
+                    &["-y".to_string(), format!("{slug}@1.0.0")],
+                    &[("LOG".to_string(), Some("info".to_string())), ("TOKEN".to_string(), None)],
+                ));
+            }
+            let mut cb: ClientBundle = serde_json::from_value(serde_json::json!({
+                "client_id": "c", "label": "C", "template_index": 0,
+                "template": {
+                    "kind": "mcp", "format": "json", "title": "T", "body": LOCAL_BODY, "local_mcp": "config",
+                    "filename": "~/.c.json", "project_filename": ".c.json",
+                    "keyed_arrays": {"/enabled": streamscope_client_templates::STRING_ENTRIES},
+                },
+                "placeholders": {"mcp_servers": Value::List(servers)},
+                "rendered_body": "", "rendered_instructions": null, "launch_command": null, "warnings": [],
+            }))
+            .expect("a bundle client");
+            cb.rendered_body = render(&cb.template.body, cb.template.format, &cb.placeholders).unwrap();
+            cb
+        }
+
+        /// Write `local` for the client as recorded in `ws`, and record it.
+        fn provision(&self, ws: &mut WorkspaceManifest, local: &[&str], stamp: &str) {
+            let cb = self.bundle(local);
+            let records = crate::state::FileRecords { ws, others: &[] };
+            let mode = WriteMode { dry_run: false, print: false, verbose: false };
+            let mut m = provision_one(&cb, None, &mode, stamp, &records, &self.paths, &mut Vec::new())
+                .unwrap()
+                .expect("a written client");
+            let ids: Vec<uuid::Uuid> = (0..local.len()).map(|i| uuid::Uuid::from_u128(i as u128 + 1)).collect();
+            let slugs: BTreeMap<uuid::Uuid, String> =
+                ids.iter().copied().zip(local.iter().map(|s| s.to_string())).collect();
+            m.mcp_local_servers = managed_local(&ids, &slugs, std::mem::take(&mut m.mcp_local_servers));
+            m.mcp_local_commands = local_commands_written(&cb, true);
+            ws.clients.retain(|c| c.client_id != "c");
+            ws.clients.push(m);
+        }
+
+        fn paste(&self, placeholder_of: &str, value: &str) {
+            let text = std::fs::read_to_string(self.config()).unwrap();
+            let sentinel = format!("<paste-your-{placeholder_of}-token-here>");
+            assert!(text.contains(&sentinel), "{text}");
+            std::fs::write(self.config(), text.replace(&sentinel, value)).unwrap();
+        }
+    }
+
+    impl Drop for LocalProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Withdrawing a local server from a client removes that server's entry
+    /// — from the map and from the list of names, with the value the developer
+    /// pasted into it — and nothing else: the other local server and its
+    /// pasted value, the gateway server, the provider and key, and the
+    /// developer's own settings are as they were; the client keeps its record,
+    /// less that server; and a later write of the remaining selection changes
+    /// nothing. A preview changes neither the file nor the record.
+    #[test]
+    fn withdrawing_a_local_server_removes_its_entry_and_nothing_else() {
+        let id = uuid::Uuid::from_u128;
+        let project = LocalProject::new("withdraw");
+        std::fs::write(project.config(), r#"{"theme": "dark", "mcpServers": {"mine": {"command": "my-server"}}}"#).unwrap();
+        let mut ws = WorkspaceManifest::default();
+        project.provision(&mut ws, &["fs", "git"], "20261010T000000Z");
+        for server in &ws.clients[0].mcp_local_servers {
+            let roots: Vec<(&str, Option<&str>, bool)> = server
+                .entries
+                .iter()
+                .map(|e| (e.root.path.as_str(), e.root.entry.as_ref().map(|x| x.id.as_str()), e.created))
+                .collect();
+            let map_root = format!("/mcpServers/{}", server.slug);
+            assert_eq!(roots, vec![("/enabled", Some(server.slug.as_str()), true), (map_root.as_str(), None, true)]);
+        }
+        project.paste("fs", "fs-secret");
+        project.paste("git", "git-secret");
+        let before = project.read();
+
+        let gone = [(id(1), WithdrawReason::Deselected)];
+        // A preview says it and changes nothing.
+        assert!(!withdraw_local_servers(&mut ws.clients[0], &gone, &[], "20261010T000001Z", &project.paths, true).unwrap());
+        assert_eq!(project.read(), before);
+        assert_eq!(ws.clients[0].mcp_local_servers.len(), 2);
+
+        assert!(withdraw_local_servers(&mut ws.clients[0], &gone, &[], "20261010T000002Z", &project.paths, false).unwrap());
+        let v = project.read();
+        assert!(v["mcpServers"].get("fs").is_none() && !v.to_string().contains("fs-secret"), "{v}");
+        assert_eq!(v["enabled"], serde_json::json!(["web", "git"]));
+        let mut expected = before.clone();
+        expected["mcpServers"].as_object_mut().unwrap().remove("fs");
+        expected["enabled"] = serde_json::json!(["web", "git"]);
+        assert_eq!(v, expected, "something besides the server's entry changed");
+        assert_eq!(v["provider"], serde_json::json!({"key": "sk-fixed", "model": "m"}));
+        assert_eq!(v["mcpServers"]["git"]["env"]["TOKEN"], "git-secret");
+        // The record: the client stays, less the server and what it owned.
+        let client = &ws.clients[0];
+        assert_eq!(client.mcp_local_servers.iter().map(|s| s.slug.as_str()).collect::<Vec<_>>(), vec!["git"]);
+        assert!(!client.mcp_local_commands.contains_key("fs") && client.mcp_local_commands.contains_key("git"));
+        assert!(client.files[0].owned.iter().all(|o| !o.path.starts_with("/mcpServers/fs")), "{:?}", client.files[0].owned);
+        // Nothing to withdraw twice; and the remaining selection writes back unchanged.
+        assert!(!withdraw_local_servers(&mut ws.clients[0], &gone, &[], "20261010T000003Z", &project.paths, false).unwrap());
+        project.provision(&mut ws, &["git"], "20261010T000004Z");
+        assert_eq!(project.read(), v);
+
+        // The last one too: its entry goes, the client and the rest stay.
+        assert!(withdraw_local_servers(&mut ws.clients[0], &[(id(1), WithdrawReason::NotOffered)], &[], "20261010T000005Z", &project.paths, false).unwrap());
+        let v = project.read();
+        assert!(!v.to_string().contains("git"), "{v}");
+        assert_eq!(v["mcpServers"]["web"]["url"], "https://gw/web");
+        assert_eq!(v["mcpServers"]["mine"], serde_json::json!({"command": "my-server"}));
+        assert_eq!((v["provider"]["key"].as_str(), v["theme"].as_str()), (Some("sk-fixed"), Some("dark")));
+        assert!(ws.clients[0].mcp_local_servers.is_empty() && ws.clients.len() == 1);
+    }
+
+    /// An entry the file held BEFORE the server was first written there is
+    /// the developer's: the write merges into it and records that it was not
+    /// created, and a withdrawal takes out only the leaves written and left
+    /// unchanged — their own key and the value they pasted stay.
+    #[test]
+    fn an_entry_the_file_already_had_is_never_removed_whole() {
+        let project = LocalProject::new("preexisting");
+        std::fs::write(
+            project.config(),
+            r#"{"mcpServers": {"fs": {"command": "my-fs", "cwd": "/srv"}}, "enabled": ["fs"]}"#,
+        )
+        .unwrap();
+        let mut ws = WorkspaceManifest::default();
+        project.provision(&mut ws, &["fs"], "20261010T000000Z");
+        let created: Vec<bool> = ws.clients[0].mcp_local_servers[0].entries.iter().map(|e| e.created).collect();
+        assert_eq!(created, vec![false, false]);
+        project.paste("fs", "fs-secret");
+
+        let gone = [(uuid::Uuid::from_u128(1), WithdrawReason::NoForm)];
+        assert!(withdraw_local_servers(&mut ws.clients[0], &gone, &[], "20261010T000001Z", &project.paths, false).unwrap());
+        let v = project.read();
+        assert_eq!(v["mcpServers"]["fs"], serde_json::json!({"cwd": "/srv", "env": {"TOKEN": "fs-secret"}}), "{v}");
+        // The name we wrote is unchanged, so it goes; theirs was the same
+        // string and the list held it once.
+        assert_eq!(v["enabled"], serde_json::json!(["web"]));
+        assert_eq!(v["provider"]["key"], "sk-fixed");
+    }
+
+    /// A withdrawal rewrites only a file of the job's own scope: the same
+    /// record under the global job (a project's file is not a home-directory
+    /// path) leaves the file exactly as it is, while the selection still
+    /// drops the server. Positive control: the project's own job removes it.
+    #[test]
+    fn a_withdrawal_rewrites_only_a_file_of_the_jobs_scope() {
+        let project = LocalProject::new("scope");
+        let mut ws = WorkspaceManifest::default();
+        project.provision(&mut ws, &["fs"], "20261010T000000Z");
+        project.paste("fs", "fs-secret");
+        let before = std::fs::read_to_string(project.config()).unwrap();
+        let gone = [(uuid::Uuid::from_u128(1), WithdrawReason::NotOffered)];
+
+        let global = Paths::for_scope(&ManifestScope::Global).unwrap();
+        let mut elsewhere = ws.clients[0].clone();
+        assert!(withdraw_local_servers(&mut elsewhere, &gone, &[], "20261010T000001Z", &global, false).unwrap());
+        assert_eq!(std::fs::read_to_string(project.config()).unwrap(), before);
+        assert!(elsewhere.mcp_local_servers.is_empty());
+
+        assert!(withdraw_local_servers(&mut ws.clients[0], &gone, &[], "20261010T000002Z", &project.paths, false).unwrap());
+        let v = project.read();
+        assert!(v["mcpServers"].get("fs").is_none() && !v.to_string().contains("fs-secret"), "{v}");
+    }
+
+    /// Which recorded local servers leave a selection, and why: one the
+    /// workspace no longer hands out, one lost with the template's form, one
+    /// this run took out — and, when what the workspace hands out is not
+    /// known, never "no longer offered".
+    #[test]
+    fn a_local_server_leaves_a_selection_for_one_of_three_reasons() {
+        let id = uuid::Uuid::from_u128;
+        let recorded = managed_with_local("cursor", &[(1, "fs"), (2, "git"), (3, "db")]).mcp_local_servers;
+        let offered = BTreeSet::from([id(1), id(2)]);
+        // Everything kept: nothing leaves.
+        assert!(local_withdrawals(&recorded, &[id(1), id(2), id(3)], Some(&offered), false).is_empty());
+        // `db` is no longer offered; `git` was taken out by the run.
+        assert_eq!(
+            local_withdrawals(&recorded, &[id(1)], Some(&offered), false),
+            vec![(id(2), WithdrawReason::Deselected), (id(3), WithdrawReason::NotOffered)]
+        );
+        // The form went: every server still offered leaves for that reason.
+        assert_eq!(
+            local_withdrawals(&recorded, &[], Some(&offered), true),
+            vec![(id(1), WithdrawReason::NoForm), (id(2), WithdrawReason::NoForm), (id(3), WithdrawReason::NotOffered)]
+        );
+        // What is offered is unknown: a missing server is not called withdrawn.
+        assert_eq!(local_withdrawals(&recorded, &[id(1), id(2)], None, false), vec![(id(3), WithdrawReason::Deselected)]);
+        let texts: BTreeSet<&str> =
+            [WithdrawReason::NotOffered, WithdrawReason::NoForm, WithdrawReason::Deselected].iter().map(|r| r.text()).collect();
+        assert_eq!(texts.len(), 3);
+    }
+
+    /// What a run gives each client, by kind and by flag. With no flag a
+    /// client keeps what it was provisioned with and is still offered —
+    /// gateway servers and local ones alike; a named or ticked set replaces
+    /// that kind for the run; a client with no record gets nothing by default.
+    #[test]
+    fn a_client_keeps_its_recorded_servers_of_each_kind_unless_the_run_says_otherwise() {
+        let id = uuid::Uuid::from_u128;
+        let server = |n: u128, slug: &str| -> crate::api::McpLocalServer {
+            serde_json::from_value(serde_json::json!({
+                "id": id(n), "slug": slug, "name": slug, "launch": {"command": "npx", "env": []}, "command_line": "npx",
+            }))
+            .unwrap()
+        };
+        // ---- gateway servers ----
+        let recorded = [id(2), id(1), id(9)];
+        // No flag, nothing read: the record as it stands.
+        let untouched = McpChoice { offered: None, chosen: None };
+        assert_eq!(untouched.for_client(&recorded), (vec![id(1), id(2), id(9)], 0));
+        assert_eq!(untouched.for_client(&[]), (vec![], 0));
+        // No flag, the offer read: the recorded ones still offered.
+        let kept = McpChoice { offered: Some(BTreeSet::from([id(1), id(2), id(3)])), chosen: None };
+        assert_eq!(kept.for_client(&recorded), (vec![id(1), id(2)], 1));
+        // `--mcp` / `--all-mcp` / the prompt: that set, whatever was recorded.
+        let named = McpChoice { offered: None, chosen: Some(vec![id(3)]) };
+        assert_eq!(named.for_client(&recorded), (vec![id(3)], 0));
+        assert_eq!(named.for_client(&[]), (vec![id(3)], 0));
+        // `--no-mcp`: none.
+        let none = McpChoice { offered: None, chosen: Some(Vec::new()) };
+        assert_eq!(none.for_client(&recorded), (vec![], 0));
+
+        // ---- local servers ----
+        let recorded = managed_with_local("cursor", &[(2, "git"), (1, "fs"), (9, "gone")]).mcp_local_servers;
+        let offered = vec![server(1, "fs"), server(2, "git"), server(3, "db")];
+        let kept = LocalChoice { offered: offered.clone(), offered_read: true, chosen: None, picked_for: None };
+        assert_eq!(kept.for_client("cursor", &recorded), vec![id(1), id(2)]);
+        assert!(kept.for_client("cursor", &[]).is_empty());
+        // The offer not read: the record as it stands.
+        let unread = LocalChoice { offered: Vec::new(), offered_read: false, chosen: None, picked_for: None };
+        assert_eq!(unread.for_client("cursor", &recorded), vec![id(1), id(2), id(9)]);
+        // Named on the command line: the set, for every client.
+        let named = LocalChoice { offered: offered.clone(), offered_read: true, chosen: Some(vec![id(3)]), picked_for: None };
+        assert_eq!(named.for_client("cursor", &recorded), vec![id(3)]);
+        assert_eq!(named.for_client("zed", &[]), vec![id(3)]);
+        // Ticked in the prompt: only for the clients the prompt named.
+        let picked = LocalChoice {
+            offered: offered.clone(),
+            offered_read: true,
+            chosen: Some(vec![id(3)]),
+            picked_for: Some(vec!["cursor".to_string()]),
+        };
+        assert_eq!(picked.for_client("cursor", &[]), vec![id(3)]);
+        assert!(picked.for_client("zed", &[]).is_empty());
+        // `--no-local-mcp` / `--no-mcp`: none.
+        let none = LocalChoice { offered: Vec::new(), offered_read: false, chosen: Some(Vec::new()), picked_for: None };
+        assert!(none.for_client("cursor", &recorded).is_empty());
+
+        // The interactive pick is one selection for the run: ticked is what
+        // ANY selected client has (the union the caller passes), all when
+        // nothing is recorded; with several clients the question names them.
+        let base = "Which local MCP servers (started on this machine) should I add?";
+        let union = BTreeSet::from([id(1), id(3), id(9)]);
+        let two = ["claude-desktop".to_string(), "cursor".to_string()];
+        assert_eq!(
+            super::local_pick(&offered, &union, &two),
+            (format!("{base} One selection, for: claude-desktop, cursor"), vec![0, 2])
+        );
+        assert_eq!(super::local_pick(&offered, &union, &two[..1]), (base.to_string(), vec![0, 2]));
+        assert_eq!(super::local_pick(&offered, &BTreeSet::new(), &two[..1]), (base.to_string(), vec![0, 1, 2]));
+    }
+
+    /// The launch recorded for a client is the whole one — the administrator's
+    /// environment values first — of each local server its written config
+    /// carries: every one for a template that writes them anywhere, none
+    /// outside a project for one that writes them only in a project's file,
+    /// none for a template with no form — and never a gateway server.
+    #[test]
+    fn the_recorded_local_commands_are_the_ones_the_written_config_carries() {
+        let want = BTreeMap::from([("fs".to_string(), "LOG=info npx -y pkg@1.0.0 'two words'".to_string())]);
+        assert_eq!(super::local_commands_written(&local_bundle("config", None), false), want);
+        assert_eq!(super::local_commands_written(&local_bundle("config", Some(".c.json")), true), want);
+        assert_eq!(super::local_commands_written(&local_bundle("project", Some(".c.json")), true), want);
+        assert!(super::local_commands_written(&local_bundle("project", Some(".c.json")), false).is_empty());
+        // A project job writes a client with no project form at its global path.
+        assert!(super::local_commands_written(&local_bundle("project", None), true).is_empty());
+        assert!(super::local_commands_written(&local_bundle("none", None), false).is_empty());
+    }
+
+    /// `sync` prints a local server's launch when it is new or changed — a
+    /// changed environment value included — and nothing for one written as
+    /// before.
+    #[test]
+    fn only_an_added_or_changed_local_command_is_printed() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        let before = map(&[("fs", "LOG=info npx -y pkg@1.0.0"), ("git", "uvx git==1.0")]);
+        assert!(super::changed_local_command_lines(Some(&before), &before).is_empty());
+        assert_eq!(
+            super::changed_local_command_lines(Some(&before), &map(&[("fs", "LOG=info npx -y pkg@2.0.0"), ("git", "uvx git==1.0")])),
+            vec!["local MCP server 'fs' now runs: LOG=info npx -y pkg@2.0.0".to_string()]
+        );
+        // The arguments as before, one environment value changed.
+        assert_eq!(
+            super::changed_local_command_lines(Some(&before), &map(&[("fs", "LOG=debug npx -y pkg@1.0.0"), ("git", "uvx git==1.0")])),
+            vec!["local MCP server 'fs' now runs: LOG=debug npx -y pkg@1.0.0".to_string()]
+        );
+        assert_eq!(
+            super::changed_local_command_lines(None, &map(&[("fs", "npx -y pkg@1.0.0")])),
+            vec!["local MCP server 'fs' now runs: npx -y pkg@1.0.0".to_string()]
+        );
+        // One removed prints nothing here: nothing new runs.
+        assert!(super::changed_local_command_lines(Some(&before), &map(&[("git", "uvx git==1.0")])).is_empty());
+    }
+
+    /// A template of `kind` (and LLM `protocol`) with the local form `local_mcp`.
+    fn tpl(kind: &str, protocol: Option<&str>, local_mcp: &str, title: &str) -> ClientProfileTemplate {
+        serde_json::from_value(serde_json::json!({
+            "kind": kind, "protocol": protocol, "format": "json", "title": title,
+            "filename": "~/.x.json", "body": "{}", "local_mcp": local_mcp,
+        }))
+        .expect("a template")
+    }
+
+    fn managed_with_local(client_id: &str, local: &[(u128, &str)]) -> crate::state::ManagedClient {
+        serde_json::from_value(serde_json::json!({
+            "client_id": client_id, "template_index": 0, "mode": "gateway", "provider_id": null, "key_id": null,
+            "mcp_server_ids": [],
+            "mcp_local_servers": local.iter().map(|(id, slug)| serde_json::json!({"id": uuid::Uuid::from_u128(*id), "slug": slug, "entries": []})).collect::<Vec<_>>(),
+            "mcp_local_commands": {}, "files": [], "last_provisioned": "2026-10-01T00:00:00Z", "launch_command": null,
+        }))
+        .expect("a managed client")
+    }
+
+    /// A sync asks for the local servers the workspace still offers; a client
+    /// the run does not cover keeps its selection, withdrawn server included;
+    /// and when what the workspace offers could not be read, every recorded
+    /// server is kept.
+    #[test]
+    fn a_sync_drops_the_local_servers_the_workspace_no_longer_offers() {
+        let id = uuid::Uuid::from_u128;
+        let clients = vec![
+            managed_with_local("cursor", &[(1, "fs"), (2, "git")]),
+            managed_with_local("codex", &[(2, "git"), (3, "db")]),
+            managed_with_local("zed", &[]),
+        ];
+        let offered = BTreeMap::from([(id(1), "fs".to_string()), (id(3), "db".to_string())]);
+        let all: HashSet<String> = ["cursor", "codex", "zed"].iter().map(|s| s.to_string()).collect();
+        let kept = super::split_offered_local(&clients, &all, Some(&offered));
+        assert_eq!(kept["cursor"], vec![id(1)]);
+        assert_eq!(kept["codex"], vec![id(3)]);
+        assert!(kept["zed"].is_empty());
+        // Everything still offered: nothing is dropped.
+        let everything = BTreeMap::from([(id(1), "fs".into()), (id(2), "git".into()), (id(3), "db".into())]);
+        assert_eq!(super::split_offered_local(&clients, &all, Some(&everything))["cursor"], vec![id(1), id(2)]);
+        // A run covering cursor alone leaves codex's selection as recorded.
+        let only: HashSet<String> = ["cursor".to_string()].into_iter().collect();
+        let kept = super::split_offered_local(&clients, &only, Some(&offered));
+        assert_eq!(kept["cursor"], vec![id(1)]);
+        assert_eq!(kept["codex"], vec![id(2), id(3)]);
+        // The offer unknown: nothing is dropped, whatever it would have said.
+        let kept = super::split_offered_local(&clients, &all, None);
+        assert_eq!(kept["cursor"], vec![id(1), id(2)]);
+        assert_eq!(kept["codex"], vec![id(2), id(3)]);
+    }
+
+    /// A client is left alone — nothing asked of the gateway, nothing written
+    /// — exactly when its template is MCP-only and its selection is empty.
+    /// Any other client is rendered: one with a server of either kind, one on
+    /// a setup that holds a provider, one whose template could not be read.
+    #[test]
+    fn a_client_is_left_alone_only_on_an_mcp_only_template_with_no_server() {
+        let id = uuid::Uuid::from_u128;
+        let group = |mcp: &[u128], local: &[u128]| Group {
+            client_id: "cursor".into(),
+            mode: Mode::Gateway,
+            provider_id: None,
+            mcp_server_ids: mcp.iter().map(|n| id(*n)).collect(),
+            mcp_local_server_ids: local.iter().map(|n| id(*n)).collect(),
+            indices: vec![0],
+        };
+        let mcp = Some(TemplateKind::Mcp);
+        assert!(super::nothing_to_write(mcp, &group(&[], &[])));
+        assert!(!super::nothing_to_write(mcp, &group(&[9], &[])));
+        assert!(!super::nothing_to_write(mcp, &group(&[], &[1])));
+        for kind in [TemplateKind::Combined, TemplateKind::Llm, TemplateKind::Instructions] {
+            assert!(!super::nothing_to_write(Some(kind), &group(&[], &[])), "{kind:?}");
+        }
+        assert!(!super::nothing_to_write(None, &group(&[], &[])));
+        assert_eq!(
+            super::nothing_to_write_line("cursor"),
+            "cursor: no MCP server is selected for it — nothing to write"
+        );
+    }
+
+    /// A local server goes only to a plan whose template has a form for one:
+    /// the others lose it and are named, one line each; none is dropped
+    /// silently and no plan is removed.
+    #[test]
+    fn a_plan_keeps_its_local_servers_only_where_its_template_writes_them() {
+        let id = uuid::Uuid::from_u128;
+        let templates = BTreeMap::from([
+            ("writes".to_string(), vec![tpl("mcp", None, "config", "Writes")]),
+            ("project".to_string(), vec![tpl("mcp", None, "project", "Project")]),
+            ("plain".to_string(), vec![tpl("mcp", None, "none", "Plain setup")]),
+        ]);
+        let plan = |client: &str, local: &[u128]| super::ClientPlan {
+            client_id: client.into(),
+            template_index: 0,
+            mode: super::Mode::Gateway,
+            provider_id: None,
+            mcp_server_ids: Vec::new(),
+            mcp_local_server_ids: local.iter().map(|n| id(*n)).collect(),
+        };
+        let mut plans = vec![plan("writes", &[1, 2]), plan("project", &[1]), plan("plain", &[1, 2]), plan("unknown", &[1])];
+        let slugs = BTreeMap::from([(id(1), "fs".to_string()), (id(2), "git".to_string())]);
+        let lines = super::keep_local_where_writable(&mut plans, &slugs, |c| templates.get(c).map(Vec::as_slice));
+        assert_eq!(plans.len(), 4);
+        assert_eq!(plans[0].mcp_local_server_ids, vec![id(1), id(2)]);
+        assert_eq!(plans[1].mcp_local_server_ids, vec![id(1)]);
+        assert!(plans[2].mcp_local_server_ids.is_empty() && plans[3].mcp_local_server_ids.is_empty());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("warning: plain: local MCP server 'fs', local MCP server 'git' not added"), "{}", lines[0]);
+        assert!(lines[0].contains("Plain setup"), "{}", lines[0]);
+        assert!(lines[1].starts_with("warning: unknown: local MCP server 'fs' not added"), "{}", lines[1]);
+        // Nothing selected: nothing said.
+        let mut plans = vec![plan("plain", &[])];
+        assert!(super::keep_local_where_writable(&mut plans, &slugs, |c| templates.get(c).map(Vec::as_slice)).is_empty());
+    }
+
+    /// A local server breaks the default pick only for a client with no LLM
+    /// template in a run with no gateway server, and only toward an MCP
+    /// template that has a form for one.
+    #[test]
+    fn a_local_server_never_moves_a_client_onto_a_template_that_cannot_write_it() {
+        let mcp_plain = tpl("mcp", None, "none", "MCP");
+        let mcp_local = tpl("mcp", None, "config", "MCP with local");
+        let instr = tpl("instructions", None, "none", "Instructions");
+        let llm = tpl("combined", Some("chat_completions"), "none", "LLM");
+        // No LLM template: instructions without MCP, the MCP template with a
+        // gateway server, and with a local server alone only the one that writes it.
+        let gui = [instr.clone(), mcp_plain.clone(), mcp_local.clone()];
+        assert_eq!(super::default_template_index(&gui, false, false), Some(0));
+        assert_eq!(super::default_template_index(&gui, true, false), Some(1));
+        assert_eq!(super::default_template_index(&gui, true, true), Some(1));
+        assert_eq!(super::default_template_index(&gui, false, true), Some(2));
+        let no_form = [instr.clone(), mcp_plain.clone()];
+        assert_eq!(super::default_template_index(&no_form, false, true), Some(0));
+        assert_eq!(super::default_template_index(std::slice::from_ref(&mcp_plain), false, true), None);
+        // An LLM template wins whatever is selected.
+        let cli = [mcp_local, llm];
+        for (has_mcp, wants_local) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert_eq!(super::default_template_index(&cli, has_mcp, wants_local), Some(1));
+        }
+    }
+
+    /// Each note is printed only for the kind of command it is true of: the
+    /// runner notes for `npx` / `uvx`, the path note for a path, the engine
+    /// note for a container engine, and for any other program only that it
+    /// must be installed; the Windows note only on Windows, only for a runner.
+    #[test]
+    fn a_local_command_note_is_printed_only_for_what_it_describes() {
+        let notes = |c: &str, windows: bool| super::local_command_notes(c, windows).join(" | ");
+        for runner in ["npx", "uvx", "npx.exe"] {
+            let n = notes(runner, false);
+            assert!(n.contains("must be installed") && n.contains("native") && n.contains("in the image"), "{runner}: {n}");
+            assert!(!n.contains("Windows"), "{runner}: {n}");
+            assert!(notes(runner, true).contains("cmd /c npx"), "{runner}");
+        }
+        for typed in ["my-tool", "node", "python3"] {
+            let n = notes(typed, true);
+            assert!(n.contains("must be installed"), "{typed}: {n}");
+            assert!(!n.contains("runner") && !n.contains("native") && !n.contains("Windows") && !n.contains("PyPI"), "{typed}: {n}");
+        }
+        let path = notes("/opt/tools/mcp", true);
+        assert!(path.contains("path on this machine") && !path.contains("runner") && !path.contains("Windows"), "{path}");
+        for engine in ["docker", "podman", "/usr/bin/docker", "docker.exe"] {
+            let n = notes(engine, true);
+            assert!(n.contains("container engine") && !n.contains("native") && !n.contains("runner"), "{engine}: {n}");
+        }
+        assert!(!notes("dockerize", false).contains("container engine"));
+    }
+
+    /// The optional proposal of local servers: read, it is offered as it is;
+    /// unreadable, the run goes on with none and one line says why.
+    #[test]
+    fn an_unreadable_local_server_list_is_a_warning_and_no_proposal() {
+        let (available, warning) = super::proposal_or_none(Err(anyhow::anyhow!("gateway error: 503")));
+        assert!(available.is_empty());
+        let warning = warning.expect("a line saying the list could not be read");
+        assert!(warning.contains("503") && warning.contains("continuing without any"), "{warning}");
+
+        let servers: Vec<crate::api::McpLocalServer> = serde_json::from_value(serde_json::json!([
+            {"id": "00000000-0000-0000-0000-000000000001", "slug": "fs", "name": "Files",
+             "command_line": "npx -y pkg@1.0.0", "launch": {"command": "npx", "env": []}},
+        ]))
+        .unwrap();
+        let (available, warning) = super::proposal_or_none(Ok(servers));
+        assert_eq!(available.len(), 1);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn a_provision_run_shows_each_whole_launch_and_what_the_developer_fills() {
+        let servers: Vec<crate::api::McpLocalServer> = serde_json::from_value(serde_json::json!([
+            {"id": "00000000-0000-0000-0000-000000000001", "slug": "fs", "name": "Files",
+             "command_line": "LOG=info npx -y pkg@1.0.0",
+             "launch": {"command": "npx", "args": ["-y", "pkg@1.0.0"],
+                        "env": [{"name": "LOG", "value": "info"}, {"name": "TOKEN", "secret": true}]}},
+        ]))
+        .expect("the server's shape deserializes");
+        let lines = super::local_server_notice_lines(&servers, false);
+        assert_eq!(lines[0], "local MCP server 'fs' runs: LOG=info npx -y pkg@1.0.0");
+        assert!(lines[1].contains("TOKEN") && !lines[1].contains("LOG"), "{}", lines[1]);
+        assert!(lines.len() > 2 && !lines.iter().any(|l| l.contains("Windows")), "{lines:?}");
+        assert!(super::local_server_notice_lines(&servers, true).iter().any(|l| l.contains("Windows")));
+    }
+
     #[test]
     fn splice_replaces_only_the_gateway_sentinel() {
         // The gateway-key sentinel is replaced; the upstream-key sentinel
@@ -2745,6 +4315,7 @@ mod splice_tests {
                 body: body.into(),
             }],
             keyed_arrays: Default::default(),
+            local_mcp: Default::default(),
             body: String::new(),
         }
     }
@@ -2896,6 +4467,7 @@ mod group_tests {
             mode: Mode::Gateway,
             provider_id: provider,
             mcp_server_ids: mcp.to_vec(),
+            mcp_local_server_ids: Vec::new(),
         }
     }
 
@@ -2963,6 +4535,8 @@ mod group_tests {
                 provider_id: Some(provider),
                 key_id: None,
                 mcp_server_ids: vec![web],
+                mcp_local_servers: vec![],
+                mcp_local_commands: Default::default(),
                 files: vec![],
                 last_provisioned: chrono::Utc::now(),
                 launch_command: None,
@@ -2974,6 +4548,7 @@ mod group_tests {
             mode: Mode::Gateway,
             provider_id: Some(provider),
             mcp_server_ids: vec![web],
+            mcp_local_server_ids: vec![],
             indices: vec![0],
         }
         .signature();

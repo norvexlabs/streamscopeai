@@ -117,6 +117,40 @@ pub struct McpVirtualServer {
     /// server sends more fields (`requires_connection`, `built_in`, …); serde
     /// ignores the ones the CLI doesn't consume.
     pub connection_status: String,
+    /// The headers this server's upstreams read from the MCP client itself
+    /// (the written config carries a placeholder for each, to fill in).
+    pub client_headers: Vec<String>,
+    /// The server is reached on `/fwd/<key>/mcp/<slug>` (a client header is
+    /// `Authorization`), which a sign-in (spec-OAuth) client setup cannot use.
+    pub fwd_mount: bool,
+}
+
+/// A local MCP server the workspace is handed: one this machine starts.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpLocalServer {
+    pub id: uuid::Uuid,
+    pub slug: String,
+    pub name: String,
+    pub launch: LocalLaunch,
+    /// The whole launch as one line — the administrator's environment values,
+    /// the command and its arguments — as the gateway renders it.
+    pub command_line: String,
+}
+
+/// What the CLI reads of a local MCP server's launch: the command (for the
+/// notes that depend on its kind) and the variables. The whole launch, as it
+/// is printed, is the server's `command_line`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalLaunch {
+    pub command: String,
+    pub env: Vec<LocalEnv>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocalEnv {
+    pub name: String,
+    /// Absent: the developer fills it in the written config.
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,7 +222,24 @@ pub struct ClientBundle {
     pub rendered_instructions: Option<String>,
     /// Command that launches the tool (e.g. `claude`). `None` for GUI clients.
     pub launch_command: Option<String>,
+    /// The selected MCP servers this client's config leaves out, and why.
+    pub warnings: Vec<McpServerWarning>,
 }
+
+/// A selected MCP server a rendered config leaves out. The CLI prints the
+/// server's own `message`, and reads the closed `reason` for the one it
+/// answers itself (see [`LOCAL_SERVER_PROJECT_ONLY`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpServerWarning {
+    pub reason: String,
+    pub message: String,
+}
+
+/// The reason for a local MCP server a template writes only in a project's
+/// own config file. The gateway renders the config outside a project, so it
+/// says this for every such template; a project run writes the server and
+/// does not repeat it.
+pub const LOCAL_SERVER_PROJECT_ONLY: &str = "local_server_project_only";
 
 #[derive(Debug, serde::Serialize)]
 pub struct BundleRequest {
@@ -199,6 +250,7 @@ pub struct BundleRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub llm_provider_id: Option<uuid::Uuid>,
     pub mcp_servers: Vec<McpSelection>,
+    pub mcp_local_servers: Vec<McpLocalSelection>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -270,6 +322,11 @@ pub struct McpSelection {
     pub virtual_server_id: uuid::Uuid,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpLocalSelection {
+    pub local_server_id: uuid::Uuid,
+}
+
 /// A refusal the gateway answered with its error envelope.
 #[derive(Debug)]
 pub struct GatewayError {
@@ -293,6 +350,16 @@ pub fn error_code(e: &anyhow::Error) -> Option<&str> {
 
 /// The refusal for a client the administrator has disabled.
 pub const CLIENT_DISABLED: &str = "client_disabled";
+
+/// The portal path of a client read — the list, or one client — naming the
+/// workspace it is for: the gateway refuses a read that names none.
+fn clients_path(client_id: Option<&str>, workspace_id: uuid::Uuid) -> String {
+    match client_id {
+        Some(id) => format!("/quickstart/clients/{id}?workspace_id={workspace_id}"),
+        None => format!("/quickstart/clients?workspace_id={workspace_id}"),
+    }
+}
+
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorEnvelope {
@@ -349,13 +416,14 @@ impl ApiClient {
             .await
     }
 
-    pub async fn quickstart_clients(&self) -> Result<QuickstartClients> {
-        self.get_json(&self.portal_url("/quickstart/clients")).await
+    /// The clients `workspace_id` is offered — each workspace has its own set.
+    pub async fn quickstart_clients(&self, workspace_id: uuid::Uuid) -> Result<QuickstartClients> {
+        self.get_json(&self.portal_url(&clients_path(None, workspace_id))).await
     }
 
-    pub async fn client_profile(&self, id: &str) -> Result<ClientProfileWire> {
-        self.get_json(&self.portal_url(&format!("/quickstart/clients/{id}")))
-            .await
+    /// One client's templates, as `workspace_id` is offered it.
+    pub async fn client_profile(&self, id: &str, workspace_id: uuid::Uuid) -> Result<ClientProfileWire> {
+        self.get_json(&self.portal_url(&clients_path(Some(id), workspace_id))).await
     }
 
     /// Every item of a paged list, walking `offset` until `has_more` is false.
@@ -383,8 +451,17 @@ impl ApiClient {
         .await
     }
 
-    pub async fn mcp_virtual_servers(&self) -> Result<Vec<McpVirtualServer>> {
-        self.get_all_pages(&self.portal_url("/mcp/virtual-servers")).await
+    /// The MCP virtual servers `workspace_id` grants — the ones a config
+    /// provisioned for it can use.
+    pub async fn mcp_virtual_servers(&self, workspace_id: uuid::Uuid) -> Result<Vec<McpVirtualServer>> {
+        self.get_all_pages(&self.portal_url(&format!("/mcp/virtual-servers?workspace_id={workspace_id}")))
+            .await
+    }
+
+    /// The local MCP servers `workspace_id` is handed.
+    pub async fn mcp_local_servers(&self, workspace_id: uuid::Uuid) -> Result<Vec<McpLocalServer>> {
+        self.get_all_pages(&self.portal_url(&format!("/mcp/local-servers?workspace_id={workspace_id}")))
+            .await
     }
 
     /// What `workspace_id` is offered now.
@@ -427,6 +504,7 @@ pub fn http_client() -> Result<reqwest::Client> {
                 reqwest::Client::builder()
                     .connect_timeout(std::time::Duration::from_secs(10))
                     .timeout(std::time::Duration::from_secs(30))
+                    .user_agent(user_agent(&hostname()))
             };
             // reqwest's Display stops at "builder error": the cause is in the chain.
             let chain = |e: reqwest::Error| format!("{:#}", anyhow::Error::from(e));
@@ -469,6 +547,47 @@ pub fn http_client() -> Result<reqwest::Client> {
         Ok(c) => Ok(c.clone()),
         Err(e) => Err(anyhow!("failed to build HTTP client: {e}")),
     }
+}
+
+/// `ssai/<version> (<os>; <host>)` on every call: the gateway records it on
+/// this machine's CLI sign-in, so the portal can name the host whose CLI is
+/// older than the one it serves. The server accepts only this shape, so the
+/// host is cut to what it records ([`short_host`]).
+fn user_agent(raw_host: &str) -> String {
+    format!("ssai/{} ({}; {})", crate::VERSION, std::env::consts::OS, short_host(raw_host))
+}
+
+/// A host name as the gateway records it: its first label (`laptop` of
+/// `laptop.corp.example`), only ASCII letters, digits, `-` and `_`, at most
+/// 63 characters; `unknown` when nothing is left.
+fn short_host(raw: &str) -> String {
+    let label = raw.trim().split('.').next().unwrap_or_default();
+    let kept: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(63)
+        .collect();
+    if kept.is_empty() { "unknown".to_string() } else { kept }
+}
+
+/// This machine's name, as the OS reports it.
+#[cfg(unix)]
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for writes of its whole length, and
+    // `gethostname` writes at most that many bytes into it.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if rc != 0 {
+        return String::new();
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// This machine's name, as Windows sets it for every process.
+#[cfg(windows)]
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
 /// The TLS error inside one link of an error chain. The connector hands it up
@@ -803,4 +922,30 @@ async fn decode_response<T: serde::de::DeserializeOwned>(resp: reqwest::Response
         )));
     }
     Err(GatewayError { code, detail }.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{short_host, user_agent};
+
+    #[test]
+    fn the_host_is_its_first_label_in_the_characters_the_gateway_records() {
+        assert_eq!(short_host("laptop.corp.example"), "laptop");
+        assert_eq!(short_host("  build_01 \n"), "build_01");
+        assert_eq!(short_host("Dev-MacBook-Pro.local"), "Dev-MacBook-Pro");
+        assert_eq!(short_host("my box"), "mybox");
+        assert_eq!(short_host("bôx"), "bx");
+        assert_eq!(short_host(&"h".repeat(64)), "h".repeat(63));
+        assert_eq!(short_host(&"h".repeat(63)), "h".repeat(63));
+        assert_eq!(short_host(""), "unknown");
+        assert_eq!(short_host(".corp"), "unknown");
+    }
+
+    #[test]
+    fn the_user_agent_names_the_version_the_os_and_the_host() {
+        assert_eq!(
+            user_agent("laptop.corp"),
+            format!("ssai/{} ({}; laptop)", crate::VERSION, std::env::consts::OS)
+        );
+    }
 }

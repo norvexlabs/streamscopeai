@@ -10,6 +10,22 @@
   import SelectInput from '#lib/components/forms/SelectInput.svelte';
   import NumberInput from '#lib/components/forms/NumberInput.svelte';
   import OauthProviderGuide from '#lib/components/mcp/OauthProviderGuide.svelte';
+  import RemoteHeadersEditor from '#lib/components/mcp/RemoteHeadersEditor.svelte';
+  import AdminInputValues from '#lib/components/mcp/AdminInputValues.svelte';
+  import {
+    adminValuesPatch,
+    declaredInputs,
+    missingAdminValues,
+    remoteFillers,
+    remoteFromRows,
+    rowsFromRemote,
+    splitAdminValues,
+    type HeaderRow,
+    type Remote,
+    type RemoteType,
+    type SecretEdit,
+  } from '#lib/mcp/headerInputs.js';
+  import { changedUrlValues, previewUrl, urlVariables } from '#lib/mcp/serverJson.js';
 
   type UpstreamRow = components['schemas']['McpUpstreamServerRow'];
 
@@ -22,28 +38,59 @@
 
   let { open, editing, onclose, onsaved }: Props = $props();
 
-  let form = $state({
-    name: '',
-    description: '',
-    upstream_url: '',
-    transport: 'streamable_http',
-    auth_mode: 'no_auth',
-    /// Empty on edit (we never echo the stored ciphertext).
-    /// On create or rotate, the operator types a fresh bearer token here.
-    credential: '',
+  type FormState = {
+    name: string;
+    description: string;
+    /** The remote URL; may carry `{var}`s declared in `urlVariables`. */
+    url: string;
+    type: RemoteType;
+    auth_mode: 'headers' | 'per_user_oauth';
     // ── Per-user OAuth client config ──
-    oauth_issuer_url: '',
-    oauth_authorization_url: '',
-    oauth_token_url: '',
-    oauth_revocation_url: '',
-    oauth_client_id: '',
+    oauth_issuer_url: string;
+    oauth_authorization_url: string;
+    oauth_token_url: string;
+    oauth_revocation_url: string;
+    oauth_client_id: string;
     /// Empty on edit — never echoed. New value rotates the secret.
-    oauth_client_secret: '',
-    oauth_default_scopes_csv: '',
-    enabled: true,
-    connect_timeout_ms: 10000,
-    request_timeout_ms: 60000,
-  });
+    oauth_client_secret: string;
+    oauth_default_scopes_csv: string;
+    enabled: boolean;
+    connect_timeout_ms: number;
+    request_timeout_ms: number;
+  };
+
+  function blankForm(): FormState {
+    return {
+      name: '',
+      description: '',
+      url: '',
+      type: 'streamable-http',
+      auth_mode: 'headers',
+      oauth_issuer_url: '',
+      oauth_authorization_url: '',
+      oauth_token_url: '',
+      oauth_revocation_url: '',
+      oauth_client_id: '',
+      oauth_client_secret: '',
+      oauth_default_scopes_csv: '',
+      enabled: true,
+      connect_timeout_ms: 10000,
+      request_timeout_ms: 60000,
+    };
+  }
+
+  let form = $state<FormState>(blankForm());
+  /// The declared headers, one row each.
+  let rows = $state<HeaderRow[]>([]);
+  /// Values of the URL's `{var}`s; on edit, prefilled with the stored ones,
+  /// and a blank field keeps its stored value.
+  let urlValues = $state<Record<string, string>>({});
+  /// Administrator values: non-secret by input id, secrets as keep/replace/clear.
+  let plain = $state<Record<string, string>>({});
+  let secrets = $state<Record<string, SecretEdit>>({});
+  /// The remote as first read into the form — a save sends `remote` only
+  /// when the edited one differs.
+  let baseline = $state<string>('');
   let formError = $state('');
 
   // OAuth endpoint discovery — the gateway probes the upstream's RFC 9728 +
@@ -71,9 +118,31 @@
   // the authorization server a verdict describes — and any delimiter cheap
   // enough to write is one a URL could itself contain.
   let discovered = $state<{ upstream: string; issuer: string; dcr: boolean } | null>(null);
+
+  /// The remote the form describes (headers + fillers + URL template).
+  const remote = $derived<Remote>(
+    remoteFromRows({ type: form.type, url: form.url, variables: editing?.remote.variables }, rows, true, editing?.remote),
+  );
+  const urlVars = $derived(urlVariables(remote));
+  const allInputs = $derived(declaredInputs(remote));
+  const fillers = $derived(remoteFillers(remote));
+  const adminInputs = $derived(allInputs.filter((d) => fillers[d.id] === 'admin'));
+  const storedUrlValues = $derived<Record<string, string>>(editing?.url_variables ?? {});
+  /// The URL variable values a save changes (on create: every typed one).
+  const urlChanges = $derived(changedUrlValues(editing ? storedUrlValues : {}, urlValues));
+  const urlEdited = $derived(
+    editing !== null && (form.url.trim() !== (editing.remote.url ?? '') || Object.keys(urlChanges).length > 0),
+  );
+  /// The URL requests go to: the stored one while its template and variables
+  /// are untouched, else the template with the stored values and the changes.
+  const finishedUrl = $derived(
+    editing !== null && !urlEdited
+      ? editing.upstream_url
+      : previewUrl(remote, { ...(editing ? storedUrlValues : {}), ...urlChanges }, !editing).trim(),
+  );
   const dcrUnsupported = $derived(
     discovered !== null &&
-      discovered.upstream === form.upstream_url.trim() &&
+      discovered.upstream === finishedUrl &&
       discovered.issuer === form.oauth_issuer_url.trim() &&
       !discovered.dcr,
   );
@@ -81,7 +150,7 @@
   async function registerClient() {
     formError = '';
     registerMsg = null;
-    if (form.upstream_url.trim() === '') {
+    if (finishedUrl === '') {
       formError = 'Enter the server URL first.';
       return;
     }
@@ -95,7 +164,7 @@
         '/api/v1/admin/mcp/upstream-servers/actions/register-oauth-client',
         {
           body: {
-            upstream_url: form.upstream_url.trim(),
+            upstream_url: finishedUrl,
             issuer_url: form.oauth_issuer_url.trim() || undefined,
             default_scopes: scopes,
           },
@@ -124,7 +193,7 @@
   async function discoverEndpoints() {
     formError = '';
     discoverMsg = null;
-    if (form.upstream_url.trim() === '') {
+    if (finishedUrl === '') {
       formError = 'Enter the server URL first.';
       return;
     }
@@ -134,7 +203,7 @@
         '/api/v1/admin/mcp/upstream-servers/actions/discover-oauth',
         {
           body: {
-            upstream_url: form.upstream_url.trim(),
+            upstream_url: finishedUrl,
             issuer_url: form.oauth_issuer_url.trim() || undefined,
           },
         },
@@ -154,7 +223,7 @@
       // pair a subsequent registration will send, so the verdict is tagged with
       // the server it actually describes rather than with a blank issuer field.
       discovered = {
-        upstream: form.upstream_url.trim(),
+        upstream: finishedUrl,
         issuer: form.oauth_issuer_url.trim(),
         dcr: (data.registration_endpoint ?? '') !== '',
       };
@@ -205,15 +274,19 @@
   const dirty = useDirtyForm();
   let snapshot = $state<string | null>(null);
   function fieldSignature() {
+    // Blank values and untouched secrets are left out: the value fields fill
+    // those in as they mount, which is not an edit.
     return JSON.stringify([
-      form.name, form.description, form.upstream_url, form.transport, form.auth_mode,
-      form.credential, form.oauth_issuer_url, form.oauth_authorization_url, form.oauth_token_url,
-      form.oauth_revocation_url, form.oauth_client_id, form.oauth_client_secret,
-      form.oauth_default_scopes_csv, form.enabled, form.connect_timeout_ms, form.request_timeout_ms,
+      form,
+      rows,
+      urlValues,
+      Object.entries(plain).filter(([, v]) => v !== ''),
+      Object.entries(secrets).filter(([, e]) => e.action === 'clear' || e.value !== ''),
     ]);
   }
 
-  $effect(() => {
+  // Before the fields render: each binds to a key this sets.
+  $effect.pre(() => {
     if (!open) {
       snapshot = null;
       return;
@@ -222,10 +295,9 @@
       form = {
         name: editing.name,
         description: editing.description ?? '',
-        upstream_url: editing.upstream_url,
-        transport: editing.transport,
-        auth_mode: editing.auth_mode,
-        credential: '',
+        url: editing.remote.url ?? '',
+        type: editing.remote.type ?? (editing.transport === 'sse' ? 'sse' : 'streamable-http'),
+        auth_mode: editing.auth_mode === 'per_user_oauth' ? 'per_user_oauth' : 'headers',
         oauth_issuer_url: editing.oauth_issuer_url ?? '',
         oauth_authorization_url: editing.oauth_authorization_url ?? '',
         oauth_token_url: editing.oauth_token_url ?? '',
@@ -237,26 +309,19 @@
         connect_timeout_ms: editing.connect_timeout_ms,
         request_timeout_ms: editing.request_timeout_ms,
       };
+      rows = rowsFromRemote(editing.remote);
+      plain = { ...editing.inputs };
     } else {
-      form = {
-        name: '',
-        description: '',
-        upstream_url: '',
-        transport: 'streamable_http',
-        auth_mode: 'no_auth',
-        credential: '',
-        oauth_issuer_url: '',
-        oauth_authorization_url: '',
-        oauth_token_url: '',
-        oauth_revocation_url: '',
-        oauth_client_id: '',
-        oauth_client_secret: '',
-        oauth_default_scopes_csv: '',
-        enabled: true,
-        connect_timeout_ms: 10000,
-        request_timeout_ms: 60000,
-      };
+      form = blankForm();
+      rows = [];
+      plain = {};
     }
+    // Every URL variable gets its key: a field bound to a missing key would
+    // be `bind:value={undefined}`, which a bindable with a fallback refuses.
+    urlValues = Object.fromEntries(
+      urlVariables(editing?.remote ?? {}).map((v) => [v.name, editing?.url_variables[v.name] ?? '']),
+    );
+    secrets = {};
     formError = '';
     discoverMsg = null;
     registerMsg = null;
@@ -264,6 +329,7 @@
     // modal would decide the button for whichever server is opened next.
     discovered = null;
     queueMicrotask(() => {
+      baseline = JSON.stringify(remote);
       snapshot = fieldSignature();
       dirty.markClean();
     });
@@ -275,67 +341,99 @@
     else dirty.markClean();
   });
 
+  /// The URL variables to send: on edit only the changed ones (the server
+  /// merges them onto the stored values), none while the URL is untouched;
+  /// on create every typed value.
+  function urlVariablesBody(): Record<string, string> | undefined {
+    if (editing ? !urlEdited : urlVars.length === 0) return undefined;
+    return urlChanges;
+  }
+
   async function save() {
     formError = '';
-    const credential = form.credential.trim() !== '' ? form.credential : undefined;
+    if (form.name.trim() === '') {
+      formError = 'Name is required.';
+      return;
+    }
+    if (!/^https?:\/\//.test(form.url.trim())) {
+      formError = 'The URL must start with http:// or https://.';
+      return;
+    }
+    const isOauth = form.auth_mode === 'per_user_oauth';
+    const missing = missingAdminValues(adminInputs, fillers, (id) =>
+      adminInputs.find((d) => d.id === id)?.isSecret
+        ? (secrets[id]?.action === 'keep' && (editing?.secret_input_ids ?? []).includes(id)) ||
+          (secrets[id]?.action === 'replace' && secrets[id].value !== '')
+        : (plain[id] ?? '') !== '',
+    );
+    if (missing.length > 0) {
+      formError = `Enter a value for ${missing.join(', ')} — it is filled by the administrator and required.`;
+      return;
+    }
     const oauth_client_secret =
       form.oauth_client_secret.trim() !== '' ? form.oauth_client_secret : undefined;
-    const isOauth = form.auth_mode === 'per_user_oauth';
     const oauth_default_scopes = isOauth
       ? form.oauth_default_scopes_csv
           .split(/[\s,]+/)
           .map((s) => s.trim())
           .filter((s) => s.length > 0)
       : undefined;
-    // Send description verbatim (including empty string) so operators can
-    // explicitly clear the field. The admin-api trims and treats `""` as
-    // NULL; absent preserves. auth_mode is omitted on edit because it's
-    // locked post-create — sending it back would still pass the equality
-    // check but the field isn't bound to the form on edit anyway.
-    const body = editing
-      ? {
-          name: form.name,
-          description: form.description,
-          upstream_url: form.upstream_url,
-          transport: form.transport,
-          credential,
-          oauth_issuer_url: isOauth ? form.oauth_issuer_url || undefined : undefined,
-          oauth_authorization_url: isOauth ? form.oauth_authorization_url || undefined : undefined,
-          oauth_token_url: isOauth ? form.oauth_token_url || undefined : undefined,
-          oauth_revocation_url: isOauth ? form.oauth_revocation_url || null : undefined,
-          oauth_client_id: isOauth ? form.oauth_client_id || undefined : undefined,
-          oauth_client_secret: isOauth ? oauth_client_secret : undefined,
-          oauth_default_scopes,
-          enabled: form.enabled,
-          connect_timeout_ms: form.connect_timeout_ms,
-          request_timeout_ms: form.request_timeout_ms,
-        }
-      : {
-          name: form.name,
-          description: form.description,
-          upstream_url: form.upstream_url,
-          transport: form.transport,
-          auth_mode: form.auth_mode,
-          credential,
-          oauth_issuer_url: isOauth ? form.oauth_issuer_url || undefined : undefined,
-          oauth_authorization_url: isOauth ? form.oauth_authorization_url || undefined : undefined,
-          oauth_token_url: isOauth ? form.oauth_token_url || undefined : undefined,
-          oauth_revocation_url: isOauth ? form.oauth_revocation_url || undefined : undefined,
-          oauth_client_id: isOauth ? form.oauth_client_id || undefined : undefined,
-          oauth_client_secret: isOauth ? oauth_client_secret : undefined,
-          oauth_default_scopes,
-          enabled: form.enabled,
-          connect_timeout_ms: form.connect_timeout_ms,
-          request_timeout_ms: form.request_timeout_ms,
-        };
+    const oauth = {
+      oauth_issuer_url: isOauth ? form.oauth_issuer_url || undefined : undefined,
+      oauth_authorization_url: isOauth ? form.oauth_authorization_url || undefined : undefined,
+      oauth_token_url: isOauth ? form.oauth_token_url || undefined : undefined,
+      oauth_client_id: isOauth ? form.oauth_client_id || undefined : undefined,
+      oauth_client_secret: isOauth ? oauth_client_secret : undefined,
+      oauth_default_scopes,
+    };
     if (editing) {
+      // auth_mode is locked post-create, so it is never sent. Description is
+      // sent verbatim: "" clears it, absent would keep it.
+      const remoteChanged = JSON.stringify(remote) !== baseline;
+      const values = adminValuesPatch(
+        allInputs,
+        fillers,
+        { inputs: editing.inputs, secret_input_ids: editing.secret_input_ids },
+        plain,
+        secrets,
+      );
       const { error } = await adminApi.PATCH('/api/v1/admin/mcp/upstream-servers/{id}', {
         params: { path: { id: editing.id } },
-        body,
+        body: {
+          name: form.name,
+          description: form.description,
+          remote: remoteChanged ? remote : undefined,
+          url_variables: urlVariablesBody(),
+          ...values,
+          ...oauth,
+          oauth_revocation_url: isOauth ? form.oauth_revocation_url || null : undefined,
+          enabled: form.enabled,
+          connect_timeout_ms: form.connect_timeout_ms,
+          request_timeout_ms: form.request_timeout_ms,
+        },
       });
       if (error) { formError = extractError(error); return; }
     } else {
-      const { error } = await adminApi.POST('/api/v1/admin/mcp/upstream-servers', { body });
+      const secretValues = Object.fromEntries(
+        Object.entries(secrets).map(([id, e]) => [id, e.action === 'replace' ? e.value : '']),
+      );
+      const values = splitAdminValues(allInputs, fillers, { ...plain, ...secretValues });
+      const { error } = await adminApi.POST('/api/v1/admin/mcp/upstream-servers', {
+        body: {
+          name: form.name,
+          description: form.description,
+          remote,
+          url_variables: urlVariablesBody(),
+          auth_mode: form.auth_mode,
+          inputs: values.inputs,
+          secret_inputs: values.secret_inputs,
+          ...oauth,
+          oauth_revocation_url: isOauth ? form.oauth_revocation_url || undefined : undefined,
+          enabled: form.enabled,
+          connect_timeout_ms: form.connect_timeout_ms,
+          request_timeout_ms: form.request_timeout_ms,
+        },
+      });
       if (error) { formError = extractError(error); return; }
     }
     dirty.markClean();
@@ -358,20 +456,47 @@
         <TextInput bind:value={form.description} />
       </label>
       <label class="block">
-        <span class="text-sm font-medium text-(--text-primary)">Upstream URL</span>
-        <TextInput mono placeholder="https://example.com/mcp" bind:value={form.upstream_url} />
+        <span class="text-sm font-medium text-(--text-primary)">Server URL</span>
+        <TextInput mono placeholder="https://example.com/mcp" bind:value={form.url} data-testid="upstream-url" />
       </label>
+      {#if urlVars.length > 0}
+        <div class="space-y-2 rounded-lg border border-(--border) p-3" data-testid="url-variables">
+          <div class="text-xs uppercase tracking-wide text-(--text-secondary)">URL variables</div>
+          {#if editing}
+            <p class="text-xs text-(--text-secondary)">
+              Current URL: <code class="font-mono text-(--text-primary)">{editing.upstream_url}</code>. Each
+              variable shows the value it was built from; change one to rebuild the URL (a blank field keeps its
+              stored value; one with no stored value must be filled — its default is not used on an edit).
+            </p>
+          {/if}
+          {#each urlVars as v (v.name)}
+            <label class="block">
+              <span class="text-xs font-mono text-(--text-primary)">{v.name}{#if v.input.isRequired}<span class="text-(--warning-text)"> *</span>{/if}</span>
+              {#if v.input.description}<span class="text-xs text-(--text-secondary) ml-1">{v.input.description}</span>{/if}
+              <TextInput
+                mono
+                bind:value={urlValues[v.name]}
+                placeholder={editing
+                  ? Object.hasOwn(storedUrlValues, v.name)
+                    ? ''
+                    : 'no stored value — enter one'
+                  : (v.input.default ?? v.input.placeholder ?? '')} />
+            </label>
+          {/each}
+          <p class="text-xs text-(--text-secondary)">Requests go to <code class="font-mono">{finishedUrl}</code></p>
+        </div>
+      {/if}
       <div class="grid grid-cols-2 gap-3">
         <label class="block">
           <span class="text-sm font-medium text-(--text-primary)">Transport</span>
-          <SelectInput bind:value={form.transport}>
-            <option value="streamable_http">streamable_http</option>
-            <option value="sse">sse</option>
+          <SelectInput bind:value={form.type}>
+            <option value="streamable-http">Streamable HTTP</option>
+            <option value="sse">HTTP+SSE</option>
           </SelectInput>
         </label>
         <label class="block">
           <span class="text-sm font-medium text-(--text-primary)">
-            Auth Mode{#if editing}<span class="text-xs text-(--text-secondary) ml-2 font-normal">(locked post-create — delete and recreate to switch modes)</span>{/if}
+            User sign-in{#if editing}<span class="text-xs text-(--text-secondary) ml-2 font-normal">(locked — re-create the server to switch)</span>{/if}
           </span>
           {#if editing}
             <!-- Raw input, not <TextInput>: a muted, read-only mirror of the
@@ -379,43 +504,23 @@
             <input
               data-testid="auth-mode"
               readonly
-              value={form.auth_mode}
-              class="w-full px-2.5 py-1.5 bg-(--bg-primary) border border-(--border) rounded-lg text-sm text-(--text-secondary) font-mono cursor-not-allowed"
+              value={form.auth_mode === 'per_user_oauth' ? 'Per-user OAuth' : 'None (headers only)'}
+              class="w-full px-2.5 py-1.5 bg-(--bg-primary) border border-(--border) rounded-lg text-sm text-(--text-secondary) cursor-not-allowed"
             />
           {:else}
             <SelectInput bind:value={form.auth_mode} data-testid="auth-mode">
-              <option value="no_auth">no_auth</option>
-              <option value="service_account">service_account</option>
-              <option value="per_user_oauth">per_user_oauth</option>
-              <option value="byot">byot</option>
+              <option value="headers">None (headers only)</option>
+              <option value="per_user_oauth">Per-user OAuth</option>
             </SelectInput>
           {/if}
         </label>
       </div>
-      {#if form.auth_mode === 'service_account'}
-        <label class="block">
-          <span class="text-sm font-medium text-(--text-primary)">
-            Bearer Token
-            {#if editing && editing.has_credential}
-              <span class="text-xs text-(--text-secondary) ml-2">(currently set — leave blank to keep, type a new value to rotate)</span>
-            {:else}
-              <span class="text-xs text-(--text-secondary) ml-2">(required)</span>
-            {/if}
-          </span>
-          <TextInput
-            type="password"
-            mono
-            placeholder={editing && editing.has_credential
-              ? '•••••••• (stored, encrypted at rest)'
-              : 'paste the upstream API token'}
-            autocomplete="off"
-            bind:value={form.credential}
-          />
-          <span class="text-xs text-(--text-secondary)">
-            Encrypted with AES-256-GCM at rest. Never echoed back. Rotate by typing a new value.
-          </span>
-        </label>
-      {/if}
+      <RemoteHeadersEditor bind:rows withFillers oauth={form.auth_mode === 'per_user_oauth'} />
+      <AdminInputValues
+        inputs={adminInputs}
+        bind:plain
+        bind:secrets
+        storedSecrets={editing?.secret_input_ids ?? []} />
       {#if form.auth_mode === 'per_user_oauth'}
         <div class="border border-(--info-border) bg-(--info-bg) rounded-sm p-3 space-y-3">
           <div class="text-sm font-semibold text-(--text-primary)">Per-user OAuth client config</div>
@@ -489,7 +594,7 @@
             </div>
           {/if}
           <OauthProviderGuide
-            upstreamUrl={form.upstream_url}
+            upstreamUrl={finishedUrl}
             issuerUrl={form.oauth_issuer_url}
             redirectUri={oauthRedirectUri}
             homepage={oauthHomepage}
@@ -553,23 +658,6 @@
               placeholder="read:user, repo"
               bind:value={form.oauth_default_scopes_csv} />
           </label>
-        </div>
-      {/if}
-      {#if form.auth_mode === 'byot'}
-        <div data-testid="byot-info-panel" class="border border-(--warning-border) bg-(--warning-bg) rounded-sm p-3 space-y-2">
-          <div class="text-sm font-semibold text-(--text-primary)">BYOT (Bring Your Own Token)</div>
-          <p class="text-xs text-(--text-secondary)">
-            The proxy stores no credential here — clients supply the upstream bearer themselves
-            via <code>Authorization: Bearer …</code> on
-            <code class="font-mono">/fwd/{'{key}'}/mcp/&lt;slug&gt;</code>. Issue an
-            <code class="font-mono">vk-*</code> key from the portal, bound to a single-route
-            downstream pointed at this upstream.
-          </p>
-          <p class="text-xs text-(--text-secondary)">
-            Multi-route downstreams (fan-in) are not supported with BYOT — the forwarded
-            bearer can't be split across upstreams. Adding this upstream as a route blocks any
-            additional routes on the same downstream.
-          </p>
         </div>
       {/if}
       <div class="grid grid-cols-2 gap-3">

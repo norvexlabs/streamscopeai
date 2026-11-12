@@ -158,6 +158,29 @@ pub fn guarded_egress_builder(
     max_redirects: usize,
     custom_ca: Option<&str>,
 ) -> reqwest::ClientBuilder {
+    guarded_builder(egress, max_redirects, custom_ca, false)
+}
+
+/// [`guarded_egress_builder`] for a client that stamps headers declared per
+/// upstream (an MCP server's admin, user and client inputs): a redirect is
+/// followed only within the origin it started from. reqwest drops only its
+/// own credential headers on a hop to another origin, so a declared header (a
+/// user's access token in `X-Api-Token`) would otherwise reach a host nobody
+/// configured.
+pub fn guarded_same_origin_builder(
+    egress: Egress,
+    max_redirects: usize,
+    custom_ca: Option<&str>,
+) -> reqwest::ClientBuilder {
+    guarded_builder(egress, max_redirects, custom_ca, true)
+}
+
+fn guarded_builder(
+    egress: Egress,
+    max_redirects: usize,
+    custom_ca: Option<&str>,
+    same_origin_only: bool,
+) -> reqwest::ClientBuilder {
     let (resolver, _handle) = streamscope_mcp_auth::ssrf::GuardedResolver::pair(egress);
     let policy = reqwest::redirect::Policy::custom(move |attempt| {
         if attempt.previous().len() > max_redirects {
@@ -177,6 +200,13 @@ pub fn guarded_egress_builder(
             // did not answer (`ssrf::refusal`).
             let target = attempt.url().to_string();
             return attempt.error(streamscope_mcp_auth::ssrf::AddressRefused(format!("redirect to {target}")));
+        }
+        if same_origin_only
+            && let Some(first) = attempt.previous().first()
+            && first.origin() != attempt.url().origin()
+        {
+            let target = attempt.url().to_string();
+            return attempt.error(format!("redirect to another origin refused: {target}"));
         }
         attempt.follow()
     });
@@ -306,6 +336,61 @@ mod tests {
             c.call(post("http://10.0.0.5:9/token")).await,
             Err(OauthHttpError::Transport(_))
         );
+    }
+
+    /// A one-shot HTTP server on loopback: answers every request with
+    /// `response` and counts the requests it saw.
+    async fn serve(response: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// On a same-origin client a redirect to another origin is never followed
+    /// — a declared header would ride it to a host nobody configured — while a
+    /// redirect within the origin still is; the general egress client (LLM
+    /// providers, token endpoints) still follows the cross-origin hop.
+    #[tokio::test]
+    async fn a_redirect_to_another_origin_is_refused_and_one_within_it_is_followed() {
+        let egress = list_every_private_address();
+        let http = guarded_same_origin_builder(egress, 3, None).build().expect("build guarded client");
+        let general = guarded_egress_builder(egress, 3, None).build().expect("build guarded client");
+        let (sink, sink_hits) = serve("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+        let to_sink: &'static str = Box::leak(
+            format!("HTTP/1.1 302 Found\r\nlocation: {sink}/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .into_boxed_str(),
+        );
+        let (origin, _) = serve(to_sink).await;
+        let refused = http.get(format!("{origin}/mcp")).header("x-api-token", "secret").send().await;
+        assert!(refused.is_err(), "a cross-origin hop must not be followed");
+        assert_eq!(sink_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let followed = general.get(format!("{origin}/mcp")).send().await.expect("the general client follows");
+        assert!(followed.status().is_success());
+        assert_eq!(sink_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let followed = http.get(format!("{sink}/start")).send().await.expect("same origin answers");
+        assert!(followed.status().is_success());
+        let to_self: &'static str = Box::leak(
+            "HTTP/1.1 307 Temporary Redirect\r\nlocation: /next\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_string()
+                .into_boxed_str(),
+        );
+        let (looping, looping_hits) = serve(to_self).await;
+        // Within one origin the hops are followed until the redirect limit.
+        assert!(http.get(format!("{looping}/a")).send().await.is_err());
+        assert_eq!(looping_hits.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[test]
