@@ -1414,6 +1414,9 @@ Upgrades and rollbacks go through the installer. As on the VM, read the changelo
 between yours and the target first: a **BREAKING** entry names what to do around the upgrade.
 
 ```bash
+# Is a newer release out? The one `upgrade --version` would move to, with its changelog
+# (read from the install's registry, signed by a key the install trusts; --json for a script).
+sh streamscopeai.sh k8s updates [--channel C] [--version V]
 # Upgrade to a named release (fetches that release's installer and runs its upgrade).
 sh streamscopeai.sh k8s upgrade --version <release> [--values values.yaml]
 # Or, with the new release's own installer:
@@ -1806,6 +1809,9 @@ many connections (the `network` profile); on a host shared with other work, a re
 **Upgrade** with the new release's installer, or name the version:
 
 ```bash
+# Is a newer release out? The one `upgrade --version` would move to, with its changelog
+# (read from the install's registry, signed by a key the install trusts; --json for a script).
+streamscopeai/ssai-stow updates --dir ./streamscopeai [--channel C] [--version V]
 streamscopeai/ssai-stow upgrade --dir ./streamscopeai --version <release>
 # or: docker run --rm <registry>/streamscopeai-installer:latest > streamscopeai.sh && sh streamscopeai.sh upgrade --dir ./streamscopeai
 ```

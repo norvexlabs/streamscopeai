@@ -1309,7 +1309,7 @@ fn stripped_record(record: &Record, reason: &str, max: usize, depth: usize) -> O
 /// blobs it names (`buffered_blobs`), which no row stores but which name what
 /// the turn's messages embed, so its images still reach admin-api with it.
 const KEPT_STRUCTURE: &[&str] =
-    &["billed_units", "message_hashes", "moved_on_from", "media_call", "end_user_groups", "buffered_blobs"];
+    &["billed_units", "message_hashes", "link_hashes", "moved_on_from", "media_call", "end_user_groups", "buffered_blobs"];
 
 /// The keys only a record's turn reads: once its message hashes go, so do they.
 const TURN_ONLY: &[&str] = &["tools_available_hash", "tools_effective_hash", "system_prompt_hash"];

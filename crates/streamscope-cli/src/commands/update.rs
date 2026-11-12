@@ -193,6 +193,44 @@ fn replace_exe(exe: &std::path::Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+/// `YYYY.M.MICRO` as a comparable triple; `None` for anything else.
+fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
+    let field = |p: &str| (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse::<u32>().ok()).flatten();
+    let mut parts = v.trim().split('.').map(field);
+    let triple = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(triple)
+}
+
+/// Whether the gateway's `shipped` build is newer than `running`: compared as
+/// numbers, and never when either version does not parse.
+fn is_newer(shipped: &str, running: &str) -> bool {
+    matches!((parse_version(shipped), parse_version(running)), (Some(s), Some(r)) if s > r)
+}
+
+/// Say so when the gateway at `origin` ships a newer `ssai` than this one,
+/// and how to get it; returns whether the gateway answered. Best effort: a
+/// gateway that cannot be asked says nothing.
+pub async fn newer_version_notice(origin: &str) -> bool {
+    let Ok(info) = api::cli_version(origin).await else { return false };
+    if !is_newer(&info.version, crate::VERSION) {
+        return true;
+    }
+    let served = SELF_TARGET.is_some_and(|t| info.targets.iter().any(|x| x.target == t));
+    // `ssai update` takes a build over https only, and for a system it ships for.
+    let how = if !origin.starts_with("https://") || SELF_TARGET.is_none() {
+        format!("reinstall it: {}", reinstall_hint(origin))
+    } else if served {
+        format!("run: ssai update --host {origin}")
+    } else {
+        "it serves no build for this system".to_string()
+    };
+    crate::ui::note(
+        "",
+        format_args!("the gateway ships ssai v{} (you run v{}) — {how}", info.version, crate::VERSION),
+    );
+    true
+}
+
 /// The gateway origin to update from: `--host` / `STREAMSCOPE_URL` (any
 /// portal URL), or the stored login when there's exactly one.
 fn resolve_origin(host: Option<&str>) -> Result<String> {
@@ -216,6 +254,25 @@ fn resolve_origin(host: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a strictly newer `YYYY.M.MICRO` is announced, compared as
+    /// numbers: never an older or equal one, never one that does not parse.
+    #[test]
+    fn only_a_strictly_newer_release_is_announced() {
+        assert!(is_newer("2026.11.36", "2026.11.35"));
+        assert!(is_newer("2026.11.10", "2026.11.9"));
+        assert!(is_newer("2026.12.1", "2026.11.99"));
+        assert!(is_newer("2027.1.1", "2026.12.400"));
+        assert!(!is_newer("2026.11.35", "2026.11.35"));
+        assert!(!is_newer("2026.11.34", "2026.11.35"));
+        assert!(!is_newer("2026.11", "2026.10.1"));
+        assert!(!is_newer("2026.11.36.1", "2026.11.35"));
+        assert!(!is_newer("2026.11.36-dev", "2026.11.35"));
+        assert!(!is_newer("2026.11.+37", "2026.11.35"));
+        assert!(!is_newer("2026..37", "2026.11.35"));
+        assert!(!is_newer("2026.11.36", "dev"));
+        assert!(!is_newer("", "2026.11.35"));
+    }
 
     /// `--host` takes any portal URL and the origin is what survives — the CLI talks to
     /// the API origin, not to whatever deep link the operator happened to paste. This

@@ -183,22 +183,36 @@ fn take_content(record: &mut AuditRecord, content: &mut Content) {
             .as_array()
             .map(|arr| arr.iter().map(|m| serde_json::to_string(m).unwrap_or_default()).collect())
     });
-    if let (Some(messages_json), Some(hashes)) = (&messages_json, &record.message_hashes) {
-        for (hash, json) in hashes.iter().zip(messages_json) {
-            match serde_json::from_str::<serde_json::Value>(json) {
-                Ok(message) => {
+    // Each message is stored, and named by the turn, under the hash of the
+    // stored bytes — never under its session-link hash, which leaves parts out
+    // and so is shared by messages that differ. A message with no body to ship
+    // is named by a key no stored body has (a stored key is 64 hex digits): it
+    // reads as unavailable, never as another request's message.
+    if let Some(links) = &record.link_hashes {
+        let mut keys = Vec::with_capacity(links.len());
+        for (i, link) in links.iter().enumerate() {
+            let parsed = messages_json.as_ref().and_then(|all| all.get(i)).map(|json| serde_json::from_str::<serde_json::Value>(json));
+            match parsed {
+                Some(Ok(message)) => {
+                    let (hash, size) = streamscope_core::proxy::content::stored_message_key(&message);
                     content.messages.push(MessageContent {
                         hash: hash.clone(),
                         message,
-                        content_size: i32::try_from(json.len()).unwrap_or(i32::MAX),
+                        content_size: i32::try_from(size).unwrap_or(i32::MAX),
                     });
+                    keys.push(hash);
                 }
-                Err(e) => tracing::error!(
-                    request_id = %record.request_id, %hash,
-                    "conversation message could not be read back for shipping — not stored: {e}"
-                ),
+                Some(Err(e)) => {
+                    tracing::error!(
+                        request_id = %record.request_id, link = %link,
+                        "conversation message could not be read back for shipping — not stored: {e}"
+                    );
+                    keys.push(format!("unstored-{link}"));
+                }
+                None => keys.push(format!("unstored-{link}")),
             }
         }
+        record.message_hashes = Some(keys);
     }
     let mut blob = |content_hash: String, blob_type: BlobType, media_type: String, data: &[u8]| {
         let b = BlobContent {
@@ -1357,7 +1371,7 @@ mod tests {
         }))
         .unwrap();
         let mut record = AuditRecord {
-            message_hashes: Some(vec!["h1".into(), "h2".into()]),
+            link_hashes: Some(vec!["h1".into(), "h2".into()]),
             request_messages_json: Some(vec![r#"{"role":"user","content":"a"}"#.into(), r#"{"role":"user","content":"b"}"#.into()]),
             tools_available_hash: Some("tools".into()),
             tool_definitions_to_buffer: vec![streamscope_core::audit::ToolDefinitionBlobEntry {
@@ -1406,6 +1420,58 @@ mod tests {
         take_content(&mut empty, &mut content);
         assert!(content.is_empty());
         assert_eq!(empty.system_prompt_hash, None);
+    }
+
+    /// A message is stored, and its turn names it, under the hash of the
+    /// stored bytes: two messages the session-link hash cannot tell apart — a
+    /// teammate's `<system-reminder>`, their `name` — are two bodies, so one
+    /// user's message is never read back for another's turn.
+    #[test]
+    fn a_message_is_named_by_the_hash_of_what_is_stored() {
+        let ship = |link: &str, messages: &[serde_json::Value]| {
+            let mut record = AuditRecord {
+                link_hashes: Some(vec![link.to_string(); messages.len()]),
+                request_messages_json: Some(messages.iter().map(|m| m.to_string()).collect()),
+                ..Default::default()
+            };
+            let mut content = Content::default();
+            take_content(&mut record, &mut content);
+            (record.message_hashes.unwrap_or_default(), content.messages)
+        };
+        let prompt = |reminder: &str| serde_json::json!({"role": "user", "content": [
+            {"type": "text", "text": format!("<system-reminder>{reminder}</system-reminder>")},
+            {"type": "text", "text": "commit"},
+        ]});
+        // One link hash (the reminder left out), two different messages.
+        let (alice, alice_bodies) = ship("same-link", &[prompt("alice@example.com")]);
+        let (bob, bob_bodies) = ship("same-link", &[prompt("bob@example.com")]);
+        assert_ne!(alice, bob, "two different messages are two stored bodies");
+        for (keys, bodies) in [(&alice, &alice_bodies), (&bob, &bob_bodies)] {
+            let stored = serde_json::to_string(&bodies[0].message).unwrap();
+            assert_eq!(keys[0], hex::encode(<sha2::Sha256 as sha2::Digest>::digest(stored.as_bytes())), "the key is the hash of the stored bytes");
+            assert_eq!(bodies[0].hash, keys[0], "the body travels under the key its turn names");
+            assert_eq!(bodies[0].content_size as usize, stored.len());
+        }
+        // A field the link hash does not read is part of the message, too.
+        let (named_a, _) = ship("l", &[serde_json::json!({"role": "user", "name": "alice", "content": "hi"})]);
+        let (named_b, _) = ship("l", &[serde_json::json!({"role": "user", "name": "bob", "content": "hi"})]);
+        assert_ne!(named_a, named_b);
+        // The body is stored exactly as sent — a member named like a cache
+        // breakpoint in a tool's arguments included.
+        let call = serde_json::json!({"role": "model", "parts": [{"functionCall": {"name": "fetch", "args": {"cache_control": "no-store"}}}]});
+        let (_, call_bodies) = ship("l", std::slice::from_ref(&call));
+        assert_eq!(call_bodies[0].message, call);
+        // Positive control: the same message, sent twice, is one body.
+        let plain = serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]});
+        let (p1, _) = ship("l", std::slice::from_ref(&plain));
+        let (p2, _) = ship("l", std::slice::from_ref(&plain));
+        assert_eq!(p1, p2);
+        // A message with no body to ship names a key no stored body has.
+        let mut record = AuditRecord { link_hashes: Some(vec!["abc".into()]), ..Default::default() };
+        let mut content = Content::default();
+        take_content(&mut record, &mut content);
+        assert_eq!(record.message_hashes, Some(vec!["unstored-abc".to_string()]));
+        assert!(content.messages.is_empty());
     }
 
     #[tokio::test]

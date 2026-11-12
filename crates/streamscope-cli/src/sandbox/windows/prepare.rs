@@ -76,7 +76,7 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
             let folder = in_folder(&value, c.granted);
             // Refused before anything is created or seeded there, as the
             // grant would refuse it.
-            if let Some(why) = refused_root(&folder.to_string_lossy(), &host.profile.to_string_lossy(), true) {
+            if let Some(why) = refused_root(&folder.to_string_lossy(), &host.profile.to_string_lossy()) {
                 bail!("the Windows sandbox refuses the client's folder {}: {why}", folder.display());
             }
             std::fs::create_dir_all(&folder).with_context(|| format!("create {}", folder.display()))?;
@@ -269,7 +269,7 @@ mod tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            allow_outside_profile: false,
+            private_project: false,
         };
         (profile, spec)
     }
@@ -529,7 +529,7 @@ mod tests {
         spec.client_files = vec![project.clone(), home.clone(), away.clone(), ca.clone(), profile.join("gone.json")];
         let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None }).unwrap();
         assert_eq!(dirs.files, vec![ca, project, home.clone()]);
-        // A project outside the profile (`--allow-outside-profile`): its
+        // A project outside the profile: its
         // provisioned file is the developer's to grant; a CA file beside it
         // is not granted.
         let outside_project = outside.join("proj");

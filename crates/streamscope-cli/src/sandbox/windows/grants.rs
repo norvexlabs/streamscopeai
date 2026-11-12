@@ -1,8 +1,11 @@
 //! The Windows access entries one run of the sandbox account needs, as a
 //! plan: pure, so it is tested on every host; `acl.rs` writes it.
 //!
-//! The account owns nothing and is granted only what the plan lists, by
-//! inheritable entries on a folder — never a walk over its files. The
+//! The account owns nothing and is granted only what the plan lists: an
+//! inheritable entry on a folder it works in (written once, which gives each
+//! file below its inherited copy), and an entry for the folder alone on each
+//! folder above one — never an inheritable entry there, which would rewrite
+//! every file of the profile. The
 //! entries are written with the access-control API with exact masks: a deny
 //! written by `icacls` carries SYNCHRONIZE, which refuses even opening the
 //! file to read it (git then cannot read its own config).
@@ -143,13 +146,12 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     let mut reached: Vec<&Path> = Vec::new();
     // `OWNER RIGHTS` replaces an owner's implied right to change access with
     // the entry's (Modify, which has none). Inside the profile the developer
-    // keeps that right through their own full-control entry; outside it
-    // (`--allow-outside-profile`) it may come from ownership alone, and the
-    // entry would cost them revoke and the sweep there, so it is not written.
-    let inside = |dir: &Path| below(dir, profile).is_some_and(|rest| !rest.as_os_str().is_empty());
+    // keeps that right through their own full-control entry; outside it the
+    // right may come from ownership alone, and the entry would cost them
+    // revoke and the sweep there, so it is not written.
     for dir in std::iter::once(root).chain(project.extra_rw.iter().map(PathBuf::as_path)) {
         push(dir, Trustee::Account, Kind::Modify);
-        if inside(dir) {
+        if inside(dir, profile) {
             push(dir, Trustee::OwnerRights, Kind::Modify);
         }
         reached.push(dir);
@@ -161,7 +163,7 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     // owner, from changing who may read it.
     for dir in &dirs.state {
         push(dir, Trustee::Account, Kind::Modify);
-        if inside(dir) {
+        if inside(dir, profile) {
             push(dir, Trustee::OwnerRights, Kind::Modify);
         }
         reached.push(dir);
@@ -181,7 +183,7 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     }
     // Never on a folder the grant refuses (a drive root, the profile or
     // above): there the entry would need an administrator or reach too far.
-    let grantable = |d: &PathBuf| refused_root(&d.to_string_lossy(), &profile.to_string_lossy(), true).is_none();
+    let grantable = |d: &PathBuf| refused_root(&d.to_string_lossy(), &profile.to_string_lossy()).is_none();
     for dir in project.stat_only.iter().filter(|d| grantable(d)) {
         push(dir, Trustee::Account, Kind::ReadAttributes);
         reached.push(dir);
@@ -210,6 +212,12 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     out
 }
 
+/// Whether `path` lies below the profile folder `profile` (not the profile
+/// itself), compared without case.
+pub fn inside(path: &Path, profile: &Path) -> bool {
+    below(path, profile).is_some_and(|rest| !rest.as_os_str().is_empty())
+}
+
 /// What follows `base` in `path` when `path` is `base` or under it, compared
 /// without case, as Windows compares paths.
 fn below(path: &Path, base: &Path) -> Option<PathBuf> {
@@ -226,28 +234,36 @@ fn below(path: &Path, base: &Path) -> Option<PathBuf> {
 }
 
 /// Why the folder at `root` may not be a sandbox project, if it may not:
-/// a drive root; the profile folder `profile` or a folder above it (the
-/// grant would reach every secret in it); and, unless `outside_ok`, a folder
-/// outside the profile — a folder made directly under a drive inherits the
-/// drive's "Authenticated Users: Modify", so every local account (the
-/// sandbox's included) writes it whatever the grant says. Compared without
-/// case, as Windows compares paths.
-pub fn refused_root(root: &str, profile: &str, outside_ok: bool) -> Option<String> {
-    let norm = |p: &str| p.trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+/// a drive root, a network share, or the profile folder `profile` or a
+/// folder above it (the grant would reach every secret in it). Compared without case, as Windows
+/// compares paths. A folder that every local account may write is refused
+/// by what its access list says, not by where it is (`run.rs`).
+pub fn refused_root(root: &str, profile: &str) -> Option<String> {
+    // A local `\\?\` spelling is the same folder: compared without it.
+    let norm = |p: &str| {
+        let p = p.trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+        // `\\.\` names a local device path the same way.
+        match p.strip_prefix("\\\\?\\").or_else(|| p.strip_prefix("\\\\.\\")) {
+            // A volume mounted without a letter is a drive's root too.
+            Some(rest) if rest.starts_with("volume{") && !rest.contains('\\') => "volume:".to_string(),
+            Some(rest) if !rest.starts_with("unc\\") => rest.to_string(),
+            _ => p,
+        }
+    };
     let (r, p) = (norm(root), norm(profile));
-    let is_drive = r.len() <= 2 && r.ends_with(':');
+    let is_drive = (r.len() <= 2 && r.ends_with(':')) || r == "volume:";
     if is_drive || r.is_empty() {
         return Some(format!("{root} is a drive's root: run in a project folder"));
     }
+    // A share is reached with the developer's own sign-in, which the
+    // sandbox account does not have; its access list is the server's.
+    // (`\\?\` alone is a long local path, `\\?\UNC\` a share.)
+    let share = r.starts_with("\\\\?\\unc\\") || r.starts_with("\\\\.\\unc\\") || (r.starts_with("\\\\") && !r.starts_with("\\\\?\\") && !r.starts_with("\\\\.\\"));
+    if share {
+        return Some(format!("{root} is on a network share, which the sandbox account cannot reach: run in a local folder"));
+    }
     if r == p || p.starts_with(&format!("{r}\\")) {
         return Some(format!("{root} holds your whole profile: run in a project folder inside it"));
-    }
-    if !r.starts_with(&format!("{p}\\")) && !outside_ok {
-        return Some(format!(
-            "{root} is outside your profile ({profile}), where every account on this computer may write \
-             (a folder under a drive's root inherits that); move the project into your profile, or pass \
-             --allow-outside-profile to run there anyway"
-        ));
     }
     None
 }
@@ -367,7 +383,7 @@ mod tests {
         let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
         assert!(has("/Users/dev/code", Trustee::Account, Kind::ReadAttributes));
-        // One outside the profile (`--allow-outside-profile`) is opened too;
+        // One outside the profile is opened too;
         // a drive root never gets an entry.
         let project =
             ProjectGrants { stat_only: vec![PathBuf::from("/srv/main"), PathBuf::from(r"D:\")], ..Default::default() };
@@ -380,17 +396,25 @@ mod tests {
     #[test]
     fn roots_that_reach_too_far_are_refused() {
         let profile = r"C:\Users\dev";
-        assert_eq!(refused_root(r"C:\Users\dev\src\app", profile, false), None);
-        assert_eq!(refused_root(r"c:\users\DEV\src\app\", profile, false), None);
-        for bad in [r"C:\", "C:", r"C:\Users", r"C:\Users\dev", r"C:\Users\dev\"] {
-            assert!(refused_root(bad, profile, true).is_some(), "{bad}");
+        assert_eq!(refused_root(r"C:\Users\dev\src\app", profile), None);
+        assert_eq!(refused_root(r"c:\users\DEV\src\app\", profile), None);
+        for bad in [r"C:\", "C:", r"D:\", r"C:\Users", r"C:\Users\dev", r"C:\Users\dev\", r"c:\users\DEV"] {
+            assert!(refused_root(bad, profile).is_some(), "{bad}");
         }
-        // Outside the profile: refused unless forced.
-        let outside = refused_root(r"C:\proj", profile, false).unwrap();
-        assert!(outside.contains("--allow-outside-profile"), "{outside}");
-        assert_eq!(refused_root(r"C:\proj", profile, true), None);
-        assert_eq!(refused_root(r"D:\work\app", profile, true), None);
-        // A sibling sharing the profile's prefix is outside it.
-        assert!(refused_root(r"C:\Users\dev2\app", profile, false).is_some());
+        // Outside the profile, a folder is decided by its access list.
+        assert_eq!(refused_root(r"C:\proj", profile), None);
+        assert_eq!(refused_root(r"D:\work\app", profile), None);
+        // A network share is refused.
+        assert!(refused_root(r"\\nas\code\app", profile).unwrap().contains("network share"));
+        assert!(refused_root(r"\\?\UNC\nas\code\app", profile).unwrap().contains("network share"));
+        // A long local path keeps its `\\?\` prefix: it is no share, and it
+        // is held to the same rules as the plain spelling.
+        assert_eq!(refused_root(r"\\?\C:\Users\dev\src\app", profile), None);
+        assert_eq!(refused_root(r"\\.\C:\Users\dev\src\app", profile), None);
+        for bad in [r"\\?\C:\", r"\\?\C:\Users\dev", r"\\?\c:\users", r"\\?\Volume{0a1b2c3d-0000-0000-0000-000000000000}\"] {
+            assert!(refused_root(bad, profile).is_some(), "{bad}");
+        }
+        // A sibling sharing the profile's prefix does not hold it.
+        assert_eq!(refused_root(r"C:\Users\dev2\app", profile), None);
     }
 }

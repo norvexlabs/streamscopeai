@@ -467,6 +467,9 @@ struct Keyed {
     protocol: u8,
     beta: Option<String>,
     body: serde_json::Value,
+    /// The request's own values of the [`CALLER_ECHOED`] members the key left
+    /// out — what a served answer must carry in place of its producer's.
+    caller: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `None` when the body cannot be serialized: the request is then not cached
@@ -480,11 +483,42 @@ fn keyed(request: &ApiRequest, headers: &axum::http::HeaderMap) -> Option<Keyed>
     };
     let mut body = request.wire_value()?;
     let members = body.as_object_mut()?;
+    let mut caller = serde_json::Map::new();
     for key in UNKEYED {
-        members.remove(*key);
+        if let Some(value) = members.remove(*key)
+            && CALLER_ECHOED.contains(key)
+        {
+            caller.insert((*key).to_string(), value);
+        }
     }
     let beta = headers.get("anthropic-beta").map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
-    Some(Keyed { protocol, beta, body })
+    Some(Keyed { protocol, beta, body, caller })
+}
+
+/// The [`UNKEYED`] members that name the CALLER — who asked and the caller's
+/// bookkeeping — and that a response may echo back at its top level (an
+/// OpenAI Responses object carries `metadata`, `user`, `safety_identifier`,
+/// `prompt_cache_key` and `prompt_cache_retention`). Two callers share an entry
+/// exactly because the key leaves these out, so a served answer carries the
+/// requester's own values, never the producer's.
+const CALLER_ECHOED: &[&str] = &["user", "safety_identifier", "prompt_cache_key", "prompt_cache_retention", "metadata"];
+
+/// Put the requester's own [`CALLER_ECHOED`] values into a stored answer's
+/// body: each member the body carries at its top level takes the request's
+/// value, or — when the request sent none — the value an upstream reports for
+/// an absent one (`metadata` an empty object, every other member `null`). A
+/// member the body does not carry is never added.
+fn restamp_caller(body: &mut serde_json::Value, caller: &serde_json::Map<String, serde_json::Value>) {
+    let Some(members) = body.as_object_mut() else { return };
+    for key in CALLER_ECHOED {
+        if let Some(slot) = members.get_mut(*key) {
+            *slot = match caller.get(*key) {
+                Some(value) => value.clone(),
+                None if *key == "metadata" => serde_json::Value::Object(serde_json::Map::new()),
+                None => serde_json::Value::Null,
+            };
+        }
+    }
 }
 
 fn hash_keyed(h: &mut Sha256, keyed: &Keyed) {
@@ -758,6 +792,10 @@ pub struct RequestCacheContext {
     /// Prompt tokens the embedding consumed. Reported alongside its cost and
     /// deliberately kept out of the request's own `prompt_tokens`.
     pub embedding_tokens: u32,
+    /// The request's own values of the members a stored answer may echo of its
+    /// producer ([`CALLER_ECHOED`]); [`Self::accept`] writes them into the
+    /// entry it serves.
+    caller: serde_json::Map<String, serde_json::Value>,
 }
 
 impl RequestCacheContext {
@@ -896,6 +934,7 @@ pub fn request_context(
         embedding_cost: 0.0,
         embedding_priced: true,
         embedding_tokens: 0,
+        caller: keyed.caller.clone(),
     };
     if bypass {
         return Some(ctx);
@@ -943,6 +982,8 @@ impl RequestCacheContext {
             .amount();
         self.similarity = similarity;
         if self.policy.mode.serves() {
+            let mut entry = entry;
+            restamp_caller(&mut entry.body, &self.caller);
             self.served = Some(entry);
         } else {
             self.observed_age = Some(entry.age());
@@ -1735,6 +1776,7 @@ pub(crate) mod tests {
             embedding_cost: 0.0,
             embedding_priced: true,
             embedding_tokens: 0,
+            caller: serde_json::Map::new(),
         }
     }
 
@@ -1773,6 +1815,67 @@ pub(crate) mod tests {
         // The same counterfactual is recorded — it is what an observe run is
         // for — but the outcome is what stops it being summed as savings.
         assert!(observing.avoided_cost > 0.0);
+    }
+
+    /// Two callers share an entry because the key leaves out who they are, so
+    /// the answer one stored must reach the other carrying the second caller's
+    /// own `metadata`, `safety_identifier`, `prompt_cache_key` and `user`, never
+    /// the first one's (an OpenAI Responses object echoes each of them).
+    #[test]
+    fn a_served_answer_carries_the_requesters_own_caller_fields() {
+        let ask = |caller: serde_json::Value| {
+            let mut body = serde_json::json!({"model": "m", "input": "hello"});
+            for (k, v) in caller.as_object().expect("object") {
+                body[k] = v.clone();
+            }
+            domain_request(ApiVersion::Responses, body)
+        };
+        let producer = ask(serde_json::json!({
+            "metadata": {"account": "a-1"}, "safety_identifier": "user-a",
+            "prompt_cache_key": "conv-a", "user": "alice",
+        }));
+        let requester = ask(serde_json::json!({"metadata": {"account": "b-2"}, "safety_identifier": "user-b"}));
+        let headers = axum::http::HeaderMap::new();
+        let (a, b) = (keyed(&producer, &headers).unwrap(), keyed(&requester, &headers).unwrap());
+        // Positive control: the two requests ARE one entry, so a hit is served.
+        assert_eq!(content_of(&a), content_of(&b));
+
+        let cache = ResponseCache::new(BIG, 8);
+        let k = key(Uuid::nil(), Uuid::nil(), Uuid::nil(), 1);
+        let mut stored = store_req(60);
+        stored.protocol = ApiVersion::Responses;
+        stored.body = serde_json::json!({
+            "id": "resp_1", "object": "response", "output": [],
+            "metadata": {"account": "a-1"}, "safety_identifier": "user-a",
+            "prompt_cache_key": "conv-a", "user": "alice",
+        });
+        cache.store(k.clone(), stored, BIG).expect("stored");
+
+        let mut ctx = ctx_for(CacheMode::Exact);
+        ctx.caller = b.caller;
+        let entry = cache.get(&k, Duration::from_secs(60)).expect("stored");
+        ctx.accept(entry, None, &crate::pricing::Rates::free(), &crate::config::TenantConfig::default());
+        let served = ctx.served.expect("an exact match is served").body;
+        assert_eq!(served["metadata"], serde_json::json!({"account": "b-2"}));
+        assert_eq!(served["safety_identifier"], "user-b");
+        // Members the requester did not send read as an upstream reports them
+        // absent — never the producer's.
+        assert_eq!(served["prompt_cache_key"], serde_json::Value::Null);
+        assert_eq!(served["user"], serde_json::Value::Null);
+        // The answer itself is untouched, and nothing is added that the body
+        // did not carry.
+        assert_eq!(served["id"], "resp_1");
+        assert!(served.get("prompt_cache_retention").is_none());
+        // The stored entry keeps the producer's values for the next requester.
+        let again = cache.get(&k, Duration::from_secs(60)).expect("still stored");
+        assert_eq!(again.body["safety_identifier"], "user-a");
+    }
+
+    #[test]
+    fn an_absent_metadata_reads_as_an_empty_object() {
+        let mut body = serde_json::json!({"metadata": {"k": "v"}, "output": []});
+        restamp_caller(&mut body, &serde_json::Map::new());
+        assert_eq!(body["metadata"], serde_json::json!({}));
     }
 
     /// A client opting out never got a chance to hit, so counting it as a miss

@@ -9181,10 +9181,13 @@ pub fn assemble_audit_record(
             .as_ref()
             .and_then(|c| c.session_info.parent_request_id),
         is_baseline: meta.content.as_ref().map(|c| c.session_info.is_baseline),
-        message_hashes: meta
+        // The content-store keys are the edge's to set, from the bodies it
+        // ships (`stored_message_key`); the record carries the link hashes.
+        message_hashes: None,
+        link_hashes: meta
             .content
             .as_mut()
-            .map(|c| std::mem::take(&mut c.message_hashes)),
+            .map(|c| std::mem::take(&mut c.link_hashes)),
         first_user_prompt: meta
             .content
             .as_mut()

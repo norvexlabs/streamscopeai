@@ -52,7 +52,9 @@ separately on an Apple Silicon machine: generate its third-party licence list wi
 crates/streamscope-cli/Cargo.toml -c docker/about.toml docker/about.hbs -o licenses.txt`), then
 `SSAI_THIRD_PARTY_LICENSES=$PWD/licenses.txt cargo build --release -p streamscope-cli --target
 aarch64-apple-darwin` (an absolute path: the build script runs in the crate's directory), and copy the binary to `artifacts/cli/ssai-darwin-arm64` before the image
-build. An image built without it serves no macOS download.
+build. The image refuses a macOS build of another version than its own, so it is rebuilt for every
+release; an image built without it serves no macOS download, and the release spec refuses to
+ship one without it.
 
 A complete release (the images, the installer `ssai-stow`, the Helm chart and the VM images)
 is packaged by [Stowage](https://github.com/norvexlabs/stowage) from `stowage.yaml`, pinned by
@@ -94,6 +96,12 @@ maintainers write the changelog entry and set the version when they release.
   crate's `content_store` module, and read there by tenant and key. A body may later move out of
   the database; its key, size and stamp stay database columns, and a history chunk, a list of keys,
   stays there whole.
+- A stored body's key is the hash of the whole stored value in its one canonical serialisation.
+  Every user of a tenant shares the store, so a key computed over less than the body would show one
+  user's content to another. The hash that leaves out what a client injects between turns decides
+  only which turns form one session and which messages a turn adds — it never names a body.
+  Likewise, an answer the response cache serves carries the requester's own identifiers, never
+  those of the request that produced it.
 
 **Database migrations**
 - PostgreSQL 18 or newer, its database created with the built-in `PG_UNICODE_FAST` locale (UTF-8,

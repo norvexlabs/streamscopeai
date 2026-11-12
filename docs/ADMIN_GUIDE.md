@@ -889,7 +889,9 @@ follows, so there is one place to tune. A preset carries:
 - **Shared with** — who may be served an answer someone else's request produced: only the same
   **person**, the **workspace** (the default), or the whole **tenant**. A stored answer can contain
   content from the prompt that produced it, so widening this is a deliberate data-sharing decision;
-  the editor warns when you pick tenant-wide.
+  the editor warns when you pick tenant-wide. Who asked is never shared: a served answer carries the
+  requester's own identifiers and bookkeeping (`user`, `metadata`, `safety_identifier`, the prompt
+  cache key), never those of the request that produced it.
 
 **Start in Observe.** Requests keep going to the provider, and the audit log marks each one that
 would have been a hit — so you can see the real repeat rate on your traffic before enabling it.
@@ -3181,7 +3183,8 @@ no longer touches it and its config file is left exactly as it is for you to tak
 changes on the gateway either: `forget` names the key the tool's config still holds, which stays
 valid — other projects may use it — until you revoke it on the **Keys** page. `ssai update` self-updates the CLI from the gateway
 (checksum-verified; on Windows the running `ssai.exe` is set aside as `ssai.old.exe` and removed the
-next time `ssai` starts), and `sync` mentions when a newer version is available. Every call `ssai`
+next time `ssai` starts). When the gateway serves a newer version, `ssai provision` says so every
+time and `ssai sync` once a day, naming the `ssai update` to run. Every call `ssai`
 makes to the gateway names its version, its operating system and the machine's host name (its first
 label), which the portal's Home uses to say which of your machines run an older `ssai`. `ssai logout`
 revokes the device's access immediately — the keys already written into your tools keep working
@@ -3351,13 +3354,29 @@ while one project runs, the sandbox account can also write every project it was 
 `ssai sandbox revoke [<folder>]` takes one project's back, and
 `--all` every one (revoking a project that holds another granted project inside it takes that
 folder's entries back too; the inner project's next run grants them again). A folder in the project
-with an access list of its own (one that inherits nothing) is named on the first run: the sandbox
-cannot write there. `run` refuses a drive's root,
-your profile folder and any folder above it, and a project outside your profile: a folder made
-directly on a drive inherits a setting that lets every account on the computer write it, the
-sandbox's included, whatever it is granted — move the project into your profile, or pass
-`--allow-outside-profile` to run there anyway (it warns on every run; there, the agent can also
-change who may open the files it creates, and giving them back to you may need an administrator). Files the agent creates in the
+with an access list of its own (one that inherits nothing) is named on the first run: the sandbox's
+grant does not reach into it. Granting a project takes a moment the first time, as every file in it is given
+the account's access; the folders above a grant are opened for the account alone, so your profile's
+other files are never touched. `run` refuses a drive's root, a network share (the sandbox's
+account cannot reach one), your profile folder and any folder above it. A project folder that
+every account on the computer may write — a folder made directly on a drive inherits that
+setting — would let the sandbox's account write it whatever it is granted, so the sandbox runs
+there only once the folder is private to you: `run` explains this and asks whether to make it so
+(it stops instead when nobody can be asked), and `--private-project` makes it so without asking.
+The project folder then stops inheriting from the folder above it: you keep full control, SYSTEM
+and the administrators keep their access, and the groups every account belongs to (Everyone,
+Authenticated Users, Users and the like) keep reading but no longer write it, even where the
+folder named them itself; any other account or group it names keeps what it has. A file or folder
+inside it that lets every account write by its own access list keeps that. A change that was stopped part-way is asked for again on the next
+run. For a linked worktree, the main repository's folder is checked and made private the same
+way. A drive that keeps no access lists (FAT, exFAT) cannot hold a sandboxed project. Revoke
+leaves the folder private; the run that changes it names the command that makes it inherit
+again. A folder above the project that every account may write is named on each run and never
+changed (it may be shared by every account on the computer): the agent can leave there what a
+tool looking upward finds, such as a `node_modules` folder — and so it can at a drive's root,
+where every account may create folders. Outside your profile each run also warns that the agent
+can change who may open the files it creates, and giving them back to you may need an
+administrator. Files the agent creates in the
 project are given back to you when a run ends with no other run of yours still going (otherwise
 by the next one that does), so you remain their owner. The tool runs with the
 account's own profile and temporary folder: its history and caches stay there, apart from yours,

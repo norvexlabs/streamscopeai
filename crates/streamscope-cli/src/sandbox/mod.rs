@@ -116,10 +116,10 @@ pub struct LaunchSpec {
     /// so the account's grant on their folder does not reach them.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub client_files: Vec<PathBuf>,
-    /// Windows: the developer accepted a project outside their profile
-    /// (`--allow-outside-profile`).
+    /// Windows: make a project folder every local account may write private
+    /// to the developer without asking (`--private-project`).
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub allow_outside_profile: bool,
+    pub private_project: bool,
 }
 
 /// The trust-store variables a combined bundle answers: the three that
@@ -851,7 +851,9 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
             point_at_ca_bundle(&mut spec, &path);
         }
         let dirs = windows::run::prepare(&mut spec)?;
-        let project = windows::run::grant(&spec, &ready.record.account_sid, &dirs)?;
+        // It may ask at the terminal and wait on another run's record lock
+        // (a whole project's first grant): off the runtime's workers.
+        let project = tokio::task::block_in_place(|| windows::run::grant(&spec, &ready.record.account_sid, &dirs))?;
         let account = windows::launch::Account {
             name: ready.record.account,
             sid: ready.record.account_sid.clone(),
@@ -1512,7 +1514,7 @@ mod tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            allow_outside_profile: false,
+            private_project: false,
         }
     }
 
@@ -1534,7 +1536,7 @@ mod tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            allow_outside_profile: false,
+            private_project: false,
         };
         point_at_ca_bundle(&mut spec, Path::new("/root/run.pem"));
         // `Command::env` keeps the last value of a key.

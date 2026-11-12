@@ -4,9 +4,11 @@
 //! A history of n message hashes is cut at fixed boundaries of
 //! [`HISTORY_CHUNK`]: chunk k holds hashes `[16k, 16k+16)`, the last one
 //! possibly fewer. A chunk's hash covers its parent's hash and its own hashes,
-//! so two histories that share a prefix share every FULL chunk of it, and the
-//! turn that adds m messages to its session stores at most `m / 16 + 2` new
-//! chunks instead of its whole history. The stored chain is walked back into
+//! so two histories that share a prefix share every FULL chunk of it: a turn
+//! stores new chunks only from the first message whose stored bytes differ from
+//! its parent's — at most `m / 16 + 2` for one that appends m messages and edits
+//! none, more for one whose client rewrote an earlier message (a reminder it
+//! withdrew, a cache breakpoint it moved), from that message on. The stored chain is walked back into
 //! the ordered array by `turn_message_hashes` (`001_init.sql`), which must
 //! agree with [`message_hashes`] here.
 
@@ -49,7 +51,8 @@ pub(crate) fn message_hashes(from_head: &[Chunk]) -> Vec<String> {
 }
 
 /// sha256 over the parent's hash and the chunk's hashes, one per line, hex.
-/// Message hashes are hex, so a newline cannot occur inside one.
+/// A message key is hex, or `unstored-` and hex for a message the edge shipped
+/// no body of, so a newline cannot occur inside one.
 fn chunk_hash(parent: Option<&str>, hashes: &[String]) -> String {
     let mut h = Sha256::new();
     h.update(parent.unwrap_or("-").as_bytes());

@@ -766,7 +766,7 @@ async fn analyze_request(
             request_params: pre_content.params,
             system_prompt: pre_content.system_prompt,
             transform_diff: serde_json::to_value(&transform_diff).ok(),
-            message_hashes: pre_content.message_hashes,
+            link_hashes: pre_content.link_hashes,
             session_info: final_info,
             request_size_bytes: pre_content.request_size_bytes,
             first_user_prompt: pre_content.first_user_prompt,

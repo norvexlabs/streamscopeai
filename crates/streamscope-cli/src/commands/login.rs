@@ -182,22 +182,26 @@ fn validate_portal_url(input: &str) -> Result<(), &'static str> {
     }
 }
 
+/// This machine's name as the OS reports it (`gethostname` on Unix,
+/// `COMPUTERNAME` on Windows); `unknown-device` when it reports none.
 fn default_device_name() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
+    Some(api::hostname().trim().to_string())
         .filter(|h| !h.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|h| !h.is_empty())
-        })
         .unwrap_or_else(|| "unknown-device".to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_portal_url;
+    use super::{default_device_name, validate_portal_url};
+
+    /// The device a login names is the machine's own name, on every OS the
+    /// CLI ships for — the OS always reports one where the tests run.
+    #[test]
+    fn a_login_names_the_device_after_the_machine() {
+        let name = default_device_name();
+        assert_ne!(name, "unknown-device");
+        assert_eq!(name, crate::api::hostname().trim());
+    }
 
     #[test]
     fn the_prompt_accepts_a_portal_url_with_a_tenant() {

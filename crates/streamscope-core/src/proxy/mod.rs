@@ -243,7 +243,7 @@ pub use crate::auth::TenantRequestCtx;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ContentMeta {
-    /// Per-message JSON strings, aligned 1:1 with `message_hashes` — the
+    /// Per-message JSON strings, aligned 1:1 with `link_hashes` — the
     /// primary capture of the request messages (no `Value` tree is built on
     /// the capture path). Consumed by the edge SQLite buffer as-is.
     pub request_messages_json: Vec<String>,
@@ -259,7 +259,8 @@ pub struct ContentMeta {
     pub request_params: Option<serde_json::Value>,
     pub system_prompt: Option<String>,
     pub transform_diff: Option<serde_json::Value>,
-    pub message_hashes: Vec<String>,
+    /// The session-link hash of each message (`RequestContent::link_hashes`) — never a content-store key.
+    pub link_hashes: Vec<String>,
     pub session_info: content::SessionInfo,
     pub request_size_bytes: usize,
     pub first_user_prompt: Option<String>,
@@ -1238,8 +1239,9 @@ async fn proxy_handler_inner(
         api_request.is_streaming(),
         &body_bytes,
     );
-    // `session_hashes` (volatile-filtered + system prompt) drives detection;
-    // the full `message_hashes` are stored for content dedup in the audit row.
+    // `session_hashes` (whole volatile messages dropped) drives detection; the
+    // link hashes ride the audit record, and the edge names each stored message
+    // by the hash of its own bytes (`stored_message_key`), never by these.
     // Served from here until the request is over by any path: a copy of it
     // arriving meanwhile is this turn again (`SessionDetector::detect_serving`).
     let (session_info, serving) = state.session_detector.detect_serving(
@@ -1563,7 +1565,7 @@ async fn proxy_handler_inner(
             request_params: pre_content.params,
             system_prompt: pre_content.system_prompt,
             transform_diff: serde_json::to_value(&transform_diff).ok(),
-            message_hashes: pre_content.message_hashes,
+            link_hashes: pre_content.link_hashes,
             session_info: final_info,
             request_size_bytes: pre_content.request_size_bytes,
             first_user_prompt: pre_content.first_user_prompt,

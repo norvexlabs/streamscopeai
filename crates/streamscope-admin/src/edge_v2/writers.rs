@@ -474,12 +474,7 @@ pub(crate) async fn ingest_llm_audit(
     // empty-`message_hashes` array would yield an audit row with no matching
     // turn. Require non-empty.
     let chat_hashes = |item: &serde_json::Value| -> Option<Vec<String>> {
-        let hashes: Vec<String> = item
-            .get("message_hashes")?
-            .as_array()?
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
+        let hashes = string_array(item, "message_hashes")?;
         (!hashes.is_empty()).then_some(hashes)
     };
     let is_media_turn = |item: &serde_json::Value| -> bool {
@@ -571,16 +566,22 @@ struct AddedMessages {
 
 impl ChatTurns {
     /// Derive each record's history: its chunks, and how many of its leading
-    /// messages the session's previous turn carried (`added_from`) — read off
-    /// the parent turn when this request carries it, else off the parent's
-    /// stored chain; 0 when neither is found.
+    /// messages the session's previous turn carried (`added_from`) — compared
+    /// over the session-link hashes, with the parent turn when this request
+    /// carries it, else with the parent's stored `link_head`; 0 when neither is
+    /// found.
     async fn build(conn: &mut IngestConn, chat: &[(&serde_json::Value, Vec<String>)]) -> Result<Self, sqlx::Error> {
         let uuid_of = |v: &serde_json::Value, k: &str| -> Option<uuid::Uuid> {
             v.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()).and_then(|s| s.parse().ok())
         };
+        // Each record's session-link hashes, one per message: what tells which
+        // leading messages a turn repeats of its parent. `None` when the record
+        // carries none, or not one per message — its turn is then a baseline.
+        let links: Vec<Option<Vec<String>>> = chat.iter().map(|(v, hashes)| link_hashes(v, hashes.len())).collect();
         let in_request: HashMap<(uuid::Uuid, uuid::Uuid), &Vec<String>> = chat
             .iter()
-            .filter_map(|(v, h)| Some(((uuid_of(v, "tenant_id")?, uuid_of(v, "request_id")?), h)))
+            .zip(&links)
+            .filter_map(|((v, _), l)| Some(((uuid_of(v, "tenant_id")?, uuid_of(v, "request_id")?), l.as_ref()?)))
             .collect();
         let missing: Vec<(uuid::Uuid, uuid::Uuid)> = chat
             .iter()
@@ -592,11 +593,13 @@ impl ChatTurns {
         } else {
             let (tenants, requests): (Vec<uuid::Uuid>, Vec<uuid::Uuid>) = missing.iter().copied().unzip();
             let rows: Vec<(uuid::Uuid, uuid::Uuid, String, i32)> = sqlx::query_as(
-                "SELECT ct.tenant_id, ct.request_id, ct.history_head, ct.message_count \
+                // A turn written before `link_head` existed named its messages
+                // by their link hashes, so its `history_head` IS its link head.
+                "SELECT ct.tenant_id, ct.request_id, COALESCE(ct.link_head, ct.history_head), ct.message_count \
                    FROM conversation_turns ct \
                    JOIN unnest($1::uuid[], $2::uuid[]) AS p(tenant_id, request_id) \
                      ON ct.tenant_id = p.tenant_id AND ct.request_id = p.request_id \
-                  WHERE ct.history_head IS NOT NULL",
+                  WHERE COALESCE(ct.link_head, ct.history_head) IS NOT NULL",
             )
             .bind(&tenants)
             .bind(&requests)
@@ -613,7 +616,7 @@ impl ChatTurns {
             added: Vec::new(),
         };
         let mut seen_chunks: HashSet<(uuid::Uuid, String)> = HashSet::new();
-        for (v, hashes) in chat {
+        for ((v, hashes), links) in chat.iter().zip(&links) {
             let (Some(tenant), Some(request)) = (uuid_of(v, "tenant_id"), uuid_of(v, "request_id")) else {
                 continue;
             };
@@ -622,13 +625,21 @@ impl ChatTurns {
             // the turn a baseline: its whole history counts as added, so the
             // audit search also lists it for the history it repeats. The turn
             // is written once, so a later parent does not revise it.
-            let added_from = uuid_of(v, "parent_request_id")
-                .map(|parent| match (in_request.get(&(tenant, parent)), stored.get(&(tenant, parent))) {
-                    (Some(p), _) => super::history::added_from_parent(hashes, p),
-                    (None, Some((head, n))) => super::history::added_from_stored(hashes, head, *n),
+            //
+            // Compared over the session-link hashes, never the stored ones: a
+            // client that edits what it injected into an old message (a
+            // reminder it withdraws, a cache breakpoint it moves) still repeats
+            // that message, and the turn adds only what follows.
+            let added_from = links
+                .as_ref()
+                .zip(uuid_of(v, "parent_request_id"))
+                .map(|(links, parent)| match (in_request.get(&(tenant, parent)), stored.get(&(tenant, parent))) {
+                    (Some(p), _) => super::history::added_from_parent(links, p),
+                    (None, Some((head, n))) => super::history::added_from_stored(links, head, *n),
                     (None, None) => 0,
                 })
                 .unwrap_or(0);
+            let link_head = links.as_deref().and_then(super::history::head);
             let chunks = super::history::chunks(hashes);
             let head = chunks.last().map(|c| c.hash.clone());
             for c in chunks {
@@ -650,6 +661,7 @@ impl ChatTurns {
                 "parent_request_id": v.get("parent_request_id"),
                 "is_baseline": v.get("is_baseline"),
                 "history_head": head,
+                "link_head": link_head,
                 "message_count": hashes.len(),
                 "added_from": added_from,
                 "message_hashes": hashes,
@@ -680,6 +692,17 @@ impl ChatTurns {
         let chunk_refs: Vec<&serde_json::Value> = self.chunks.iter().collect();
         history_chunks::insert_chunks_jsonb(conn, &json_array(&chunk_refs)).await
     }
+}
+
+/// The strings of a record's array member `key` (a non-string entry skipped).
+fn string_array(item: &serde_json::Value, key: &str) -> Option<Vec<String>> {
+    Some(item.get(key)?.as_array()?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+}
+
+/// A record's session-link hashes (`link_hashes`), when it carries one per
+/// message of its history (`count`).
+fn link_hashes(item: &serde_json::Value, count: usize) -> Option<Vec<String>> {
+    string_array(item, "link_hashes").filter(|links| links.len() == count)
 }
 
 /// Record which messages each newly inserted turn (`fresh`: tenant, request)
@@ -1871,7 +1894,7 @@ async fn bulk_insert_chat_turns(
     sqlx::query_as(
         "INSERT INTO conversation_turns ( \
              request_id, timestamp, tenant_id, session_id, turn_number, \
-             parent_request_id, is_baseline, history_head, message_count, message_bytes, added_from, \
+             parent_request_id, is_baseline, history_head, link_head, message_count, message_bytes, added_from, \
              tools_available_hash, tools_effective_hash, \
              request_params, system_prompt_hash, transform_diff, \
              response_content, response_tool_calls, \
@@ -1886,6 +1909,7 @@ async fn bulk_insert_chat_turns(
              NULLIF(j->>'parent_request_id', '')::uuid, \
              COALESCE((j->>'is_baseline')::bool, true), \
              j->>'history_head', \
+             j->>'link_head', \
              (j->>'message_count')::int, \
              (SELECT COALESCE(sum(cm.content_size), 0) FROM conversation_messages cm \
                WHERE cm.tenant_id = (j->>'tenant_id')::uuid \

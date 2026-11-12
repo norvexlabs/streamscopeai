@@ -49,6 +49,81 @@ fn profile_dir() -> Result<PathBuf> {
     Ok(dunce::canonicalize(&profile).unwrap_or(profile))
 }
 
+/// The folders above `dirs` (below the drive's root and the profile, the
+/// dirs themselves left out) that a group every local account belongs to
+/// may write. A folder whose list cannot be read is left out: it is only
+/// named, never decided on.
+fn open_parents(dirs: &[&Path], profile_text: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        for folder in dir.ancestors().skip(1) {
+            if refused_root(&folder.to_string_lossy(), profile_text).is_some() {
+                break;
+            }
+            let same = |a: &Path| a.to_string_lossy().to_lowercase() == folder.to_string_lossy().to_lowercase();
+            if dirs.iter().any(|d| same(d)) || out.iter().any(|o| same(o)) {
+                continue;
+            }
+            if acl::broad_writers(folder).is_ok_and(|w| !w.is_empty()) {
+                out.push(folder.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
+/// Refuse to grant `dir` while a group every local account belongs to may
+/// write it (a folder made under a drive's root inherits "Authenticated
+/// Users: Modify"): the sandbox account would write it whatever it is
+/// granted, and revoke could not take that back. With `make_private` (or
+/// the developer's yes at a terminal) the folder is made private to them
+/// instead; otherwise the run stops, saying why. A folder whose making
+/// private was cut short counts as not private: its root already reads as
+/// private, the files below it may not be.
+fn ensure_private(dir: &Path, make_private: bool, account_sid: &str) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let record = acl::record_path()?;
+    let pending = acl::private_pending(&record, dir)?;
+    let writers = acl::broad_writers(dir)?;
+    if writers.is_empty() && !pending {
+        return Ok(());
+    }
+    let who = if writers.is_empty() {
+        "every account on this computer (making it private to you was started and did not finish)".to_string()
+    } else {
+        format!("{} — every account on this computer", writers.join(", "))
+    };
+    let why = format!(
+        "{} may be written by {}, the sandbox's included, whatever the sandbox grants (a folder made \
+         under a drive's root inherits that; an entry of the folder's own may say so too), so the sandbox \
+         cannot confine its writes there. It runs once \
+         the folder is private to you: it then stops inheriting from its parent, those groups keep reading \
+         it, and SYSTEM and the administrators keep their access",
+        dir.display(),
+        who
+    );
+    if !make_private {
+        if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+            bail!("{why}. Pass --private-project to make it so.");
+        }
+        crate::ui::warn("", &why);
+        if !crate::commands::session::confirm_no(&format!("Make {} private to you?", dir.display()))? {
+            bail!("the Windows sandbox did not run: {} stays writable by every account", dir.display());
+        }
+    }
+    acl::make_private(&record, dir, &crate::win_acl::current_user_sid()?, account_sid)?;
+    crate::ui::note(
+        "",
+        format_args!(
+            "{} is private to you now (revoke keeps it so); `icacls \"{}\" /inheritance:e` makes it inherit \
+             from its parent again",
+            dir.display(),
+            dir.display()
+        ),
+    );
+    Ok(())
+}
+
 /// A `--ca-file` trust bundle where the sandbox account can read it: in the
 /// developer's cache, named for its content (the same CAs, the same file —
 /// so the grant record does not grow by a file per run), never removed: it
@@ -80,31 +155,59 @@ pub fn grant(spec: &LaunchSpec, account_sid: &str, dirs: &RunDirs) -> Result<Pro
     let profile = profile_dir()?;
     let root = &spec.project_root;
     let (root_text, profile_text) = (root.to_string_lossy(), profile.to_string_lossy());
-    if let Some(why) = refused_root(&root_text, &profile_text, spec.allow_outside_profile) {
+    if let Some(why) = refused_root(&root_text, &profile_text) {
         bail!("the Windows sandbox refuses this project: {why}");
-    }
-    if refused_root(&root_text, &profile_text, false).is_some() {
-        crate::ui::warn(
-            "",
-            format_args!(
-                "{root_text} is outside your profile: every account on this computer may write it, the sandbox \
-                 account included, whatever it is granted (--allow-outside-profile)"
-            ),
-        );
     }
     let project = protect::resolve(root);
     // A linked worktree's main git folder is granted like the project, so it
     // meets the project's conditions; a client's own folder (one an `--env`
     // may name) must not hold the profile or a drive.
     for dir in &project.extra_rw {
-        if let Some(why) = refused_root(&dir.to_string_lossy(), &profile_text, spec.allow_outside_profile) {
+        if let Some(why) = refused_root(&dir.to_string_lossy(), &profile_text) {
             bail!("the Windows sandbox refuses this worktree's main git folder: {why}");
         }
     }
     for dir in &dirs.state {
-        if let Some(why) = refused_root(&dir.to_string_lossy(), &profile_text, true) {
+        if let Some(why) = refused_root(&dir.to_string_lossy(), &profile_text) {
             bail!("the Windows sandbox refuses the client's folder {}: {why}", dir.display());
         }
+    }
+    // The main checkout of a linked worktree too: code planted there (a
+    // hook manager's script, a build script) runs outside the sandbox.
+    // The main checkout before its git folder: made private, it is what
+    // the git folder inherits from, so the developer is asked once.
+    let granted: Vec<&Path> = std::iter::once(root.as_path())
+        .chain(project.stat_only.iter().map(PathBuf::as_path))
+        .chain(project.extra_rw.iter().map(PathBuf::as_path))
+        .filter(|d| refused_root(&d.to_string_lossy(), &profile_text).is_none())
+        .collect();
+    for dir in &granted {
+        ensure_private(dir, spec.private_project, account_sid)?;
+    }
+    // An open folder above them is named, never changed: it may be shared
+    // by every account (`C:\Users\Public`), and the drive's root, which
+    // every account may create folders in, stays open whatever is changed.
+    let open = open_parents(&granted, &profile_text);
+    if !open.is_empty() {
+        let shown: Vec<String> = open.iter().map(|p| p.display().to_string()).collect();
+        crate::ui::warn(
+            "",
+            format_args!(
+                "{} above the project may be written by every account on this computer: the agent can leave \
+                 there what a tool looking upward finds (a node_modules folder, a .git); make it private to \
+                 you, or move the project",
+                shown.join(", ")
+            ),
+        );
+    }
+    if !super::grants::inside(root, &profile) {
+        crate::ui::warn(
+            "",
+            format_args!(
+                "{root_text} is outside your profile: the agent can change who may open the files it creates \
+                 there, and giving them back to you may need an administrator"
+            ),
+        );
     }
     project.prepare().context("prepare the project's protected git folders")?;
     let aces = plan(root, &project, dirs, &profile);
@@ -118,8 +221,8 @@ pub fn grant(spec: &LaunchSpec, account_sid: &str, dirs: &RunDirs) -> Result<Pro
             crate::ui::warn(
                 "",
                 format_args!(
-                    "{} folder(s) in the project keep an access list of their own, so the sandbox cannot write \
-                     in them: {}{}",
+                    "{} folder(s) in the project keep an access list of their own, which the sandbox's grant \
+                     does not reach into: {}{}",
                     walled.len(),
                     shown.join(", "),
                     if walled.len() > shown.len() { ", …" } else { "" }

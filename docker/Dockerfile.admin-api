@@ -6,7 +6,7 @@
 #   licenses — source + the third-party licence list
 #   sbom     — source + the SBOMs of the binaries the image ships
 #   release  — source + the admin binary and the CLI (static Linux, Windows)
-#   macos    — release + the optional macOS CLI artifact, checked
+#   macos    — release + the optional macOS CLI artifact, of this release or refused
 #
 # BuildKit builds `checks` and `release` concurrently. The runtime stage copies a
 # marker out of `checks`, which is what keeps them a GATE: BuildKit builds only
@@ -221,17 +221,15 @@ FROM release AS macos
 # runtime user can read it without owning /usr/local/share.
 #
 # It is checked against the Linux binary's version before it is installed, and a
-# disagreement WARNS. It does not fail the build, deliberately: the CLI is
-# versioned off CHANGELOG.md, so every release bumps it whether or not the CLI
-# changed, and failing on that would demand an out-of-band macOS rebuild for
-# releases that do not touch the CLI at all. Nothing refuses an older client —
-# the only version comparison at runtime is an advisory "run ssai update"
-# note — and the installer reports the version it actually installed rather than
-# the one the gateway advertises, so an older artifact is a staleness the
-# operator can see and act on, not a break. Rebuild when the CLI's behaviour or
-# wire actually changed; the warning is the reminder, not a gate.
+# disagreement FAILS the build: the gateway's version manifest names one version
+# for every target, so a macOS binary from another release would be announced as
+# this one: `ssai update` and the installer would put an older build on a Mac
+# while claiming the gateway's version, and the new-version notice would never
+# clear. Every release therefore stages a macOS build of its own version, or none (the macOS
+# target is then absent). The Windows binary cannot disagree: it is built here,
+# from this tree.
 #
-# What IS fatal is the Linux binary reporting no version: that means the probe
+# Also fatal is the Linux binary reporting no version: that means the probe
 # itself failed, and an empty pattern matches every file — a check that passes
 # exactly when it breaks is worse than no check.
 #
@@ -249,13 +247,11 @@ RUN mkdir /macos /macos-sbom && if [ -f /tmp/streamscope-cli-artifacts/ssai-darw
             exit 1; \
         fi; \
         if ! grep -qaP "\Q$ver\E(?![0-9])" /tmp/streamscope-cli-artifacts/ssai-darwin-arm64; then \
-            echo "WARNING: artifacts/cli/ssai-darwin-arm64 is not a v$ver build." >&2; \
-            echo "  Installing it anyway — an older client still works against this" >&2; \
-            echo "  gateway and reports its own version, so macOS users are served a" >&2; \
-            echo "  working-but-older binary rather than none." >&2; \
-            echo "  If this release changed the CLI, rebuild it on an arm64 Mac as" >&2; \
-            echo "  CONTRIBUTING.md says and copy it to artifacts/cli/ssai-darwin-arm64," >&2; \
-            echo "  or delete artifacts/cli/ssai-darwin-arm64 to ship Linux-only." >&2; \
+            echo "ERROR: artifacts/cli/ssai-darwin-arm64 is not a v$ver build." >&2; \
+            echo "  Every target the gateway serves is of its own release. Rebuild it on" >&2; \
+            echo "  an arm64 Mac as CONTRIBUTING.md says and copy it to" >&2; \
+            echo "  artifacts/cli/ssai-darwin-arm64, or delete it to serve no macOS build." >&2; \
+            exit 1; \
         fi; \
         if grep -qa "made without its third-party licence list" /tmp/streamscope-cli-artifacts/ssai-darwin-arm64; then \
             echo "ERROR: artifacts/cli/ssai-darwin-arm64 was built without its third-party" >&2; \

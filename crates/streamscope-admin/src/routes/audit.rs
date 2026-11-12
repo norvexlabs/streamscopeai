@@ -1965,7 +1965,10 @@ pub struct RawTurn {
     /// The turn this one continues — its parent, which need not be the turn
     /// just before it in the list. When `whole_history` is false, the turn's whole
     /// history is the parent's first `added_from` messages followed by
-    /// `messages`.
+    /// `messages`, up to what the client injects and withdraws between turns: a
+    /// repeated message may differ from the parent's copy in a
+    /// `<system-reminder>` or a cache breakpoint. The turn's trace holds its
+    /// history exactly as sent.
     pub parent_request_id: Option<Uuid>,
     /// How many leading messages of this turn's history its parent carried.
     pub added_from: i32,

@@ -46,11 +46,12 @@ pub struct RunArgs {
     /// entry is also exposed read-only inside the sandbox.
     #[arg(long = "env", short = 'e')]
     pub env: Vec<String>,
-    /// Windows: run the native sandbox in a project outside your profile,
-    /// where every account on the computer may write (a folder under a
-    /// drive's root inherits that). Warned about on every run.
+    /// Windows: when every account on this computer may write the project
+    /// folder (a folder made under a drive's root inherits that), make it
+    /// private to you so the native sandbox can confine its writes there,
+    /// without asking. Without it, ssai asks at a terminal and stops elsewhere.
     #[arg(long)]
-    pub allow_outside_profile: bool,
+    pub private_project: bool,
     /// Arguments forwarded verbatim to the client (everything after `--`).
     #[arg(last = true)]
     pub client_args: Vec<String>,
@@ -186,7 +187,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         ca_bundle,
         home_files: resolved.home_files,
         client_files: resolved.client_files,
-        allow_outside_profile: args.allow_outside_profile,
+        private_project: args.private_project,
     };
 
     let tier = sandbox::select_tier(choice)?;

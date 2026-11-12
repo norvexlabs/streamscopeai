@@ -882,7 +882,7 @@ mod tests {
             ca_bundle: None,
             home_files,
             client_files: vec![],
-            allow_outside_profile: false,
+            private_project: false,
         }
     }
 

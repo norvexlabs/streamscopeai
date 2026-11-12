@@ -572,7 +572,7 @@ fn short_host(raw: &str) -> String {
 
 /// This machine's name, as the OS reports it.
 #[cfg(unix)]
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for writes of its whole length, and
     // `gethostname` writes at most that many bytes into it.
@@ -586,7 +586,7 @@ fn hostname() -> String {
 
 /// This machine's name, as Windows sets it for every process.
 #[cfg(windows)]
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_default()
 }
 
@@ -836,8 +836,8 @@ pub struct CliTargetInfo {
 }
 
 /// Shipped CLI version + sha256 manifest from the gateway's public
-/// distribution surface — backs `ssai update` and the passive
-/// new-version notice in `sync`.
+/// distribution surface — backs `ssai update` and the new-version notice
+/// in `provision` and `sync`.
 pub async fn cli_version(origin: &str) -> Result<CliVersionResponse> {
     let url = format!("{}/api/v1/cli/version", origin.trim_end_matches('/'));
     let resp = http_client()?

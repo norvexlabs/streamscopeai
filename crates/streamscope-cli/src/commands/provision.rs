@@ -129,6 +129,8 @@ pub struct ProvisionArgs {
 pub async fn run(mut args: ProvisionArgs) -> Result<()> {
     let session = session::open(args.host.as_deref()).await?;
     let api = &session.api;
+    // First, so a provision this build can no longer make still names the fix.
+    super::update::newer_version_notice(&api.origin).await;
     // CI sessions (`STREAMSCOPE_AK`) never prompt — an ambiguous choice is an
     // error, exactly as if --yes had been passed.
     if session.ci {

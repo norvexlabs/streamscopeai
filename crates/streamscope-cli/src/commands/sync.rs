@@ -90,6 +90,8 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 async fn sync_once(args: &SyncArgs) -> Result<()> {
     let session = session::open(args.host.as_deref()).await?;
     let api = &session.api;
+    // First, so a sync this build can no longer make still names the fix.
+    update_notice(&api.origin).await;
     let yes = args.yes || session.ci;
 
     // Auto-resolve the scope from the cwd: inside a provisioned project (one with
@@ -696,11 +698,11 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
     } else {
         println!("Synced {wrote_total} client(s).");
     }
-    update_notice(&api.origin).await;
     Ok(())
 }
 
-/// Passive once-a-day new-version notice — best-effort, never fails the sync.
+/// The new-version notice, at most once a day per gateway — a `--watch`
+/// would otherwise ask on every pass. Best effort, never fails the sync.
 async fn update_notice(origin: &str) {
     let mut stamps = UpdateCheckFile::load();
     let now = chrono::Utc::now();
@@ -709,14 +711,9 @@ async fn update_notice(origin: &str) {
     {
         return;
     }
-    let Ok(info) = crate::api::cli_version(origin).await else {
-        return;
-    };
-    stamps.last_checked.insert(origin.to_string(), now);
-    let _ = stamps.save();
-    if info.version != crate::VERSION {
-        crate::ui::note("", format_args!("the gateway ships ssai v{} (you run v{}) — run: ssai update", info.version,
-            crate::VERSION));
+    if super::update::newer_version_notice(origin).await {
+        stamps.last_checked.insert(origin.to_string(), now);
+        let _ = stamps.save();
     }
 }
 

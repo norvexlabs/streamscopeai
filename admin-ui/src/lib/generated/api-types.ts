@@ -18533,7 +18533,10 @@ export interface components {
              * @description The turn this one continues — its parent, which need not be the turn
              *     just before it in the list. When `whole_history` is false, the turn's whole
              *     history is the parent's first `added_from` messages followed by
-             *     `messages`.
+             *     `messages`, up to what the client injects and withdraws between turns: a
+             *     repeated message may differ from the parent's copy in a
+             *     `<system-reminder>` or a cache breakpoint. The turn's trace holds its
+             *     history exactly as sent.
              */
             parent_request_id?: string | null;
             /**

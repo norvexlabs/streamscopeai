@@ -351,7 +351,7 @@ pub struct AuditRecord {
     /// as the fallback when `request_messages_json` is absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub request_messages: Option<serde_json::Value>,
-    /// Pre-serialised per-message JSON, aligned 1:1 with `message_hashes`,
+    /// Pre-serialised per-message JSON, aligned 1:1 with `link_hashes`,
     /// captured pre-transform — the primary form of the request messages
     /// (no `Value` tree is built on the capture path). Transient — consumed
     /// by the edge SQLite buffer, then dropped before the audit row is
@@ -399,8 +399,19 @@ pub struct AuditRecord {
     pub parent_request_id: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub is_baseline: Option<bool>,
+    /// The key of each message of the turn's history in the content store:
+    /// the hash of the message as stored ([`crate::proxy::content::stored_message_key`]),
+    /// so a stored body is only ever named by a request that sent those exact
+    /// bytes. Set by the edge when the record's content is taken out for
+    /// shipping, never at assembly.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub message_hashes: Option<Vec<String>>,
+    /// The session-link hash of each message, aligned with `message_hashes`:
+    /// what a client injects and withdraws between turns left out, so the next
+    /// turn of the session can tell which leading messages it repeats. Never a
+    /// content-store key.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub link_hashes: Option<Vec<String>>,
     /// First meaningful user prompt text (max 200 chars), extracted protocol-aware at the proxy.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_user_prompt: Option<String>,
@@ -600,6 +611,7 @@ impl Default for AuditRecord {
             parent_request_id: None,
             is_baseline: None,
             message_hashes: None,
+            link_hashes: None,
             first_user_prompt: None,
             parent_session_id: None,
             upstream_server_id: None,

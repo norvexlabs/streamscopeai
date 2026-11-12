@@ -2410,7 +2410,7 @@ mod tests {
         for (version, body) in cases {
             let mut request = ApiRequest::parse(version, &Bytes::from(body.to_string())).unwrap();
             let content = crate::proxy::content::extract_request_content(&request, 0);
-            keys_seen.push(content.message_hashes[0].clone());
+            keys_seen.push(content.link_hashes[0].clone());
             let keys = content.screen_keys();
             let out = scan_inbound_request(&mut request, &guardrail, tenant, Some(conversation), Some(&keys)).await.unwrap();
             masked.push(out.messages_modified);

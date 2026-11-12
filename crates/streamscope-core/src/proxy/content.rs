@@ -1,9 +1,12 @@
 //! Request content extraction, session detection, and transform diff capture.
 //!
 //! Extracts normalized content from requests for audit and session tracking.
-//! Message hashing (SHA-256) supports two modes: `message_hashes` for content
-//! dedup in conversation turns, and `session_hashes` for session detection
-//! (excludes volatile metadata blocks like `<available-deferred-tools>`).
+//! Message hashing (SHA-256) has two jobs, kept apart. The session-link hash of
+//! each message (`link_hashes`, here and on the audit record)
+//! leaves out what a client injects and withdraws between turns, so one
+//! conversation stays one session; `session_hashes` further drops whole volatile
+//! messages for session detection. Neither ever names a stored body: the
+//! content store's key is [`stored_message_key`], the hash of the stored bytes.
 //! Transform diffs record before/after snapshots when `capture_diffs` is enabled.
 
 use sha2::{Digest, Sha256};
@@ -20,7 +23,7 @@ const MAX_PROMPT_PREVIEW_CHARS: usize = 200;
 /// Extracted content from a request (before transforms).
 #[derive(Debug, Clone)]
 pub struct RequestContent {
-    /// Per-message JSON strings, aligned 1:1 with `message_hashes` — the
+    /// Per-message JSON strings, aligned 1:1 with `link_hashes` — the
     /// primary capture of the request messages. Serialised once from the
     /// typed Rust structs; no `serde_json::Value` tree of the messages is
     /// built on the capture path (the finalize-time media pass parses these
@@ -36,15 +39,16 @@ pub struct RequestContent {
     pub tools: Option<serde_json::Value>,
     pub params: Option<serde_json::Value>,
     pub system_prompt: Option<String>,
-    /// Full message hashes — used for conversation_turns storage and content dedup.
-    pub message_hashes: Vec<String>,
-    /// Whether each `message_hashes` entry hashed its item's exact text (no
+    /// The session-link hash of each message — volatile parts and cache
+    /// breakpoints left out. Links turns and keys the inbound guardrail's
+    /// record; never a content-store key ([`stored_message_key`] is).
+    pub link_hashes: Vec<String>,
+    /// Whether each `link_hashes` entry hashed its item's exact text (no
     /// volatile part dropped) — what [`RequestContent::screen_keys`] is built
     /// from.
     pub hash_exact: Vec<bool>,
-    /// Filtered hashes for session detection — excludes volatile metadata blocks
-    /// (e.g., `<available-deferred-tools>`) and includes system prompt hash.
-    /// Falls back to `message_hashes` when no client session ID is provided.
+    /// Filtered hashes for session detection — `link_hashes` without the
+    /// messages that are volatile whole (e.g. `<available-deferred-tools>`).
     pub session_hashes: Vec<String>,
     pub request_size_bytes: usize,
     /// First meaningful user prompt text (max 200 chars), extracted protocol-aware.
@@ -516,6 +520,38 @@ fn hash_anthropic_message_exact(msg: &AnthropicMessage) -> (String, bool) {
     (hex::encode(hasher.finalize()), !dropped)
 }
 
+/// A conversation message's key in the content store, and the length of the
+/// bytes it is stored as.
+///
+/// The key is the sha256 of the message exactly as stored and of nothing else,
+/// so two requests name one stored body only when they sent the same message:
+/// a body is never read back for a request that sent anything else — a
+/// teammate's reminder, their `name`, a field the gateway does not model, a
+/// cache breakpoint. `message` is a JSON value, whose object members serialize
+/// in one order (`serde_json` without `preserve_order`), so the same message
+/// keys the same; it is hashed as it streams out, never copied.
+///
+/// This is not the session-link hash ([`hash_message`] and its siblings),
+/// which leaves out what a client injects and withdraws between turns: that one
+/// decides which turns are one conversation, and never names a body.
+pub fn stored_message_key(message: &serde_json::Value) -> (String, usize) {
+    struct Digesting(Sha256, usize);
+    impl std::io::Write for Digesting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            self.1 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Digesting(Sha256::new(), 0);
+    // Writing a `Value` into a sink that never fails cannot fail.
+    let _ = serde_json::to_writer(&mut out, message);
+    (hex::encode(out.0.finalize()), out.1)
+}
+
 /// Remove every `cache_control` from a message's blocks, at any depth — but
 /// never inside a tool call's arguments, which are the model's own data.
 fn strip_breakpoints(value: &mut serde_json::Value) {
@@ -538,14 +574,14 @@ fn strip_breakpoints(value: &mut serde_json::Value) {
 }
 
 impl RequestContent {
-    /// One key per conversation item, aligned with `message_hashes`, naming
+    /// One key per conversation item, aligned with `link_hashes`, naming
     /// its exact text — what the inbound guardrail's record of what it
-    /// screened is keyed by: the item's `message_hashes` entry where that
+    /// screened is keyed by: the item's `link_hashes` entry where that
     /// hashed the exact text, else a hash of its JSON (a volatile part the
     /// dedup hash drops is text the guardrail reads). Built on demand, only
     /// for a request the guardrail screens.
     pub fn screen_keys(&self) -> Vec<String> {
-        screen_keys(&self.message_hashes, &self.hash_exact, &self.messages_json)
+        screen_keys(&self.link_hashes, &self.hash_exact, &self.messages_json)
     }
 }
 
@@ -1186,7 +1222,7 @@ const INJECTED_CONTEXT_PREFIXES: &[&str] = &[
 
 /// Detect volatile metadata blocks that change between turns without
 /// representing actual conversation content. These are excluded from
-/// session detection hashes (but kept in storage hashes for dedup).
+/// session detection hashes; the stored message keeps them.
 ///
 /// A whole message is volatile when it is a single text block whose
 /// content begins with any tag in `VOLATILE_TAG_PREFIXES`. Example:
@@ -1511,7 +1547,7 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 tools,
                 params,
                 system_prompt,
-                message_hashes,
+                link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
                 request_size_bytes,
@@ -1563,7 +1599,7 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 }
                 ResponseInput::Raw(items) => {
                     let json_strs = pre_serialize(items);
-                    // Hash each raw item 1:1 so the turn's `message_hashes` line up with
+                    // Hash each raw item 1:1 so the turn's `link_hashes` line up with
                     // the captured messages (downstream message dedup and session-prefix
                     // matching both require non-empty hashes — see b80b137).
                     let hashes: Vec<(String, bool)> =
@@ -1633,7 +1669,7 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 tools,
                 params,
                 system_prompt,
-                message_hashes,
+                link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
                 request_size_bytes,
@@ -1708,7 +1744,7 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 tools,
                 params,
                 system_prompt,
-                message_hashes,
+                link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
                 request_size_bytes,
@@ -1787,7 +1823,7 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 tools,
                 params,
                 system_prompt,
-                message_hashes,
+                link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
                 request_size_bytes,
@@ -3388,11 +3424,11 @@ mod tests {
             };
             let (one, other) = (read(&one), read(&other));
             let (one_keys, other_keys) = (one.screen_keys(), other.screen_keys());
-            if one.message_hashes[0] == other.message_hashes[0] {
+            if one.link_hashes[0] == other.link_hashes[0] {
                 conflated += 1;
             }
             assert_ne!(one_keys[0], other_keys[0], "{version:?}: two texts to screen");
-            assert_eq!(one_keys[1], one.message_hashes[1], "{version:?}: no volatile part, its hash is its key");
+            assert_eq!(one_keys[1], one.link_hashes[1], "{version:?}: no volatile part, its hash is its key");
         }
         // The case the key exists for — the dedup hash taking two texts for one.
         assert!(conflated >= 3, "{conflated}");
@@ -3519,12 +3555,12 @@ mod tests {
         let content = extract_request_content(&ApiRequest::Responses(req), 256);
         // Raw input MUST produce one hash per item: the ingest writer inserts a
         // conversation_turn only for a non-empty hash list.
-        assert_eq!(content.message_hashes.len(), 3, "one hash per raw item");
-        for h in &content.message_hashes {
+        assert_eq!(content.link_hashes.len(), 3, "one hash per raw item");
+        for h in &content.link_hashes {
             assert_eq!(h.len(), 64, "sha256 hex");
         }
         // Session hashes mirror message hashes for Responses (no volatile blocks).
-        assert_eq!(content.session_hashes, content.message_hashes);
+        assert_eq!(content.session_hashes, content.link_hashes);
     }
 
     /// Regression: a `{role, content}` item must hash identically whether the
@@ -3577,15 +3613,15 @@ mod tests {
         assert_matches!(input_2, ResponseInput::Raw(_), "turn 2 should parse as Raw");
         let c2 = extract_request_content(&ApiRequest::Responses(mk(input_2)), 256);
 
-        assert_eq!(c1.message_hashes.len(), 2);
-        assert_eq!(c2.message_hashes.len(), 4);
+        assert_eq!(c1.link_hashes.len(), 2);
+        assert_eq!(c2.link_hashes.len(), 4);
         // The shared two-item prefix MUST hash identically across variants.
         assert_eq!(
-            c1.message_hashes[0], c2.message_hashes[0],
+            c1.link_hashes[0], c2.link_hashes[0],
             "system-role prefix hash must match across Messages / Raw variants",
         );
         assert_eq!(
-            c1.message_hashes[1], c2.message_hashes[1],
+            c1.link_hashes[1], c2.link_hashes[1],
             "user-role prefix hash must match across Messages / Raw variants",
         );
     }
@@ -3628,7 +3664,7 @@ mod tests {
             256,
         );
 
-        assert_eq!(c_text.message_hashes, c_msgs.message_hashes);
+        assert_eq!(c_text.link_hashes, c_msgs.link_hashes);
     }
 
     #[test]
@@ -4026,7 +4062,7 @@ mod tests {
         });
 
         let content = extract_request_content(&req, 256);
-        assert_eq!(content.message_hashes.len(), 2);
+        assert_eq!(content.link_hashes.len(), 2);
         assert_eq!(content.system_prompt.as_deref(), Some("You are helpful."));
         assert_eq!(content.messages_json.len(), 2);
         for s in &content.messages_json {

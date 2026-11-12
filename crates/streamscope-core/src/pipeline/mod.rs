@@ -110,7 +110,7 @@ pub async fn run_request_phase(
     let screen_keys = guardrail.screens_inbound().then(|| {
         let items = crate::api::domain_request::DomainRequest::conversation_len(request);
         match request_content {
-            Some(content) if !transform.flags.messages_modified && content.message_hashes.len() == items => {
+            Some(content) if !transform.flags.messages_modified && content.link_hashes.len() == items => {
                 content.screen_keys()
             }
             _ => crate::proxy::content::screen_keys_of(request),

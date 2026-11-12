@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.39]
+
+- **Fixed (security): a conversation could show another user's message.** When two users of an
+  organisation sent the same prompt, the stored copy of the first sender's message could be shown in
+  the second sender's conversation — including the context their client adds to it (a coding
+  agent's reminder carrying the user's email, project instructions and git status), or their
+  `name`. Each distinct message is now stored on its own, so a conversation shows only messages its
+  own requests sent. **Conversations recorded before this release can still show another user's
+  copy**: which copy each one shows cannot be told after the fact. They leave with your retention
+  period; to remove them sooner, delete the affected sessions or use **Wipe All Data**.
+- **Fixed (security): a response cache hit could carry another caller's identifiers.** On an OpenAI
+  Responses provider, an answer served from the cache repeated the `metadata`, `user`,
+  `safety_identifier` and prompt cache key of the request that first produced it. A cache hit now
+  carries the requester's own.
+
+## [2026.11.38]
+
+- **Fixed: the gateway offered no `ssai` for macOS since 2026.11.36.** Those releases were
+  published without it; every release now carries the macOS build of its own version, and is not
+  published without it.
+- **`ssai-stow updates` on Docker and Kubernetes** (`k8s updates`): which release `upgrade
+  --version` would move to, with its changelog, read from the install's registry and signed by a
+  key the install trusts — as on the VM appliance.
+- **Fixed: on Windows, a sandboxed run's first start went over every file in your profile.**
+  Opening the folders above the project to the sandbox's account rewrote the access of everything
+  under them, so on a full profile the first run of each project or tool, and each revoke, took
+  minutes. Those folders are now changed alone; only the project and the tool's own folders are
+  given access file by file, once.
+- **BREAKING (Windows): a project folder every account may write is made private instead of run
+  as it is.** `--allow-outside-profile` is gone. When the project folder lets every account on the
+  computer write it (a folder made directly on a drive does), `ssai run --sandbox` explains why the
+  sandbox cannot confine its writes there and asks to make it private to you; `--private-project`
+  does so without asking. A folder above the project that every account may write is named on
+  each run. A project on a network share, which the sandbox's account cannot reach, is refused. A project
+  outside your profile that no other account may write now runs without any flag.
+
+## [2026.11.37]
+
+- **`ssai provision` says when your CLI is older than the gateway's.** Every run first checks the
+  version the gateway serves and, when it is newer, names the `ssai update` to run — so a provision
+  an older CLI can no longer complete still tells you the fix. `ssai sync` does the same once a day,
+  now before it syncs rather than after.
+- **Fixed: on Windows and macOS, `ssai login` named the device `unknown-device`.** It now names
+  it after the machine.
+
 ## [2026.11.36]
 
 - **The portal's CLI steps name no particular client.** The Quickstart's run step reads
