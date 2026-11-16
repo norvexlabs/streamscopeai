@@ -42,6 +42,7 @@ pub struct Host<'a> {
 ///   set to `true` when absent;
 /// - the column's arguments go before the client's own;
 /// - git trusts the project root and a linked worktree's common git folder
+///   and every repository under the root, a submodule's checkout included
 ///   (`safe.directory`, appended after any `GIT_CONFIG_COUNT` the run sets);
 /// - `tools`: the folder of `ssai` and of the client's program (and the
 ///   folder it resolves to, when another); `files`: the CA files and the
@@ -92,7 +93,12 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
     }
     trust_in_git(spec)?;
     carry_node_ca(spec, host);
-    let found = host.own_dir.map(Path::to_path_buf).into_iter().chain(host.program.into_iter().flat_map(program_dirs));
+    let found = host
+        .own_dir
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(host.program.into_iter().flat_map(program_dirs))
+        .chain(host.program.into_iter().flat_map(|p| tool_environments(p, host)));
     for dir in found {
         if under(&dir, host.profile) && !dirs.tools.contains(&dir) {
             dirs.tools.push(dir);
@@ -190,13 +196,19 @@ fn seed(path: &Path, key: &str) -> Result<()> {
 }
 
 /// Git refuses a repository another account owns ("dubious ownership"):
-/// trust the project root and a linked worktree's common git folder for this
-/// run, through the `GIT_CONFIG_*` variables — no gitconfig is written —
-/// appended after the entries the run already sets.
+/// trust the project root, every repository under it (`<root>/*`: a
+/// submodule's checkout — git 2.46 and later read the wildcard) and a linked
+/// worktree's common git folder for this run, through the `GIT_CONFIG_*`
+/// variables — no gitconfig is written — appended after the entries the run
+/// already sets. The trust is the sandbox account's alone, in a project it
+/// may write.
 fn trust_in_git(spec: &mut LaunchSpec) -> Result<()> {
     let project = protect::resolve(&spec.project_root);
-    let trusted: Vec<String> =
-        std::iter::once(&spec.project_root).chain(&project.extra_rw).map(|p| git_path(p)).collect();
+    let root = git_path(&spec.project_root);
+    let trusted: Vec<String> = std::iter::once(root.clone())
+        .chain(project.extra_rw.iter().map(|p| git_path(p)))
+        .chain(std::iter::once(format!("{}/*", root.trim_end_matches('/'))))
+        .collect();
     let start = match last(&spec.env, "GIT_CONFIG_COUNT").map(str::trim) {
         None | Some("") => 0,
         Some(n) => n.parse::<usize>().with_context(|| format!("GIT_CONFIG_COUNT={n:?} is not a count"))?,
@@ -228,6 +240,52 @@ fn program_dirs(program: &Path) -> Vec<PathBuf> {
         && !out.contains(&real)
     {
         out.push(real);
+    }
+    out
+}
+
+/// The Python environments a launcher in `~/.local/bin` (where uv and pipx
+/// put theirs) starts the client from: uv's (`%APPDATA%\uv\tools\<tool>`) and pipx's
+/// (`~\pipx\venvs\<tool>`, `~\.local\pipx\venvs\<tool>`) environment
+/// whose `Scripts` folder holds a program of the same name, and the Python
+/// its `pyvenv.cfg` names as `home` — what the launcher runs, which the
+/// program's folder alone does not reach.
+fn tool_environments(program: &Path, host: &Host) -> Vec<PathBuf> {
+    // Only a launcher in the folder both put theirs in: a program found
+    // elsewhere (`python`, a tool's own `Scripts`) names no one environment.
+    let launchers = host.profile.join(".local").join("bin");
+    let in_launchers = program.parent().is_some_and(|dir| {
+        let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
+        norm(dir) == norm(&launchers)
+    });
+    let Some(name) = program.file_name().filter(|_| in_launchers) else { return Vec::new() };
+    let roots = host
+        .appdata
+        .map(|a| a.join("uv").join("tools"))
+        .into_iter()
+        .chain([host.profile.join("pipx").join("venvs"), host.profile.join(".local").join("pipx").join("venvs")]);
+    let mut out = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else { continue };
+        for env in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+            if !env.join("Scripts").join(name).is_file() {
+                continue;
+            }
+            let home = std::fs::read_to_string(env.join("pyvenv.cfg")).ok().and_then(|cfg| {
+                cfg.lines().find_map(|l| {
+                    let (k, v) = l.split_once('=')?;
+                    (k.trim() == "home").then(|| PathBuf::from(v.trim()))
+                })
+            });
+            out.push(env);
+            // As it is on disk (`..`, a junction or a short name followed), as
+            // the profile is, so the caller's inside-the-profile check holds;
+            // and only a folder holding the interpreter: the file is the
+            // developer's, but a `home` naming a broad folder must not widen
+            // the grant.
+            let home = home.filter(|h| h.is_absolute()).and_then(|h| dunce::canonicalize(h).ok());
+            out.extend(home.filter(|h| h.join("python.exe").is_file()));
+        }
     }
     out
 }
@@ -264,12 +322,15 @@ mod tests {
             cwd: root,
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         };
         (profile, spec)
     }
@@ -448,12 +509,92 @@ mod tests {
     }
 
     #[test]
-    fn a_client_without_a_windows_column_is_changed_only_for_git() {
-        let (profile, mut spec) = setup("plain", "opencode", &[]);
+    fn a_client_without_a_profile_is_changed_only_for_git() {
+        let (profile, mut spec) = setup("plain", "my-own-agent", &[]);
         let dirs = run(&mut spec, &profile);
         assert!(dirs.state.is_empty());
         assert_eq!(spec.args, ["--resume"]);
         assert!(spec.env.iter().all(|(k, _)| k.starts_with("GIT_CONFIG_")), "{:?}", spec.env);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// OpenCode is pointed at the folder provision writes its configuration
+    /// into, by its own variable, and that folder alone is granted; in a
+    /// project the run's own value (the project's folder) wins.
+    #[test]
+    fn opencode_reads_the_developers_config_folder_and_only_its_own_is_granted() {
+        let (profile, mut spec) = setup("opencode", "opencode", &[]);
+        let dirs = run(&mut spec, &profile);
+        let config = profile.join(".config").join("opencode");
+        assert_eq!(spec.env[0], ("OPENCODE_CONFIG_DIR".to_string(), config.to_string_lossy().into_owned()));
+        assert_eq!(dirs.state, vec![config.clone()]);
+        assert!(config.is_dir());
+        let _ = std::fs::remove_dir_all(&profile);
+
+        let (profile, mut spec) = setup("opencode-project", "opencode", &[]);
+        let project = profile.join("project").join(".opencode");
+        spec.env.push(("OPENCODE_CONFIG_DIR".into(), project.to_string_lossy().into_owned()));
+        let dirs = run(&mut spec, &profile);
+        assert_eq!(dirs.state, vec![project]);
+        assert_eq!(spec.env.iter().filter(|(k, _)| k == "OPENCODE_CONFIG_DIR").count(), 1);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// A client that reads no variable but the home: `USERPROFILE` is the
+    /// developer's profile, and only the client's folder in it is granted.
+    #[test]
+    fn a_home_only_client_is_given_the_profile_and_granted_its_folder_alone() {
+        let (profile, mut spec) = setup("ocr", "ocr", &[]);
+        let dirs = run(&mut spec, &profile);
+        assert_eq!(spec.env[0], ("USERPROFILE".to_string(), profile.to_string_lossy().into_owned()));
+        assert_eq!(dirs.state, vec![profile.join(".opencodereview")]);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// A uv or pipx launcher: its environment and the Python it was made
+    /// with are granted when in the profile; another tool's environment, a
+    /// Python outside the profile, and a `home` holding no interpreter are not.
+    #[test]
+    fn a_python_tool_launcher_reaches_its_environment_and_its_python() {
+        let (profile, mut spec) = setup("venv", "aider", &[]);
+        let appdata = profile.join("AppData").join("Roaming");
+        let bin = profile.join(".local").join("bin");
+        let python = appdata.join("uv").join("python").join("cpython-3.12");
+        let aider = appdata.join("uv").join("tools").join("aider-chat");
+        let other = appdata.join("uv").join("tools").join("other");
+        let pipx = profile.join("pipx").join("venvs").join("aider-chat");
+        for d in [&bin, &python, &aider.join("Scripts"), &other.join("Scripts"), &pipx.join("Scripts")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for f in [python.join("python.exe"), bin.join("aider.exe"), aider.join("Scripts").join("aider.exe"), other.join("Scripts").join("vibe.exe"), pipx.join("Scripts").join("aider.exe")] {
+            std::fs::write(f, b"").unwrap();
+        }
+        std::fs::write(aider.join("pyvenv.cfg"), format!("home = {}\nversion = 3.12\n", python.display())).unwrap();
+        std::fs::write(pipx.join("pyvenv.cfg"), "home = C:\\Program Files\\Python312\n").unwrap();
+        let program = bin.join("aider.exe");
+        let host = Host { profile: &profile, appdata: Some(&appdata), node_ca: None, own_dir: None, program: Some(&program) };
+        let dirs = prepare(&mut spec, agent_for("aider"), &host).unwrap();
+        assert_eq!(dirs.tools, vec![bin.clone(), aider.clone(), python.clone(), pipx.clone()]);
+        // A `home` without the interpreter in it is not granted.
+        std::fs::remove_file(python.join("python.exe")).unwrap();
+        let (other, mut again) = setup("venv-again", "aider", &[]);
+        let dirs = prepare(&mut again, agent_for("aider"), &host).unwrap();
+        assert_eq!(dirs.tools, vec![bin.clone(), aider.clone(), pipx.clone()]);
+        // A `home` spelled inside the profile that resolves outside it is not.
+        let outside = scratch("venv-outside");
+        std::fs::write(outside.join("python.exe"), b"").unwrap();
+        let dotted = profile.join("x").join("..").join("..").join(outside.file_name().unwrap());
+        std::fs::create_dir_all(profile.join("x")).unwrap();
+        std::fs::write(aider.join("pyvenv.cfg"), format!("home = {}\n", dotted.display())).unwrap();
+        let dirs = prepare(&mut again, agent_for("aider"), &host).unwrap();
+        assert_eq!(dirs.tools, vec![bin, aider.clone(), pipx]);
+        // A program found anywhere else names no environment, whatever its name.
+        let elsewhere = aider.join("Scripts").join("aider.exe");
+        let host = Host { program: Some(&elsewhere), ..host };
+        let dirs = prepare(&mut again, agent_for("aider"), &host).unwrap();
+        assert_eq!(dirs.tools, vec![aider.join("Scripts")]);
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&profile);
     }
 
@@ -464,13 +605,16 @@ mod tests {
         let root = git_path(&spec.project_root);
         assert_eq!(last(&spec.env, "GIT_CONFIG_KEY_2"), Some("safe.directory"));
         assert_eq!(last(&spec.env, "GIT_CONFIG_VALUE_2"), Some(root.as_str()));
-        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("3"));
+        // Then every repository under it (a submodule's checkout).
+        assert_eq!(last(&spec.env, "GIT_CONFIG_KEY_3"), Some("safe.directory"));
+        assert_eq!(last(&spec.env, "GIT_CONFIG_VALUE_3"), Some(format!("{root}/*").as_str()));
+        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("4"));
         assert_eq!(last(&spec.env, "GIT_CONFIG_KEY_0"), None);
         // None set: from 0.
         let (profile2, mut spec) = setup("gitzero", "opencode", &[]);
         run(&mut spec, &profile2);
         assert_eq!(last(&spec.env, "GIT_CONFIG_VALUE_0"), Some(git_path(&spec.project_root).as_str()));
-        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("2"));
         // Not a count: refused.
         let (profile3, mut spec) = setup("gitbad", "opencode", &[("GIT_CONFIG_COUNT", "x")]);
         let err = prepare(&mut spec, None, &Host { profile: &profile3, appdata: None, node_ca: None, own_dir: None, program: None }).unwrap_err();
@@ -496,7 +640,7 @@ mod tests {
         assert_eq!(last(&spec.env, "GIT_CONFIG_VALUE_0"), Some(git_path(&spec.project_root).as_str()));
         assert_eq!(last(&spec.env, "GIT_CONFIG_KEY_1"), Some("safe.directory"));
         assert_eq!(last(&spec.env, "GIT_CONFIG_VALUE_1"), Some(git_path(&common).as_str()));
-        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("2"));
+        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("3"));
         let _ = std::fs::remove_dir_all(&profile);
     }
 

@@ -1090,6 +1090,7 @@ pub async fn get_trace_impl(
         transform_diff: t_transform_diff,
         response_content: t_response_content,
         response_tool_calls: t_response_tool_calls,
+        response_citations: t_response_citations,
         request_size_bytes: t_request_size_bytes,
         response_size_bytes: t_response_size_bytes,
         event_type: t_event_type,
@@ -1271,6 +1272,7 @@ pub async fn get_trace_impl(
                 request_params: t_request_params.as_ref(),
                 response_content: t_response_content.as_deref(),
                 response_tool_calls: t_response_tool_calls.as_ref(),
+                response_citations: t_response_citations.as_ref(),
                 thinking: None,
                 model: &model_str,
                 metadata: None,
@@ -1380,6 +1382,7 @@ pub async fn get_trace_impl(
                         request_params: next_request_params.as_ref(),
                         response_content: None,
                         response_tool_calls: None,
+                        response_citations: None,
                         thinking: None,
                         model: &next_model,
                         metadata: None,
@@ -2215,19 +2218,6 @@ fn extract_summary(text: &str) -> Option<String> {
     None
 }
 
-/// Remove framework-injected volatile blocks from rendered text. Thin
-/// alias over [`streamscope_core::proxy::content::strip_volatile_inline`]
-/// — see that function's doc for the full list of recognized tags
-/// (`<system-reminder>`, `<available-deferred-tools>`, `<session_context>`,
-/// `<local-command-*>`, `<command-*>`). Kept as a named function so the
-/// many event-builder call sites don't churn.
-pub(crate) fn strip_system_reminders(text: &str) -> String {
-    streamscope_core::proxy::content::strip_volatile_inline(text)
-        .trim()
-        .to_string()
-}
-
-
 /// No session carries this id, on any of the three sources that can know one.
 ///
 /// Carried through `anyhow` so every caller of
@@ -2300,6 +2290,7 @@ fn unrendered_turn_marker(
     tracing::warn!(turn, "turn not rendered: {error}");
     let content = format!("[corrupt turn {turn}: {error}]");
     ConversationEvent::Message {
+        citations: Vec::new(),
         role: "assistant".to_string(),
         content,
         thinking: None,
@@ -2830,6 +2821,7 @@ pub async fn get_session_conversation_impl(
                 request_params: row_request_params.as_ref(),
                 response_content: response_content.as_deref(),
                 response_tool_calls: row.response_tool_calls.as_ref(),
+                response_citations: row.response_citations.as_ref(),
                 thinking: None,
                 model: &model_ref,
                 metadata: Some(meta.clone()),
@@ -2917,6 +2909,8 @@ pub async fn get_session_conversation_impl(
                         data: None,
                         url: None,
                         title: Some("Generated Image".to_string()),
+                        context: None,
+                        detail: None,
                         size_bytes: Some(entry.size_bytes),
                         turn: turn_number,
                         is_new: true,
@@ -3948,33 +3942,5 @@ mod tests {
         c.extra.insert("context_management".into(), serde_json::json!({"enabled": false}));
         let sig_c = serde_json::to_value(&c).expect("to_value c");
         assert_ne!(sig_a, sig_c, "different content must compare non-equal");
-    }
-
-    /// `strip_system_reminders` delegates to the core helper which covers
-    /// every `VOLATILE_TAG_PREFIXES` entry, not only `<system-reminder>`:
-    /// the admin rendering also strips `<available-deferred-tools>`,
-    /// `<local-command-*>`, and `<command-*>` inline blocks from
-    /// displayed text. Non-volatile strings round-trip unchanged.
-    #[test]
-    fn strip_system_reminders_delegates_to_core_helper() {
-        // Original behavior preserved
-        assert_eq!(
-            strip_system_reminders("prefix<system-reminder>X</system-reminder>suffix"),
-            "prefixsuffix",
-        );
-        // Broadened — family prefixes now also stripped
-        assert_eq!(
-            strip_system_reminders("A<local-command-stdout>out</local-command-stdout>B"),
-            "AB",
-        );
-        assert_eq!(
-            strip_system_reminders("X<command-name>/clear</command-name>Y"),
-            "XY",
-        );
-        // Non-volatile unchanged
-        assert_eq!(
-            strip_system_reminders("Just normal prose."),
-            "Just normal prose.",
-        );
     }
 }

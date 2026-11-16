@@ -2391,6 +2391,18 @@ pub(crate) fn responses_answer_finish(response_json: &Value) -> Option<FinishRea
 
 // ─── Part H: Non-streaming Response Translation (Responses → Anthropic / ChatCompletions) ───
 
+/// Whether a Responses answer's turn ended `failed` or `cancelled` — those two
+/// statuses alone (an unknown one is read as an error finish, and keeps its
+/// calls). Its function and custom calls
+/// are no calls to run: a translation withholds them, the client told in
+/// their place ([`crate::pipeline::response::FAILED_TURN_NOTICE`]) and the row
+/// told by [`crate::pipeline::response_pipeline::record_calls_not_carried`],
+/// so its finish claims no call. (A stream that fails ends in the client
+/// protocol's own error event.)
+pub(crate) fn responses_turn_failed(response_json: &Value) -> bool {
+    matches!(responses_answer_status(response_json), "failed" | "cancelled")
+}
+
 /// Translate an OpenAI Responses API non-streaming response to Anthropic Messages format.
 pub fn responses_response_to_anthropic(
     response_json: &Value,
@@ -2401,6 +2413,8 @@ pub fn responses_response_to_anthropic(
     max_output_tokens: u32,
 ) -> Value {
     let mut content_blocks = Vec::new();
+    let failed = responses_turn_failed(response_json);
+    let mut withheld = false;
 
     if let Some(output) = response_json.get("output").and_then(|o| o.as_array()) {
         for item in output {
@@ -2411,7 +2425,7 @@ pub fn responses_response_to_anthropic(
                         for part in content {
                             let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             if matches!(part_type, "output_text" | "refusal")
-                                && let Some(text) = part.get("text").and_then(|t| t.as_str())
+                                && let Some(text) = crate::api::responses::part_text(part)
                                     && !text.is_empty() {
                                         content_blocks.push(serde_json::json!({
                                             "type": "text",
@@ -2434,6 +2448,7 @@ pub fn responses_response_to_anthropic(
                 }
                 // A custom (freeform) tool call reaches the client as a call
                 // carrying its text as `{"input": …}` (`tool_call_item`).
+                "function_call" | "custom_tool_call" if failed => withheld = true,
                 "function_call" | "custom_tool_call" => {
                     let Some(call) = crate::api::domain::tool_call_item(item) else { continue };
                     let input: Value = serde_json::from_str(&call.arguments)
@@ -2453,6 +2468,10 @@ pub fn responses_response_to_anthropic(
                 _ => {}
             }
         }
+    }
+
+    if withheld {
+        content_blocks.push(serde_json::json!({"type": "text", "text": crate::pipeline::response::FAILED_TURN_NOTICE}));
     }
 
     // A Responses answer says `completed` whether or not it called a tool, so
@@ -2522,6 +2541,8 @@ pub fn responses_response_to_chat_completions(
     let mut content_text = String::new();
     let mut reasoning_text = String::new();
     let mut tool_calls = Vec::new();
+    let failed = responses_turn_failed(response_json);
+    let mut withheld = false;
 
     if let Some(output) = response_json.get("output").and_then(|o| o.as_array()) {
         for item in output {
@@ -2533,7 +2554,7 @@ pub fn responses_response_to_chat_completions(
                             let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             // Handle both output_text and refusal content types
                             if matches!(part_type, "output_text" | "refusal")
-                                && let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                && let Some(text) = crate::api::responses::part_text(part) {
                                     content_text.push_str(text);
                                 }
                         }
@@ -2554,6 +2575,7 @@ pub fn responses_response_to_chat_completions(
                 // A custom (freeform) tool call reaches the client as the Chat
                 // custom call it is — Chat has one, `{type: "custom", custom:
                 // {name, input}}` — and a function call as a function call.
+                "function_call" | "custom_tool_call" if failed => withheld = true,
                 "function_call" | "custom_tool_call" => {
                     let Some(call) = crate::api::domain::tool_call_item(item) else { continue };
                     let id = call.call_id.unwrap_or_default();
@@ -2586,6 +2608,9 @@ pub fn responses_response_to_chat_completions(
         }
     }
 
+    if withheld {
+        content_text.push_str(crate::pipeline::response::FAILED_TURN_NOTICE);
+    }
     let finish_reason = chat_finish(responses_answer_finish(response_json), !tool_calls.is_empty());
 
     let usage = response_json.get("usage");
@@ -2676,6 +2701,9 @@ pub struct ChatCompletionsResponseBuilder {
     /// it carries, so its reason is a claim about all of them (a call first
     /// seen after the finish included).
     pending_finish: Option<Option<crate::api::domain::FinishReason>>,
+    /// The client did not ask for usage (`stream_options.include_usage`): the
+    /// usage chunk is not written.
+    usage_withheld: bool,
 }
 
 /// A Chat client's index for each call, by the call's number on the stream:
@@ -2731,7 +2759,13 @@ impl ChatCompletionsResponseBuilder {
             minted: crate::pipeline::response::MintedIds::default(),
             done_pending: false,
             pending_finish: None,
+            usage_withheld: false,
         }
+    }
+
+    /// Write no usage chunk: the client did not ask for one.
+    pub fn withhold_usage(&mut self, withheld: bool) {
+        self.usage_withheld = withheld;
     }
 
     /// The client's index for call `n` (see [`ChatWireIndexes`]).
@@ -3052,28 +3086,30 @@ impl ChatCompletionsResponseBuilder {
             // Every call delta was written above.
             DomainEvent::ToolCallDelta { .. } => {}
             DomainEvent::Usage(usage) => {
-                let mut usage_json = serde_json::json!({
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens
-                });
-                if let Some(rt) = usage.reasoning_tokens {
-                    usage_json["completion_tokens_details"] =
-                        serde_json::json!({"reasoning_tokens": rt});
+                if !self.usage_withheld {
+                    let mut usage_json = serde_json::json!({
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens,
+                        "total_tokens": usage.total_tokens
+                    });
+                    if let Some(rt) = usage.reasoning_tokens {
+                        usage_json["completion_tokens_details"] =
+                            serde_json::json!({"reasoning_tokens": rt});
+                    }
+                    // cached_tokens is a prompt-side cache HIT — it belongs in
+                    // prompt_tokens_details (not completion_*), and excludes cache
+                    // creations (premium writes, not hits).
+                    CacheUsage::from_parts(usage.cache_read_tokens, usage.cache_creation_tokens)
+                        .apply_chat(&mut usage_json);
+                    let chunk = serde_json::json!({
+                        "id": self.response_id,
+                        "object": "chat.completion.chunk",
+                        "model": self.model,
+                        "choices": [],
+                        "usage": usage_json
+                    });
+                    out.push(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
                 }
-                // cached_tokens is a prompt-side cache HIT — it belongs in
-                // prompt_tokens_details (not completion_*), and excludes cache
-                // creations (premium writes, not hits).
-                CacheUsage::from_parts(usage.cache_read_tokens, usage.cache_creation_tokens)
-                    .apply_chat(&mut usage_json);
-                let chunk = serde_json::json!({
-                    "id": self.response_id,
-                    "object": "chat.completion.chunk",
-                    "model": self.model,
-                    "choices": [],
-                    "usage": usage_json
-                });
-                out.push(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
                 self.write_done(&mut out);
             }
             // Held for the stream's end (`write_finish`): a call may still
@@ -3920,6 +3956,8 @@ pub fn anthropic_to_gemini_response(response_json: &Value) -> Value {
 /// Responses API upstream → Gemini client (non-streaming).
 pub fn responses_to_gemini_response(response_json: &Value) -> Value {
     let mut parts = Vec::new();
+    let failed = responses_turn_failed(response_json);
+    let mut withheld = false;
 
     if let Some(output) = response_json.get("output").and_then(|o| o.as_array()) {
         for item in output {
@@ -3927,7 +3965,7 @@ pub fn responses_to_gemini_response(response_json: &Value) -> Value {
                 Some("message") => {
                     if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                         for part in content {
-                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            if let Some(t) = crate::api::responses::part_text(part) {
                                 parts.push(serde_json::json!({"text": t}));
                             }
                         }
@@ -3935,6 +3973,7 @@ pub fn responses_to_gemini_response(response_json: &Value) -> Value {
                 }
                 // A custom (freeform) tool call reaches the client as a call
                 // carrying its text as `{"input": …}` (`tool_call_item`).
+                Some("function_call" | "custom_tool_call") if failed => withheld = true,
                 Some("function_call" | "custom_tool_call") => {
                     let Some(call) = crate::api::domain::tool_call_item(item) else { continue };
                     let args = serde_json::from_str::<Value>(&call.arguments)
@@ -3957,6 +3996,9 @@ pub fn responses_to_gemini_response(response_json: &Value) -> Value {
         }
     }
 
+    if withheld {
+        parts.push(serde_json::json!({"text": crate::pipeline::response::FAILED_TURN_NOTICE}));
+    }
     let finish_reason = gemini_finish_reason(&responses_answer_finish(response_json).unwrap_or(FinishReason::Stop), None);
 
     let usage = response_json.get("usage");
@@ -5310,7 +5352,7 @@ mod tests {
             "output": [{
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "refusal", "text": "I cannot help with that."}]
+                "content": [{"type": "refusal", "refusal": "I cannot help with that."}]
             }],
             "usage": {"input_tokens": 5, "output_tokens": 8, "total_tokens": 13}
         });
@@ -5324,6 +5366,19 @@ mod tests {
         assert_eq!(content[0]["text"], "I cannot help with that.");
     }
 
+    /// A Responses refusal reaches a Gemini client as its text: the part's
+    /// `refusal` member, read by the one part reader.
+    #[test]
+    fn responses_to_gemini_carries_a_refusal() {
+        let response_json = serde_json::json!({
+            "id": "resp_123", "status": "completed",
+            "output": [{"type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": "I cannot do that."}]}],
+            "usage": {"input_tokens": 5, "output_tokens": 8, "total_tokens": 13}
+        });
+        let result = serde_json::to_string(&responses_to_gemini_response(&response_json)).unwrap();
+        assert!(result.contains("I cannot do that."), "{result}");
+    }
+
     #[test]
     fn responses_to_chat_completions_handles_refusal() {
         let response_json = serde_json::json!({
@@ -5332,7 +5387,7 @@ mod tests {
             "output": [{
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "refusal", "text": "I cannot do that."}]
+                "content": [{"type": "refusal", "refusal": "I cannot do that."}]
             }],
             "usage": {"input_tokens": 5, "output_tokens": 8, "total_tokens": 13}
         });
@@ -7281,8 +7336,8 @@ mod tests {
     /// A whole Responses answer's stop is read from its status once, and the
     /// calls it carries, on every target and on the stream: a completed turn
     /// that called a tool stopped for it, a failed or cancelled one is an
-    /// error (a call it carries keeps `tool_calls` on Chat, which says what
-    /// the message holds), an incomplete one is a cut or a filter.
+    /// error whose calls are withheld (so Chat says `stop`: the message holds
+    /// none), an incomplete one is a cut or a filter.
     #[test]
     fn a_responses_status_reads_as_one_finish_on_every_target() {
         let answer = |status: &str, call: bool| {
@@ -7303,8 +7358,8 @@ mod tests {
             ("incomplete", None, true, "max_tokens", Some("length"), "MAX_TOKENS"),
             ("incomplete", Some("max_output_tokens"), true, "max_tokens", Some("length"), "MAX_TOKENS"),
             ("incomplete", Some("content_filter"), true, "end_turn", Some("content_filter"), "SAFETY"),
-            ("failed", None, true, "end_turn", None, "OTHER"),
-            ("cancelled", None, true, "end_turn", None, "OTHER"),
+            ("failed", None, true, "end_turn", Some("stop"), "OTHER"),
+            ("cancelled", None, true, "end_turn", Some("stop"), "OTHER"),
             // Not finished: no finish is stated, so the calls decide.
             ("in_progress", None, true, "tool_use", Some("tool_calls"), "STOP"),
             ("queued", None, false, "end_turn", Some("stop"), "STOP"),
@@ -7316,8 +7371,6 @@ mod tests {
             let case = format!("{status} {reason:?}, call: {call}");
             let got = responses_response_to_anthropic(&body, "m", "abc12345", None, None, 0);
             assert_eq!(got["stop_reason"], anthropic, "{case}: {got}");
-            // A failed turn's Chat word follows the calls the message still
-            // carries, not the status, and is not this table's claim.
             if let Some(chat) = chat {
                 let got = responses_response_to_chat_completions(&body, "m");
                 assert_eq!(got["choices"][0]["finish_reason"], chat, "{case}: {got}");
@@ -7337,6 +7390,48 @@ mod tests {
             };
             assert_eq!(*finish_reason, responses_answer_finish(&body), "{case}");
         }
+    }
+
+    /// A Responses turn that ended `failed` or `cancelled` is no call to run:
+    /// a client of another protocol gets its text and a notice in place of
+    /// its calls, never the calls; the row records each one not carried.
+    #[test]
+    fn a_failed_responses_turns_calls_are_withheld_on_every_target() {
+        let body = |status: &str| {
+            serde_json::json!({"id": "resp_1", "object": "response", "status": status, "output": [
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
+                {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "lookup", "arguments": "{}", "status": "completed"},
+                {"type": "custom_tool_call", "id": "ct_1", "call_id": "call_2", "name": "patch", "input": "x"},
+            ], "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}})
+        };
+        let notice = crate::pipeline::response::FAILED_TURN_NOTICE;
+        for status in ["failed", "cancelled"] {
+            let failed = body(status);
+            let anthropic = responses_response_to_anthropic(&failed, "m", "abc12345", None, None, 0);
+            assert_eq!(anthropic["content"], serde_json::json!([{"type": "text", "text": "ok"}, {"type": "text", "text": notice}]), "{status}");
+            let chat = responses_response_to_chat_completions(&failed, "m");
+            assert_eq!(chat["choices"][0]["message"]["tool_calls"], Value::Null, "{status}: {chat}");
+            assert_eq!(chat["choices"][0]["message"]["content"], format!("ok{notice}"), "{status}");
+            let gemini = responses_to_gemini_response(&failed);
+            assert_eq!(gemini["candidates"][0]["content"]["parts"], serde_json::json!([{"text": "ok"}, {"text": notice}]), "{status}");
+
+            let mut state = crate::pipeline::response::TransformState::new(crate::api::sse::ApiVersion::Responses);
+            crate::pipeline::response_pipeline::record_calls_not_carried(&failed, crate::api::sse::ApiVersion::Responses, &mut state);
+            let recorded: Vec<&str> = state.response_injection_blocks.iter().map(|b| b.content.as_str()).collect();
+            assert_eq!(recorded.len(), 2, "{status}: {recorded:?}");
+            assert!(recorded.iter().all(|r| r.contains("did not complete")), "{recorded:?}");
+        }
+        // Control: a completed turn's calls are delivered, and nothing is
+        // recorded — nor for a status the spec does not name.
+        let unknown = responses_response_to_chat_completions(&body("vendor_status"), "m");
+        assert_eq!(unknown["choices"][0]["message"]["tool_calls"].as_array().map(Vec::len), Some(2), "{unknown}");
+        let done = body("completed");
+        let chat = responses_response_to_chat_completions(&done, "m");
+        assert_eq!(chat["choices"][0]["message"]["tool_calls"].as_array().map(Vec::len), Some(2), "{chat}");
+        assert_eq!(chat["choices"][0]["message"]["content"], "ok");
+        let mut state = crate::pipeline::response::TransformState::new(crate::api::sse::ApiVersion::Responses);
+        crate::pipeline::response_pipeline::record_calls_not_carried(&done, crate::api::sse::ApiVersion::Responses, &mut state);
+        assert!(state.response_injection_blocks.is_empty());
     }
 
     #[test]

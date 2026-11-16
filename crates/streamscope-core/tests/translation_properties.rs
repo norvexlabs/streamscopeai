@@ -79,6 +79,7 @@ fn message_strategy() -> impl Strategy<Value = DomainMessage> {
         content: vec![DomainContentBlock::Text {
             text,
             cache_control: None,
+            citations: Vec::new(),
         }],
     })
 }
@@ -94,6 +95,7 @@ fn system_prompt_strategy() -> impl Strategy<Value = Option<DomainSystemPrompt>>
                         text,
                         cache_control: None,
                         client_metadata: Vec::new(),
+                        citations: Vec::new(),
                     })
                     .collect()
             )

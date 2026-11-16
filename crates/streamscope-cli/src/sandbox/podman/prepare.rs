@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 
 use super::config::{DockerConfig, ImageSource, Lifecycle};
+use super::images::{self, Record};
 
 /// The label naming the base image an agent layer was built on.
 pub const BASE_LABEL: &str = "ai.streamscope.sandbox-base";
@@ -77,66 +78,32 @@ pub fn prepare(root: &Path, config: &DockerConfig, command: &str, npm: Option<&s
     }
     let workspace = super::workspace(config, root);
     // The image's own entries first. One this parser cannot read is the
-    // image's, which the developer cannot fix: skipped whole, and said.
-    // An image built here with `features` carries the project's own entry.
-    let lifecycle = label_lifecycle(&entries, !config.has_features, &|text| super::config::expand_lenient(text, root, &workspace), &|i, e| {
+    // image's, which the developer cannot fix: skipped whole, and said. An
+    // image built here with `features` carries, as its own entry, only what
+    // its build was given ([`features_recipe`]): the project's commands and
+    // variables come from the project's file.
+    let lifecycle = label_lifecycle(&entries, &|text| super::config::expand_lenient(text, root, &workspace), &|i, e| {
         eprintln!("ssai: entry {i} of the image {}'s devcontainer.metadata is skipped — {e:#}", config.source_name())
     })
     .then(config.lifecycle.clone());
-    let image = match npm {
-        Some(package) => agent_layer(&base_id, package, force)?,
-        None => base_id.clone(),
-    };
+    let image = if npm.is_some() || config.docker { agent_layer(&base_id, npm, config.docker, force)? } else { base_id.clone() };
     let env = image_env(&inspect(&image, "{{json .Config.Env}}")?);
     let container_root = super::sweep::Root::for_agent(user.uid, user.gid);
     Ok(Prepared { image, user, env, container_root, base: base_id, lifecycle })
 }
 
-/// Where the image source a project's last run used is recorded: its
-/// reference (`image:<ref>`) or its build's tag.
-fn build_record(root: &Path) -> Result<PathBuf> {
-    let mut h = Sha256::new();
-    h.update(root.as_os_str().as_encoded_bytes());
-    Ok(crate::state::cache_dir()?.join("sandbox-builds").join(hex::encode(&h.finalize()[..12])))
-}
-
-/// The guard below fails closed: a record that cannot be written stops the
-/// run, rather than leaving every later build unasked.
-fn record_build(root: &Path, tag: &str, engine: bool) -> Result<()> {
-    let path = build_record(root)?;
-    std::fs::create_dir_all(path.parent().unwrap_or(Path::new("."))).context("create the sandbox's build records")?;
-    std::fs::write(&path, format!("{tag}\n{}", if engine { "engine" } else { "no-engine" }))
-        .with_context(|| format!("record the project's image in {}", path.display()))
-}
-
 /// An engine inside makes the container privileged: `"docker": true` that
 /// was off at the project's last run (the agent can edit `sandbox.json`) is
 /// taken only after `ssai sandbox prepare`.
-fn engine_turned_on(root: &Path, engine: bool, force: bool) -> Result<()> {
-    let path = build_record(root)?;
-    let was = match std::fs::read_to_string(&path) {
-        Ok(text) => text.lines().nth(1).map(|l| l.trim() == "engine"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    if !force && engine && was == Some(false) {
+fn engine_turned_on(before: Option<&Record>, engine: bool, force: bool) -> Result<()> {
+    if !force && engine && before.is_some_and(|b| !b.engine) {
         bail!(
-            "`\"docker\": true` is new in sandbox.json since the project's last run (an engine runs privileged) — \
-             check it, then run `ssai sandbox prepare <client>`"
+            "an engine inside (`\"docker\": true` in sandbox.json, or in your organisation's default image) is new \
+             since the project's last run (an engine runs privileged) — check it, then run \
+             `ssai sandbox prepare <client>`"
         );
     }
     Ok(())
-}
-
-/// The recorded source, `None` when there is none; an unreadable record is
-/// an error, never "none".
-fn last_build(root: &Path) -> Result<Option<String>> {
-    let path = build_record(root)?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(text.lines().next().map(|l| l.trim().to_string())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
-    }
 }
 
 /// An image source (a reference, or a recipe: Dockerfile, devcontainer.json)
@@ -145,11 +112,12 @@ fn last_build(root: &Path) -> Result<Option<String>> {
 /// network open before any guard. `ssai sandbox prepare` (`force`) does it
 /// after the developer has read the change; a project's first one needs no
 /// such step.
-fn changed_since_last_build(root: &Path, source: &str, force: bool) -> Result<()> {
-    if !force && last_build(root)?.is_some_and(|last| last != source) {
+fn changed_since_last_build(before: Option<&Record>, source: &str, force: bool) -> Result<()> {
+    if !force && before.is_some_and(|b| b.source != source) {
         bail!(
-            "the image (its reference, Dockerfile or devcontainer.json) changed since the last run — read the \
-             change, then rebuild with `ssai sandbox prepare <client>`"
+            "the image (its reference — sandbox.json's or your organisation's default —, Dockerfile or \
+             devcontainer.json) changed since the last run — read the change, then rebuild with \
+             `ssai sandbox prepare <client>`"
         );
     }
     Ok(())
@@ -160,8 +128,8 @@ fn changed_since_last_build(root: &Path, source: &str, force: bool) -> Result<()
 /// before any guard. Only a project's first image is built on a run; every
 /// later build (a changed recipe, or an image removed since) waits for `ssai
 /// sandbox prepare` (`force`), after the developer has read what it builds.
-fn rebuild_needs_prepare(root: &Path, force: bool) -> Result<()> {
-    if !force && last_build(root)?.is_some() {
+fn rebuild_needs_prepare(before: Option<&Record>, force: bool) -> Result<()> {
+    if !force && before.is_some() {
         bail!(
             "the project's image needs a rebuild (its Dockerfile, devcontainer.json or build context may have \
              changed) — read them, then rebuild with `ssai sandbox prepare <client>`"
@@ -194,13 +162,11 @@ fn metadata_entries(label: &str) -> Vec<serde_json::Value> {
 
 /// The lifecycle of an image's metadata entries: the variables of every
 /// entry, the commands of a feature's only (an entry with an `id`). An entry
-/// without one is the `devcontainer.json` the image was built from — the
-/// project's own, for an image built from it, which runs its commands
-/// itself; `say_own` names the commands left out (an image this project did
-/// not build). One this parser cannot read is passed to `skipped` and left out.
+/// without one is the `devcontainer.json` an image was built from: its
+/// commands are named as not run. One this parser cannot read is passed to
+/// `skipped` and left out.
 fn label_lifecycle(
     entries: &[serde_json::Value],
-    say_own: bool,
     expand: &dyn Fn(&str) -> Result<String>,
     skipped: &dyn Fn(usize, anyhow::Error),
 ) -> Lifecycle {
@@ -211,13 +177,8 @@ fn label_lifecycle(
             if entry.contains_key("id") || (theirs.create.is_empty() && theirs.start.is_empty()) {
                 return Ok(theirs);
             }
-            if say_own {
-                let hooks: Vec<&str> = theirs.create.iter().chain(&theirs.start).map(|s| s.hook.as_str()).collect();
-                eprintln!(
-                    "ssai: the image's own devcontainer.json commands ({}) are not run — only its features' are",
-                    hooks.join(", ")
-                );
-            }
+            let hooks: Vec<&str> = theirs.create.iter().chain(&theirs.start).map(|s| s.hook.as_str()).collect();
+            eprintln!("ssai: the image's own devcontainer.json commands ({}) are not run — only its features' are", hooks.join(", "));
             Ok(theirs.env_only())
         });
         match theirs {
@@ -235,23 +196,32 @@ fn metadata_users(entries: &[serde_json::Value]) -> (Option<String>, Option<Stri
     (last("remoteUser"), last("containerUser"))
 }
 
-/// The base image's reference, pulled or built when absent (or `force`).
+/// The base image's reference, pulled or built when absent (or `force`). The
+/// record names the image once it is there; an image the sandbox's pull added
+/// is marked as the sandbox's, for `ssai sandbox prune`. A run removes no
+/// image: disk is freed on the developer's request (`images`).
 fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String> {
-    engine_turned_on(root, config.docker, force)?;
+    let before = images::read(root)?;
+    let before = before.as_ref();
+    engine_turned_on(before, config.docker, force)?;
     if let ImageSource::Build { context, dockerfile, .. } = &config.source {
         confined(root, dockerfile, "dockerfile")?;
         confined(root, context, "context")?;
     }
+    let record = |source: &str| Record { source: source.to_string(), engine: config.docker, project: None };
+    // A build under the tag `tag`, when absent or `force`.
+    let build = |tag: &str, run: &dyn Fn() -> Result<()>| -> Result<()> {
+        if force || !exists(tag)? {
+            rebuild_needs_prepare(before, force)?;
+            run()?;
+        }
+        images::write(root, &record(tag))
+    };
     // `features` apply to an `image` and a `build` alike, and only the
     // devcontainer CLI applies them.
-    if config.has_features {
-        let tag = format!("localhost/ssai-base:{}", build_hash(root, config)?);
-        if force || !exists(&tag)? {
-            rebuild_needs_prepare(root, force)?;
-            build_with_devcontainer_cli(root, config, &tag)?;
-        }
-        // The image this run uses is the one a later change is compared with.
-        record_build(root, &tag, config.docker)?;
+    if config.features.is_some() {
+        let tag = format!("{}{}", images::BUILD_PREFIX, build_hash(root, config)?);
+        build(&tag, &|| build_with_devcontainer_cli(root, config, &tag))?;
         return Ok(tag);
     }
     match &config.source {
@@ -260,20 +230,29 @@ fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String>
             // before any guard: a reference changed since the last run (the
             // agent can edit it) is pulled only after a `prepare`.
             let source = format!("image:{reference}");
+            let now = record(&source);
+            let old = if exists(reference)? { Some(inspect(reference, "{{.Id}}")?) } else { None };
             // A `localhost/` image exists only on this machine: no registry
             // serves it, so a `prepare` uses it as it is.
-            if (force && !local_only(reference)) || !exists(reference)? {
-                changed_since_last_build(root, &source, force)?;
-                eprintln!("ssai: pulling {reference} for the docker sandbox");
-                podman(&["pull", reference]).with_context(|| format!("pull {reference}"))?;
+            if !((force && !local_only(reference)) || old.is_none()) {
+                images::write(root, &now)?;
+                return Ok(reference.clone());
             }
-            record_build(root, &source, config.docker)?;
+            changed_since_last_build(before, &source, force)?;
+            eprintln!("ssai: pulling {reference} for the docker sandbox");
+            podman(&["pull", reference]).with_context(|| format!("pull {reference}"))?;
+            images::write(root, &now)?;
+            // The sandbox made the image when its pull added it — or brought a
+            // new id under a name an earlier pull of its own added; never under
+            // a name the developer had.
+            if old.as_deref().is_none_or(images::pulled_by_sandbox) {
+                images::mark_pulled(&inspect(reference, "{{.Id}}")?);
+            }
             Ok(reference.clone())
         }
         ImageSource::Build { context, dockerfile, target, args } => {
-            let tag = format!("localhost/ssai-base:{}", build_hash(root, config)?);
-            if force || !exists(&tag)? {
-                rebuild_needs_prepare(root, force)?;
+            let tag = format!("{}{}", images::BUILD_PREFIX, build_hash(root, config)?);
+            build(&tag, &|| {
                 eprintln!("ssai: building {} for the docker sandbox", dockerfile.display());
                 let mut a: Vec<String> = vec![
                     "build".into(),
@@ -291,61 +270,139 @@ fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String>
                     a.extend(["--build-arg".into(), format!("{k}={v}")]);
                 }
                 a.push(path(context));
-                podman(&a.iter().map(String::as_str).collect::<Vec<_>>()).context("build the project's image")?;
-            }
-            record_build(root, &tag, config.docker)?;
+                podman(&a.iter().map(String::as_str).collect::<Vec<_>>()).context("build the project's image")
+            })?;
             Ok(tag)
         }
     }
 }
 
-/// An image whose `devcontainer.json` has `features` is built by the
-/// devcontainer CLI, driving podman; without it, refused naming the install.
-fn build_with_devcontainer_cli(root: &Path, config: &DockerConfig, tag: &str) -> Result<()> {
-    let Some(dc) = &config.devcontainer else { bail!("features without a devcontainer.json") };
-    eprintln!("ssai: building {} (with its features) for the docker sandbox", dc.display());
-    let status = Command::new("devcontainer")
-        .args(["build", "--docker-path", "podman", "--workspace-folder"])
-        .arg(root)
-        .arg("--config")
-        .arg(dc)
-        .args(["--image-name", tag])
-        .stdin(Stdio::null())
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => bail!("the devcontainer CLI could not build {} ({s})", dc.display()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "{} uses `features`, which only the devcontainer CLI builds — install it \
-             (`npm install -g @devcontainers/cli`), or drop the features and install them in the Dockerfile",
-            dc.display()
-        ),
-        Err(e) => Err(e).context("run the devcontainer CLI"),
+/// What the Dev Container CLI builds an image with `features` from: a copy of
+/// the project's `devcontainer.json` holding only what its build reads — the
+/// image or the build (its paths absolute, its variables expanded), the
+/// features and their order, the users (a feature's install scripts get them)
+/// and the workspace path (a feature option may name it). A lifecycle command
+/// or a variable is not in it: they are the project's file's, read at each
+/// run, and their change rebuilds nothing.
+fn features_recipe(config: &DockerConfig) -> serde_json::Value {
+    use serde_json::Value;
+    let mut recipe = config.features.clone().unwrap_or_default();
+    let cache_from = recipe.remove("cacheFrom");
+    match &config.source {
+        ImageSource::Image(reference) => {
+            recipe.insert("image".into(), Value::String(reference.clone()));
+        }
+        ImageSource::Build { context, dockerfile, target, args } => {
+            let mut build = serde_json::Map::new();
+            build.insert("dockerfile".into(), Value::String(path(dockerfile)));
+            build.insert("context".into(), Value::String(path(context)));
+            if let Some(t) = target {
+                build.insert("target".into(), Value::String(t.clone()));
+            }
+            if !args.is_empty() {
+                build.insert("args".into(), args.iter().map(|(k, v)| (k.clone(), Value::String(v.clone()))).collect());
+            }
+            if let Some(c) = cache_from {
+                build.insert("cacheFrom".into(), c);
+            }
+            recipe.insert("build".into(), Value::Object(build));
+        }
+    }
+    for (key, value) in [
+        ("remoteUser", &config.remote_user),
+        ("containerUser", &config.container_user),
+        ("workspaceFolder", &config.workspace_folder),
+    ] {
+        if let Some(v) = value {
+            recipe.insert(key.into(), Value::String(v.clone()));
+        }
+    }
+    Value::Object(recipe)
+}
+
+/// The project's feature lockfile, which pins the features' versions — where
+/// the Dev Container CLI looks for it beside `dc` — when there is one.
+fn feature_lockfile(dc: &Path) -> Result<Option<Vec<u8>>> {
+    let hidden = dc.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b"."));
+    let lock = dc.with_file_name(if hidden { ".devcontainer-lock.json" } else { "devcontainer-lock.json" });
+    match std::fs::read(&lock) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", lock.display())),
     }
 }
 
+/// An image whose `devcontainer.json` has `features` is built by the
+/// devcontainer CLI, driving podman, from [`features_recipe`] in a private
+/// directory of its own (the project's lockfile beside it); without the CLI,
+/// refused naming the install.
+fn build_with_devcontainer_cli(root: &Path, config: &DockerConfig, tag: &str) -> Result<()> {
+    let Some(dc) = &config.devcontainer else { bail!("features without a devcontainer.json") };
+    eprintln!("ssai: building {} (with its features) for the docker sandbox", dc.display());
+    let dir = private_build_dir("features")?;
+    let built = (|| {
+        let copy = dir.join("devcontainer.json");
+        std::fs::write(&copy, serde_json::to_vec_pretty(&features_recipe(config))?).context("write the features build's devcontainer.json")?;
+        if let Some(lock) = feature_lockfile(dc)? {
+            std::fs::write(dir.join("devcontainer-lock.json"), lock).context("copy the features' lockfile")?;
+        }
+        let status = Command::new("devcontainer")
+            .args(["build", "--docker-path", "podman", "--workspace-folder"])
+            .arg(root)
+            .arg("--config")
+            .arg(&copy)
+            .args(["--image-name", tag, "--label", &format!("{BASE_LABEL}=project")])
+            .stdin(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => bail!("the devcontainer CLI could not build {} ({s})", dc.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} uses `features`, which only the devcontainer CLI builds — install it \
+                 (`npm install -g @devcontainers/cli`), or drop the features and install them in the Dockerfile",
+                dc.display()
+            ),
+            Err(e) => Err(e).context("run the devcontainer CLI"),
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    built
+}
+
+/// A new private directory under the sandbox's build dir (`what-<pid>-<rand>`),
+/// never one that already exists.
+fn private_build_dir(what: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let parent = crate::state::cache_dir()?.join("sandbox-build");
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent).with_context(|| format!("create {}", parent.display()))?;
+    let dir = parent.join(format!("{what}-{}-{}", std::process::id(), hex::encode(rand::random::<[u8; 6]>())));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).with_context(|| format!("create {}", dir.display()))?;
+    Ok(dir)
+}
+
 /// What a build is built from (the context's other files are not followed —
-/// `ssai sandbox prepare` rebuilds after a change to them). With `features`,
-/// the whole devcontainer.json: the Dev Container CLI reads all of it, and
-/// writes its lifecycle commands into the image's metadata. Without, what
-/// `podman build` is given — the Dockerfile's text, its context, target and
-/// args — so a change to a lifecycle command or the environment needs no
-/// rebuild.
+/// `ssai sandbox prepare` rebuilds after a change to them): the Dockerfile's
+/// text, its context, target and args; with `features`, [`features_recipe`]
+/// and the features' lockfile too. A change to a lifecycle command or the
+/// environment needs no rebuild.
 fn build_hash(root: &Path, config: &DockerConfig) -> Result<String> {
     let mut h = Sha256::new();
     h.update(root.as_os_str().as_encoded_bytes());
-    if config.has_features
-        && let Some(dc) = &config.devcontainer
-    {
-        h.update(std::fs::read(dc).with_context(|| format!("read {}", dc.display()))?);
+    // Each part length-prefixed: no two recipes hash alike.
+    let mut part = |b: &[u8]| {
+        h.update((b.len() as u64).to_le_bytes());
+        h.update(b);
+    };
+    if config.features.is_some() {
+        part(&serde_json::to_vec(&features_recipe(config))?);
+        let lock = match &config.devcontainer {
+            Some(dc) => feature_lockfile(dc)?,
+            None => None,
+        };
+        part(lock.as_deref().unwrap_or(b"\0"));
     }
     if let ImageSource::Build { dockerfile, context, target, args } = &config.source {
-        h.update(std::fs::read(dockerfile).with_context(|| format!("read {}", dockerfile.display()))?);
-        // Each part length-prefixed: no two recipes hash alike.
-        let mut part = |b: &[u8]| {
-            h.update((b.len() as u64).to_le_bytes());
-            h.update(b);
-        };
+        part(&std::fs::read(dockerfile).with_context(|| format!("read {}", dockerfile.display()))?);
         part(dockerfile.as_os_str().as_encoded_bytes());
         part(context.as_os_str().as_encoded_bytes());
         part(target.as_deref().unwrap_or("\0").as_bytes());
@@ -357,27 +414,29 @@ fn build_hash(root: &Path, config: &DockerConfig) -> Result<String> {
     Ok(hex::encode(&h.finalize()[..12]))
 }
 
-/// The agent layer: `package` installed on the base, tagged by the base's
-/// id, built when absent (or `force`).
-fn agent_layer(base_id: &str, package: &str, force: bool) -> Result<String> {
-    let recipe = layer_dockerfile(base_id, package);
-    let tag = layer_tag(package, base_id, &recipe);
+/// The agent layer on the base: Docker Engine when `engine` and the image
+/// has none, and the client `npm` (with the Node runtime it runs on); tagged
+/// by the base's id and the recipe, built when absent (or `force`).
+fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> Result<String> {
+    let node = match npm {
+        Some(_) => Some(NodeDist::for_image(base_id)?),
+        None => None,
+    };
+    let recipe = layer_dockerfile(base_id, npm.zip(node.as_ref()), engine);
+    let tag = layer_tag(npm, engine, base_id, &recipe);
     if !force && exists(&tag)? {
         return Ok(tag);
     }
-    eprintln!("ssai: installing {package} into the docker sandbox's image");
+    let what: Vec<&str> = [engine.then_some("Docker Engine (when the image has none)"), npm].into_iter().flatten().collect();
+    eprintln!("ssai: installing {} into the docker sandbox's image", what.join(" and "));
     // An empty, private context (the Dockerfile comes on stdin): created
-    // new, never one that already exists.
-    let context = {
-        use std::os::unix::fs::DirBuilderExt;
-        let parent = crate::state::cache_dir()?.join("sandbox-build");
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent)
-            .with_context(|| format!("create {}", parent.display()))?;
-        let dir = parent.join(format!("layer-{}-{}", std::process::id(), hex::encode(rand::random::<[u8; 6]>())));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir).context("create the agent layer's build context")?;
-        dir
-    };
+    // new, never one that already exists. It holds only the Node archive.
+    let context = private_build_dir("layer")?;
     let built = (|| {
+        if let Some(node) = &node {
+            let archive = node.fetch()?;
+            std::fs::copy(&archive, context.join(node.file())).context("put the Node archive in the build context")?;
+        }
         // A forced rebuild skips the layer cache, or the cached `npm install`
         // step would keep the release it installed last time.
         let mut child = Command::new("podman")
@@ -396,7 +455,7 @@ fn agent_layer(base_id: &str, package: &str, force: bool) -> Result<String> {
             .and_then(|mut s| Ok(std::io::Write::write_all(&mut s, recipe.as_bytes())?));
         let status = child.wait()?;
         if !status.success() {
-            bail!("could not install {package} into the image ({status})");
+            bail!("could not install {} into the image ({status})", what.join(" and "));
         }
         written
     })();
@@ -404,17 +463,25 @@ fn agent_layer(base_id: &str, package: &str, force: bool) -> Result<String> {
     built.map(|()| tag)
 }
 
-/// `localhost/ssai-agent-<package>:<base id, 12 hex>-<recipe, 8 hex>`: named
-/// by the package, which `run` and `sandbox prepare` resolve alike whatever
-/// name the client is launched by; the recipe is in the tag, so a layer an
-/// earlier `ssai` built another way is never taken for this one.
-fn layer_tag(package: &str, base_id: &str, recipe: &str) -> String {
-    let name: String = package.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+/// `localhost/ssai-agent-<name>:<base id, 12 hex>-<recipe, 8 hex>`: named
+/// by the package (`engine` without one; `<package>-with-engine` with both),
+/// which `run` and `sandbox prepare` resolve alike whatever name the client
+/// is launched by; the recipe is in the tag, so a layer an earlier `ssai`
+/// built another way is never taken for this one. A layer with an engine and
+/// one without are two repositories: two projects on one base, one with an
+/// engine, keep a layer each.
+fn layer_tag(package: Option<&str>, engine: bool, base_id: &str, recipe: &str) -> String {
+    let name: String = package
+        .unwrap_or("engine")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
     // A reference component may not start or end with a separator.
     let name = name.trim_matches('-');
+    let name = if package.is_some() && engine { format!("{name}-with-engine") } else { name.to_string() };
     let id = base_id.trim_start_matches("sha256:");
     let recipe = hex::encode(Sha256::digest(recipe.as_bytes()));
-    format!("localhost/ssai-agent-{name}:{}-{}", &id[..id.len().min(12)], &recipe[..8])
+    format!("{}{name}:{}-{}", images::LAYER_PREFIX, &id[..id.len().min(12)], &recipe[..8])
 }
 
 /// Where the agent layer installs the client, first on the agent's `PATH`.
@@ -423,15 +490,200 @@ fn layer_tag(package: &str, base_id: &str, recipe: &str) -> String {
 /// install there.
 pub const AGENT_PREFIX: &str = "/opt/ssai-agent";
 
-/// The layer's recipe: `package` and the base alone, so every name the client
-/// is launched by builds (and finds) the same layer.
-fn layer_dockerfile(base_id: &str, package: &str) -> String {
-    format!(
-        "FROM {base_id}\nUSER root\nRUN command -v npm >/dev/null 2>&1 || {{ echo \"ssai: the image has no npm — add \
-         Node.js to it to run {package} in the docker sandbox\" >&2; exit 1; }}; \
-         npm install -g --prefix {AGENT_PREFIX} {package}@latest\n\
-         ENV PATH={AGENT_PREFIX}/bin:${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}\n"
-    )
+/// The Node release the clients run on — the layer's own, beside the image's
+/// (if any), which the project keeps. Pinned with each archive's SHA-256, as
+/// the publisher lists it; the musl builds are the publisher's unofficial
+/// ones.
+const NODE_VERSION: &str = "v24.22.3";
+const NODE_ARCHIVES: [(&str, &str, &str); 4] = [
+    ("x64", "", "061ec3e3062115705b56b51fa9cc330ab50d34b6969387d4e4b1a50c6809acc2"),
+    ("arm64", "", "261af2af250dfd7e9f25cf151d1b2713a0adf8f10a9ad116c4947f68627affe8"),
+    ("x64", "-musl", "2db4f8a40abe5f5b5d119964223fedc9c4c7c5e7c632901ae860af522c7844b2"),
+    ("arm64", "-musl", "248c96a84f6c8338646b9fd73bf125124678f8fb08db5f23023f462055e0eedc"),
+];
+/// The largest archive accepted (they are ~30 MB).
+const NODE_ARCHIVE_CAP: usize = 128 << 20;
+
+/// The Node archive for one image: this machine's architecture, the image's
+/// C library.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeDist {
+    arch: &'static str,
+    libc: &'static str,
+    sha256: &'static str,
+}
+
+impl NodeDist {
+    fn new(arch: &str, musl: bool) -> Result<Self> {
+        let arch = match arch {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            other => bail!("the docker sandbox has no Node runtime for {other} — run the client with another sandbox"),
+        };
+        let libc = if musl { "-musl" } else { "" };
+        let (arch, libc, sha256) =
+            NODE_ARCHIVES.iter().copied().find(|(a, l, _)| *a == arch && *l == libc).context("no pinned Node archive")?;
+        Ok(Self { arch, libc, sha256 })
+    }
+
+    fn for_image(base_id: &str) -> Result<Self> {
+        Self::new(std::env::consts::ARCH, image_is_musl(base_id)?)
+    }
+
+    /// `node-v…-linux-x64[-musl]`: the archive's top directory.
+    fn dir(&self) -> String {
+        format!("node-{NODE_VERSION}-linux-{}{}", self.arch, self.libc)
+    }
+
+    fn file(&self) -> String {
+        format!("{}.tar.gz", self.dir())
+    }
+
+    fn url(&self) -> String {
+        let host = if self.libc.is_empty() { "https://nodejs.org/dist" } else { "https://unofficial-builds.nodejs.org/download/release" };
+        format!("{host}/{NODE_VERSION}/{}", self.file())
+    }
+
+    /// The archive, from this machine's cache or downloaded into it; its
+    /// checksum verified either way.
+    fn fetch(&self) -> Result<PathBuf> {
+        let dir = crate::state::cache_dir()?.join("sandbox-node");
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        let path = dir.join(self.file());
+        if let Ok(bytes) = std::fs::read(&path)
+            && hex::encode(Sha256::digest(&bytes)) == self.sha256
+        {
+            return Ok(path);
+        }
+        eprintln!("ssai: downloading Node {NODE_VERSION} for the docker sandbox ({})", self.url());
+        let url = self.url();
+        let bytes = std::thread::spawn(move || -> Result<Vec<u8>> {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            rt.block_on(async {
+                let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()?;
+                let mut resp = client.get(&url).send().await?.error_for_status()?;
+                let mut body = Vec::new();
+                while let Some(chunk) = resp.chunk().await? {
+                    if body.len() + chunk.len() > NODE_ARCHIVE_CAP {
+                        bail!("{url} is larger than any Node archive");
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(body)
+            })
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("the Node download stopped"))?
+        .with_context(|| format!("download {}", self.url()))?;
+        let got = hex::encode(Sha256::digest(&bytes));
+        if got != self.sha256 {
+            bail!("{} does not match its pinned checksum (got {got}) — not used", self.url());
+        }
+        let part = dir.join(format!("{}.part-{}", self.file(), std::process::id()));
+        std::fs::write(&part, &bytes).with_context(|| format!("write {}", part.display()))?;
+        std::fs::rename(&part, &path).with_context(|| format!("write {}", path.display()))?;
+        Ok(path)
+    }
+}
+
+/// Whether the image's C library is musl (Alpine and the like), probed once
+/// per base id: an image never changes under its id.
+fn image_is_musl(base_id: &str) -> Result<bool> {
+    let cache = musl_cache(base_id);
+    if let Some(path) = &cache
+        && let Ok(text) = std::fs::read_to_string(path)
+    {
+        match text.trim() {
+            "musl" => return Ok(true),
+            "glibc" => return Ok(false),
+            _ => {}
+        }
+    }
+    let Some(musl) = probe_musl(base_id)? else { return Ok(false) };
+    if let Some(path) = &cache {
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")));
+        let _ = std::fs::write(path, if musl { "musl" } else { "glibc" });
+    }
+    Ok(musl)
+}
+
+fn musl_cache(base_id: &str) -> Option<PathBuf> {
+    let id = hex::encode(&Sha256::digest(base_id.as_bytes())[..12]);
+    Some(crate::state::cache_dir().ok()?.join("sandbox-libc").join(id))
+}
+
+/// `Some(true)` for musl, `Some(false)` for any other C library; `None` when
+/// the probe did not answer (podman failed, no shell) — not cached, read as
+/// glibc for this run only.
+fn probe_musl(base_id: &str) -> Result<Option<bool>> {
+    let out = Command::new("podman")
+        .args(["run", "--rm", "--pull=never", "--network=none", "--user=0", "--entrypoint=/bin/sh", base_id, "-c"])
+        .arg("for f in /lib/ld-musl-*; do [ -e \"$f\" ] && { echo musl; exit 0; }; done; echo glibc")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .context("read the image's C library")?;
+    Ok(match String::from_utf8_lossy(&out.stdout).trim() {
+        "musl" if out.status.success() => Some(true),
+        "glibc" if out.status.success() => Some(false),
+        _ => None,
+    })
+}
+
+/// Docker Engine from the image's own distribution, when it has no
+/// `dockerd`: the engine, its CLI (a package of its own on Debian trixie),
+/// `iptables` (it needs one), compose and buildx where the distribution has
+/// them.
+const ENGINE_INSTALL: &str = "if ! command -v dockerd >/dev/null 2>&1; then \
+    if command -v apt-get >/dev/null 2>&1; then \
+      export DEBIAN_FRONTEND=noninteractive; apt-get update; \
+      apt-get install -y --no-install-recommends docker.io iptables ca-certificates; \
+      command -v docker >/dev/null 2>&1 || apt-get install -y --no-install-recommends docker-cli; \
+      apt-get install -y --no-install-recommends docker-compose-v2 || apt-get install -y --no-install-recommends docker-compose || true; \
+      apt-get install -y --no-install-recommends docker-buildx || true; \
+      rm -rf /var/lib/apt/lists/*; \
+    elif command -v apk >/dev/null 2>&1; then \
+      apk add --no-cache docker-engine docker-cli iptables ip6tables; \
+      apk add --no-cache docker-cli-compose docker-cli-buildx || true; \
+    elif command -v dnf >/dev/null 2>&1; then \
+      dnf install -y moby-engine iptables-nft; dnf install -y docker-compose || true; dnf clean all; \
+    else \
+      echo 'ssai: the image has no dockerd, nor apt-get, apk or dnf to add one with — install Docker Engine in the image' >&2; exit 1; \
+    fi; \
+  fi";
+
+/// The layer's recipe: the engine when asked for, then the client with its
+/// Node, the client package's own install scripts approved by name (npm 12
+/// skips an unapproved one, and a client such as OpenCode then cannot start);
+/// the base, `engine` and `client` alone, so every name the client is
+/// launched by builds (and finds) the same layer. The client's commands are
+/// put first on `PATH` as wrappers running it on the layer's Node; that Node
+/// is last on `PATH`, so the project's own `node` wins and an image without
+/// one still has `node`, `npm` and `npx` (an `npx` MCP server, say).
+fn layer_dockerfile(base_id: &str, client: Option<(&str, &NodeDist)>, engine: bool) -> String {
+    let mut df = format!("FROM {base_id}\nUSER root\n");
+    if engine {
+        df.push_str(&format!("RUN set -e; {ENGINE_INSTALL}\n"));
+    }
+    if let Some((package, node)) = client {
+        let musl = if node.libc.is_empty() { "" } else { "command -v apk >/dev/null 2>&1 && apk add --no-cache libstdc++ libgcc; " };
+        df.push_str(&format!(
+            "# node {sha}\nADD {file} {AGENT_PREFIX}/\n\
+             RUN set -e; {musl}mv {AGENT_PREFIX}/{dir} {AGENT_PREFIX}/node; \
+             PATH={AGENT_PREFIX}/node/bin:$PATH npm install -g --no-update-notifier --allow-scripts={package} --prefix {AGENT_PREFIX}/client {package}@latest; \
+             mkdir -p {AGENT_PREFIX}/bin; \
+             for f in {AGENT_PREFIX}/client/bin/*; do n=${{f##*/}}; \
+               if head -n 1 \"$f\" | grep -q node; then \
+                 printf '#!/bin/sh\\nexec {AGENT_PREFIX}/node/bin/node \"%s\" \"$@\"\\n' \"$f\" > {AGENT_PREFIX}/bin/$n; chmod 755 {AGENT_PREFIX}/bin/$n; \
+               else ln -s \"$f\" {AGENT_PREFIX}/bin/$n; fi; \
+             done\n\
+             ENV PATH={AGENT_PREFIX}/bin:${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}:{AGENT_PREFIX}/node/bin\n",
+            sha = node.sha256,
+            file = node.file(),
+            dir = node.dir(),
+        ));
+    }
+    df
 }
 
 /// The agent user's ids, from the image's `/etc/passwd`, cached per (base id,
@@ -523,6 +775,8 @@ fn local_only(reference: &str) -> bool {
     reference.starts_with("localhost/")
 }
 
+/// Whether `image` is on this machine: podman's 0 or 1; any other answer is
+/// an error, never "absent" (a pull would then be taken for the sandbox's).
 fn exists(image: &str) -> Result<bool> {
     let status = Command::new("podman")
         .args(["image", "exists", image])
@@ -530,7 +784,11 @@ fn exists(image: &str) -> Result<bool> {
         .stderr(Stdio::null())
         .status()
         .context("run podman")?;
-    Ok(status.success())
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!("podman could not say whether {image} is on this machine ({status})"),
+    }
 }
 
 /// An image's `Config.Env` (`["K=V", …]`, or `null`) as pairs.
@@ -635,28 +893,106 @@ mod tests {
         }
         std::fs::write(root.join(".devcontainer/Dockerfile"), "FROM b\n").unwrap();
         assert_ne!(base, hash(r#"{"build": {"dockerfile": "Dockerfile"}, "postCreateCommand": "a"}"#), "the Dockerfile's text");
-        // With features the Dev Container CLI reads the whole file, its commands into the image's metadata.
-        let f = r#"{"build": {"dockerfile": "Dockerfile"}, "features": {"ghcr.io/x/y:1": {}}, "postCreateCommand": "a"}"#;
-        assert_ne!(hash(f), hash(&f.replace(r#""a""#, r#""b""#)));
+        // With features: what the Dev Container CLI's build reads, never a lifecycle command or a variable.
+        let f = r#"{"build": {"dockerfile": "Dockerfile"}, "features": {"ghcr.io/x/y:1": {"v": "1"}}, "postCreateCommand": "a"}"#;
+        let with_features = hash(f);
+        assert_ne!(with_features, base, "features are part of the build");
+        for same in [
+            f.replace(r#""postCreateCommand": "a""#, r#""postCreateCommand": "b", "postStartCommand": "c""#),
+            f.replace(r#""postCreateCommand": "a""#, r#""remoteEnv": {"A": "2"}, "containerEnv": {"B": "3"}"#),
+        ] {
+            assert_eq!(with_features, hash(&same), "{same}");
+        }
+        for other in [
+            f.replace(r#"{"v": "1"}"#, r#"{"v": "2"}"#),
+            f.replace(r#""ghcr.io/x/y:1""#, r#""ghcr.io/x/y:2""#),
+            f.replace(r#""postCreateCommand": "a""#, r#""overrideFeatureInstallOrder": ["ghcr.io/x/y"]"#),
+            f.replace(r#""postCreateCommand": "a""#, r#""remoteUser": "dev""#),
+            f.replace(r#""dockerfile": "Dockerfile""#, r#""dockerfile": "Dockerfile", "target": "t""#),
+        ] {
+            assert_ne!(with_features, hash(&other), "{other}");
+        }
+        // The features' lockfile pins their versions.
+        std::fs::write(root.join(".devcontainer/devcontainer-lock.json"), "{}").unwrap();
+        assert_ne!(with_features, hash(f), "the lockfile");
+        std::fs::write(root.join(".devcontainer/Dockerfile"), "FROM c\n").unwrap();
+        let locked = hash(f);
+        std::fs::write(root.join(".devcontainer/Dockerfile"), "FROM d\n").unwrap();
+        assert_ne!(locked, hash(f), "the Dockerfile's text, with features too");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
+    fn the_features_build_is_given_what_it_reads_and_no_lifecycle() {
+        let root = Path::new("/home/dev/app");
+        let dc = r#"{"build": {"dockerfile": "Dockerfile", "args": {"V": "${localWorkspaceFolderBasename}"}, "cacheFrom": "c/d"},
+            "features": {"ghcr.io/x/y:1": {"v": "1"}}, "overrideFeatureInstallOrder": ["ghcr.io/x/y"],
+            "remoteUser": "dev", "workspaceFolder": "/w", "postCreateCommand": "a", "remoteEnv": {"A": "1"}, "containerEnv": {"B": "2"}}"#;
+        let config = super::super::config::resolve(root, &super::super::config::example(r#"{"devcontainer": ".devcontainer/devcontainer.json"}"#), &|_| {
+            Ok(dc.to_string())
+        })
+        .unwrap();
+        let recipe = features_recipe(&config);
+        assert_eq!(
+            recipe,
+            serde_json::json!({
+                "build": {"dockerfile": "/home/dev/app/.devcontainer/Dockerfile", "context": "/home/dev/app/.devcontainer",
+                          "args": {"V": "app"}, "cacheFrom": "c/d"},
+                "features": {"ghcr.io/x/y:1": {"v": "1"}},
+                "overrideFeatureInstallOrder": ["ghcr.io/x/y"],
+                "remoteUser": "dev",
+                "workspaceFolder": "/w",
+            })
+        );
+        let image = super::super::config::resolve(root, &super::super::config::example(r#"{"devcontainer": ".devcontainer/devcontainer.json"}"#), &|_| {
+            Ok(r#"{"image": "ubuntu", "features": {"f:1": {}}}"#.to_string())
+        })
+        .unwrap();
+        assert_eq!(features_recipe(&image), serde_json::json!({"image": "ubuntu", "features": {"f:1": {}}}));
+    }
+
+    #[test]
     fn the_agent_layer_is_tagged_by_its_base_and_installs_the_latest_package() {
-        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", "@anthropic-ai/claude-code");
-        let tag = layer_tag("@anthropic-ai/claude-code", "sha256:0123456789abcdef0123", &recipe);
+        let node = NodeDist::new("x86_64", false).unwrap();
+        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", Some(("@anthropic-ai/claude-code", &node)), false);
+        let tag = layer_tag(Some("@anthropic-ai/claude-code"), false, "sha256:0123456789abcdef0123", &recipe);
         let named = "localhost/ssai-agent-anthropic-ai-claude-code:0123456789ab-";
         assert!(tag.starts_with(named) && tag.len() == named.len() + 8, "{tag}");
-        assert!(layer_tag("Qwen.Code", "abc", "r").starts_with("localhost/ssai-agent-qwen-code:abc-"));
-        assert!(layer_tag("@scope/tool.", "abc", "r").starts_with("localhost/ssai-agent-scope-tool:abc-"));
+        assert!(layer_tag(Some("Qwen.Code"), false, "abc", "r").starts_with("localhost/ssai-agent-qwen-code:abc-"));
+        assert!(layer_tag(Some("@scope/tool."), false, "abc", "r").starts_with("localhost/ssai-agent-scope-tool:abc-"));
+        // With an engine, another repository; the engine alone, its own.
+        assert!(layer_tag(Some("x"), true, "abc", "r").starts_with("localhost/ssai-agent-x-with-engine:abc-"));
+        assert!(layer_tag(None, true, "abc", "r").starts_with("localhost/ssai-agent-engine:abc-"));
         // Another recipe on the same base is another layer.
-        assert_ne!(layer_tag("@anthropic-ai/claude-code", "sha256:0123456789abcdef0123", "FROM x\n"), tag);
-        let df = layer_dockerfile("sha256:aa", "@anthropic-ai/claude-code");
-        assert!(df.starts_with("FROM sha256:aa\nUSER root\n"), "{df}");
-        assert!(df.contains("npm install -g --prefix /opt/ssai-agent @anthropic-ai/claude-code@latest"), "{df}");
+        assert_ne!(layer_tag(Some("@anthropic-ai/claude-code"), false, "sha256:0123456789abcdef0123", "FROM x\n"), tag);
+        let df = recipe;
+        assert!(df.starts_with("FROM sha256:0123456789abcdef0123\nUSER root\n"), "{df}");
+        assert!(df.contains(&format!("ADD node-{NODE_VERSION}-linux-x64.tar.gz /opt/ssai-agent/\n")), "{df}");
+        assert!(
+            df.contains("npm install -g --no-update-notifier --allow-scripts=@anthropic-ai/claude-code --prefix /opt/ssai-agent/client @anthropic-ai/claude-code@latest"),
+            "the client's own install script approved (npm 12 skips an unapproved one): {df}"
+        );
+        // The layer's Node runs the client, whatever `node` comes first on PATH.
+        assert!(df.contains("exec /opt/ssai-agent/node/bin/node"), "{df}");
         // First on PATH, and never an empty entry (the working directory) when the image sets none.
-        assert!(df.ends_with("\nENV PATH=/opt/ssai-agent/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}\n"), "{df}");
-        assert!(df.contains("has no npm"), "{df}");
+        // The layer's Node last: the image's own `node` wins.
+        assert!(df.ends_with("\nENV PATH=/opt/ssai-agent/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:/opt/ssai-agent/node/bin\n"), "{df}");
+        assert!(!df.contains("dockerd"), "no engine unless asked: {df}");
+        // The engine alone, and with the client: each its own recipe.
+        let engine = layer_dockerfile("sha256:aa", None, true);
+        assert!(engine.contains("command -v dockerd") && engine.contains("docker.io iptables") && !engine.contains("npm"), "{engine}");
+        let both = layer_dockerfile("sha256:aa", Some(("@anthropic-ai/claude-code", &node)), true);
+        assert!(both.contains("command -v dockerd") && both.contains("npm install"), "{both}");
+        // A musl image gets the musl build, and the C++ runtime it needs.
+        let musl = NodeDist::new("x86_64", true).unwrap();
+        let df = layer_dockerfile("sha256:aa", Some(("x", &musl)), false);
+        assert!(df.contains("-linux-x64-musl.tar.gz") && df.contains("apk add --no-cache libstdc++"), "{df}");
+        assert!(musl.url().starts_with("https://unofficial-builds.nodejs.org/"));
+        assert!(node.url().starts_with("https://nodejs.org/dist/"));
+        // The pin is in the recipe: a new pin is a new layer.
+        assert!(layer_dockerfile("sha256:aa", Some(("x", &node)), false).contains(node.sha256));
+        assert!(NodeDist::new("riscv64", false).is_err());
+        assert_eq!(NodeDist::new("aarch64", false).unwrap().arch, "arm64");
     }
 
 
@@ -667,7 +1003,7 @@ mod tests {
             {"id": "ghcr.io/x/bad:1", "postCreateCommand": 7},
             {"postCreateCommand": "the project's copy", "remoteEnv": {"R": "2"}}]"#;
         let skipped = std::cell::RefCell::new(Vec::new());
-        let l = label_lifecycle(&metadata_entries(label), false, &|t| Ok(t.to_string()), &|i, _| skipped.borrow_mut().push(i));
+        let l = label_lifecycle(&metadata_entries(label), &|t| Ok(t.to_string()), &|i, _| skipped.borrow_mut().push(i));
         let argv: Vec<&str> = l.create.iter().map(|s| s.argv[2].as_str()).collect();
         assert_eq!(argv, ["feature"], "the entry without an id runs no command");
         assert_eq!(l.container_env, [("F".to_string(), "1".to_string())]);

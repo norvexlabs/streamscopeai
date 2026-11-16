@@ -13,6 +13,7 @@ pub mod companions;
 pub mod destination;
 pub mod fixture;
 pub mod render;
+pub mod sandbox_image;
 pub mod types;
 
 pub use companions::{companion_files, CompanionFile};

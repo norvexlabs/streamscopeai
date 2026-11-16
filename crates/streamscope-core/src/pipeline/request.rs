@@ -654,7 +654,9 @@ pub async fn transform_request(
                         .iter()
                         .map(|t| (t.id.clone(), t.name.clone(), t.arguments_json.clone()))
                         .collect();
-                    (m.role.clone(), m.content.clone(), tcs)
+                    // The answered result and the origin say which message
+                    // it is: a script changing either changed the messages.
+                    (m.role.clone(), m.content.clone(), tcs, m.tool_call_id.clone(), m.origin)
                 })
                 .collect::<Vec<_>>()
         };
@@ -707,9 +709,12 @@ pub async fn transform_request(
         step_diffs.extend(script_step_diffs);
         injection_blocks.extend(script_injection_blocks);
 
-        // Translate ctx-level change descriptions into typed flags.
+        // Translate ctx-level change descriptions into typed flags. A script
+        // edit with no place on the wire (`…_not_applied`) changed nothing it
+        // claims to: the row says not applied, never a modification.
         for change in change_descriptions {
             match change.as_str() {
+                c if c.ends_with("_not_applied") => badges.add(crate::audit::AuditBadge::ModifiedNotApplied),
                 "system_prompt" | "system_prompt_removed" => flags.system_prompt_modified = true,
                 "tools" => flags.tools_modified = true,
                 c if c.starts_with("message") => flags.messages_modified = true,
@@ -728,12 +733,21 @@ pub async fn transform_request(
         }
     }
 
-    // 2. Inject stream_options.include_usage for streaming ChatCompletions.
-    // Internal-only — not surfaced as a badge (operator-irrelevant).
+    // 2. Ask a streaming ChatCompletions upstream for the usage chunk — the
+    // gateway reads it for the audit and the budgets. Only `include_usage` is
+    // set: every other member the client sent (`include_obfuscation`) travels
+    // as it is, and what the client itself asked is honoured on the way back
+    // (`EventEmitter::with_chat_usage`). Internal-only — not surfaced as a
+    // badge (operator-irrelevant).
     if request.is_streaming()
         && let ApiRequest::ChatCompletions(req) = request
     {
-        req.stream_options = Some(serde_json::json!({"include_usage": true}));
+        match req.stream_options.as_mut().and_then(serde_json::Value::as_object_mut) {
+            Some(options) => {
+                options.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+            }
+            None => req.stream_options = Some(serde_json::json!({"include_usage": true})),
+        }
     }
 
     // 3. Sanitize request (tool names, etc.)
@@ -1459,6 +1473,34 @@ mod tests {
         if let ApiRequest::ChatCompletions(chat) = &request {
             let opts = chat.stream_options.as_ref().unwrap();
             assert_eq!(opts["include_usage"], true);
+        }
+    }
+
+    /// The upstream is asked for usage, and nothing else the client sent in
+    /// `stream_options` changes: a client's `include_usage: false` is turned
+    /// on (the gateway needs it, and withholds the chunk on the way back) and
+    /// `include_obfuscation` travels as sent.
+    #[tokio::test]
+    async fn stream_options_keeps_every_member_the_client_sent() {
+        let user = make_user_context_with_map(ModelMap::default());
+        let (engine, programs) = empty_engine_and_programs();
+        for (sent, expected) in [
+            (
+                serde_json::json!({"include_usage": false, "include_obfuscation": false}),
+                serde_json::json!({"include_usage": true, "include_obfuscation": false}),
+            ),
+            (serde_json::json!({"include_obfuscation": true}), serde_json::json!({"include_usage": true, "include_obfuscation": true})),
+            (serde_json::Value::Null, serde_json::json!({"include_usage": true})),
+        ] {
+            let mut request = make_chat_request("gpt-4o", true);
+            if let ApiRequest::ChatCompletions(chat) = &mut request {
+                chat.stream_options = Some(sent.clone());
+            }
+            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+                .await
+                .unwrap();
+            let ApiRequest::ChatCompletions(chat) = &request else { panic!("chat request") };
+            assert_eq!(chat.stream_options.as_ref(), Some(&expected), "sent {sent}");
         }
     }
 
@@ -2286,7 +2328,8 @@ mod tests {
             (ApiVersion::ChatCompletions, chat, chat_masked, vec!["4", "0"]),
             (ApiVersion::ChatCompletions, chat_blank, chat_blank_masked, vec!["5", "1"]),
             (ApiVersion::AnthropicMessages, anthropic.clone(), masked(&anthropic), vec!["4", "1"]),
-            (ApiVersion::GoogleGemini, gemini.clone(), masked(&gemini), vec!["3", "1"]),
+            // A content's function response goes before its text.
+            (ApiVersion::GoogleGemini, gemini.clone(), masked(&gemini), vec!["3", "0"]),
             (ApiVersion::Responses, responses_raw.clone(), masked(&responses_raw), vec!["3", "0"]),
             (ApiVersion::Responses, responses_messages.clone(), masked(&responses_messages), vec!["2", "0"]),
             (ApiVersion::Responses, responses_text.clone(), masked(&responses_text), vec!["0"]),

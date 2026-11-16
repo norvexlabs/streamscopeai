@@ -192,8 +192,14 @@ pub struct CreateWorkspaceRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// The ID-token claim the OIDC auto-membership rule reads (`groups`, `group`
+    /// on AD FS, `roles`). Set together with `oidc_claim_pattern`, or neither.
     #[serde(default)]
     pub oidc_claim_name: Option<String>,
+    /// A POSIX regular expression that must match one of the claim's values
+    /// WHOLE, case-sensitively: `RD` joins `RD`, never `RD-ext`; `RD|IT` joins
+    /// either; `.*IT.*` joins any value containing `IT`. A pattern Postgres
+    /// cannot compile, or a leading embedded option such as `(?i)`, is a 400.
     #[serde(default)]
     pub oidc_claim_pattern: Option<String>,
 }
@@ -204,8 +210,12 @@ pub struct UpdateWorkspaceRequest {
     pub name: Option<String>,
     #[serde(default, deserialize_with = "crate::routes::double_option::deserialize")]
     pub description: Option<Option<String>>,
+    /// The claim the OIDC auto-membership rule reads; `null` clears it. A
+    /// request naming either OIDC field must leave both set or both cleared.
     #[serde(default, deserialize_with = "crate::routes::double_option::deserialize")]
     pub oidc_claim_name: Option<Option<String>>,
+    /// The rule's pattern, matched against a claim value WHOLE — as on create;
+    /// `null` clears it.
     #[serde(default, deserialize_with = "crate::routes::double_option::deserialize")]
     pub oidc_claim_pattern: Option<Option<String>>,
     /// `private` or `members` — how much of this workspace one member sees of
@@ -631,6 +641,71 @@ async fn load_assignments(
     Ok(by_ws)
 }
 
+/// The longest OIDC rule field a save stores, in bytes. The sync compiles each
+/// rule's pattern at every sign-in its backend's regex cache misses, so the
+/// pattern's size is bounded where it is written.
+const OIDC_RULE_FIELD_MAX: usize = 1024;
+
+/// One OIDC rule field as a save stores it: trimmed (the sync trims the claim
+/// values too), and refused when blank — a field is cleared with `null`, never
+/// `""`, which would store a rule that matches nothing — when longer than
+/// [`OIDC_RULE_FIELD_MAX`], or when it holds a NUL, which Postgres cannot store.
+fn oidc_rule_field(value: Option<&str>, field: &'static str) -> Result<Option<String>, ApiError> {
+    let Some(value) = value else { return Ok(None) };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::bad_request(format!("the {field} cannot be blank; clear it with null")));
+    }
+    if value.len() > OIDC_RULE_FIELD_MAX {
+        return Err(ApiError::bad_request(format!(
+            "the {field} is longer than {OIDC_RULE_FIELD_MAX} bytes"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(ApiError::bad_request(format!("the {field} cannot contain a NUL character")));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// An OIDC rule is a claim and a pattern together: a pattern without the claim
+/// it reads never matches, and a claim without a pattern matches nothing.
+fn check_oidc_rule_pair(name: Option<&str>, pattern: Option<&str>) -> Result<(), ApiError> {
+    if name.is_some() != pattern.is_some() {
+        return Err(ApiError::bad_request(
+            "the OIDC claim name and pattern are set together, or both cleared",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a pattern the membership sync could not run. Postgres must compile
+/// it anchored, as the sync runs it (`oidc_whole_value_sql!`), and also as
+/// written: only a pattern balanced on its own stays inside the anchoring
+/// group (`a)|(b` would otherwise match part of a value). Two columns, so both
+/// are compiled — an `AND` would stop at the first false. The refusal is read
+/// from the SQLSTATE; inside a transaction it aborts it, so the caller returns
+/// the 400 without committing.
+async fn check_oidc_pattern(conn: &mut Scoped, pattern: &str) -> Result<(), ApiError> {
+    let compiled = sqlx::query(concat!(
+        "SELECT '' ~ $1::text, '' ~ ",
+        oidc_whole_value_sql!("$1::text")
+    ))
+    .bind(pattern)
+    .execute(&mut *conn)
+    .await;
+    match compiled {
+        Ok(_) => Ok(()),
+        Err(e) if super::is_invalid_regular_expression(&e) => Err(ApiError::bad_request(
+            "the OIDC claim pattern is not a valid regular expression (it must match a whole \
+             claim value; embedded options such as (?i) are not supported)",
+        )),
+        Err(e) => {
+            tracing::error!("check workspace OIDC pattern: {e}");
+            Err(super::db_read_error(&e, "the OIDC pattern could not be checked"))
+        }
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/admin/workspaces",
@@ -638,7 +713,7 @@ async fn load_assignments(
     request_body = CreateWorkspaceRequest,
     responses(
         (status = 201, description = "Workspace created", body = Workspace),
-        (status = 400, description = "Validation failed", body = ApiErrorResponse),
+        (status = 400, description = "Validation failed: no name, or an OIDC rule left half-set, blank, or with a pattern that does not compile", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
@@ -649,6 +724,12 @@ pub async fn create_workspace(
 ) -> Result<(axum::http::StatusCode, Json<Workspace>), ApiError> {
     if req.name.trim().is_empty() {
         return Err(ApiError::bad_request("name is required").code(ApiErrorCode::ValidationFailed));
+    }
+    let oidc_claim_name = oidc_rule_field(req.oidc_claim_name.as_deref(), "OIDC claim name")?;
+    let oidc_claim_pattern = oidc_rule_field(req.oidc_claim_pattern.as_deref(), "OIDC claim pattern")?;
+    check_oidc_rule_pair(oidc_claim_name.as_deref(), oidc_claim_pattern.as_deref())?;
+    if let Some(pattern) = &oidc_claim_pattern {
+        check_oidc_pattern(db.conn(), pattern).await?;
     }
 
     let tenant_id = db.tenant_uuid();
@@ -662,8 +743,8 @@ pub async fn create_workspace(
     .bind(tenant_id)
     .bind(req.name.trim())
     .bind(&req.description)
-    .bind(&req.oidc_claim_name)
-    .bind(&req.oidc_claim_pattern)
+    .bind(oidc_claim_name)
+    .bind(oidc_claim_pattern)
     .fetch_one(db.conn())
     .await
     .map_err(|e| {
@@ -817,7 +898,7 @@ fn client_access_assignment_allowed(
     request_body = UpdateWorkspaceRequest,
     responses(
         (status = 200, description = "Workspace updated", body = Workspace),
-        (status = 400, description = "Validation failed, or a profile choice the kind does not take", body = ApiErrorResponse),
+        (status = 400, description = "Validation failed (an OIDC rule left half-set, blank, or with a pattern that does not compile), or a profile choice the kind does not take", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -868,6 +949,19 @@ pub async fn update_workspace(
         }
     }
 
+    // `Some(None)` clears a field, `Some(Some(_))` sets it, `None` leaves it.
+    let oidc_claim_name = req
+        .oidc_claim_name
+        .as_ref()
+        .map(|v| oidc_rule_field(v.as_deref(), "OIDC claim name"))
+        .transpose()?;
+    let oidc_claim_pattern = req
+        .oidc_claim_pattern
+        .as_ref()
+        .map(|v| oidc_rule_field(v.as_deref(), "OIDC claim pattern"))
+        .transpose()?;
+    let touches_oidc_rule = oidc_claim_name.is_some() || oidc_claim_pattern.is_some();
+
     // One transaction: the workspace row UPDATE plus N per-kind assignment writes
     // are a single atomic change — a mid-sequence failure (e.g. a later kind's
     // profile 404s) must roll back the row edit and any earlier assignments.
@@ -896,10 +990,10 @@ pub async fn update_workspace(
     .bind(req.name.as_deref().map(str::trim))
     .bind(req.description.is_some())
     .bind(req.description.flatten())
-    .bind(req.oidc_claim_name.is_some())
-    .bind(req.oidc_claim_name.flatten())
-    .bind(req.oidc_claim_pattern.is_some())
-    .bind(req.oidc_claim_pattern.flatten())
+    .bind(oidc_claim_name.is_some())
+    .bind(oidc_claim_name.flatten())
+    .bind(oidc_claim_pattern.is_some())
+    .bind(oidc_claim_pattern.flatten())
     .bind(req.member_visibility.as_deref())
     .bind(req.counts_toward_tenant_budget)
     .bind(req.qos_class_id.is_some())
@@ -911,6 +1005,17 @@ pub async fn update_workspace(
         tracing::error!("update workspace: {e}");
         ApiError::internal("failed to update workspace")
     })?;
+    // The rule is judged on the row as it now stands, since a request may name
+    // one field and keep the other's stored value — which may be half a rule,
+    // or a pattern the check refuses. Only when the request names an OIDC
+    // field, so such a row still takes other edits. Returning drops the
+    // transaction, which rolls the UPDATE back.
+    if touches_oidc_rule {
+        check_oidc_rule_pair(ws.oidc_claim_name.as_deref(), ws.oidc_claim_pattern.as_deref())?;
+        if let Some(pattern) = ws.oidc_claim_pattern.as_deref() {
+            check_oidc_pattern(&mut tx, pattern).await?;
+        }
+    }
 
     // Apply per-kind profile assignment changes. Assignments live in a separate
     // table, so the generic `change_diff` (which snapshots the `workspaces` row)
@@ -2564,5 +2669,40 @@ mod limit_value_tests {
             assert!(validate_limit_values(None, None, Some(bad), None).is_err(), "{bad}");
             assert!(validate_limit_values(None, None, None, Some(bad)).is_err(), "{bad}");
         }
+    }
+}
+
+#[cfg(test)]
+mod oidc_rule_tests {
+    use super::{check_oidc_rule_pair, oidc_rule_field};
+
+    #[test]
+    fn a_rule_field_is_stored_trimmed_and_absent_stays_absent() {
+        assert_eq!(oidc_rule_field(Some("  RD \t"), "f").ok().flatten().as_deref(), Some("RD"));
+        assert_eq!(oidc_rule_field(Some("RD|IT"), "f").ok().flatten().as_deref(), Some("RD|IT"));
+        assert!(oidc_rule_field(None, "f").is_ok_and(|v| v.is_none()));
+    }
+
+    #[test]
+    fn a_blank_or_nul_rule_field_is_refused() {
+        for bad in ["", "   ", "\t\n", "R\0D"] {
+            assert!(oidc_rule_field(Some(bad), "f").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_rule_field_is_capped_at_its_length_and_trimmed_before_it_is_measured() {
+        let at_cap = "a".repeat(super::OIDC_RULE_FIELD_MAX);
+        assert!(oidc_rule_field(Some(&at_cap), "f").is_ok());
+        assert!(oidc_rule_field(Some(&format!(" {at_cap} ")), "f").is_ok());
+        assert!(oidc_rule_field(Some(&format!("{at_cap}a")), "f").is_err());
+    }
+
+    #[test]
+    fn a_rule_is_a_claim_and_a_pattern_together() {
+        assert!(check_oidc_rule_pair(Some("groups"), Some("RD")).is_ok());
+        assert!(check_oidc_rule_pair(None, None).is_ok());
+        assert!(check_oidc_rule_pair(Some("groups"), None).is_err());
+        assert!(check_oidc_rule_pair(None, Some("RD")).is_err());
     }
 }

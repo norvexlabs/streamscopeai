@@ -44,6 +44,7 @@ pub fn part_to_block(part: &A2aPart) -> DomainContentBlock {
         A2aPart::Text { text, .. } => DomainContentBlock::Text {
             text: text.clone(),
             cache_control: None,
+            citations: Vec::new(),
         },
         A2aPart::Raw {
             base64,
@@ -72,7 +73,7 @@ pub fn part_to_block(part: &A2aPart) -> DomainContentBlock {
                     cache_control: None,
                 };
             }
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: base64.clone(),
                 media_type: media_type.to_string(),
                 title: filename.clone(),
@@ -88,7 +89,7 @@ pub fn part_to_block(part: &A2aPart) -> DomainContentBlock {
             url,
             media_type,
             filename,
-        } => DomainContentBlock::File {
+        } => DomainContentBlock::File { detail: None,
             file_id: None,
             url: Some(url.clone()),
             media_type: media_type.clone(),

@@ -107,7 +107,7 @@ pub async fn run(selector: Option<&str>) -> Result<()> {
                     // A config the client's own rules or pins override is not
                     // `ok`, however intact the file is.
                     // The warnings are about the client's main config (its first file).
-                    let warnings = crate::opencode_global::for_managed(client);
+                    let warnings = crate::opencode_global::for_managed(client, paths.project_root());
                     for (i, file) in client.files.iter().enumerate() {
                         let path = expand_tilde(&file.path)?;
                         let overridden = i == 0 && warnings.iter().any(|w| w.overrides);

@@ -588,6 +588,10 @@ pub(crate) async fn validate_attachments(
     Ok(())
 }
 
+/// The seeded list of internal address ranges, blocked by default for the
+/// sandbox of a profile created from the seed.
+pub(crate) const INTERNAL_NETWORKS_SEED: &str = "internal-networks";
+
 /// The Web tool's attached lists as the config body carries them: every
 /// attached list's canonical entries, flattened by mode.
 pub(crate) async fn web_lists(conn: &mut Scoped) -> Result<streamscope_core::web::WebDestinationLists, sqlx::Error> {

@@ -165,7 +165,7 @@ pub struct BundleResponse {
 
 /// What a workspace is offered (`GET /portal/client-access`, and the bundle's
 /// `client_access`).
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct ClientAccess {
     /// The ids of the clients the workspace is offered.
     pub clients: Vec<String>,
@@ -173,7 +173,7 @@ pub struct ClientAccess {
 }
 
 /// What the sandbox may reach besides the gateway.
-#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct SandboxPolicy {
     /// Canonical destination entries attached as allow.
     pub allow: Vec<String>,
@@ -183,18 +183,25 @@ pub struct SandboxPolicy {
     pub revision: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq)]
 pub struct SandboxSettings {
     /// `ssai run --sandbox off` is refused.
     pub require_sandbox: bool,
     /// `ssai run --sandbox docker` is allowed.
     pub docker_tier: bool,
+    /// What the sandbox may reach besides the gateway, before any list.
+    #[serde(default)]
+    pub network: streamscope_client_templates::destination::Posture,
+    /// The container sandbox's image for a project without a
+    /// `.streamscopeai/sandbox.json`; none = such a project is refused.
+    #[serde(default)]
+    pub default_image: Option<streamscope_client_templates::sandbox_image::DefaultImage>,
 }
 
 impl Default for SandboxSettings {
     /// The server's default: the container sandbox is allowed.
     fn default() -> Self {
-        Self { require_sandbox: false, docker_tier: true }
+        Self { require_sandbox: false, docker_tier: true, network: Default::default(), default_image: None }
     }
 }
 

@@ -133,6 +133,7 @@ fn badges_without_content(badges: &mut [AuditBadge]) {
             | AuditBadge::ModifiedNotApplied
             | AuditBadge::Compressed
             | AuditBadge::JsonHealed
+            | AuditBadge::Refusal
             | AuditBadge::BlockOverflow { .. }
             | AuditBadge::ScriptError { .. }
             | AuditBadge::ProtocolTranslated { .. }

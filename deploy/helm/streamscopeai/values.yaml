@@ -100,7 +100,7 @@ postgres:
     # every other shape runs. Streamscope requires PostgreSQL 18+ and refuses to
     # boot on an older server. Another 18+ image may be set; never one below the
     # cluster's current major: CloudNativePG rejects a major-version downgrade.
-    imageName: "ghcr.io/cloudnative-pg/postgresql:18.6-standard-trixie@sha256:39add80f5b1e573e2f6b641c66fd1a2f8dede67ca0330e870285bc1078551390"
+    imageName: "ghcr.io/cloudnative-pg/postgresql:18.7-standard-trixie@sha256:23719505c7cc417b043ffd9998b44ab8d57fec1d92f0bf11b231a1754a5962f2"
     database: streamscope
     storage:
       size: 20Gi

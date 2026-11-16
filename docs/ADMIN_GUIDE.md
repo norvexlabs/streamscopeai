@@ -454,8 +454,8 @@ as they are).
     way except by signing in from *Admin Group*. An account in neither group is disabled at its
     next sign-in, as in any organization.
   - On every OIDC login, each workspace's auto-membership rule is checked against the claim that
-    workspace names (`oidc_claim_name` — `groups`, or `group` on AD FS) for additive workspace
-    auto-membership (step 8 of the workspace setup).
+    workspace names (`oidc_claim_name` — `groups`, or `group` on AD FS), its pattern matching a
+    whole value, for additive workspace auto-membership (step 8 of the workspace setup).
   - **Accept client ID metadata documents (CIMD)** (on by default, and independent of the
     sign-in mode) controls whether an MCP client may identify itself by a web address it
     publishes rather than by registering. See step 5.4 for what that means in practice.
@@ -518,7 +518,11 @@ as they are).
      every user has a mailbox (otherwise `upn`), and turn on **Accept addresses the provider does
      not mark as verified**. Enter *Admin Group* / *Read-only Group* exactly as AD FS sends them —
      plain group names with the rule above, case included.
-  5. **Workspace auto-membership** — set a workspace's `oidc_claim_name` to `group`.
+  5. **Workspace auto-membership** — set a workspace's `oidc_claim_name` to `group` (or the name
+     a claim rule of yours gives it), and its pattern to the group exactly as AD FS sends it: the
+     pre-Windows 2000 name, case included, with any special character escaped (step 8 of the
+     workspace setup). `Token-Groups - Unqualified Names` lists security groups only, so a
+     distribution group never arrives and joins nobody.
 
   A user who belongs to a single group arrives with that group as a plain value rather than a
   list; both shapes are read the same way.
@@ -967,7 +971,7 @@ gateway cannot compare the part that decides the answer, and it would rather mis
 Aliases with a preset attached show a **cached** chip in the route list.
 
 **What is never cached.** Responses the gateway cannot reproduce faithfully are served normally and
-left unstored: tool calls, generated media, errors, cut-short streams, and anything over the
+left unstored: tool calls, generated media, answers citing sources, refusals, errors, cut-short streams, and anything over the
 tenant's maximum cached-response size. The audit row says which of these applied, so an alias that
 never accumulates cached answers tells you why rather than looking silently broken.
 
@@ -1473,9 +1477,30 @@ A workspace is where access, budget, and key issuance come together.
      example, Background traffic off an expensive fallback provider when your own pool is full. A
      target that names no class accepts all of them.
 8. **(OIDC) Auto-membership** — set `oidc_claim_name` (the ID-token claim to read — e.g.
-   `groups`, or `group` on AD FS; one value or a list) + a POSIX `oidc_claim_pattern` so users
-   with a matching value auto-join on login (additive only — never removes or demotes). A claim
-   the sign-in does not carry matches nothing. Under header auth the proxy's group header is the
+   `groups`, or `group` on AD FS; one value or a list) + an `oidc_claim_pattern`, a POSIX regular
+   expression, so users with a matching value auto-join on login (additive only — never removes
+   or demotes). The two are set together. The pattern must match a **whole** value, case
+   included (spaces at either end of a value or of the pattern are ignored), and a user joins
+   when any one of their values matches:
+
+   | To join | Pattern | Joins | Does not join |
+   |---|---|---|---|
+   | One group | `RD` | `RD` | `RD-ext`, `CARD` |
+   | Any of several | `RD\|IT\|Sales` | `RD`, `IT`, `Sales` | `IT-Admins` |
+   | Starts with | `eng-.*` | `eng-web` | `old-eng-web` |
+   | Ends with | `.*-admins` | `it-admins` | `admins-ro` |
+   | Contains | `.*IT.*` | `IT-Admins`, `SECURITY` | `It-support` |
+   | Special characters | `R&D \(Paris\)` | `R&D (Paris)` | `R&D Paris` |
+   | Anyone with the claim | `.*` | any value | a sign-in without the claim |
+
+   Put a backslash before `. ( ) [ ] { } + * ? | ^ $ \` to match it literally. A pattern cannot
+   exclude a group — any other group the user has would still match — and embedded options such
+   as `(?i)` are not accepted. Saving checks the rule: a pattern that is not a valid regular
+   expression, or a claim name without a pattern (or the reverse), is refused; leaving the
+   pattern blank on the workspace page turns the rule off. Each value is one group: a provider
+   that sends several groups in one string must send them as a list instead. A user joins at their next sign-in
+   through the identity provider, not when the workspace is created: a session already open keeps
+   its memberships until then. A claim the sign-in does not carry matches nothing. Under header auth the proxy's group header is the
    `groups` claim. Name a claim your directory sets — never one users can edit themselves
    (`name`, `nickname`), or anyone could join by choosing a matching value.
 9. **(Optional) Policy profiles** — the workspace **Access** tab has one selector per policy
@@ -1973,7 +1998,8 @@ configuration.
 - **Which clients can be given one.** Claude Code (in a project: the server is written to the
   project's own MCP file, so provision it from inside the project), Claude Desktop, Cursor, Cline,
   Codex, Continue, Crush, Gemini CLI, Goose, Mistral Vibe, OpenCode and Qwen Code. Aider, Zed and
-  the curl / SDK snippets take no MCP server; Claude Code outside a project, and its MCP-only
+  the curl / SDK snippets take no MCP server; Open Code Review takes only the gateway's (it reads a
+  local server's variables as one list, which a re-provision would rewrite over your pasted values); Claude Code outside a project, and its MCP-only
   setups, register servers with a command of their own rather than a file, and are not given
   local ones. For those the server is left out and the Quickstart and the CLI say so; nothing is
   dropped silently. A client template you edit yourself declares whether it writes local servers
@@ -2114,8 +2140,10 @@ Every tenant has a built-in `/mcp/web` virtual server exposing `web_search` and
 `web_fetch`. Configure the backend (SearXNG is the supported backend; set `endpoint` — your installation may have set it for you, and you can change it; an endpoint you enter must be a public `http`/`https` URL, only the one your installation was given may be internal),  its
 **Destination lists** (§ 9c: a list attached as **allow** narrows the URLs the tools consider — search
 hits and fetch targets — to what it names, and an allowed list with no entries lets nothing through;
-a list attached as **block** removes what it names, and a block always wins; with nothing attached
-every public site passes), `max_results`, and a fetch byte cap. For the Web tool a destination list
+a list attached as **block** removes what it names, and a block always wins; with no allowed list
+every public site passes — the same default as the developers' sandbox, whose **Internet** setting
+blocks the internal networks with a list: for the Web tool the platform's web egress list keeps
+them out already), `max_results`, and a fetch byte cap. For the Web tool a destination list
 never opens an internal address: the platform's web egress list still decides those. `web_fetch` needs no
 backend: it is served on every tenant, through the same destination lists and SSRF guard. `web_search`
 is served once a search backend is configured — choosing no backend removes it again — and the
@@ -2617,7 +2645,14 @@ admin-console only (read-only accounts see them too).
   conversation show everything else; the missing content is simply absent.
 - **Sessions** (`/sessions`) — agentic conversations grouped into sessions and **replayed**
   turn-by-turn: messages, tool calls, thinking/reasoning blocks, and media, rendered the same way the
-  gateway saw them. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
+  gateway saw them. A message that cites sources (an Anthropic answer's web-search or document
+  citations, an OpenAI answer's web-page and file annotations, or such an answer sent back in a
+  conversation's history) carries a collapsed **Sources** list: each source's title or link, the file it
+  names, where in it the quote is, and the quote. A document shows the context the client set beside it,
+  and a file the detail it was sent with. An answer that is the model's refusal shows the refusal as its
+  text and carries the **Refusal** badge. A program the model ran (OpenAI programmatic tool calling)
+  shows as a tool call with its code, its output as the call's result, and a client's request to compact
+  the conversation as a compaction. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
   **badges** flag sessions the experts found noteworthy.
 - **Tool Calls** (`/tool-calls`) — every tool invocation (LLM and MCP) with the policy rule that
   classified, blocked, or rewrote it shown inline — the fastest way to audit what agents are doing.
@@ -2708,7 +2743,9 @@ metadata address is never reachable, whatever a list says. Lists ship **seeded**
 developer destinations — Docker Hub, GitHub Container Registry, GitHub, GitLab.com, npm, PyPI,
 crates.io, Go modules, Maven Central and Gradle, Ubuntu, Debian and Alpine packages, Microsoft and
 Quay container registries, Kubernetes downloads, Dev Container features — plus **Paste and
-file-sharing sites**, meant to be blocked. A seeded list behaves like every seeded item: editing it
+file-sharing sites** and **Internal networks** (the private, shared, loopback and link-local address
+ranges, IPv4 and IPv6), meant to be blocked — attached to every profile created fresh. Deleting it, or
+detaching it from a profile set to **Internet**, lets that profile's sandbox reach every private address. A seeded list behaves like every seeded item: editing it
 makes it yours (upgrades leave it alone), **Reset** puts it back, deleting it hides it, and
 **Restore seeded lists** brings back every one. Each list shows where it is attached. Deleting a list
 detaches it everywhere — except the Web tool's only allowed list, whose deletion is refused: without it
@@ -2720,7 +2757,8 @@ profiles you create for a team. Each line says which workspaces the profile is *
 many clients it offers.
 
 - **New profile** makes an independent copy — of the Default unless you pick another profile, or a
-  fresh one that offers every client and attaches no destination list. A profile owns its whole
+  fresh one that offers every client, with the sandbox's network set to **Internet** and the
+  **Internal networks** list blocked. A profile owns its whole
   content: a later change to the Default does not reach it, and a change to it does not reach the
   Default. The one thing profiles share is a destination list's entries — a profile attaches a list,
   it does not copy it, so editing the list on **Destinations** reaches every profile that attaches it.
@@ -2763,20 +2801,38 @@ Open a profile to edit it:
   **New** means exactly that: the client was added after this profile was created and is not offered
   on it. A profile created afterwards never shows it as new — a copy starts with what its source
   offers, switched on or off. **Offer all** and **Offer none** switch every client in one step.
-- **Sandbox** — what `ssai run` lets an agent reach besides the gateway: the destination lists
-  attached as allow or block. The gateway is always reachable; then a blocked destination is refused,
-  an allowed one permitted, and anything else refused. A new organization attaches nothing (the
-  gateway only); **Use the developer defaults** attaches, in one step, Docker Hub, GitHub Container
+- **Sandbox** — what `ssai run` lets an agent reach besides the gateway. The gateway is always
+  reachable. **Network** sets the rest:
+  - **Internet** — every destination a list attached as block does not name. A new organization's
+    Default, a profile created fresh, and a profile reset to the seed start here with **Internal
+    networks** blocked, so the sandbox reaches the internet but not the private address ranges; to let
+    it reach an internal service, remove that service's range from the list (a block always wins). An
+    internal service on a public or global IPv6 address — a developer's machine has one on a dual-stack
+    network — or reached through a NAT64 prefix is not covered: add it to the list.
+  - **Allowed lists only** — a blocked destination is refused, an allowed one permitted, and
+    anything else refused. A profile with no network setting stored reads this way.
+  - **Gateway only** — nothing besides the gateway; the attached lists are kept but not read.
+
+  A developer can narrow a run to the gateway alone (`ssai run --network gateway`, or, for the
+  container sandbox, `"network": "gateway"` in the project's `sandbox.json`; `--network policy` takes
+  the profile's again), never widen it. **Use the developer defaults** attaches, in one step, Docker Hub, GitHub Container
   Registry, GitHub, npm and Yarn, PyPI, crates.io, Go modules, Maven Central and Gradle and Ubuntu
   packages as allow, and the paste sites as block — each stays detachable; the other seeded lists
   (GitLab.com, Debian and Alpine packages, Microsoft and Quay registries, Kubernetes, Dev Container
   features) are yours to attach. Add your own internal services (registry, git server, artifact mirror) as a list of
-  your own and attach it beside them. **Require the sandbox** refuses `ssai run --sandbox off` and `--sandbox learn`
+  your own and attach it beside them — and, while **Internal networks** is blocked, remove their
+  ranges from it: a block on an address wins over an allowed name. **Require the sandbox** refuses `ssai run --sandbox off` and `--sandbox learn`
   (which leaves the filesystem unconfined); on Windows the developer first runs `ssai sandbox setup` once
   (see *The Windows sandbox* under [Set up tools with the `ssai` CLI](#set-up-tools-with-the-ssai-cli)). **Allow the container sandbox** (on by default) lets developers
   run `ssai run --sandbox docker`, which starts the agent in a container on their Linux machine; turned
-  off, that run is refused and names `--sandbox native`. Both settings apply to the workspaces on this
-  profile. `ssai` enforces these on the developer's machine: a guard against an agent's mistakes and
+  off, that run is refused and names `--sandbox native`. While it is on, **Default container image**
+  sets what such a run uses in a project with no `.streamscopeai/sandbox.json` of its own: an image
+  reference from a registry, **Docker engine inside**, and the container's **Memory** (`8g`) and
+  **CPUs** limits — **Save** stores them, **Remove the default** clears them. A project's own file replaces
+  all of it; without either, the run is refused and names the file to write. The sandbox adds the tool to
+  the image itself, as for any image. A developer's machine picks a change up on its next `ssai sync`,
+  or on its own within the hour, and asks for `ssai sandbox prepare` before pulling a new image. These
+  settings apply to the workspaces on this profile. `ssai` enforces these on the developer's machine: a guard against an agent's mistakes and
   injected instructions, not against a developer who edits their own machine. Traffic to an allowed
   destination does not pass the gateway, so it is not in the gateway's audit.
 - **Portal pages** — two switches for what members see of their own activity in the portal:
@@ -2820,14 +2876,16 @@ Once a workspace has a provider and a user has a portal password (or OIDC access
 them at the console host's root, `/` (or `/portal/login/{slug}`). There they:
 
 - **Quickstart** — opens on **Set up via CLI** (the `ssai` commands that configure every
-  installed tool at once, below); the **Web wizard** tab is the copy-paste alternative. In the
+  installed tool at once, below; under its run step, **How the sandbox works — modes and options**
+  opens a short reference: the run modes, what the tool can reach, keeping a container up to date,
+  and the other options); the **Web wizard** tab is the copy-paste alternative. In the
   wizard — which works in the workspace selected in the portal header and starts over when that
   changes; a configuration already on screen stays, under a notice, until they start over —
   they pick their client (Claude Code, opencode, Cursor, Cline, Claude Desktop,
-  Continue, Aider, Gemini CLI, Codex, Mistral Vibe, Qwen Code, Goose, Zed, generic curl/SDK); the wizard mints a key bound to the chosen
+  Continue, Aider, Gemini CLI, Codex, Mistral Vibe, Qwen Code, Goose, Zed, Open Code Review, generic curl/SDK); the wizard mints a key bound to the chosen
   provider and renders a copy-paste config with the right base URL, model alias, and flags.
   A tool that can speak both the OpenAI and the Anthropic protocol (OpenCode, Crush, Continue,
-  Cline, Aider) defaults to its **OpenAI-compatible** variant, which works with every model; its
+  Cline, Aider, Open Code Review) defaults to its **OpenAI-compatible** variant, which works with every model; its
   **Native Anthropic** variant is the one to pick for Claude
   models — extended thinking and prompt caching then pass through unchanged. Some tools read their key from a second file of their own — a secrets file, or an environment
   file the tool loads on start — and the wizard renders that file alongside the config, with the
@@ -2936,7 +2994,9 @@ Windows through a dedicated sandbox account, set up once by an administrator (**
 sandbox**, below). (`--ca-file` there gives the client, for that run, the roots Windows trusts plus
 the file's — it changes nothing in Windows' own trust.)
 
-If your gateway uses a private or self-signed certificate, the installer detects that the
+If your gateway uses a private or self-signed certificate, `curl` cannot fetch the installer itself
+until it trusts that certificate: ask your gateway operator for its root certificate and fetch with
+`curl -fsSL --cacert <that file> https://<portal-host>/api/v1/cli/install.sh | sh`. The installer detects that the
 certificate isn't trusted, captures the gateway's CA, and prints its SHA-256 fingerprint before
 offering to install it into the system trust store — compare that fingerprint against the value your
 gateway operator published and only accept if they match (the certificate is captured over an
@@ -3010,8 +3070,8 @@ added yourself to Mistral Vibe's `[[providers]]` / `[[models]]` or Continue's `m
 `mcpServers` stay where they are, beside the gateway's. A tool that's configured through its own UI (Cursor)
 prints setup instructions instead of writing a file, and a tool that can only be set up with an MCP
 server is skipped with a notice rather than failing the run. Supported in this release: Claude Code, Codex, Gemini CLI, OpenCode 2,
-Mistral Vibe, Qwen Code, Goose, Zed, Cursor, Cline, Continue, Aider, Crush, Claude Desktop, and the curl/SDK
-snippets (printed to the terminal). Your own entries in Aider's `set-env` list and Continue's `models` and `mcpServers` lists are kept beside the gateway's.
+Mistral Vibe, Qwen Code, Goose, Zed, Cursor, Cline, Continue, Aider, Crush, Claude Desktop, Open Code Review,
+and the curl/SDK snippets (printed to the terminal). Your own entries in Aider's `set-env` list and Continue's `models` and `mcpServers` lists are kept beside the gateway's.
 One caveat: Aider's, Continue's, and Goose's YAML config files keep all your settings but not
 your comments — the other formats preserve comments too, including a JSON config with comments or
 trailing commas (VS Code's `settings.json` for Cline, Gemini CLI's and Qwen Code's), which is edited in
@@ -3028,7 +3088,7 @@ JSON even allowing comments and trailing commas, or one with comments that repea
 rewritten — `provision` stops before writing anything for that tool and names the file.
 
 **Picking a variant.** A tool that can speak both the OpenAI and the Anthropic protocol (OpenCode,
-Crush, Continue, Cline, Aider) is provisioned with its OpenAI-compatible variant, which works with
+Crush, Continue, Cline, Aider, Open Code Review) is provisioned with its OpenAI-compatible variant, which works with
 every model. On a BYOK provider it gets the variant speaking that provider's own protocol instead,
 when it has one: your credential is forwarded as-is, and one a vendor issues for its own protocol (a
 subscription sign-in) works on nothing else. The Quickstart page picks the same, until you choose a
@@ -3100,7 +3160,7 @@ server, since Claude Code keeps its own state in the one file it reads them from
 and again when your servers change; `forget` and `restore` leave a server you added this way, which
 `claude mcp remove --scope user <name>` removes), `./.gemini/settings.json`, or `./.opencode/opencode.json` — and tracks what it wrote in a
 `./.streamscopeai/` folder inside the project. A project provisioning writes **only** project files: a
-tool that has only a global configuration (Codex, Continue, Crush, Goose, Qwen Code, Mistral Vibe —
+tool that has only a global configuration (Codex, Continue, Crush, Goose, Qwen Code, Mistral Vibe, Open Code Review —
 Continue's editor extension and CLI, for one, both read a single file in your home directory) is
 skipped with the command that provisions it globally (`ssai provision --global --client …`),
 unless you name it with `--client`, or tick it in the prompt and confirm writing it to your home
@@ -3111,7 +3171,7 @@ project that has a `./.streamscopeai/` folder (which otherwise auto-selects the 
 
 **OpenCode and your home-directory config.** OpenCode reads your home-directory config
 (`~/.config/opencode/opencode.json`) as well as the project's, and two of its settings outrank a
-project's: a provider rule (`experimental.policies`, or an older `enabled_providers` list) that
+project's: a provider rule (`policies`, `experimental.policies`, or an older `enabled_providers` list) that
 leaves the gateway's provider out, and a model pinned to an agent (`agents.build.model`, …). Every
 OpenCode config the CLI writes, project or home directory, therefore pins every built-in OpenCode
 agent (`build`, `plan`, `general`, `explore`, `compaction`, `title`, `summary`) to one of the
@@ -3122,11 +3182,14 @@ gateway model for yourself, pin it in a project config. Agents of your own, and 
 entries you define yourself in that file, are kept, except a rule of your own for `opencode` (below). A home-directory provider rule still wins over any project, so
 `provision` and `status` name the file and the exact line that would allow the gateway's
 provider when yours leaves it out (then restart OpenCode's background service with `opencode service
-restart`), and list every agent your home config, or another OpenCode config it loads, still pins to another provider it can use (one of your own, or a pin under
-the older `agent` key). An agent pinned to a provider your rules deny runs on the default model, so it is not listed. A **global** OpenCode
-provisioning adds that allow line itself: at the end of the file's provider rules, where OpenCode
-reads it last, or — when the file already has a rule for the gateway's provider — in that rule's
-place, which it then manages. Your other rules are kept, and a deny you add after it still wins. A project
+restart`), and list every agent your home config, or another OpenCode config it loads, still pins to another provider it can use (one of your own, in a config or in a Markdown agent file, or a pin under
+the older `agent` key). An agent pinned to a provider your rules deny runs on the default model, so it is not listed. They also name a config loaded after the
+gateway's that sets the default `model` to another provider: every agent without a model of its own runs there. A **global** OpenCode
+provisioning adds that allow line itself, in both of the file's lists of provider rules — `experimental.policies`
+and the top-level `policies`, which OpenCode 2.3 reads after it (an earlier OpenCode 2 reads only the first): at
+the end of each list, or — when a list already has a rule for the gateway's provider — in that rule's place, which
+it then manages. Your other rules are kept, so a `deny` on `*` in either list is lifted, and a deny you add after
+the allow in the top-level list still wins; `provision` and `status` name it. A project
 provisioning never writes your home-directory config.
 
 Every OpenCode config for the gateway's models, from the CLI or Web Quickstart, project or home
@@ -3153,16 +3216,28 @@ The configs for the other tools likewise turn off what each tool sends its own v
 your requests, wherever its config file has a switch for it: usage statistics, telemetry and crash
 reports, and update checks, for Claude Code, Codex, Gemini CLI, Qwen Code, Crush, Goose, Mistral
 Vibe, Aider and Zed. Continue's command-line client sends no usage data of its own (its metrics go
-only to a collector you configure yourself), and Cline and Cursor have no such
+only to a collector you configure yourself), and Open Code Review sends none unless
+`OCR_ENABLE_TELEMETRY=1` is set; its npm launcher's check for a newer release is switched off only by
+the environment (`OCR_NO_UPDATE=1`, which `ssai run` sets). Cline and Cursor have no such
 switch in the files the gateway writes. To turn one of these back on, edit that tool's client
 profile.
 
 Because a provisioned config can hold your gateway key, both the
 `./.streamscopeai/` folder and each written tool config are added to the project's `.gitignore`
-automatically, so a `git add .` never commits a credential. A file git already tracks (a team's
-committed `.claude/settings.json`, or a home directory that is itself a git repository) cannot be ignored
-that way, so when git reports the file tracked the CLI refuses to write your key into it and names
-the file. Keep that file out of git, or provision the tool in the other scope. When you run
+automatically, so a `git add .` never commits a credential. Where the project's `.gitignore` does
+not reach — a home directory that is itself a git repository, or a repository nested in the project
+(a submodule) — a file the CLI writes your key or sign-in tokens into (and the CLI's own files in
+its settings folder) is instead added to that repository's `.git/info/exclude`, which only your
+clone reads, and the CLI says so. A file git already tracks (a team's committed
+`.claude/settings.json`) cannot be ignored either way, so the CLI refuses to write your key into it
+and names the file; it refuses as well when a rule in that repository's `.gitignore` brings the file
+back (git reads it over `.git/info/exclude`), or when a git repository is above the file but git
+cannot answer for it (git not installed, a broken repository) — before signing in or asking for a key
+when it is its own settings folder. Keep that file out of git, or provision the tool in the other scope.
+A tracked file your clone marks `skip-worktree` or `assume-unchanged` (`git update-index`) is
+refused too — git does not promise that either mark keeps a change out of a commit — and the CLI says
+so; keep an ignored copy of a committed template instead. `ssai restore` checks the same way each
+file it puts back holding a gateway key, before it puts anything back. When you run
 `sync`, `status`, `forget`, or `restore` from inside a provisioned project they act on **that
 project**; run from anywhere else they act on your global setup.
 
@@ -3229,13 +3304,14 @@ pnpm registry tokens, the GitHub CLI's login) are kept out of reach. The tools y
 common version managers (nvm, fnm and n — each installed Node version's programs and libraries —
 pyenv, pipx, rbenv, RVM), plus `/nix` and `/snap` — so an agent can run `uv`, `cargo` or `npm` as
 it would unconfined. This grant is read-and-run only, for every tool. A Node-based tool (OpenCode,
-Claude Code, Gemini CLI, Qwen Code, Continue, Vibe) may also write where a global `npm install`
+Claude Code, Gemini CLI, Qwen Code, Continue, Open Code Review) may also write where a global `npm install`
 does — each installed nvm or fnm version's programs, libraries and manual pages — and to the package managers'
 caches, but never to npm's configuration files (`~/.npmrc`, or the global one each Node version
 keeps beside its programs), where a registry token is stored. Volta is the exception: a Node-based
 tool can write its whole directory, because Volta's own launchers run from all of it. On macOS the
 npm configuration inside Volta is still out of reach; on Linux it is not, so use nvm or fnm there if
-a registry token is kept in it. Gemini CLI reads a project's `.gemini/.env` only in a folder you have trusted, so trust the project
+a registry token is kept in it. A Python-based tool (Aider, Vibe) may write to uv's and pipx's
+folders and the pip and uv caches, where a `uv tool install` or `pipx install` puts it. Gemini CLI reads a project's `.gemini/.env` only in a folder you have trusted, so trust the project
 folder in Gemini (or pass it `--skip-trust`). The shared skills folder `~/.agents/skills` is readable
 inside the sandbox, and a tool's own state folders are created on its first run there. Each run
 gets its own private temporary folder under your cache folder (`~/.cache/streamscopeai/tmp`, or
@@ -3304,11 +3380,18 @@ plugins and commands, and its `permissions` rules (a deny you set on a shell com
 rule you want under `run` in the project's `.opencode/opencode.json`. `~/.opencode` and a repository's own
 `opencode.json` apply under `run` too (`~/.opencode` for a project under your home directory): that project file
 decides a provider rule ahead of them, and a model they pin on an agent replaces the one it pins, which `provision`
-and `status` report. A config in a subdirectory applies only when you start OpenCode there, and they do not read it, nor a default
-model set in one of those other files, nor an agent defined in a Markdown file. Outside such a project (a global provisioning), OpenCode reads your
+and `status` report, as they report a default `model` one of them sets for another provider (loaded after the project
+file under `run`, it replaces the project's) and an agent a Markdown file defines. A config in a subdirectory applies
+only when you start OpenCode there: `provision` and `status` do not read it. `ssai run opencode` prints the same
+warnings as it starts, judged from the folder you start it in, so it names that one too — as it does, for a global
+provisioning, a config in a folder outside your home directory, which `provision` and `status` (judging OpenCode as
+started from your home directory) do not see. Under `--sandbox docker` the container keeps a home of its own
+that your machine does not read, so the run checks the OpenCode configs it loads inside the container, with the
+agent's own permissions. Under the Windows sandbox the run does not check them. Outside such a project (a global provisioning), OpenCode reads your
 home-directory config as usual, and `provision` and `status` report a rule there that would keep it
 off the gateway. When a run fails, `run` keeps the private
-server's log and names it. The OpenCode TUI, `opencode run` and its
+server's log and names it. From a script, give `opencode run` a stdin that ends (`ssai run opencode -- run "…" < /dev/null`):
+OpenCode reads a stdin that is not a terminal into its message, and waits for it to end. The OpenCode TUI, `opencode run` and its
 session commands work this way; OpenCode's built-in terminal panes are not available under the
 sandbox. `run` needs OpenCode 2 or later (it says so and stops if it finds an older one).
 
@@ -3338,18 +3421,27 @@ after taking back every grant.
 
 The first run in a project grants the sandbox account that folder (read, write, run, delete —
 never its access settings), the tool's configuration folder among your folders
-(`%USERPROFILE%\.claude` for Claude Code, `.codex` for Codex, `.gemini` for Gemini CLI,
+(`%USERPROFILE%\.claude` for Claude Code, `.codex` for Codex, `.gemini` for Gemini CLI, `.qwen` for
+Qwen Code, `.config\opencode` for OpenCode (in a project provisioned for it, the project's own
+`.opencode`), `.config\crush` for Crush, `.continue` for the Continue
+CLI, `.vibe` for Mistral Vibe, `.opencodereview` for Open Code Review, `.aider` for Aider,
 `%APPDATA%\Block\goose` for Goose; or the one you name with `--env CLAUDE_CONFIG_DIR=…`,
-`CODEX_HOME=…`, `GEMINI_CLI_HOME=…` — the folder holding `.gemini` — or `GOOSE_PATH_ROOT=…`; the
-agent reads and writes all of that folder, the tool's own sign-ins and history in it included —
+`CODEX_HOME=…`, `GEMINI_CLI_HOME=…` — the folder holding `.gemini` — `QWEN_HOME=…`,
+`OPENCODE_CONFIG_DIR=…`, `CRUSH_GLOBAL_CONFIG=…`,
+`CONTINUE_GLOBAL_DIR=…`, `VIBE_HOME=…` or `GOOSE_PATH_ROOT=…`; Open Code Review and Aider read
+only the home folder, so they run with `USERPROFILE` set to your profile, of which only their own
+folder is granted; the agent reads and writes all of that folder, the tool's own sign-ins and history in it included —
 Claude Code keeps its user-scope settings there too, so an MCP server added with
-`claude mcp add --scope user` outside the sandbox is not seen in it), read-and-run on the folders of `ssai` and of the tool, and read on the gateway's
+`claude mcp add --scope user` outside the sandbox — the gateway's own included — is not seen in it;
+provision Claude Code for the project instead, which writes the gateway's servers into the project), read-and-run on the folders of `ssai` and of the tool (for a Python tool installed with uv or
+pipx, also its environment and the Python it was made with), and read on the gateway's
 certificate files — each of those inside your profile (elsewhere every account may read them
 already) — and read, never write, on each file `provision` wrote for the tool (its configuration,
 which holds its gateway key and is otherwise readable by you alone), inside your profile or the
 project, and read on a file an `--env` value names — and keeps the git and `.streamscopeai\` holds described above. Git, which refuses a
 repository another account owns, trusts the project for the run without a change to your git
-configuration; Claude Code starts past its first-run screen. The grants stay between runs (granting a large project again each time would cost seconds), so
+configuration (and, with Git for Windows 2.46 or later, every repository in it — a submodule's
+checkout); Claude Code starts past its first-run screen. The grants stay between runs (granting a large project again each time would cost seconds), so
 while one project runs, the sandbox account can also write every project it was granted before:
 `ssai sandbox revoke [<folder>]` takes one project's back, and
 `--all` every one (revoking a project that holds another granted project inside it takes that
@@ -3385,8 +3477,16 @@ run under another account; the sandbox account confines Codex instead). Every pr
 ends with it, and whatever the agent scheduled to run later as the account, or left running outside
 the run, is removed when the run ends and before the next one starts — while you have another
 sandboxed run open, this waits until the last one ends, so one run never stops another. The
-Windows sandbox runs the command-line agents — Claude Code, Codex, Gemini CLI, OpenCode and Goose,
-with their terminal interfaces — not OpenCode's desktop app.
+Windows sandbox runs the command-line agents — Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode,
+Crush, the Continue CLI, Goose, Aider and Open Code Review, with their terminal interfaces — not
+OpenCode's desktop app. Aider writes a git identity into the project's own git configuration when
+it finds none, which the sandbox refuses: set `user.name` and `user.email` in the project (or run it
+with `--no-git`). Mistral Vibe changes the access settings of the folders it creates, which the
+sandbox never allows, so it stops at its first session. A Go tool resolving a project inside your
+profile (Open Code Review's `review`) needs to list your profile folder, which the sandbox account
+cannot: keep such a project outside your profile. Aider and Open Code Review's `USERPROFILE` reaches every program the agent starts: one
+reading its home (`gh`, git's global settings) looks in your profile, which it may not read, rather
+than in the sandbox account's.
 
 What it does not hold, as on the other systems: name lookups (DNS) still resolve, a channel an
 agent could use to leak data in small amounts; the agent can write where every account on the
@@ -3405,9 +3505,9 @@ built from your project's own image instead of on your machine — for a project
 an image, or one that needs a Docker engine of its own. Step by step:
 
 1. **Your administrator allows it.** **Allow the container sandbox** is on by default (**Governance →
-   Portal & clients**, the **Sandbox** section of the profile your workspace is on — see [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)). The agent reaches only the gateway and the destination lists attached there,
-   so a project whose agent installs packages or pulls images needs those registries allowed (**Use the
-   developer defaults** covers the public ones).
+   Portal & clients**, the **Sandbox** section of the profile your workspace is on — see [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)). The agent reaches the gateway and what that section's **Network** and lists
+   allow: with **Allowed lists only**, a project whose agent installs packages or pulls images needs
+   those registries allowed (**Use the developer defaults** covers the public ones).
 2. **Set up rootless Podman, once per machine.** You need Podman 4.4 or newer, run as your own user
    (never as root), with a subordinate id range for your user and cgroup v2 with the `memory` and
    `pids` controllers delegated to it (`cpu` too, for a `cpus` limit). On Ubuntu or Debian:
@@ -3426,9 +3526,11 @@ an image, or one that needs a Docker engine of its own. Step by step:
 
    `run` checks each of these before it starts, and names the fix for anything still missing.
    `"docker": true` (step 3) also needs `/dev/fuse` (the `fuse` kernel module).
-3. **Name the project's image.** In the project, create `.streamscopeai/sandbox.json`. It holds named
-   sandboxes under `sandboxes`; `run` starts the one named `default`, which names either a registry image
-   or the project's dev container:
+3. **Name the project's image** — or use your administrator's default. When your workspace's profile
+   sets a **Default container image** (step 1), a project without a `sandbox.json` runs in it, and `run`
+   says so. Otherwise, or to use another image, create `.streamscopeai/sandbox.json` in the project; it
+   replaces the default whole. It holds named sandboxes under `sandboxes`; `run` starts the one named
+   `default`, which names either a registry image or the project's dev container:
 
    ```json
    {"sandboxes": {"default": {"image": "mcr.microsoft.com/devcontainers/javascript-node:22"}}}
@@ -3440,21 +3542,30 @@ an image, or one that needs a Docker engine of its own. Step by step:
 
    A file naming another sandbox, naming one twice, or whose keys are not under `sandboxes` is refused.
 
-   `run` installs Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue and Crush into the
-   image through its `npm`, so the image needs Node.js; Goose, Aider and Vibe must already be in it.
-   `"docker": true` gives the agent a Docker engine of its own. Every key is in the table below.
+   `run` installs Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue, Crush and Open Code Review into the
+   image, with a Node.js runtime of the sandbox's own, so the image needs none; Goose, Aider and Vibe must already be
+   in it. `"docker": true` gives the agent a Docker engine of its own: the image's, or one the sandbox adds from
+   the image's distribution when it has none. Every key is in the table below.
 4. **Provision the tool in the project** as for any other run: `ssai provision`.
 5. **Run it:** `ssai run --sandbox docker claude` (or `codex`, `opencode`, …). The first run pulls or
    builds the image, adds the tool to it and then starts the agent; later runs start at once. `run`
    prints the image, where the project sits in the container, and the gateway the agent reaches.
-6. **Keep it current.** `ssai sandbox prepare <tool>` rebuilds (or pulls again) the image — one named
+6. **Keep it current.** `ssai sandbox prepare <tool>` (with `--host`, as for `run`, when several
+   gateways are provisioned) rebuilds (or pulls again) the image — one named
    `localhost/…`, built on this machine, is used as it is — and installs the tool's latest release — the way the tool is updated in the container (an update the tool makes of itself there does
    not replace that install). `run` stops and asks you to run it when `sandbox.json` names another
    image, when the image's recipe changed (its Dockerfile or the `devcontainer.json` keys it is built from), and when `"docker": true`
-   was turned on. `ssai sandbox prune` removes every image and
-   volume the container sandbox made.
+   was turned on. A run never removes an image: an image replaced by a rebuild or another reference
+   stays until you remove it. `ssai sandbox status` lists each project's image, tool layers and
+   volumes with their sizes (a project whose folder was deleted is not listed), what no project
+   uses any more, and the total a prune frees;
+   `ssai sandbox prune --project [<folder>]` removes one project's (the project at or above the folder,
+   the current one by default) — its image when the sandbox built or pulled it and no other project
+   uses it, its tool layers and its volumes — and `ssai sandbox prune` every image and volume the
+   container sandbox made. An image you had before, or named yourself, always stays.
 
-If a run says it refused a destination, ask your administrator to add it to an allowed list (step 1).
+If a run says it refused a destination, ask your administrator to add it to an allowed list (step 1),
+then run `ssai sync`: the run banner names the network setting and lists the run has.
 
 The keys of a sandbox in `.streamscopeai/sandbox.json` (`{"sandboxes": {"default": {…}}}`):
 
@@ -3462,7 +3573,8 @@ The keys of a sandbox in `.streamscopeai/sandbox.json` (`{"sandboxes": {"default
 |---|---|
 | `image` | an image reference from a registry, e.g. `"mcr.microsoft.com/devcontainers/base:ubuntu-24.04"` (a local archive or folder — `oci-archive:`, `dir:` — is refused). A dev container image's own metadata applies: its user, its variables, and its features' lifecycle commands (below) |
 | `devcontainer` | instead of `image`: the path of a `devcontainer.json` inside the project (its `image`, or `build` with `dockerfile`, `context`, `target` and `args`; its `remoteUser` or `containerUser`; its `workspaceFolder`. `${localWorkspaceFolder}` and `${localWorkspaceFolderBasename}` are expanded in `workspaceFolder`, the users and `build.args`, and `${containerWorkspaceFolder}` in the last two; `${localEnv:…}` is refused, since it would carry your environment into the build) |
-| `docker` | `true` starts a Docker engine inside the container, its image cache kept between runs (needs `/dev/fuse`) |
+| `docker` | `true` starts a Docker engine inside the container, its image cache kept between runs (needs `/dev/fuse`). An image without Docker Engine gets one from its distribution (Debian, Ubuntu, Alpine, Fedora) |
+| `network` | `"gateway"` limits this project's container-sandbox runs to the gateway alone; `"policy"` (the default) takes the profile's network. `ssai run --network` wins over it, and narrows a native run too |
 | `memory`, `cpus`, `pids` | the container's limits, e.g. `"6g"`, `3`; `pids` defaults to 16384, at least 64 |
 
 A `devcontainer.json` that sets `runArgs`, `mounts`, `workspaceMount`, `privileged`, `capAdd`,
@@ -3480,9 +3592,8 @@ server, is started in the background (`npm run dev > dev.log 2>&1 &`):
 and again when one of them, their variables, the user they run as, the project's folder in the container or
 the image changes; `postStartCommand` and `postAttachCommand` on every
 run. The commands of the features the image was built with (read from its dev container metadata) run
-first; the commands of the `devcontainer.json` an image was built from do not — for an image built from
-this project's, they are the project's own, which run once from the project (for another image, `run`
-names those it leaves out). An entry of the metadata
+first, then the project's own; the commands of the `devcontainer.json` another image was built from do
+not, and `run` names those it leaves out. An entry of the metadata
 the sandbox cannot read is skipped, and `run` names it. While one run's create commands run, another run
 on the project waits for them (Ctrl-C stops it; on a filesystem that cannot lock, such as some network
 mounts, they run unlocked, and `run` says so). A command that fails stops the run,
@@ -3494,19 +3605,28 @@ ends: the container is new on every run. It runs once per tool, since each tool 
 container's own value (the image's, or `containerEnv`'s; a `PATH` that does not name it replaces the
 image's, the folder the sandbox installs the tool in kept first; a `null` value leaves the image's own); the sandbox's own variables (its
 proxy, the tool's gateway settings, `HOME`) win over the project's. `${localEnv:…}` is refused there too. One that uses
-`features` is built with the Dev Container CLI (`npm install -g @devcontainers/cli`), and may not set
-`initializeCommand` (that CLI could run it on your machine), nor `${env:…}` (that CLI would read it from
+`features` is built with the Dev Container CLI (`npm install -g @devcontainers/cli`), from what that build
+reads alone — the image or `build`, the features and `overrideFeatureInstallOrder`, the users,
+`workspaceFolder` and the features' lockfile (`devcontainer-lock.json` beside it) — so editing a lifecycle
+command or a variable rebuilds nothing. Its features may not hold `${env:…}` (that CLI would read it from
 your environment, even the shell's `${env:-x}`), nor name a local feature folder (only a
 published feature is taken). A `workspaceFolder` on a system path of the container (`/etc`, `/run`,
 `/usr` and the like) or over the agent's home is refused, and so is a workspace, or an agent home, at or
 around `/opt/ssai-agent`, where the sandbox installs the tool. On the first run,
-`run` adds the tool to the image (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue and
-Crush, at their latest release, through the image's `npm` — an image without Node.js is refused
-naming that); Goose, Aider and Vibe must already be in the image. Only a project's first image is built (or pulled) by
+`run` adds the tool to the image (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue,
+Crush and Open Code Review, at their latest release), with the Node.js runtime the tool runs on: a pinned release,
+downloaded once on your machine from nodejs.org and checked against its checksum, kept apart from the image's own
+`node`, which the project keeps using. With `"docker": true`, an image that has no Docker Engine also gets one, from
+its own distribution's packages (the engine, `iptables`, and compose and buildx where the distribution has them); an
+image with no `apt-get`, `apk` or `dnf` must bring its own. A Dev Container image that does gets it from the
+`ghcr.io/devcontainers/features/docker-in-docker:2` feature (on Debian trixie images, such as
+`javascript-node:22`, with `{"moby": false}`, since trixie has no Moby packages);
+`docker-outside-of-docker` cannot work in the sandbox, which has no host engine to reach. Goose, Aider and Vibe must
+already be in the image. Images with an engine are large: `ssai sandbox status` shows what each project
+keeps, and `ssai sandbox prune` removes them. Only a project's first image is built (or pulled) by
 `run` on its own. After that, when the image reference changed to one not on this machine yet, or
 the image needs building again (its Dockerfile changed, or the `build` of its `devcontainer.json` —
-any of the file when it uses `features`, which writes its lifecycle commands into the image — or the image was
-removed), `run` stops and asks you to read what it would build — the agent can edit all of it, and
+with `features`, also what that build reads, above — or the image was removed), `run` stops and asks you to read what it would build — the agent can edit all of it, and
 a pull or a build reaches the network before the sandbox does. A change to other files of the build
 context is not noticed: the image already built keeps being used until you rebuild it; `ssai
 sandbox prepare <tool>` then rebuilds both — also to pick up the tool's latest release — and `ssai sandbox
@@ -3525,11 +3645,14 @@ directory, its provisioned configuration — read-only, so a tool that rewrites 
 cannot save it there (a provisioned file `run` cannot hand over is named, and the tool runs without it). Beside these, only the files `run` hands the tool are mounted, read-only: the
 CA bundles (`--ca-file` and the gateway's) and any file or directory an `-e KEY=/path` names. Nothing
 else of your machine is: not your home, your SSH keys, nor the host's Podman or Docker socket. The container has no network: everything leaves through the same guard
-and the same destinations as the native sandbox, the inner Docker engine's pulls included, and `run`
-names what it refused. The engine's own containers have no network: one that needs it runs on the
-host network with the proxy (`docker run --network host -e http_proxy="$HTTP_PROXY" …`, and for a
-build `docker build --network host --build-arg http_proxy="$HTTP_PROXY" --build-arg
-https_proxy="$HTTPS_PROXY" …`). When the run ends, any file in the project that the container's root made
+and the same destinations as the native sandbox, and `run` names what it refused. With `"docker": true`, nothing
+needs a proxy setting: every TCP connection made in the container — the tool's, the engine's pulls, and those of
+the engine's own containers and builds (`docker run`, `docker build`, compose, Testcontainers, kind) — is taken to
+the guard by name, so plain commands work as they are. The proxy variables the tool is given name an address the
+engine's containers reach too, so a tool that copies them into a container (kind does) still works. Limits: only TCP and DNS leave (no other UDP);
+a container reaching a private address directly (one not on the engine's own networks) is not taken out; and a tool
+that ignores the container's DNS (a hard-coded resolver over HTTPS, an address written in its configuration) is
+decided by that address alone, so a destination allowed by name is refused to it. When the run ends, any file in the project that the container's root made
 (a setuid binary included) is given back to you, with setuid cleared — by the next run, before its
 tool starts, when a run was killed before it could. A file of one of the container's other users (a
 database's data directory an inner container keeps in the project) keeps its owner, so the service

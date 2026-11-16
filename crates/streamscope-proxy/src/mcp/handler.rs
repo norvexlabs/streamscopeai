@@ -547,6 +547,13 @@ struct Identity {
     /// the assumed spec default is deliberately not recorded here, because
     /// stamping it would attribute traffic to a revision nobody named.
     declared_protocol_version: Option<String>,
+    /// The client application this request names (`X-App-Id`, else its
+    /// referer or User-Agent against the tenant's app registry), read once
+    /// from its headers so every audit row of the request carries it —
+    /// including the methods the gateway answers itself and its refusals.
+    /// `None` until the headers are read, and when nothing names one.
+    app_id: Option<String>,
+    detection_method: Option<String>,
 }
 
 /// Resolve the VS addressed by `slug` and assert the key's workspace permits
@@ -630,6 +637,8 @@ impl Identity {
             user: ctx.user,
             config: ctx.config,
             declared_protocol_version: None,
+            app_id: None,
+            detection_method: None,
         }
     }
 }
@@ -1547,6 +1556,14 @@ async fn handle_authenticated_request(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
+    let attribution = streamscope_core::middleware::attribution::extract_attribution(
+        &req_headers_for_attribution,
+        identity.user_id,
+        &identity.config.app_patterns,
+        false,
+    );
+    identity.app_id = attribution.app_id;
+    identity.detection_method = attribution.detection_method;
 
     // Read body once. Over the size cap, or not received within the body
     // deadline, the refusal is audited like any other: the caller is known.
@@ -2086,14 +2103,8 @@ async fn handle_authenticated_request(
     // `stsmcp://<prefix>/<b64>` URI directly. Non-virtualized URIs (legacy /
     // probe traffic) fall through to the first route as a best-effort anchor.
     let policy_mcp_server = resolve_policy_mcp_server(&request, &routes, &upstreams);
-    let policy_attribution = streamscope_core::middleware::attribution::extract_attribution(
-        &req_headers_for_attribution,
-        identity.user_id,
-        &tenant_cfg.app_patterns,
-        false,
-    );
-    let policy_app_id = policy_attribution.app_id.clone();
-    let policy_detection_method = policy_attribution.detection_method.clone();
+    let policy_app_id = identity.app_id.clone();
+    let policy_detection_method = identity.detection_method.clone();
     // Tenant rules with this request's workspace overrides layered on.
     let effective_tool_rules = tenant_cfg.effective_tool_rules(identity.user.workspace_id);
     let policy_decision = if let Some(server_name) = policy_mcp_server.as_deref() {
@@ -4356,11 +4367,11 @@ async fn emit_sampling_intercept_audit(
         workspace_id: identity.user.workspace_id,
         user_id: identity.user_id,
         key_id: identity.key_id,
-        app_id: None,
+        app_id: identity.app_id.clone(),
         session_id: session_id_hashed,
         user_agent: None,
         ip: None,
-        detection_method: None,
+        detection_method: identity.detection_method.clone(),
         latency_total_ms: match &outcome.audit_outcome {
             streamscope_core::audit::mcp::SamplingInterceptOutcome::Served {
                 latency_ms, ..
@@ -6507,47 +6518,42 @@ async fn handle_modern_subscriptions_listen(
             return error_response(StatusCode::OK, rpc_id, code, message);
         }
     };
-    // Open the gateway's own notification stream to every route FIRST, with
-    // the scope-narrowed request rather than the honored set — the honored set
-    // is derived from which of these came up, so deriving it first would be
-    // circular. A listener that asks for slightly more than is ultimately
-    // honored costs bandwidth on a stream the gateway narrows again per
-    // subscriber; the reverse would promise a client something nothing is
-    // listening for.
-    let mut sourceable: Vec<serde_json::Value> = Vec::new();
-    let mut live: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    for route in routes {
-        let Some(upstream) = upstreams.iter().find(|u| u.id == route.upstream_server_id) else {
-            continue;
-        };
+    // Open the gateway's own notification stream to every route FIRST — every
+    // route at once — with the scope-narrowed request rather than the honored
+    // set: the honored set is derived from which of these can source, so
+    // deriving it first would be circular. A listener that asks for slightly
+    // more than is ultimately honored costs bandwidth on a stream the gateway
+    // narrows again per subscriber; the reverse would promise a client
+    // something nothing is listening for. A route whose upstream the
+    // capability view left out (no credential for this caller, a failed
+    // handshake) can honor nothing, so no stream is opened for it.
+    let checks = routes.iter().filter_map(|route| {
+        let upstream = upstreams.iter().find(|u| u.id == route.upstream_server_id)?;
+        let (_, caps) = view.per_upstream.iter().find(|(id, _)| *id == upstream.id)?;
         let per_route = route_filter(&scoped, &route.prefix);
-        if ensure_upstream_listener(
-            auth,
-            upstream,
-            &route.prefix,
-            &per_route,
-        )
-        .await
-        {
-            live.insert(upstream.id);
-        } else {
+        Some(async move {
+            let sources = ensure_upstream_listener(auth, upstream, &route.prefix, &per_route).await;
+            (route, upstream, caps, per_route, sources)
+        })
+    });
+    // Honored per ROUTE, then united: what a route's upstream can do (its
+    // capabilities) while a listener can source it, narrowed to what its own
+    // stream acknowledged once it did. Two routes may share an upstream, each with
+    // its own stream, so neither answers for the other. The acknowledgement
+    // is where the spec puts the authoritative statement of what one stream
+    // will deliver, and a type named here that never arrives is
+    // indistinguishable from a quiet server.
+    let mut honored = modern::SubscriptionFilter::default();
+    for (route, upstream, caps, per_route, sources) in futures::future::join_all(checks).await {
+        let Some(acked) = sources else {
             tracing::warn!(
                 upstream_id = %upstream.id,
                 "MCP subscriptions/listen: no notification stream for this route; not honoring it"
             );
-        }
+            continue;
+        };
+        unite_route_honored(&mut honored, &scoped, &route.prefix, &per_route, caps, acked.as_ref());
     }
-    for (upstream_id, caps) in &view.per_upstream {
-        if live.contains(upstream_id) {
-            sourceable.push(caps.clone());
-        }
-    }
-
-    // Narrowed by what a LIVE listener can actually source, not by what the
-    // servers between them support. The acknowledgement is where the spec puts
-    // the authoritative statement of what one stream will deliver, and a type
-    // named here that never arrives is indistinguishable from a quiet server.
-    let honored = scoped.honored(&virtualize::merge_capabilities(&sourceable));
 
     if honored.is_empty() {
         tracing::debug!(
@@ -8196,12 +8202,12 @@ async fn dispatch_legacy_sse(
 /// this caller's virtual server, so an announcement with nothing in flight
 /// still reaches the bus.
 ///
-/// Returns whether the route can source notifications at all — which is NOT
-/// the same as whether a listener came up. A legacy route sources them in-band
-/// too, riding an in-flight response, so it stays sourceable however the
-/// listener fares; a modern route has no other path, because that era deleted
-/// `resources/subscribe` and puts its notifications only on a
-/// `subscriptions/listen` stream.
+/// Returns what the route can source. A legacy route sources notifications
+/// in-band too, riding an in-flight response, so it stays sourceable however
+/// its listener fares; a modern route has no other path, because that era
+/// deleted `resources/subscribe` and puts its notifications only on a
+/// `subscriptions/listen` stream — so it sources what its listener can, while
+/// one runs, narrowed to what its upstream acknowledged once it did.
 ///
 /// Best-effort by construction: every failure path returns quietly rather than
 /// failing the caller's `subscriptions/listen`, because a listener is an
@@ -8217,7 +8223,7 @@ async fn ensure_upstream_listener(
     upstream: &streamscope_core::config::mcp::McpUpstreamServer,
     route_prefix: &str,
     want: &modern::SubscriptionFilter,
-) -> bool {
+) -> RouteSources {
     use streamscope_core::config::mcp::McpTransport;
     // Neither needs one, and neither is a failure: an `internal://` virtual
     // server is dispatched in-process, and an `sse` upstream already keeps a
@@ -8226,11 +8232,11 @@ async fn ensure_upstream_listener(
     if super::virtual_servers::is_internal(upstream)
         || matches!(upstream.transport, McpTransport::Sse)
     {
-        return true;
+        return Some(None);
     }
 
     let Ok(era) = resolve_upstream_era(auth, upstream).await else {
-        return false;
+        return None;
     };
     // An upstream with a client-filled input is reachable only with a client
     // request behind it: a listener would reconnect long after that request,
@@ -8238,7 +8244,7 @@ async fn ensure_upstream_listener(
     // notifications reach only a request in flight — which a legacy route
     // delivers in-band and a modern one cannot.
     if super::upstream_auth::has_client_inputs(upstream) {
-        return !era.is_modern();
+        return (!era.is_modern()).then_some(None);
     }
     // A LEGACY route can source notifications whether or not this listener
     // comes up: events also reach the bus in-band, riding an in-flight
@@ -8251,7 +8257,7 @@ async fn ensure_upstream_listener(
     // only on a `subscriptions/listen` stream.
     let sourceable_without_listener = !era.is_modern();
     let Ok(upstream_auth) = resolve_upstream_auth(auth, upstream).await else {
-        return sourceable_without_listener;
+        return sourceable_without_listener.then_some(None);
     };
 
     let transport = if era.is_modern() {
@@ -8269,7 +8275,7 @@ async fn ensure_upstream_listener(
         // gateway, not on this upstream.
         let Ok(conn) = ensure_upstream_connection(auth, upstream).await
         else {
-            return sourceable_without_listener;
+            return sourceable_without_listener.then_some(None);
         };
         super::upstream_listen::ListenTransport::LegacyGet {
             session_id: conn.session_id.clone(),
@@ -8296,15 +8302,16 @@ async fn ensure_upstream_listener(
         route_prefix: route_prefix.to_string(),
     });
 
-    auth.listeners.ensure(
+    let key = super::upstream_listen::ListenerKey {
+        tenant_id: auth.tenant_id,
+        user_id: auth.user_id,
+        virtual_server_id: auth.virtual_server_id,
+        upstream_id: upstream.id,
+        route_prefix: route_prefix.to_string(),
+    };
+    let running = auth.listeners.ensure(
         super::upstream_listen::ListenRequest {
-            key: super::upstream_listen::ListenerKey {
-                tenant_id: auth.tenant_id,
-                user_id: auth.user_id,
-                virtual_server_id: auth.virtual_server_id,
-                upstream_id: upstream.id,
-                route_prefix: route_prefix.to_string(),
-            },
+            key: key.clone(),
             upstream_url: upstream.upstream_url.clone(),
             upstream_auth,
             inputs_fingerprint: inputs_key(auth, upstream),
@@ -8312,7 +8319,54 @@ async fn ensure_upstream_listener(
             filter: want.clone(),
         },
         sink,
-    ) || sourceable_without_listener
+    );
+    // A legacy route is sourceable however its listener fares (see above); a
+    // modern one while its listener runs, narrowed to what its upstream's
+    // acknowledgement agreed to once one arrived.
+    if sourceable_without_listener {
+        return Some(None);
+    }
+    running.then(|| auth.listeners.acknowledged(&key))
+}
+
+/// What one route can source: `None` nothing; `Some(None)` notifications no
+/// upstream acknowledgement narrows (a legacy or in-process route, or a modern
+/// stream whose acknowledgement has not arrived yet); `Some(f)` the subset its
+/// upstream acknowledged.
+type RouteSources = Option<Option<modern::SubscriptionFilter>>;
+
+/// Add to `honored` (the acknowledgement, in the client's namespace) what one
+/// route honors of the client's `scoped` filter: what its upstream can do
+/// (`caps`) of the route's slice of it (`per_route`, in the upstream's
+/// namespace), narrowed to what the route's own stream acknowledged when its
+/// upstream sent one. A URI comes back as the client sent it.
+fn unite_route_honored(
+    honored: &mut modern::SubscriptionFilter,
+    scoped: &modern::SubscriptionFilter,
+    route_prefix: &str,
+    per_route: &modern::SubscriptionFilter,
+    caps: &serde_json::Value,
+    acked: Option<&modern::SubscriptionFilter>,
+) {
+    let mut route = per_route.honored(&virtualize::merge_capabilities(std::slice::from_ref(caps)));
+    if let Some(acked) = acked {
+        route = route.intersect(acked);
+    }
+    // The flags united as every union of two filters is; the URIs below, back
+    // in the client's namespace.
+    *honored = super::upstream_listen::widen(
+        honored,
+        &modern::SubscriptionFilter { resource_subscriptions: Vec::new(), ..route.clone() },
+    );
+    for uri in &scoped.resource_subscriptions {
+        if let Ok((prefix, original)) = streamscope_core::mcp::tokens::decode_resource_uri(uri)
+            && prefix == route_prefix
+            && route.resource_subscriptions.contains(&original)
+            && !honored.resource_subscriptions.contains(uri)
+        {
+            honored.resource_subscriptions.push(uri.clone());
+        }
+    }
 }
 
 /// The slice of a subscription filter one route can actually serve.
@@ -9088,11 +9142,13 @@ async fn emit_audit_with_policy(
         workspace_id: identity.user.workspace_id,
         user_id: identity.user_id,
         key_id: identity.key_id,
-        app_id,
+        // A row whose caller passed none (a refusal, a method the gateway
+        // answers itself) carries what the request's headers named.
+        app_id: app_id.or_else(|| identity.app_id.clone()),
         session_id: session_id_hashed,
         user_agent,
         ip: None,
-        detection_method,
+        detection_method: detection_method.or_else(|| identity.detection_method.clone()),
         latency_total_ms: total_ms,
         status_code: Some(status.as_u16()),
         error_category: error_code.is_some().then(|| "rpc_error".to_string()),
@@ -9135,6 +9191,43 @@ async fn emit_audit_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two routes on ONE upstream, each with its own stream: each answers only
+    /// for its own URIs, a type its upstream's acknowledgement left out is not
+    /// honored, and what comes back is what the client sent.
+    #[test]
+    fn a_route_honors_only_its_own_uris_and_what_its_stream_acknowledged() {
+        use streamscope_core::mcp::tokens::encode_resource_uri;
+        let a_uri = encode_resource_uri("a", "file:///x");
+        let b_uri = encode_resource_uri("b", "file:///x");
+        let scoped = modern::SubscriptionFilter {
+            tools_list_changed: true,
+            prompts_list_changed: true,
+            resources_list_changed: false,
+            resource_subscriptions: vec![a_uri.clone(), b_uri.clone()],
+        };
+        let caps = serde_json::json!({
+            "tools": {"listChanged": true},
+            "prompts": {"listChanged": true},
+            "resources": {"subscribe": true}
+        });
+        let mut honored = modern::SubscriptionFilter::default();
+        // Route `a` is up and its upstream agreed to tools and the URI only.
+        let acked = modern::SubscriptionFilter {
+            tools_list_changed: true,
+            resource_subscriptions: vec!["file:///x".to_string()],
+            ..Default::default()
+        };
+        unite_route_honored(&mut honored, &scoped, "a", &route_filter(&scoped, "a"), &caps, Some(&acked));
+        assert_eq!(honored.resource_subscriptions, vec![a_uri.clone()], "route b's URI is not route a's to honor");
+        assert!(honored.tools_list_changed);
+        assert!(!honored.prompts_list_changed, "a type the acknowledgement left out");
+
+        // Route `b`, up with no acknowledgement to narrow it (a legacy route).
+        unite_route_honored(&mut honored, &scoped, "b", &route_filter(&scoped, "b"), &caps, None);
+        assert_eq!(honored.resource_subscriptions, vec![a_uri, b_uri]);
+        assert!(honored.prompts_list_changed);
+    }
     use axum::http::HeaderMap;
 
     fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {

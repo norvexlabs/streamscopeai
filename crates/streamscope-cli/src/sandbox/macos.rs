@@ -115,6 +115,11 @@ fn controlling_ttys() -> Vec<String> {
     ttys
 }
 
+/// The devices a confined process may write to (`(allow file-write-data …)`).
+/// `/dev/stdout`, `/dev/stderr` and `/dev/fd/<n>` open a descriptor the
+/// process already holds, so they reach nothing new.
+const WRITABLE_DEVICES: [&str; 5] = ["/dev/null", "/dev/zero", "/dev/tty", "/dev/stdout", "/dev/stderr"];
+
 /// [`profile`] granting terminal setup on `ttys` (plus `/dev/tty`).
 fn profile_with_ttys(
     spec: &LaunchSpec,
@@ -142,6 +147,14 @@ fn profile_with_ttys(
     // which the user's shell runs once the client exits. The Linux backend
     // refuses it in seccomp. Last match wins, so this follows the allow.
     p.push_str("(deny file-ioctl (ioctl-command 2147578994))\n");
+    // The devices every shell and tool writes to (`2>/dev/null`, git's
+    // `/dev/null` for an empty file, a prompt on `/dev/tty`, `> /dev/stderr`,
+    // bash's `>(…)` through `/dev/fd/<n>`): writing their data only, never
+    // creating or removing anything under `/dev`.
+    for device in WRITABLE_DEVICES {
+        p.push_str(&format!("(allow file-write-data (literal \"{device}\"))\n"));
+    }
+    p.push_str("(allow file-write-data (regex #\"^/dev/fd/[0-9]+$\"))\n");
     for s in profiles::SECRET_DENY.iter().chain(profiles::SEATBELT_ONLY_DENY) {
         let path = expand_tilde(s).with_context(|| {
             format!(
@@ -371,6 +384,28 @@ mod tests {
         );
     }
 
+    /// A shell's `2>/dev/null` and git's empty-file `/dev/null` need a write
+    /// there; only the data of those devices is writable, nothing else under `/dev`.
+    #[test]
+    fn profile_lets_a_tool_write_to_the_null_device_and_no_other_device_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
+        let prof = profile_with_ttys(&sample_spec(), &[12345], Path::new(SCRATCH), &ProjectGrants::default(), &[]).unwrap();
+        let devices: Vec<&str> = prof.lines().filter(|l| l.contains("/dev/") && l.contains("file-write")).collect();
+        assert_eq!(
+            devices,
+            [
+                "(allow file-write-data (literal \"/dev/null\"))",
+                "(allow file-write-data (literal \"/dev/zero\"))",
+                "(allow file-write-data (literal \"/dev/tty\"))",
+                "(allow file-write-data (literal \"/dev/stdout\"))",
+                "(allow file-write-data (literal \"/dev/stderr\"))",
+                "(allow file-write-data (regex #\"^/dev/fd/[0-9]+$\"))",
+            ]
+        );
+    }
+
     fn sample_spec() -> LaunchSpec {
         LaunchSpec {
             command: "claude".into(),
@@ -379,12 +414,15 @@ mod tests {
             cwd: PathBuf::from("/private/tmp/proj"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: vec![],
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         }
     }
 

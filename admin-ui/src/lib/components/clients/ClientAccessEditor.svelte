@@ -15,13 +15,27 @@
   import Skeleton from '#lib/components/Skeleton.svelte';
   import EmptyState from '#lib/components/EmptyState.svelte';
   import ToggleSetting from '#lib/components/forms/ToggleSetting.svelte';
+  import SegmentedControl from '#lib/components/forms/SegmentedControl.svelte';
   import AttachmentsEditor from '#lib/components/destinations/AttachmentsEditor.svelte';
+  import DefaultImageEditor from '#lib/components/clients/DefaultImageEditor.svelte';
   import type { Attachment } from '#lib/destinationAttachments.js';
   import type { components } from '#lib/generated/api-types.js';
 
   type Content = components['schemas']['ClientAccessResponse'];
   type DestinationList = components['schemas']['DestinationList'];
   type Body = components['schemas']['UpdateClientAccessRequest'];
+  type Posture = components['schemas']['Posture'];
+  /** What the sandbox reaches before any list, as the selector words it. */
+  const POSTURES: { value: Posture; label: string; title: string }[] = [
+    { value: 'open', label: 'Internet', title: 'Every destination a blocked list does not name' },
+    { value: 'listed', label: 'Allowed lists only', title: 'Only what an allowed list names, unless a blocked list names it' },
+    { value: 'gateway', label: 'Gateway only', title: 'No destination besides the gateway; the lists are not read' },
+  ];
+  const POSTURE_TEXT: Record<Posture, string> = {
+    open: 'The gateway is always reachable; then a blocked destination is refused and anything else permitted. The Internal networks list, blocked on a new profile, keeps the private address ranges out — the company network and the developer\'s machine on its private and loopback addresses: remove a range from it to let the sandbox reach an internal service.',
+    listed: 'The gateway is always reachable; then a blocked destination is refused, an allowed one permitted, and anything else refused.',
+    gateway: 'The sandbox reaches the gateway and nothing else: the lists below are kept but not read.',
+  };
 
   interface Props {
     profileId: string;
@@ -100,6 +114,15 @@
     }
     if (data) shown.land(visit, data);
     toast.success(done);
+  }
+
+  /** Redraws the network selector from the stored posture once a save ends:
+   *  the control shows a pick at once, which a refused or skipped save must
+   *  not leave on screen. */
+  let networkDrawn = $state(0);
+  async function setNetwork(v: Posture) {
+    await update({ settings: { network: v } }, 'Sandbox network saved');
+    networkDrawn += 1;
   }
 
   function setOffered(id: string, on: boolean) {
@@ -226,13 +249,32 @@
       </div>
     </div>
   {:else}
+    <div class="rounded-lg border border-(--border) bg-(--bg-card) p-5 space-y-3" data-testid="client-access-network">
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <h3 class="text-sm font-semibold text-(--text-primary)">Network</h3>
+          <p class="text-xs text-(--text-secondary)">
+            What the developers' sandbox may reach besides the gateway. A developer can narrow it for a run to the
+            gateway alone (<code>ssai run --network gateway</code>), never widen it.
+          </p>
+        </div>
+        {#key networkDrawn}
+          <SegmentedControl
+            options={POSTURES}
+            value={content.settings.network}
+            label="Sandbox network"
+            onchange={(v: Posture) => setNetwork(v)}
+          />
+        {/key}
+      </div>
+    </div>
     <div class="rounded-lg border border-(--border) bg-(--bg-card) p-5 space-y-3">
       <div class="flex items-start justify-between gap-3">
         <div>
           <h3 class="text-sm font-semibold text-(--text-primary)">Destinations</h3>
           <p class="text-xs text-(--text-secondary)">
-            The gateway is always reachable; then a blocked destination is refused, an allowed one permitted, and
-            anything else refused. A list is shared: editing its entries reaches every profile that attaches it.
+            {POSTURE_TEXT[content.settings.network]} A list is shared: editing its entries reaches every profile
+            that attaches it.
           </p>
         </div>
         <button
@@ -245,7 +287,9 @@
         {lists}
         value={attachments}
         disabled={saving}
-        emptyText="Nothing attached: the sandbox reaches the gateway only. The developer defaults allow the package and container registries and GitHub, and block paste sites."
+        emptyText={content.settings.network === 'open'
+          ? 'Nothing attached: the sandbox reaches every destination, internal networks included. The developer defaults allow the package and container registries and GitHub, and block paste sites.'
+          : 'Nothing attached: the sandbox reaches the gateway only. The developer defaults allow the package and container registries and GitHub, and block paste sites.'}
         onchange={(next: Attachment[]) => update({ destinations: next }, 'Sandbox destinations saved')}
       />
     </div>
@@ -265,5 +309,15 @@
         onValueChange={(v: boolean) => update({ settings: { docker_tier: v } }, 'Sandbox setting saved')}
       />
     </div>
+    {#if content.settings.docker_tier}
+      {#key `${shown.key}:${JSON.stringify(content.settings.default_image ?? null)}`}
+        <DefaultImageEditor
+          value={content.settings.default_image ?? null}
+          disabled={saving}
+          onsave={(next) =>
+            update({ settings: { default_image: next } }, next ? 'Default image saved' : 'Default image removed')}
+        />
+      {/key}
+    {/if}
   {/if}
 </div>

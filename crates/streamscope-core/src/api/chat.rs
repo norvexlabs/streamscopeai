@@ -24,13 +24,13 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_penalty: Option<f32>,
+    pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_penalty: Option<f32>,
+    pub presence_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopCondition>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,7 +46,7 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
+    pub seed: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

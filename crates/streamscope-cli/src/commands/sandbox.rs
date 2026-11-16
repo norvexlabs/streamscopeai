@@ -33,27 +33,51 @@ pub enum SandboxCommand {
     /// client's latest release. A first `ssai run --sandbox docker` prepares
     /// them on its own.
     Prepare {
-        /// The client — its id or launch command (e.g. `claude`).
+        /// The client — its id or launch command (e.g. `claude`), as
+        /// provisioned here.
         client: String,
+        /// The gateway, when several are provisioned (origin or origin#slug),
+        /// as for `ssai run`.
+        #[arg(long)]
+        host: Option<String>,
     },
+    /// The docker sandbox's images and volumes on this machine, per project,
+    /// with their sizes.
+    Status,
     /// Remove every docker-sandbox image and volume of yours (the agents'
-    /// homes and the engines' caches go with them).
-    Prune,
+    /// homes and the engines' caches go with them), or with `--project` one
+    /// project's only.
+    Prune {
+        /// Only this project's: the one at or above DIR (default: the current
+        /// folder), else that folder itself.
+        #[arg(long, value_name = "DIR", num_args = 0..=1)]
+        project: Option<Option<std::path::PathBuf>>,
+    },
 }
 
 pub async fn run(command: SandboxCommand) -> Result<()> {
     match command {
-        SandboxCommand::Prepare { client } => {
-            let crate::state::ManifestScope::Project(root) = crate::state::resolve_scope(None, false, false)? else {
-                bail!("`ssai sandbox prepare` runs inside a provisioned project (no `.streamscopeai/` above here)");
-            };
-            let command = crate::sandbox::profiles::agent_for(&client)
-                .and_then(|a| a.names.first().copied())
-                .unwrap_or(client.as_str())
-                .to_string();
-            tokio::task::spawn_blocking(move || crate::sandbox::podman_prepare(&root, &command)).await?
+        SandboxCommand::Prepare { client, host } => {
+            if !cfg!(target_os = "linux") {
+                bail!("the docker sandbox runs on Linux only");
+            }
+            // The root, the client and the default image `run` would use.
+            let (root, command, default_image) = super::run::sandbox_target(&client, host.as_deref()).await?;
+            tokio::task::spawn_blocking(move || crate::sandbox::podman_prepare(&root, &command, default_image.as_ref())).await?
         }
-        SandboxCommand::Prune => tokio::task::spawn_blocking(crate::sandbox::podman_prune).await?,
+        SandboxCommand::Status => tokio::task::spawn_blocking(crate::sandbox::podman_status).await?,
+        SandboxCommand::Prune { project: None } => tokio::task::spawn_blocking(|| crate::sandbox::podman_prune(None)).await?,
+        SandboxCommand::Prune { project: Some(dir) } => {
+            // The root a run there confines to: the provisioned project at or
+            // above the folder (DIR, else this one), else the folder itself
+            // (a home-scoped client's run).
+            let start = dunce::canonicalize(match dir {
+                Some(dir) => dir,
+                None => std::env::current_dir()?,
+            })?;
+            let root = start.ancestors().find(|d| d.join(".streamscopeai").is_dir()).unwrap_or(&start).to_path_buf();
+            tokio::task::spawn_blocking(move || crate::sandbox::podman_prune(Some(&root))).await?
+        }
         #[cfg(windows)]
         SandboxCommand::Setup { check } => {
             use crate::sandbox::windows::setup;

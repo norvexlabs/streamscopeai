@@ -612,6 +612,9 @@ pub const METHOD_DISCOVER: &str = "server/discover";
 /// the GET endpoint and `resources/subscribe`.
 pub const METHOD_SUBSCRIPTIONS_LISTEN: &str = "subscriptions/listen";
 
+/// The notification that MUST open every `subscriptions/listen` stream.
+pub const METHOD_SUBSCRIPTIONS_ACKNOWLEDGED: &str = "notifications/subscriptions/acknowledged";
+
 // ── Result shaping (§ Responses, § CacheableResult) ──────────────────────
 
 /// How long a client may treat a result as fresh, and who may share it.
@@ -1509,6 +1512,23 @@ impl SubscriptionFilter {
             && self.resource_subscriptions.is_empty()
     }
 
+    /// What both filters name: a type each carries, a resource URI in both.
+    /// How a request is narrowed by an acknowledgement — the subset its
+    /// server agreed to honor (§ Acknowledgment).
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            tools_list_changed: self.tools_list_changed && other.tools_list_changed,
+            prompts_list_changed: self.prompts_list_changed && other.prompts_list_changed,
+            resources_list_changed: self.resources_list_changed && other.resources_list_changed,
+            resource_subscriptions: self
+                .resource_subscriptions
+                .iter()
+                .filter(|uri| other.resource_subscriptions.contains(uri))
+                .cloned()
+                .collect(),
+        }
+    }
+
     /// Narrow this filter to what the merged upstream capabilities can
     /// actually deliver — the subset the acknowledgement reports.
     ///
@@ -1606,7 +1626,7 @@ pub fn stamp_subscription_id(message: &mut Value, subscription_id: &Value) {
 pub fn subscription_ack(subscription_id: &Value, honored: &SubscriptionFilter) -> Value {
     json!({
         "jsonrpc": "2.0",
-        "method": "notifications/subscriptions/acknowledged",
+        "method": METHOD_SUBSCRIPTIONS_ACKNOWLEDGED,
         "params": {
             "_meta": { META_SUBSCRIPTION_ID: subscription_id },
             "notifications": honored.to_json(),
@@ -1746,6 +1766,31 @@ pub fn input_request_key(method: &str, ordinal: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each type is kept only where BOTH filters name it — one flag at a time,
+    /// both ways, and the URIs by membership.
+    #[test]
+    fn an_intersection_keeps_only_what_both_filters_name() {
+        let all = SubscriptionFilter {
+            tools_list_changed: true,
+            prompts_list_changed: true,
+            resources_list_changed: true,
+            resource_subscriptions: vec!["a".into(), "b".into()],
+        };
+        let none = SubscriptionFilter::default();
+        assert_eq!(all.intersect(&all), all);
+        assert_eq!(all.intersect(&none), none);
+        assert_eq!(none.intersect(&all), none);
+        let tools = SubscriptionFilter { tools_list_changed: true, ..Default::default() };
+        let prompts = SubscriptionFilter { prompts_list_changed: true, ..Default::default() };
+        let resources = SubscriptionFilter { resources_list_changed: true, ..Default::default() };
+        for one in [&tools, &prompts, &resources] {
+            assert_eq!(all.intersect(one), *one);
+            assert_eq!(one.intersect(&all), *one);
+        }
+        let only_b = SubscriptionFilter { resource_subscriptions: vec!["b".into(), "c".into()], ..Default::default() };
+        assert_eq!(all.intersect(&only_b).resource_subscriptions, vec!["b".to_string()]);
+    }
     use std::assert_matches;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {

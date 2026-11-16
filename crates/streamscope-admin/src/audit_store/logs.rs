@@ -192,7 +192,10 @@ pub(crate) async fn list_audit_logs_llm(
         ApiError::internal("Failed to query audit logs")
     };
     // The turn is outer-joined, so its window rides the join's ON clause: a
-    // WHERE bound would drop every row that has no turn.
+    // WHERE bound would drop every row that has no turn. The session is joined
+    // by a key computed in its own fenced lateral (`OFFSET 0`): joined on the
+    // COALESCE inline, the key is not an index condition and every listed row
+    // is compared against every session of the tenant.
     let select = |from: &'static str, filters: &LlmFilters| {
         format!(
             "SELECT {ALL_COLUMNS} FROM {from} \
@@ -201,7 +204,8 @@ pub(crate) async fn list_audit_logs_llm(
              LEFT JOIN api_keys ak ON ak.id = g.key_id \
              LEFT JOIN workspaces ws ON ws.id = g.workspace_id \
              LEFT JOIN conversation_turns ct ON ct.request_id = a.request_id AND ct.timestamp = a.timestamp{} \
-             LEFT JOIN sessions sa ON sa.session_id = COALESCE(ct.session_id, g.session_id) \
+             LEFT JOIN LATERAL (SELECT COALESCE(ct.session_id, g.session_id) AS session_id OFFSET 0) sk ON true \
+             LEFT JOIN sessions sa ON sa.session_id = sk.session_id \
              WHERE ",
             filters.turn_window
         )

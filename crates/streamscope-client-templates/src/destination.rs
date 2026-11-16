@@ -426,21 +426,62 @@ pub enum NameDecision {
     Undecided,
 }
 
-/// The sandbox's attached lists, flattened: a block match refuses, then an
-/// allow match permits, then everything else is refused. The gateway is
-/// decided before this, by the guard.
+/// What the sandbox may reach besides the gateway, before any list is read.
+/// Ordered narrowest first: `Gateway < Listed < Open`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Posture {
+    /// The gateway only: no list is read.
+    Gateway,
+    /// What an allow list names, unless a block list names it.
+    #[default]
+    Listed,
+    /// Everything a block list does not name.
+    Open,
+}
+
+impl Posture {
+    /// The narrower of two postures.
+    pub fn narrower(self, other: Posture) -> Posture {
+        self.min(other)
+    }
+
+    /// The spelling serde uses, and a stored column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Posture::Gateway => "gateway",
+            Posture::Listed => "listed",
+            Posture::Open => "open",
+        }
+    }
+
+    /// The posture `as_str` spells `s`; `None` for any other text.
+    pub fn parse(s: &str) -> Option<Posture> {
+        [Posture::Gateway, Posture::Listed, Posture::Open].into_iter().find(|p| p.as_str() == s)
+    }
+}
+
+/// The sandbox's attached lists, flattened, under a [`Posture`]: a block
+/// match refuses; then, listed, an allow match permits and everything else
+/// is refused; open, everything else is permitted; gateway-only, nothing is.
+/// The gateway is decided before this, by the guard. In every posture the
+/// metadata address is refused, and a name never reaches a loopback or
+/// unspecified address unless an address entry allows it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
     pub allow: DestinationSet,
     pub block: DestinationSet,
+    pub posture: Posture,
 }
 
 impl Policy {
-    /// The verdict a name target's own entries give.
+    /// The verdict a name target's own entries give: open, a name no block
+    /// entry names is allowed (its addresses still checked).
     pub fn by_name(&self, host: &str, port: u16) -> NameDecision {
-        if self.block.matches_name(host, port, Mode::Block) {
+        if self.posture == Posture::Gateway || self.block.matches_name(host, port, Mode::Block) {
             NameDecision::Blocked
-        } else if self.allow.matches_name(host, port, Mode::Allow) {
+        } else if self.posture == Posture::Open || self.allow.matches_name(host, port, Mode::Allow) {
             NameDecision::Allowed
         } else {
             NameDecision::Undecided
@@ -459,20 +500,26 @@ impl Policy {
     pub fn permits_addr(&self, name_allowed: bool, ip: IpAddr, port: u16) -> bool {
         let canon = canonical_ip(ip);
         let local = canon.is_loopback() || canon.is_unspecified();
-        !is_imds_ip(ip)
+        let allowed = name_allowed || self.posture == Posture::Open;
+        self.posture != Posture::Gateway
+            && !is_imds_ip(ip)
             && !self.block.matches_ip(ip, port, Mode::Block)
-            && ((name_allowed && !local) || self.allow.matches_ip(ip, port, Mode::Allow))
+            && ((allowed && !local) || self.allow.matches_ip(ip, port, Mode::Allow))
     }
 
-    /// True when the policy can permit anything at all besides the gateway.
+    /// True when the policy permits nothing besides the gateway.
     pub fn is_empty(&self) -> bool {
-        self.allow.is_empty()
+        match self.posture {
+            Posture::Gateway => true,
+            Posture::Listed => self.allow.is_empty(),
+            Posture::Open => false,
+        }
     }
 
     /// True when resolving a name the entries do not decide can still find an
     /// address an allow entry matches.
     pub fn allows_by_address(&self) -> bool {
-        self.allow.has_addresses()
+        self.posture != Posture::Gateway && self.allow.has_addresses()
     }
 }
 
@@ -717,19 +764,19 @@ mod tests {
             assert!(!e.matches_ip(ip("fd00:ec2::254"), 443, A), "{e}");
         }
         assert!(d("169.254.0.0/16").matches_ip(ip("169.254.169.253"), 443, A), "its neighbour still matches");
-        let p = Policy { allow: DestinationSet::parse(&["169.254.0.0/16"]).unwrap(), block: DestinationSet::default() };
+        let p = Policy { allow: DestinationSet::parse(&["169.254.0.0/16"]).unwrap(), block: DestinationSet::default(), ..Policy::default() };
         assert!(!p.permits_addr(true, ip("169.254.169.254"), 443), "not even through an allowed name");
         assert!(p.permits_addr(true, ip("169.254.169.253"), 443));
     }
 
     #[test]
     fn an_allowed_name_never_reaches_a_local_address_an_address_entry_does_not_name() {
-        let p = Policy { allow: DestinationSet::parse(&["a.lan"]).unwrap(), block: DestinationSet::default() };
+        let p = Policy { allow: DestinationSet::parse(&["a.lan"]).unwrap(), block: DestinationSet::default(), ..Policy::default() };
         for local in ["127.0.0.1", "127.8.9.1", "::1", "0.0.0.0", "::", "::ffff:127.0.0.1"] {
             assert!(!p.permits_addr(true, ip(local), 443), "{local}");
         }
         assert!(p.permits_addr(true, ip("10.0.0.1"), 443), "the positive control");
-        let named = Policy { allow: DestinationSet::parse(&["127.0.0.1:5000"]).unwrap(), block: DestinationSet::default() };
+        let named = Policy { allow: DestinationSet::parse(&["127.0.0.1:5000"]).unwrap(), block: DestinationSet::default(), ..Policy::default() };
         assert!(named.permits_addr(true, ip("127.0.0.1"), 5000), "an address entry naming it opens it");
         assert!(named.permits_addr(false, ip("127.0.0.1"), 5000));
     }
@@ -739,6 +786,7 @@ mod tests {
         let p = Policy {
             allow: DestinationSet::parse(&["*.corp.example", "10.0.0.0/8"]).unwrap(),
             block: DestinationSet::parse(&["hr.corp.example", "10.9.0.0/16"]).unwrap(),
+            ..Policy::default()
         };
         assert_eq!(p.by_name("git.corp.example", 443), NameDecision::Allowed);
         assert_eq!(p.by_name("hr.corp.example", 443), NameDecision::Blocked);
@@ -751,7 +799,7 @@ mod tests {
         assert!(p.permits_addr(true, ip("203.0.113.1"), 443), "an allowed name, any unblocked address");
         assert!(!p.permits_addr(false, ip("203.0.113.1"), 443), "nothing allows it");
         assert!(p.allows_by_address());
-        let names_only = Policy { allow: DestinationSet::parse(&["a.lan"]).unwrap(), block: DestinationSet::default() };
+        let names_only = Policy { allow: DestinationSet::parse(&["a.lan"]).unwrap(), block: DestinationSet::default(), ..Policy::default() };
         assert!(!names_only.allows_by_address());
         assert!(!names_only.is_empty());
         assert!(Policy::default().is_empty());
@@ -925,4 +973,132 @@ mod tests {
     // generator emits port ranges past 65535 (saturated) and single-label
     // suffixes are refused by design; acceptance is pinned by the example
     // tests above.
+
+    mod posture {
+        use super::super::*;
+        use proptest::prelude::*;
+
+        const NAMES: [&str; 6] = ["a.corp.example", "b.corp.example", "corp.example", "pypi.org", "x.pypi.org", "github.com"];
+        const ADDRS: [&str; 7] = ["10.1.2.3", "192.168.1.1", "8.8.8.8", "127.0.0.1", "169.254.169.254", "fd00::1", "2001:db8::1"];
+        const ENTRIES: [&str; 10] = [
+            "a.corp.example", "*.corp.example", "pypi.org:443,8080", "*.pypi.org", "10.0.0.0/8", "8.8.8.8",
+            "127.0.0.1", "[fd00::]/8", "github.com:22", "192.168.1.1:80",
+        ];
+
+        fn set(picks: &[usize]) -> DestinationSet {
+            let entries: Vec<&str> = picks.iter().map(|i| ENTRIES[i % ENTRIES.len()]).collect();
+            DestinationSet::parse(&entries).unwrap()
+        }
+
+        fn arb_policy(posture: Posture) -> impl Strategy<Value = Policy> {
+            (proptest::collection::vec(0usize..10, 0..5), proptest::collection::vec(0usize..10, 0..4))
+                .prop_map(move |(a, b)| Policy { allow: set(&a), block: set(&b), posture })
+        }
+
+        /// The listed verdict, spelled out: block, then allow, then refuse.
+        fn listed_reference(p: &Policy, name: Option<&str>, ip: IpAddr, port: u16) -> bool {
+            let name_allowed = match name {
+                Some(n) if p.block.matches_name(n, port, Mode::Block) => return false,
+                Some(n) => p.allow.matches_name(n, port, Mode::Allow),
+                None => false,
+            };
+            let canon = canonical_ip(ip);
+            let local = canon.is_loopback() || canon.is_unspecified();
+            !is_imds_ip(ip)
+                && !p.block.matches_ip(ip, port, Mode::Block)
+                && ((name_allowed && !local) || p.allow.matches_ip(ip, port, Mode::Allow))
+        }
+
+        /// What the guard decides for a name resolving to `ip` (or the
+        /// address itself, without a name).
+        fn verdict(p: &Policy, name: Option<&str>, ip: IpAddr, port: u16) -> bool {
+            match name {
+                None => p.permits_addr(false, ip, port),
+                Some(n) => match p.by_name(n, port) {
+                    NameDecision::Blocked => false,
+                    NameDecision::Allowed => p.permits_addr(true, ip, port),
+                    NameDecision::Undecided => p.allows_by_address() && p.permits_addr(false, ip, port),
+                },
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn listed_is_block_then_allow_then_refuse(p in arb_policy(Posture::Listed), n in 0usize..7, a in 0usize..7, port in prop::sample::select(vec![22u16, 80, 443, 8080])) {
+                let name = NAMES.get(n).copied();
+                let ip: IpAddr = ADDRS[a].parse().unwrap();
+                prop_assert_eq!(verdict(&p, name, ip, port), listed_reference(&p, name, ip, port));
+            }
+
+            #[test]
+            fn open_never_permits_what_a_block_entry_names(p in arb_policy(Posture::Open), n in 0usize..7, a in 0usize..7, port in prop::sample::select(vec![22u16, 80, 443, 8080])) {
+                let name = NAMES.get(n).copied();
+                let ip: IpAddr = ADDRS[a].parse().unwrap();
+                let blocked = name.is_some_and(|n| p.block.matches_name(n, port, Mode::Block)) || p.block.matches_ip(ip, port, Mode::Block);
+                if blocked || is_imds_ip(ip) {
+                    prop_assert!(!verdict(&p, name, ip, port));
+                }
+                // And it permits at least what listed does, under the same lists.
+                let listed = Policy { posture: Posture::Listed, ..p.clone() };
+                if verdict(&listed, name, ip, port) {
+                    prop_assert!(verdict(&p, name, ip, port));
+                }
+            }
+
+            #[test]
+            fn gateway_only_permits_nothing(p in arb_policy(Posture::Gateway), n in 0usize..7, a in 0usize..7, port in prop::sample::select(vec![22u16, 80, 443, 8080])) {
+                let ip: IpAddr = ADDRS[a].parse().unwrap();
+                prop_assert!(!verdict(&p, NAMES.get(n).copied(), ip, port));
+                prop_assert!(p.is_empty());
+            }
+        }
+
+        #[test]
+        fn open_permits_an_unlisted_public_host_and_keeps_loopback_and_metadata_out() {
+            let p = Policy { posture: Posture::Open, ..Policy::default() };
+            assert_eq!(p.by_name("example.org", 443), NameDecision::Allowed);
+            assert!(p.permits_addr(true, "93.184.215.14".parse().unwrap(), 443));
+            assert!(p.permits_addr(false, "93.184.215.14".parse().unwrap(), 22), "an address literal too");
+            assert!(!p.permits_addr(true, "127.0.0.1".parse().unwrap(), 443));
+            assert!(!p.permits_addr(false, "::".parse().unwrap(), 443));
+            assert!(!p.permits_addr(true, "169.254.169.254".parse().unwrap(), 80));
+            assert!(!p.is_empty());
+            // Listed, the same host is refused (the positive control above holds).
+            let listed = Policy::default();
+            assert_eq!(listed.by_name("example.org", 443), NameDecision::Undecided);
+            assert!(!listed.permits_addr(false, "93.184.215.14".parse().unwrap(), 443));
+        }
+
+        #[test]
+        fn a_posture_is_spelled_as_serde_spells_it() {
+            for p in [Posture::Gateway, Posture::Listed, Posture::Open] {
+                assert_eq!(serde_json::to_value(p).unwrap(), serde_json::Value::String(p.as_str().into()));
+                assert_eq!(Posture::parse(p.as_str()), Some(p));
+            }
+            assert_eq!(Posture::parse("everything"), None);
+        }
+
+        #[test]
+        fn the_narrower_posture_wins() {
+            use Posture::*;
+            for (a, b, want) in [(Open, Gateway, Gateway), (Gateway, Open, Gateway), (Open, Listed, Listed), (Listed, Open, Listed), (Open, Open, Open), (Listed, Gateway, Gateway)] {
+                assert_eq!(a.narrower(b), want, "{a:?} {b:?}");
+            }
+        }
+
+        #[test]
+        fn the_seeded_internal_networks_list_parses_and_blocks_each_range() {
+            let seed: serde_json::Value =
+                serde_json::from_str(include_str!("../../../seeds/destination_lists/internal-networks.json")).unwrap();
+            let entries: Vec<String> = serde_json::from_value(seed["entries"].clone()).unwrap();
+            let p = Policy { block: DestinationSet::parse(&entries).unwrap(), posture: Posture::Open, ..Policy::default() };
+            for inside in ["10.1.2.3", "172.20.0.1", "192.168.0.10", "100.100.1.1", "169.254.1.1", "127.0.0.1", "192.0.0.8", "239.1.1.1", "250.0.0.1", "fd12::1", "fe80::1", "::ffff:10.0.0.1", "::10.0.0.1"] {
+                assert!(!p.permits_addr(true, inside.parse().unwrap(), 443), "{inside}");
+            }
+            for outside in ["8.8.8.8", "172.32.0.1", "2001:4860::8888"] {
+                assert!(p.permits_addr(true, outside.parse().unwrap(), 443), "{outside}");
+            }
+        }
+    }
+
 }

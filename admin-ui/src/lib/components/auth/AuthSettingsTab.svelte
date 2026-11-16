@@ -342,7 +342,7 @@
         <h3 class="text-sm font-semibold text-(--text-primary) mb-1">Group Sync</h3>
         <p class="text-xs text-(--text-secondary) mb-2">On every OIDC login, workspace memberships are synced from the ID-token claims.</p>
         <ul class="text-xs text-(--text-secondary) space-y-1 list-disc ml-4">
-          <li>Workspaces with an <code class="text-(--text-primary)">oidc_claim_pattern</code> are IdP-managed — users whose claim (the one the workspace names, e.g. <code class="text-(--text-primary)">groups</code>, or <code class="text-(--text-primary)">group</code> on AD FS) matches auto-join</li>
+          <li>Workspaces with an <code class="text-(--text-primary)">oidc_claim_pattern</code> are IdP-managed — users whose claim (the one the workspace names, e.g. <code class="text-(--text-primary)">groups</code>, or <code class="text-(--text-primary)">group</code> on AD FS) has a value the pattern matches whole auto-join at their next sign-in</li>
           <li>Workspaces without a pattern are manual — never touched by sync</li>
           <li>Set each workspace's pattern on its Members tab in <a href={thref(slug, '/workspaces')} class="text-(--accent) hover:underline">Workspaces</a></li>
         </ul>

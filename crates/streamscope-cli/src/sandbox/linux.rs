@@ -554,8 +554,8 @@ fn target_arch() -> Result<seccompiler::TargetArch> {
 /// command name itself (so `python`/`node` invoked directly still match).
 fn runtime_of(command: &str) -> String {
     match command {
-        "claude" | "opencode" | "gemini" | "qwen" | "cn" | "continue" | "vibe" => "node".to_string(),
-        "aider" => "python".to_string(),
+        "claude" | "opencode" | "gemini" | "qwen" | "cn" | "continue" | "ocr" | "open-code-review" => "node".to_string(),
+        "aider" | "vibe" => "python".to_string(),
         other => other.to_string(),
     }
 }
@@ -831,12 +831,15 @@ mod learn_tests {
             cwd: home.join("proj"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: vec![],
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         };
         let policy = build_policy_in(&home, &spec, &scratch).unwrap();
         // `fs_rw` is applied with `AccessFs::from_all`: write AND execute.
@@ -906,12 +909,15 @@ mod learn_tests {
             cwd: home.join("proj"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: vec![],
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         };
         let agent = profiles::agent_for(&spec.command).unwrap();
         create_state_dirs(&home, agent.state_dirs, &secret_deny(&home), Create::Dir);
@@ -963,12 +969,15 @@ mod learn_tests {
             cwd: home.join("proj"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: vec![],
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         };
         let policy = build_policy_in(&home, &spec, &home.join(".cache/streamscopeai/tmp/run")).unwrap();
         for dir in [
@@ -1110,5 +1119,28 @@ mod reaper_tests {
         assert_eq!(children_of(std::process::id()).len(), 1, "no orphan was reparented here");
         reap_orphans();
         assert!(children_of(std::process::id()).is_empty(), "an orphan survived the reap");
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    /// Each client gets its runtime's toolchain grants: a Python tool (uv or
+    /// pipx installs it) the Python ones, a Node tool Node's — under each
+    /// name its profile answers to.
+    #[test]
+    fn each_client_gets_its_own_runtimes_toolchain() {
+        for (command, runtime) in [
+            ("aider", "python"),
+            ("vibe", "python"),
+            ("ocr", "node"),
+            ("open-code-review", "node"),
+            ("opencode", "node"),
+            ("claude", "node"),
+        ] {
+            assert_eq!(runtime_of(command), runtime, "{command}");
+            assert!(profiles::toolchain_for(&runtime_of(command)).is_some(), "{command}");
+        }
     }
 }

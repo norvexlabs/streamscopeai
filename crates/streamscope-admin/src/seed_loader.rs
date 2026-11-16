@@ -1266,6 +1266,12 @@ let y = 2;
         ("*Briefly* summarize this partial conversation about programming.\nInclude less detail about older parts and more detail about the most recent messages.", Some("aider")),
         // A neighbour's generic opening is not Aider's.
         ("Act as an expert software developer.", None),
+        // Open Code Review: its review, planning and connection-test tasks.
+        ("## Role\nYou are a code review assistant. You are responsible for producing professional review feedback on pull requests before they are merged. The diffs show what changed; use context tools to read or search related code when needed.", Some("open-code-review")),
+        ("You are an expert in code review task planning. You have access to a set of tools for retrieving relevant context about code changes, and your responsibility is to analyze those changes and produce a structured review plan.", Some("open-code-review")),
+        ("## Role\nYou are open-code-review, a code review assistant developed by Alibaba, running in the user's command-line environment.", Some("open-code-review")),
+        // A generic reviewer prompt is not Open Code Review's.
+        ("You are a code reviewer.", None),
         ("You are opencode, an interactive CLI tool that helps users with software engineering tasks.", Some("opencode")),
         ("You are OpenCode, a coding agent that helps users with software engineering tasks.", Some("opencode")),
         ("You are OpenCode, an interactive general AI agent running on a user's computer.", Some("opencode")),
@@ -1275,6 +1281,36 @@ let y = 2;
         ("You are a title generator. You output ONLY a thread title. Nothing else.", None),
         ("You are a helpful assistant.", None),
     ];
+
+    /// User-Agents the clients really send, read off their requests, each with
+    /// the app the seeded registry must name for it (`None`: a generic client
+    /// library no app owns — Open Code Review's MCP client is Go's own).
+    const USER_AGENTS: &[(&str, Option<&str>)] = &[
+        ("open-code-review/1.13.9", Some("open-code-review")),
+        ("opencode/latest/2.2.5/cli", Some("opencode")),
+        ("Go-http-client/1.1", None),
+    ];
+
+    /// The seeded User-Agent patterns, folded as the proxy folds them, name
+    /// each client's real User-Agent — and a generic client library none.
+    #[test]
+    fn every_seeded_user_agent_pattern_names_its_client() {
+        use streamscope_core::config::AppPattern;
+        use streamscope_core::middleware::attribution::{extract_attribution, normalize_patterns};
+
+        let patterns: Vec<AppPattern> = repo_seed_loader()
+            .load_apps()
+            .into_iter()
+            .map(|a| AppPattern { ua_patterns: normalize_patterns(&a.ua_patterns, 1), app_id: a.id, ..Default::default() })
+            .collect();
+        for (ua, expected) in USER_AGENTS {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("user-agent", ua.parse().unwrap());
+            let found = extract_attribution(&headers, uuid::Uuid::nil(), &patterns, false);
+            assert_eq!(found.app_id.as_deref(), *expected, "User-Agent {ua}");
+            assert_eq!(found.detection_method.as_deref(), expected.map(|_| "user_agent"), "User-Agent {ua}");
+        }
+    }
 
     /// A prompt pattern is tried against every request no header named, so a
     /// useful one names its own client from that client's real prompt and

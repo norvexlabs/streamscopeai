@@ -160,6 +160,20 @@ enum Command {
     /// PID 1 of a docker-sandbox container. Not for direct use.
     #[command(name = "__sandbox-init", hide = true)]
     SandboxInit { start_file: std::path::PathBuf },
+    /// Inside a docker-sandbox container, as the agent user: print what
+    /// OpenCode's configs there do to the provisioned one. Not for direct use.
+    #[command(name = "__opencode-check", hide = true)]
+    OpencodeCheck {
+        /// The gateway's provider key.
+        #[arg(long)]
+        provider: String,
+        /// The provisioned config's place in the container.
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// A global provisioning: the config's own pins are judged too.
+        #[arg(long)]
+        global: bool,
+    },
     /// Give back to the developer the files a docker-sandbox container wrote
     /// under `root` (run under `podman unshare`). Not for direct use.
     #[command(name = "__sandbox-sweep", hide = true)]
@@ -227,6 +241,7 @@ fn main() {
         Command::SandboxSweep { root, container_root_uid, container_root_gid } => {
             finish(sandbox::podman_sweep(root, *container_root_uid, *container_root_gid))
         }
+        Command::OpencodeCheck { provider, config, global } => finish(sandbox::opencode_check(provider, config, *global)),
         #[cfg(windows)]
         Command::SandboxSetup { request } => finish(sandbox::windows::setup::helper(request)),
         #[cfg(not(windows))]
@@ -263,7 +278,7 @@ fn main() {
 }
 
 /// Run an async subcommand. `RunConfined`, `SandboxInit`, `SandboxSweep`,
-/// `SandboxSetup` and `SandboxHost` are handled in `main` before the runtime starts, so they never reach here.
+/// `OpencodeCheck`, `SandboxSetup` and `SandboxHost` are handled in `main` before the runtime starts, so they never reach here.
 async fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Login {
@@ -299,6 +314,7 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::RunConfined { .. }
         | Command::SandboxInit { .. }
         | Command::SandboxSweep { .. }
+        | Command::OpencodeCheck { .. }
         | Command::SandboxSetup { .. }
         | Command::SandboxHost { .. } => {
             unreachable!("handled in main before the runtime starts")

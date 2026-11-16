@@ -213,7 +213,7 @@ pub static SETTINGS_CATALOG: &[SettingMeta] = &[
     meta!("UPSTREAM_CIRCUIT_BREAKER_COOLDOWN_SECS", Proxy, "Upstream health", Integer, "30", true,
         "How long an out-of-rotation target waits before the next request is allowed through as a single recovery trial, in seconds."),
     meta!("SQLITE_POOL_SIZE", Proxy, "Edge outbox", Integer, "2", false,
-        "Outbox SQLite connection pool size."),
+        "Read connections on the edge outbox's SQLite store. Every write goes through one connection of its own."),
     meta!("AUDIT_DEBUG_ENDPOINT", Proxy, "Edge outbox", Bool, "false", false,
         "Expose the unauthenticated /debug/buffered-audit introspection endpoint (cumulative counts of audit records committed to the on-disk outbox, and the live count of records not yet delivered to the admin API). Diagnostic only; leave off in production."),
     meta!("APPLIANCE_HOST_MEMORY", Proxy, "Edge connection", Bool, "false", false,

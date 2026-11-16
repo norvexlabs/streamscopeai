@@ -509,8 +509,12 @@ fn hash_anthropic_message_exact(msg: &AnthropicMessage) -> (String, bool) {
             // Serialize via Value to maintain consistent key ordering for hash stability.
             let mut v = serde_json::to_value(blocks).unwrap_or_default();
             // STEP 1: cache_control strip (runs first so the array is
-            // clean before the volatile-part filter runs).
+            // clean before the volatile-part filter runs), and the members
+            // that say where a text or a call came from — a text's
+            // `citations`, a call's `caller` and `toolset_name` — which no
+            // reader of the link hash reads.
             strip_breakpoints(&mut v);
+            strip_provenance(&mut v);
             // STEP 2: drop volatile text blocks from the array.
             let dropped = canonicalize_content_value(&mut v);
             (serde_json::to_string(&v).unwrap_or_default(), dropped)
@@ -570,6 +574,32 @@ fn strip_breakpoints(value: &mut serde_json::Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Remove a text's `citations` and a call's `caller` and `toolset_name` from a
+/// message's blocks and a tool result's — where the protocol puts them, never
+/// inside another block's payload (a call's arguments, a server tool's result).
+fn strip_provenance(blocks: &mut serde_json::Value) {
+    let Some(blocks) = blocks.as_array_mut() else {
+        return;
+    };
+    for block in blocks.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                block.remove("citations");
+            }
+            Some("tool_use" | "server_tool_use") => {
+                block.remove("caller");
+                block.remove("toolset_name");
+            }
+            Some("tool_result") => {
+                if let Some(inner) = block.get_mut("content") {
+                    strip_provenance(inner);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -682,10 +712,25 @@ fn hash_raw_response_item_exact(item: &serde_json::Value) -> (String, bool) {
     // `content` field and pass through unchanged per the helper contract.
     // Also covers the `ResponseInput::Text` synthesis path, which
     // constructs `{"role":"user","content": text}` and routes here.
-    let (canonical, dropped) = canonicalize_message_value(item.clone());
+    let mut item = item.clone();
+    strip_responses_breakpoints(&mut item);
+    let (canonical, dropped) = canonicalize_message_value(item);
     let item_json = serde_json::to_string(&canonical).unwrap_or_default();
     hasher.update(item_json.as_bytes());
     (hex::encode(hasher.finalize()), !dropped)
+}
+
+/// Remove the `prompt_cache_breakpoint` of a Responses item's parts — a
+/// message's `content`, a tool result's `output` — which moves from turn to
+/// turn as an Anthropic block's `cache_control` does.
+fn strip_responses_breakpoints(item: &mut serde_json::Value) {
+    for key in ["content", "output"] {
+        if let Some(parts) = item.get_mut(key).and_then(serde_json::Value::as_array_mut) {
+            for part in parts.iter_mut().filter_map(serde_json::Value::as_object_mut) {
+                part.remove("prompt_cache_breakpoint");
+            }
+        }
+    }
 }
 
 /// Hash a Gemini `Content` (role + parts) with canonicalization so
@@ -816,43 +861,55 @@ fn extract_user_prompt_anthropic(messages: &[AnthropicMessage]) -> Option<String
         })
 }
 
-/// Framework-injected text-block prefixes. Their `<tag>…</tag>` (or
-/// bracket-form) blocks are transient metadata — they appear in one turn
-/// and disappear on the next. Stripped from the hash input so session
-/// prefix matching is stable across those turns.
+/// Framework-injected text blocks, by the tag that opens them. A block is
+/// transient metadata — it appears in one turn and is gone the next — so the
+/// session-link hashes leave it out (a string inline; an array part only when
+/// the whole part starts with one, [`is_volatile_text_part`]), inbound PII
+/// screening skips it, and the session view shows it as a collapsed card
+/// beside the prose.
 ///
-/// Single source of truth: add one line here to teach every protocol
-/// hasher + the admin renderer about a new transient. Kept as a `const`
-/// (not a seed file or tenant setting) because the known set is small and
-/// over-stripping is harmless — canonicalization transforms the hash
-/// input, not stored content, so applying it uniformly to every hash
-/// preserves prefix matching even when a "volatile" block happens to be
-/// genuine content.
+/// A tag opens a block only as [`split_volatile_blocks`] defines one: at the
+/// start of a line, through its matching close. An entry ending in `>` is one
+/// tag; any other names a family (`<command-name>`, `<command-message>`, …).
 ///
-/// Ordering: when two family prefixes share a root (e.g. `<local-command-`
-/// is a super-family of `<command-` in spirit), list the **longer / more
-/// specific** one first. `strip_volatile_inline` does substring-based
-/// `find` per prefix; a shorter prefix listed first would match inside a
-/// longer tag's body and corrupt stripping.
-pub(crate) const VOLATILE_TAG_PREFIXES: &[&str] = &[
-    "<system-reminder>",          // OpenCode plan↔build + Claude Code
-    "<available-deferred-tools>", // Claude Code deferred-tool churn
-    "<session_context>",          // Gemini CLI per-session environment context
-    "<local-command-",            // longer family — must precede <command-
-    "<command-",                  // Claude Code /command echoes
-    "[SUGGESTION MODE",           // Claude Code inline suggestions
-    "[SYSTEM",                    // Generic system-injected prefix
+/// Single source of truth: add one line here (and its [`VolatileLabel`]) to
+/// teach every protocol hasher, the PII screen and the session view about a
+/// new transient.
+const VOLATILE_TAG_PREFIXES: &[(&str, VolatileLabel)] = &[
+    ("<system-reminder>", VolatileLabel::SystemReminder),         // OpenCode plan↔build + Claude Code
+    ("<available-deferred-tools>", VolatileLabel::DeferredTools), // Claude Code deferred-tool churn
+    ("<session_context>", VolatileLabel::SessionContext),         // Gemini CLI per-session environment context
+    ("<local-command-", VolatileLabel::LocalCommand),             // Claude Code local command echoes
+    ("<command-", VolatileLabel::Command),                        // Claude Code /command echoes
 ];
 
-/// True iff `text`, after no trimming, begins with any volatile tag.
+/// Prefixes of a whole text a client injects with no closing form. Hashing
+/// alone reads them: a text part or message starting with one is left out of
+/// the session-link hashes. They are not blocks — the session view, the
+/// experts and the PII screen read such a text as the message it is.
+const BRACKET_PREFIXES: &[&str] = &[
+    "[SUGGESTION MODE", // Claude Code inline suggestions
+    "[SYSTEM",          // Generic system-injected prefix
+];
+
+/// True iff `text` begins with a volatile block — its first line (after any
+/// indent) opens one, as [`split_volatile_blocks`] reads it — or, untrimmed,
+/// with a bracket-form prefix. A text that starts with an opening tag it
+/// never closes is a text *about* the tag, not an injection.
 pub(crate) fn starts_with_volatile_tag(text: &str) -> bool {
-    VOLATILE_TAG_PREFIXES.iter().any(|p| text.starts_with(p))
+    if BRACKET_PREFIXES.iter().any(|p| text.starts_with(p)) {
+        return true;
+    }
+    // The scanner's first-line rule, read without scanning the rest: the
+    // opener after the indent, closed by the first matching close after it.
+    let at = text.len() - text.trim_start_matches([' ', '\t']).len();
+    opener_at(text, at).is_some_and(|(name, _)| text[at + name.len() + 2..].contains(&format!("</{name}>")))
 }
 
-/// Human-readable taxonomy for a [`VolatileSegment::Volatile`] segment.
-/// Keeps the "which family fired?" information at the crate boundary so
-/// admin renderers can map to UI labels without re-matching prefixes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Which family a volatile block belongs to. Serialized on the session
+/// conversation's `framework_reminder` event, where the console names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum VolatileLabel {
     /// `<system-reminder>…</system-reminder>` — OpenCode plan↔build +
     /// Claude Code framework reminders.
@@ -874,8 +931,7 @@ pub enum VolatileLabel {
 /// blocks. [`split_volatile_blocks`] emits these in document order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VolatileSegment {
-    /// Non-volatile user-visible text. May be empty when two volatile
-    /// blocks are adjacent; callers are expected to filter empties.
+    /// Text that is not a volatile block. Never empty.
     Prose(String),
     /// A full framework-injected block — `raw` includes the opening and
     /// closing tag so downstream renderers can surface the exact bytes
@@ -884,141 +940,118 @@ pub enum VolatileSegment {
     Volatile { label: VolatileLabel, raw: String },
 }
 
-/// Scan `text` for framework-injected `<tag>…</tag>` blocks (see
-/// [`VOLATILE_TAG_PREFIXES`]) and return the contents as an ordered list
-/// of [`VolatileSegment`]s. Preserves document order; prose segments are
-/// the spans between (or outside) volatile blocks.
+/// One volatile block of a text: `start..end` is the opening tag through its
+/// close, `line` the start of its line's indent (`start` when none); `resume`
+/// is where the text continues, past the whitespace (spaces, tabs, `\r`,
+/// `\n`) that follows the close.
+struct VolatileBlock {
+    line: usize,
+    start: usize,
+    end: usize,
+    resume: usize,
+    label: VolatileLabel,
+}
+
+/// The tag name at `from`: a non-empty run of `[A-Za-z0-9_-]` followed by `>`.
+fn tag_name(text: &str, from: usize) -> Option<&str> {
+    let rest = text.get(from..)?;
+    let len = rest.bytes().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')).count();
+    (len > 0 && rest.as_bytes().get(len) == Some(&b'>')).then(|| &rest[..len])
+}
+
+/// The family of the XML-form tag `name` (without its brackets), if it is one.
+fn xml_label(name: &str) -> Option<VolatileLabel> {
+    VOLATILE_TAG_PREFIXES.iter().find_map(|(prefix, label)| {
+        let body = prefix.strip_prefix('<')?;
+        let is = match body.strip_suffix('>') {
+            Some(tag) => name == tag,
+            None => name.len() > body.len() && name.starts_with(body),
+        };
+        is.then_some(*label)
+    })
+}
+
+/// The volatile opening tag at byte `at`, if one is there: its name and family.
+fn opener_at(text: &str, at: usize) -> Option<(&str, VolatileLabel)> {
+    if text.as_bytes().get(at) != Some(&b'<') {
+        return None;
+    }
+    let name = tag_name(text, at + 1)?;
+    Some((name, xml_label(name)?))
+}
+
+/// Every volatile block of `text`, in order.
 ///
-/// Semantics match [`strip_volatile_inline`] for the join-prose case:
-///   - Bracket-form prefixes (`[SUGGESTION MODE`, `[SYSTEM`) have no
-///     defined closing form and are NOT split — they stay inside any
-///     surrounding `Prose` segment. Dropping those is the job of
-///     [`is_volatile_text_part`] on whole text parts.
-///   - Unclosed `<tag>` with no matching `</tag>` consumes everything
-///     from `<tag>` to end-of-text into a single `Volatile` segment —
-///     the renderer surfaces it as a collapsed placeholder rather than
-///     silently truncating real prose.
-///   - After a closed `<tag>…</tag>`, leading space / newline / tab in
-///     the following text is trimmed so the next `Prose` reads cleanly
-///     — same behaviour [`strip_volatile_inline`] has always had.
-///   - Nested tags are resolved left-to-right, outermost wins: the
-///     inner tag becomes part of the outer's `raw`. Real-world traffic
-///     does not nest these.
-///
-/// When two prefixes could match at the same offset (`<local-command-`
-/// vs `<command-`), the longer / more specific one wins — see
-/// [`VOLATILE_TAG_PREFIXES`] ordering.
+/// A block opens at the start of a line — the text's start, or after a `\n`
+/// and any spaces or tabs — or directly where the previous block's `resume`
+/// lands, and runs to the first matching close after its opening tag. An
+/// opening tag anywhere else, or one never closed, is prose: a text that
+/// *mentions* a tag (a system prompt describing `<system-reminder>` blocks)
+/// would otherwise lose everything after the mention. Nested tags resolve
+/// outermost first — the inner tag is part of the outer block. The closing
+/// tags are indexed once, so the scan is linear in the text whatever it holds
+/// (a text of many unclosed openers costs no search per opener).
+fn volatile_blocks(text: &str) -> Vec<VolatileBlock> {
+    let mut blocks = Vec::new();
+    if !text.contains('<') {
+        return blocks;
+    }
+    let mut closes: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+    for (at, _) in text.match_indices("</") {
+        if let Some(name) = tag_name(text, at + 2)
+            && xml_label(name).is_some()
+        {
+            closes.entry(name).or_default().push(at);
+        }
+    }
+    if closes.is_empty() {
+        return blocks;
+    }
+    let bytes = text.as_bytes();
+    let skip = |from: usize, ws: &[u8]| from + bytes[from..].iter().take_while(|b| ws.contains(b)).count();
+    let mut line = 0usize;
+    loop {
+        let at = skip(line, b" \t");
+        let block = opener_at(text, at).and_then(|(name, label)| {
+                let starts = closes.get(name)?;
+                let open_end = at + name.len() + 2;
+                let close = *starts.get(starts.partition_point(|&s| s < open_end))?;
+                Some((close + name.len() + 3, label))
+            });
+        if let Some((end, label)) = block {
+            let resume = skip(end, b" \t\r\n");
+            blocks.push(VolatileBlock { line, start: at, end, resume, label });
+            line = resume;
+            continue;
+        }
+        match bytes[at..].iter().position(|&b| b == b'\n') {
+            Some(nl) => line = at + nl + 1,
+            None => break,
+        }
+    }
+    blocks
+}
+
+/// Split `text` into its prose and its volatile blocks (see
+/// [`volatile_blocks`] for what a block is), in document order. Prose
+/// segments are the spans between and outside the blocks, minus a block
+/// line's indent and the whitespace right after each block's close.
 pub fn split_volatile_blocks(text: &str) -> Vec<VolatileSegment> {
     let mut segments = Vec::new();
-    if text.is_empty() {
-        return segments;
-    }
-    if !text.contains('<') {
-        segments.push(VolatileSegment::Prose(text.to_string()));
-        return segments;
-    }
-
-    // Accumulate prose until we hit a well-formed volatile block; flush
-    // as one `Prose` segment when we emit a `Volatile` (or at EOF).
-    // Malformed `<local-command-…` (no `>`) just falls into `prose_buf`
-    // — matches legacy `strip_volatile_inline` which left such text
-    // untouched and continued scanning for other prefixes.
-    let mut prose_buf = String::new();
     let mut cursor = 0usize;
-    let bytes = text.as_bytes();
-
-    while cursor < text.len() {
-        // Find the earliest position at or after `cursor` where any volatile
-        // angle-bracket prefix starts. For ties on offset, the first prefix
-        // listed in `VOLATILE_TAG_PREFIXES` wins — the list is ordered
-        // longest/most-specific first so `<local-command-` wins over
-        // `<command-` on shared starts.
-        let mut best: Option<(usize, &'static str)> = None;
-        for prefix in VOLATILE_TAG_PREFIXES {
-            if !prefix.starts_with('<') {
-                continue;
-            }
-            if let Some(rel) = text[cursor..].find(prefix) {
-                let abs = cursor + rel;
-                match best {
-                    Some((cur_abs, _)) if cur_abs <= abs => {}
-                    _ => best = Some((abs, prefix)),
-                }
-            }
+    for block in volatile_blocks(text) {
+        if block.line > cursor {
+            segments.push(VolatileSegment::Prose(text[cursor..block.line].to_string()));
         }
-
-        let Some((start, prefix)) = best else {
-            // No more volatile tags — append remainder to prose and stop.
-            prose_buf.push_str(&text[cursor..]);
-            break;
-        };
-
-        // Determine tag_name + open_end. For family prefixes with no
-        // closing `>`, treat as malformed: absorb the prefix into prose,
-        // advance past it, and keep scanning.
-        let after_prefix = start + prefix.len();
-        let (open_end, tag_name) = if prefix.ends_with('>') {
-            let name = &prefix[1..prefix.len() - 1];
-            (after_prefix, name.to_string())
-        } else {
-            match text[after_prefix..].find('>') {
-                Some(gt) => {
-                    let name_end = after_prefix + gt;
-                    let name = text[start + 1..name_end].to_string();
-                    (name_end + 1, name)
-                }
-                None => {
-                    // Fold `cursor..after_prefix` into prose, continue.
-                    prose_buf.push_str(&text[cursor..after_prefix]);
-                    cursor = after_prefix;
-                    continue;
-                }
-            }
-        };
-
-        let close = format!("</{tag_name}>");
-        let close_abs_opt = text[open_end..]
-            .find(&close)
-            .map(|close_rel| open_end + close_rel + close.len());
-
-        // Flush accumulated prose up to `start` before emitting Volatile.
-        prose_buf.push_str(&text[cursor..start]);
-        if !prose_buf.is_empty() {
-            segments.push(VolatileSegment::Prose(std::mem::take(&mut prose_buf)));
-        }
-
-        match close_abs_opt {
-            Some(close_abs) => {
-                segments.push(VolatileSegment::Volatile {
-                    label: label_for_prefix(prefix),
-                    raw: text[start..close_abs].to_string(),
-                });
-                // Trim leading space/newline/tab after the closing tag so
-                // the next prose segment doesn't inherit awkward whitespace
-                // left by the injection — matches legacy semantics.
-                let mut next = close_abs;
-                while next < bytes.len()
-                    && matches!(bytes[next], b' ' | b'\n' | b'\t')
-                {
-                    next += 1;
-                }
-                cursor = next;
-            }
-            None => {
-                // Unclosed tag — rest becomes one Volatile segment.
-                segments.push(VolatileSegment::Volatile {
-                    label: label_for_prefix(prefix),
-                    raw: text[start..].to_string(),
-                });
-                break;
-            }
-        }
+        segments.push(VolatileSegment::Volatile {
+            label: block.label,
+            raw: text[block.start..block.end].to_string(),
+        });
+        cursor = block.resume;
     }
-
-    if !prose_buf.is_empty() {
-        segments.push(VolatileSegment::Prose(prose_buf));
+    if cursor < text.len() {
+        segments.push(VolatileSegment::Prose(text[cursor..].to_string()));
     }
-
     segments
 }
 
@@ -1031,63 +1064,24 @@ pub fn split_volatile_blocks(text: &str) -> Vec<VolatileSegment> {
 /// Bracket-form prefixes (`[SYSTEM`, `[SUGGESTION MODE`) have no closing form
 /// and are not split into `Volatile` segments, so they are not reported here.
 pub fn volatile_byte_spans(text: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut cursor = 0usize;
-    for seg in split_volatile_blocks(text) {
-        if let VolatileSegment::Volatile { raw, .. } = seg
-            && let Some(rel) = text[cursor..].find(raw.as_str())
-        {
-            let start = cursor + rel;
-            let end = start + raw.len();
-            spans.push((start, end));
-            cursor = end;
-        }
-    }
-    spans
+    volatile_blocks(text).into_iter().map(|b| (b.start, b.end)).collect()
 }
 
-/// Map a known `VOLATILE_TAG_PREFIXES` entry to its [`VolatileLabel`].
-/// Intended for internal use by [`split_volatile_blocks`]; panics on an
-/// unknown prefix so that adding a new prefix to the const without a
-/// matching label fails loud in tests rather than silently producing a
-/// wrong label.
-fn label_for_prefix(prefix: &str) -> VolatileLabel {
-    match prefix {
-        "<system-reminder>" => VolatileLabel::SystemReminder,
-        "<available-deferred-tools>" => VolatileLabel::DeferredTools,
-        "<local-command-" => VolatileLabel::LocalCommand,
-        "<command-" => VolatileLabel::Command,
-        "<session_context>" => VolatileLabel::SessionContext,
-        other => panic!("split_volatile_blocks: no VolatileLabel for prefix {other:?}"),
-    }
-}
-
-/// Strip every full `<tag>…</tag>` block in the input (one tag's closing
-/// form must match its opening) for every prefix in `VOLATILE_TAG_PREFIXES`
-/// that has a recognizable closing shape. Preserves text surrounding the
-/// blocks. Shared by message hashing (this file) and admin rendering
-/// (`streamscope-admin::routes::audit::strip_system_reminders`).
-///
-/// Thin wrapper over [`split_volatile_blocks`] — keeps a single canonical
-/// scanner so hashing and rendering cannot drift. Currently recognizes
-/// closing tags for the XML-ish variants (`<system-reminder>…</system-reminder>`,
-/// `<available-deferred-tools>`, `<session_context>…</session_context>`,
-/// `<local-command-*>…</local-command-*>`, `<command-*>…</command-*>`).
-/// Bracket-form prefixes (`[SUGGESTION MODE`,
-/// `[SYSTEM`) have no defined closing form and are never inline-stripped —
-/// they are dropped wholesale via [`is_volatile_text_part`] in
-/// [`canonicalize_content_value`] when they appear as the `text` of a
-/// `{type:"text",text:…}` part.
-pub fn strip_volatile_inline(text: &str) -> String {
-    if !text.contains('<') {
-        return text.to_string();
-    }
+/// `text` without its volatile blocks (see [`split_volatile_blocks`]): the
+/// session-link hash input, so a transient injection does not fragment a
+/// session: the prose segments of [`split_volatile_blocks`], joined. Hashing
+/// only — a renderer splits the text and shows the blocks, never drops them.
+/// Bracket-form prefixes have no closing form and are never inline-stripped —
+/// a whole text part starting with one is dropped via
+/// [`is_volatile_text_part`] in [`canonicalize_content_value`].
+fn strip_volatile_inline(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for seg in split_volatile_blocks(text) {
-        if let VolatileSegment::Prose(s) = seg {
-            out.push_str(&s);
-        }
+    let mut cursor = 0usize;
+    for block in volatile_blocks(text) {
+        out.push_str(&text[cursor..block.line]);
+        cursor = block.resume;
     }
+    out.push_str(&text[cursor..]);
     out
 }
 
@@ -1225,7 +1219,7 @@ const INJECTED_CONTEXT_PREFIXES: &[&str] = &[
 /// session detection hashes; the stored message keeps them.
 ///
 /// A whole message is volatile when it is a single text block whose
-/// content begins with any tag in `VOLATILE_TAG_PREFIXES`. Example:
+/// content begins with a volatile block ([`starts_with_volatile_tag`]). Example:
 /// Claude Code injects a standalone `<available-deferred-tools>`
 /// message listing unloaded tools; the list churns across turns.
 fn is_volatile_for_hashing(msg: &AnthropicMessage) -> bool {
@@ -1992,7 +1986,16 @@ pub fn whole_answer_text(response_json: &serde_json::Value, version: ApiVersion)
                         reasoning.extend(texts(item.get("summary"), "text"));
                         reasoning.extend(texts(item.get("content"), "text"));
                     }
-                    Some("message") => message.push(texts(item.get("content"), "text").collect()),
+                    // Each part in order: an `output_text`'s text, a `refusal`
+                    // part's refusal.
+                    Some("message") => message.push(
+                        item.get("content")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(crate::api::responses::part_text)
+                            .collect(),
+                    ),
                     _ => {}
                 }
             }
@@ -2014,11 +2017,74 @@ pub fn whole_answer_text(response_json: &serde_json::Value, version: ApiVersion)
     }
 }
 
-/// A Chat choice's answer, as [`whole_answer_text`] reads the first.
+/// The sources a whole answer's text cites, each as the upstream wrote it, in
+/// the order the answer carries them — what a stream's frames carry
+/// ([`crate::api::sse::StreamParser::take_citations`]): an Anthropic answer's
+/// text blocks' `citations`, a Responses answer's `output_text` parts'
+/// `annotations`, a Chat answer's message `annotations` (the first choice, the
+/// answer the record keeps). None on Gemini, whose grounding is no citation of
+/// a text.
+pub fn answer_citations(response_json: &serde_json::Value, version: ApiVersion) -> Vec<serde_json::Value> {
+    fn array(v: Option<&serde_json::Value>) -> impl Iterator<Item = &serde_json::Value> {
+        v.and_then(serde_json::Value::as_array).into_iter().flatten()
+    }
+    let of_type = |b: &&serde_json::Value, kind: &str| b.get("type").and_then(serde_json::Value::as_str) == Some(kind);
+    let cited: Vec<&serde_json::Value> = match version {
+        ApiVersion::AnthropicMessages => array(response_json.get("content"))
+            .filter(|b| of_type(b, "text"))
+            .flat_map(|b| array(b.get("citations")))
+            .collect(),
+        ApiVersion::Responses => array(response_json.get("output"))
+            .filter(|item| of_type(item, "message"))
+            .flat_map(|item| array(item.get("content")))
+            .filter(|part| of_type(part, "output_text"))
+            .flat_map(|part| array(part.get("annotations")))
+            .collect(),
+        ApiVersion::ChatCompletions => array(response_json.pointer("/choices/0/message/annotations")).collect(),
+        ApiVersion::GoogleGemini => Vec::new(),
+    };
+    cited.into_iter().filter(|c| c.is_object()).cloned().collect()
+}
+
+/// Whether a whole answer is the model's refusal: a Chat answer's message
+/// `refusal` (the first choice, the answer the record keeps), a Responses
+/// answer's `refusal` part — what a stream's frames say
+/// ([`crate::api::sse::StreamParser::refused`]). Its text is the answer's
+/// ([`whole_answer_text`]).
+pub fn answer_refused(response_json: &serde_json::Value, version: ApiVersion) -> bool {
+    match version {
+        ApiVersion::ChatCompletions => response_json
+            .pointer("/choices/0/message/refusal")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|r| !r.is_empty()),
+        ApiVersion::Responses => response_json
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+            .flat_map(|item| item.get("content").and_then(serde_json::Value::as_array).into_iter().flatten())
+            .any(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("refusal")
+                    && crate::api::responses::part_text(part).is_some_and(|r| !r.is_empty())
+            }),
+        ApiVersion::AnthropicMessages | ApiVersion::GoogleGemini => false,
+    }
+}
+
+/// A Chat choice's answer, as [`whole_answer_text`] reads the first: its
+/// `refusal` where the model refused, then its content (the spec's message
+/// carries one or the other).
 fn chat_choice_text(choice: &serde_json::Value) -> Option<String> {
     let message = choice.get("message");
     let reasoning = message.and_then(crate::api::chat::message_reasoning);
-    let text = message.and_then(|m| crate::api::chat::content_text(m.get("content")));
+    let content = message.and_then(|m| crate::api::chat::content_text(m.get("content")));
+    let refusal = message.and_then(|m| m.get("refusal")).and_then(serde_json::Value::as_str).filter(|r| !r.is_empty());
+    let text = match (content, refusal) {
+        (Some(content), Some(refusal)) => Some(format!("{refusal}{content}")),
+        (Some(content), None) => Some(content.into_owned()),
+        (None, refusal) => refusal.map(str::to_string),
+    };
     framed_answer(reasoning.as_deref(), text.as_deref())
 }
 
@@ -3072,6 +3138,56 @@ mod tests {
     }
     use std::assert_matches;
 
+    /// A whole Anthropic answer's sources are its text blocks', in block order
+    /// — what a stream's `citations_delta`s carry; a value that is no source
+    /// is none, and the other protocols carry none the gateway reads.
+    #[test]
+    fn a_whole_answers_citations_are_its_texts_in_order() {
+        let a = serde_json::json!({"type": "char_location", "cited_text": "a", "document_index": 0, "document_title": null, "start_char_index": 0, "end_char_index": 1});
+        let b = serde_json::json!({"type": "web_search_result_location", "cited_text": "b", "encrypted_index": "e", "title": "t", "url": "https://x.example"});
+        let answer = serde_json::json!({"content": [
+            {"type": "text", "text": "x", "citations": [a]},
+            {"type": "tool_use", "id": "t1", "name": "f", "input": {}, "citations": [a]},
+            {"type": "text", "text": "y", "citations": [b, 7]},
+            {"type": "text", "text": "z", "citations": null},
+        ]});
+        assert_eq!(answer_citations(&answer, ApiVersion::AnthropicMessages), [a, b]);
+        assert!(answer_citations(&answer, ApiVersion::ChatCompletions).is_empty());
+    }
+
+    /// An OpenAI answer's annotations are its citations, in order — a
+    /// Responses answer's `output_text` parts', a Chat answer's message's —
+    /// and its refusal is its text, flagged; an answer of neither reads none.
+    #[test]
+    fn an_openai_answers_annotations_and_refusal_are_read() {
+        let url = serde_json::json!({"type": "url_citation", "url": "https://x.example", "title": "t", "start_index": 0, "end_index": 1});
+        let file = serde_json::json!({"type": "file_citation", "file_id": "file-1", "filename": "a.pdf", "index": 2});
+        let responses = serde_json::json!({"output": [
+            {"type": "reasoning", "summary": []},
+            {"type": "message", "content": [{"type": "output_text", "text": "x", "annotations": [url]},
+                                            {"type": "output_text", "text": "y", "annotations": [file, 7]}]}]});
+        assert_eq!(answer_citations(&responses, ApiVersion::Responses), [url.clone(), file]);
+        assert!(!answer_refused(&responses, ApiVersion::Responses));
+        let chat_url = serde_json::json!({"type": "url_citation", "url_citation": {"url": "https://x.example", "title": "t"}});
+        let chat = serde_json::json!({"choices": [{"message": {"content": "x", "annotations": [chat_url]}}]});
+        assert_eq!(answer_citations(&chat, ApiVersion::ChatCompletions), [chat_url]);
+        assert!(!answer_refused(&chat, ApiVersion::ChatCompletions));
+
+        let chat_refused = serde_json::json!({"choices": [{"message": {"content": null, "refusal": "no"}}]});
+        assert!(answer_refused(&chat_refused, ApiVersion::ChatCompletions));
+        assert_eq!(whole_answer_text(&chat_refused, ApiVersion::ChatCompletions).as_deref(), Some("no"));
+        let responses_refused = serde_json::json!({"output": [{"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}]});
+        assert!(answer_refused(&responses_refused, ApiVersion::Responses));
+        assert_eq!(whole_answer_text(&responses_refused, ApiVersion::Responses).as_deref(), Some("no"));
+        // An empty refusal (`refusal: null` / `""` beside content, an empty
+        // refusal part beside a text) is none.
+        let empty_part = serde_json::json!({"output": [{"type": "message", "content": [
+            {"type": "output_text", "text": "x"}, {"type": "refusal", "refusal": ""}]}]});
+        assert!(!answer_refused(&empty_part, ApiVersion::Responses));
+        let not_refused = serde_json::json!({"choices": [{"message": {"content": "x", "refusal": ""}}]});
+        assert!(!answer_refused(&not_refused, ApiVersion::ChatCompletions));
+    }
+
     /// A whole answer's other choices and candidates are read as the first
     /// is, each named by where it sits; the protocols that answer once have
     /// none.
@@ -3397,7 +3513,7 @@ mod tests {
     #[test]
     fn a_screen_key_tells_apart_what_the_dedup_hash_does_not() {
         use crate::api::sse::ApiVersion;
-        let with = |reminder: &str| format!("look here<system-reminder>{reminder}</system-reminder>");
+        let with = |reminder: &str| format!("look here\n<system-reminder>{reminder}</system-reminder>");
         let bodies = |a: &str, b: &str| -> Vec<(ApiVersion, serde_json::Value, serde_json::Value)> {
             vec![
                 (ApiVersion::ChatCompletions,
@@ -3624,6 +3740,31 @@ mod tests {
             c1.link_hashes[1], c2.link_hashes[1],
             "user-role prefix hash must match across Messages / Raw variants",
         );
+    }
+
+    #[test]
+    fn a_moved_responses_breakpoint_keeps_the_items_hash() {
+        let bp = serde_json::json!({"mode": "explicit"});
+        let message = |marked: bool| {
+            let mut part = serde_json::json!({"type": "input_text", "text": "context"});
+            if marked {
+                part["prompt_cache_breakpoint"] = bp.clone();
+            }
+            serde_json::json!({"type": "message", "role": "user", "content": [part]})
+        };
+        assert_eq!(hash_raw_response_item(&message(true)), hash_raw_response_item(&message(false)));
+        let output = |marked: bool| {
+            let mut part = serde_json::json!({"type": "input_text", "text": "ok"});
+            if marked {
+                part["prompt_cache_breakpoint"] = bp.clone();
+            }
+            serde_json::json!({"type": "function_call_output", "call_id": "c", "output": [part]})
+        };
+        assert_eq!(hash_raw_response_item(&output(true)), hash_raw_response_item(&output(false)));
+        // Control: the text itself still decides the hash.
+        let mut other = message(true);
+        other["content"][0]["text"] = "changed".into();
+        assert_ne!(hash_raw_response_item(&other), hash_raw_response_item(&message(true)));
     }
 
     /// `Text` input must produce the same hash as the equivalent single-message
@@ -4197,6 +4338,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "Hello".to_string(),
                 cache_control: None,
+                extra: Default::default(),
             }]),
         };
 
@@ -4206,6 +4348,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "Hello".to_string(),
                 cache_control: Some(CacheControl::ephemeral()),
+                extra: Default::default(),
             }]),
         };
 
@@ -4214,6 +4357,22 @@ mod tests {
             hash_anthropic_message(&msg_with_cc),
             "cache_control should not affect the hash"
         );
+    }
+
+    /// The link hash reads no member saying where a text or a call came from:
+    /// a history's cited text or programmatic call links as the plain one does.
+    #[test]
+    fn hash_anthropic_message_ignores_citations_and_a_calls_caller() {
+        let plain: AnthropicMessage = serde_json::from_value(serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "a"}, {"type": "tool_use", "id": "c1", "name": "f", "input": {"caller": 1}}]})).unwrap();
+        let marked: AnthropicMessage = serde_json::from_value(serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "a", "citations": [{"type": "char_location", "cited_text": "q"}]},
+            {"type": "tool_use", "id": "c1", "name": "f", "input": {"caller": 1}, "caller": {"type": "direct"}, "toolset_name": "t"}]})).unwrap();
+        assert_eq!(hash_anthropic_message(&plain), hash_anthropic_message(&marked));
+        // A call's own argument named `caller` is the model's data, hashed.
+        let other: AnthropicMessage = serde_json::from_value(serde_json::json!({"role": "assistant", "content": [
+            {"type": "text", "text": "a"}, {"type": "tool_use", "id": "c1", "name": "f", "input": {"caller": 2}}]})).unwrap();
+        assert_ne!(hash_anthropic_message(&plain), hash_anthropic_message(&other));
     }
 
     #[test]
@@ -4287,6 +4446,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "Hello".to_string(),
                 cache_control: Some(CacheControl::ephemeral()),
+                extra: Default::default(),
             }]),
         };
         let hashes1 = vec![hash_anthropic_message(&msg1)];
@@ -4301,6 +4461,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "Hello".to_string(),
                 cache_control: None, // cache_control moved away
+                extra: Default::default(),
             }]),
         };
         let msg2_assistant = AnthropicMessage {
@@ -4308,6 +4469,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "Hi there!".to_string(),
                 cache_control: Some(CacheControl::ephemeral()),
+                extra: Default::default(),
             }]),
         };
         let msg2_user = AnthropicMessage {
@@ -4573,10 +4735,12 @@ mod tests {
                 ContentBlock::Text {
                     text: "<system-reminder>injected</system-reminder>".to_string(),
                     cache_control: None,
+                    extra: Default::default(),
                 },
                 ContentBlock::Text {
                     text: "real prompt".to_string(),
                     cache_control: None,
+                    extra: Default::default(),
                 },
             ]),
         };
@@ -4585,6 +4749,7 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "real prompt".to_string(),
                 cache_control: None,
+                extra: Default::default(),
             }]),
         };
         assert_eq!(hash_anthropic_message(&with_reminder), hash_anthropic_message(&without_reminder));
@@ -4808,29 +4973,22 @@ mod tests {
             content: AnthropicContent::Blocks(vec![ContentBlock::Text {
                 text: "<available-deferred-tools>…</available-deferred-tools>".to_string(),
                 cache_control: None,
+                extra: Default::default(),
             }]),
         };
         assert!(is_volatile_for_hashing(&msg));
     }
 
     #[test]
-    fn strip_volatile_inline_handles_system_reminder() {
+    fn strip_volatile_inline_drops_a_block_and_keeps_the_prose() {
         assert_eq!(
-            strip_volatile_inline("prefix<system-reminder>X</system-reminder>suffix"),
-            "prefixsuffix",
+            strip_volatile_inline("prefix\n<system-reminder>X</system-reminder>\nsuffix"),
+            "prefix\nsuffix",
         );
-    }
-
-    #[test]
-    fn strip_volatile_inline_handles_family_prefix() {
         assert_eq!(
-            strip_volatile_inline("A<local-command-stdout>out</local-command-stdout>B"),
-            "AB",
+            strip_volatile_inline("A\n<local-command-stdout>out</local-command-stdout>B"),
+            "A\nB",
         );
-    }
-
-    #[test]
-    fn strip_volatile_inline_preserves_non_volatile() {
         let input = "Just a normal sentence without tags.";
         assert_eq!(strip_volatile_inline(input), input);
     }
@@ -4860,13 +5018,15 @@ mod tests {
         );
     }
 
+    /// A block on its own line between two prose lines: the prose keeps its
+    /// line break, the whitespace after the close is trimmed.
     #[test]
-    fn split_volatile_blocks_prose_tag_prose() {
-        let segs = split_volatile_blocks("hi <system-reminder>R</system-reminder>bye");
+    fn a_block_on_its_own_line_splits_the_prose_around_it() {
+        let segs = split_volatile_blocks("hi\n<system-reminder>R</system-reminder>\n   bye");
         assert_eq!(
             segs,
             vec![
-                VolatileSegment::Prose("hi ".to_string()),
+                VolatileSegment::Prose("hi\n".to_string()),
                 VolatileSegment::Volatile {
                     label: VolatileLabel::SystemReminder,
                     raw: "<system-reminder>R</system-reminder>".to_string(),
@@ -4876,43 +5036,29 @@ mod tests {
         );
     }
 
+    /// Claude Code's slash-command echo: indented family tags, one per line,
+    /// each its own block.
     #[test]
-    fn split_volatile_blocks_trims_leading_whitespace_after_close() {
-        // Matches `strip_volatile_inline` semantics: leading space / newline
-        // after a closing tag is trimmed so the following prose doesn't
-        // render with awkward indentation.
-        let segs = split_volatile_blocks("hi <system-reminder>R</system-reminder>   bye");
-        assert_eq!(
-            segs,
-            vec![
-                VolatileSegment::Prose("hi ".to_string()),
-                VolatileSegment::Volatile {
-                    label: VolatileLabel::SystemReminder,
-                    raw: "<system-reminder>R</system-reminder>".to_string(),
-                },
-                VolatileSegment::Prose("bye".to_string()),
-            ],
-        );
+    fn indented_family_blocks_on_consecutive_lines_are_each_a_block() {
+        let input = "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>";
+        let labels: Vec<_> = split_volatile_blocks(input)
+            .into_iter()
+            .map(|seg| match seg {
+                VolatileSegment::Volatile { label, .. } => label,
+                VolatileSegment::Prose(p) => panic!("unexpected prose {p:?}"),
+            })
+            .collect();
+        assert_eq!(labels, vec![VolatileLabel::Command; 3]);
+    }
+
+    /// CRLF text splits like LF text: the `\r\n` after a close is trimmed.
+    #[test]
+    fn a_block_in_crlf_text_leaves_no_line_break_behind() {
+        assert_eq!(strip_volatile_inline("hi\r\n<system-reminder>R</system-reminder>\r\nbye"), "hi\r\nbye");
     }
 
     #[test]
-    fn split_volatile_blocks_family_prefix() {
-        let segs = split_volatile_blocks("A<local-command-stdout>out</local-command-stdout>B");
-        assert_eq!(
-            segs,
-            vec![
-                VolatileSegment::Prose("A".to_string()),
-                VolatileSegment::Volatile {
-                    label: VolatileLabel::LocalCommand,
-                    raw: "<local-command-stdout>out</local-command-stdout>".to_string(),
-                },
-                VolatileSegment::Prose("B".to_string()),
-            ],
-        );
-    }
-
-    #[test]
-    fn split_volatile_blocks_multiple_tags_in_sequence() {
+    fn adjacent_blocks_of_two_families_are_two_blocks() {
         let segs = split_volatile_blocks(
             "<system-reminder>A</system-reminder><available-deferred-tools>B</available-deferred-tools>",
         );
@@ -4927,30 +5073,58 @@ mod tests {
         );
     }
 
+    /// The real shapes a system prompt mentions a tag in: mid-sentence, in
+    /// backticks, never closed. Each is prose, whole — the text after the
+    /// mention is the rest of the prompt.
     #[test]
-    fn split_volatile_blocks_unclosed_tag_consumes_remainder() {
-        // Unclosed `<system-reminder>` — rest of text is captured as one
-        // Volatile segment so the UI can still surface "a reminder was
-        // injected here" even though its bytes are malformed.
-        let segs = split_volatile_blocks("hi <system-reminder>no close here");
-        assert_eq!(segs.len(), 2);
-        assert_matches!(&segs[0], VolatileSegment::Prose(s) if s == "hi ");
-        match &segs[1] {
-            VolatileSegment::Volatile { label: VolatileLabel::SystemReminder, raw } => {
-                assert_eq!(raw, "<system-reminder>no close here");
-            }
-            other => panic!("expected SystemReminder Volatile, got {other:?}"),
+    fn a_tag_the_text_mentions_is_prose() {
+        for input in [
+            "- Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information.\n\n# Next section",
+            "# Harness\n- Responses are rendered as GitHub-flavored Markdown.\n- `<system-reminder>` blocks are harness information.\n- More rules.",
+            "Recalled memories appearing inside `<system-reminder>` blocks are background context.",
+            "Wrap it as `<system-reminder>`…`</system-reminder>` when you quote one.",
+            "<system-reminder> tags are injected by the harness; the rest of this text is prose.",
+        ] {
+            assert_eq!(
+                split_volatile_blocks(input),
+                vec![VolatileSegment::Prose(input.to_string())],
+                "input={input:?}",
+            );
+            assert_eq!(strip_volatile_inline(input), input);
+            assert!(volatile_byte_spans(input).is_empty());
+            assert!(!starts_with_volatile_tag(input));
         }
     }
 
+    /// A mention does not hide a real block after it: the scan goes on past
+    /// the mention and still finds the block on its own line.
     #[test]
-    fn split_volatile_blocks_nested_outer_wins() {
-        // Left-to-right scan resolves the outer `<local-command-foo>` first;
-        // the inner `<command-bar>` becomes part of the outer's raw bytes.
-        let input = "<local-command-foo><command-bar>Z</command-bar></local-command-foo>";
-        let segs = split_volatile_blocks(input);
+    fn a_block_after_a_mention_is_still_a_block() {
+        let input = "Messages may include <system-reminder> tags.\n<system-reminder>Plan mode.</system-reminder>\nThe end.";
         assert_eq!(
-            segs,
+            split_volatile_blocks(input),
+            vec![
+                VolatileSegment::Prose("Messages may include <system-reminder> tags.\n".to_string()),
+                VolatileSegment::Volatile {
+                    label: VolatileLabel::SystemReminder,
+                    raw: "<system-reminder>Plan mode.</system-reminder>".to_string(),
+                },
+                VolatileSegment::Prose("The end.".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_closed_tag_inside_a_line_is_prose() {
+        let input = "hi <system-reminder>R</system-reminder>bye";
+        assert_eq!(split_volatile_blocks(input), vec![VolatileSegment::Prose(input.to_string())]);
+    }
+
+    #[test]
+    fn nested_tags_resolve_outermost_first() {
+        let input = "<local-command-foo><command-bar>Z</command-bar></local-command-foo>";
+        assert_eq!(
+            split_volatile_blocks(input),
             vec![VolatileSegment::Volatile {
                 label: VolatileLabel::LocalCommand,
                 raw: input.to_string(),
@@ -4958,30 +5132,101 @@ mod tests {
         );
     }
 
-    /// `strip_volatile_inline` is a thin wrapper over
-    /// `split_volatile_blocks`; ensure it behaves identically for the
-    /// cases covered above.
+    /// A text starts with a volatile block when its first line opens one the
+    /// scanner reads as a block — indented or not — or with a bracket form;
+    /// an opening tag never closed is not one.
     #[test]
-    fn strip_volatile_inline_round_trips_through_splitter() {
-        let cases = [
-            ("", ""),
-            ("plain", "plain"),
-            (
-                "hi <system-reminder>R</system-reminder>bye",
-                "hi bye",
-            ),
-            (
-                "hi <system-reminder>R</system-reminder>   bye",
-                "hi bye",
-            ),
-            (
-                "A<local-command-stdout>out</local-command-stdout>B",
-                "AB",
-            ),
-            ("hi <system-reminder>no close", "hi "),
-        ];
-        for (input, expected) in cases {
-            assert_eq!(strip_volatile_inline(input), expected, "input={input:?}");
+    fn a_text_starts_with_a_volatile_block_only_when_the_block_is_whole() {
+        assert!(starts_with_volatile_tag("<command-name>/clear</command-name>"));
+        assert!(starts_with_volatile_tag(" \t<system-reminder>R</system-reminder>"));
+        assert!(starts_with_volatile_tag("[SYSTEM x"));
+        assert!(starts_with_volatile_tag("[SUGGESTION MODE: predict]"));
+        assert!(!starts_with_volatile_tag("see [SYSTEM"));
+        assert!(!starts_with_volatile_tag("<command-name> is the tag Claude Code echoes"));
+        assert!(!starts_with_volatile_tag("hi\n<system-reminder>R</system-reminder>"));
+    }
+
+    /// Properties of the volatile-block scanner over texts built from tags,
+    /// partial tags, mentions and whitespace. Not a property: that stripping
+    /// is idempotent — a block can close another opener's text once removed.
+    mod volatile_block_properties {
+        use super::super::{split_volatile_blocks, VolatileSegment};
+        use proptest::prelude::*;
+
+        fn texts() -> impl Strategy<Value = String> {
+            let piece = prop_oneof![
+                Just("<system-reminder>"), Just("</system-reminder>"),
+                Just("<command-name>"), Just("</command-name>"),
+                Just("<local-command-stdout>"), Just("</local-command-stdout>"),
+                Just("<command-"), Just("<"), Just(">"), Just("</"), Just("`"),
+                Just("\n"), Just("\r\n"), Just("  "), Just("\t"), Just(" tags. "), Just("x"), Just("é"),
+            ];
+            prop::collection::vec(piece, 0..24).prop_map(|p| p.concat())
+        }
+
+        /// Where a block's text continues: past spaces, tabs and newlines.
+        fn resume(text: &str, from: usize) -> usize {
+            from + text[from..].bytes().take_while(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')).count()
+        }
+
+        proptest! {
+            /// Nothing is lost: the segments are the text, in order, save a
+            /// block line's indent and the whitespace right after a block. No
+            /// prose segment is empty.
+            #[test]
+            fn the_segments_are_the_text(text in texts()) {
+                let mut pos = 0;
+                for seg in split_volatile_blocks(&text) {
+                    match seg {
+                        VolatileSegment::Prose(p) => {
+                            prop_assert!(!p.is_empty());
+                            prop_assert!(text[pos..].starts_with(&p), "prose {p:?} not at {pos} of {text:?}");
+                            pos += p.len();
+                        }
+                        VolatileSegment::Volatile { raw, .. } => {
+                            pos += text[pos..].bytes().take_while(|b| matches!(b, b' ' | b'\t')).count();
+                            prop_assert!(text[pos..].starts_with(&raw), "block {raw:?} not at {pos} of {text:?}");
+                            pos = resume(&text, pos + raw.len());
+                        }
+                    }
+                }
+                prop_assert_eq!(pos, text.len());
+            }
+
+            /// A block begins a line (after its indent) or follows the previous
+            /// block, and ends with the closing tag of its own opening tag.
+            #[test]
+            fn a_block_begins_a_line_and_ends_with_its_own_close(text in texts()) {
+                let mut pos = 0;
+                let mut after_block = false;
+                for seg in split_volatile_blocks(&text) {
+                    match seg {
+                        VolatileSegment::Prose(p) => { pos += p.len(); after_block = false; }
+                        VolatileSegment::Volatile { raw, .. } => {
+                            prop_assert!(after_block || pos == 0 || text[..pos].ends_with('\n'), "block at {pos} of {text:?}");
+                            pos += text[pos..].bytes().take_while(|b| matches!(b, b' ' | b'\t')).count();
+                            let name = &raw[1..raw.find('>').unwrap()];
+                            let close = format!("</{name}>");
+                            prop_assert!(raw.ends_with(&close) && raw.len() >= name.len() * 2 + 5, "{raw:?}");
+                            pos = resume(&text, pos + raw.len());
+                            after_block = true;
+                        }
+                    }
+                }
+            }
+
+            /// A text that closes no tag has no block: whatever tags it
+            /// mentions, it is one prose segment, whole.
+            #[test]
+            fn a_text_without_a_close_is_all_prose(text in texts()) {
+                let text = text.replace("</", "");
+                let segs = split_volatile_blocks(&text);
+                if text.is_empty() {
+                    prop_assert!(segs.is_empty());
+                } else {
+                    prop_assert_eq!(segs, vec![VolatileSegment::Prose(text)]);
+                }
+            }
         }
     }
 

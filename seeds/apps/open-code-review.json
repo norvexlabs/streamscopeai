@@ -1,0 +1,15 @@
+{
+  "id": "open-code-review",
+  "name": "Open Code Review",
+  "description": "Alibaba's Open Code Review CLI (`ocr`): agentic, line-level review of a git diff, a commit range or a whole repository, over Anthropic or OpenAI-compatible APIs.",
+  "url": "https://github.com/alibaba/open-code-review",
+  "ua_patterns": [
+    "open-code-review/"
+  ],
+  "referer_patterns": [],
+  "prompt_patterns": [
+    "you are open-code-review, a code review assistant",
+    "you are responsible for producing professional review feedback on pull requests",
+    "you are an expert in code review task planning"
+  ]
+}

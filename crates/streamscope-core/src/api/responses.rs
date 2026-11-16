@@ -25,11 +25,11 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     /// Context overflow control: "auto" | "disabled".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncation: Option<Value>,
@@ -53,4 +53,12 @@ pub struct ResponsesRequest {
     /// Forward-compat: capture unknown fields.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// A Responses message part's text: an `output_text`'s `text`, a `refusal`
+/// part's `refusal` — each the spec's member for it. The one reading every
+/// reader of a part (the record, the translators, the pass-through) shares.
+pub fn part_text(part: &Value) -> Option<&str> {
+    let key = if part.get("type").and_then(Value::as_str) == Some("refusal") { "refusal" } else { "text" };
+    part.get(key).and_then(Value::as_str)
 }

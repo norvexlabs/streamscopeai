@@ -900,6 +900,10 @@ pub enum ApiErrorCode {
     /// workspace they belong to is on a Portal & clients profile that hides
     /// it. Append-only.
     PortalPageHidden,
+    /// A Portal & clients profile's default container image is not an image
+    /// reference from a registry, or its memory or CPU limit is out of range.
+    /// Append-only.
+    SandboxDefaultImageInvalid,
 }
 
 /// Structured error response body matching the proxy's `ErrorResponse` format.
@@ -1109,6 +1113,15 @@ pub fn is_foreign_key_violation(e: &sqlx::Error) -> bool {
     e.as_database_error()
         .and_then(|d| d.code())
         .is_some_and(|c| c == "23503")
+}
+
+/// True when Postgres refused a regular expression it was asked to compile
+/// (SQLSTATE `2201B`, `invalid_regular_expression`) — read from the code, never
+/// the message, for the same reason as [`is_foreign_key_violation`].
+pub fn is_invalid_regular_expression(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|c| c == "2201B")
 }
 
 /// True when a delete (or a key update) was refused because another row still
@@ -2230,7 +2243,7 @@ pub fn catalog_join(model: &'static str, server: &'static str) -> String {
              AND ( {a}.id = {model}.catalog_model_id \
                    OR ({model}.catalog_model_id IS NULL \
                        AND {} \
-                       AND {a}.model_key = canonical_catalog_key({model}.upstream_model)) )",
+                       AND {a}.model_key = catalog_key.model_key) )",
             scope_visible_of(a)
         )
     };
@@ -2258,8 +2271,17 @@ pub fn catalog_join(model: &'static str, server: &'static str) -> String {
         candidates_of("r"),
         tiers_of("r")
     );
+    // The model's catalog key, computed once per model and read by every
+    // lookup below as a plain column. Keep the `OFFSET 0`: matched inline
+    // against a function of the outer row, `model_key` is not an index
+    // condition on PostgreSQL 18.7, so each lookup scans the tenant's whole
+    // catalog; a column of a fenced subquery stays one whatever the planner
+    // flattens.
     format!(
         r#"
+    LEFT JOIN LATERAL (
+        SELECT canonical_catalog_key({model}.upstream_model) AS model_key OFFSET 0
+    ) catalog_key ON true
     LEFT JOIN LATERAL (
         SELECT mc.id as catalog_match_id, mc.context_window, mc.max_output_tokens,
                mc.supports_vision, {reasoning} AS supports_reasoning, mc.supports_function_calling,
@@ -2297,7 +2319,7 @@ pub fn catalog_join(model: &'static str, server: &'static str) -> String {
                         -- would otherwise outrank a priced global one and silently
                         -- unprice the model, which stops its budget accruing.
                         AND mc.rates -> 'units' <> '{{}}'::jsonb
-                        AND mc.model_key = canonical_catalog_key({model}.upstream_model)) )
+                        AND mc.model_key = catalog_key.model_key) )
         ORDER BY (mc.id = {model}.catalog_model_id) DESC,
                  {scope_match} DESC,
                  (mc.model = {model}.upstream_model) DESC,
@@ -3557,5 +3579,31 @@ mod db_unavailable_tests {
         ] {
             assert!(!db_unavailable(&fault), "{fault} is not an outage");
         }
+    }
+}
+
+#[cfg(test)]
+mod catalog_join_tests {
+    use super::catalog_join;
+
+    /// Every catalog lookup matches the model's key as a column of the fenced
+    /// `catalog_key` lateral, never as `canonical_catalog_key(<outer row>)`
+    /// inline: PostgreSQL 18.7 does not use the inline form as an index
+    /// condition, and each lookup then reads the tenant's whole catalog.
+    #[test]
+    fn every_catalog_lookup_reads_the_key_from_the_fenced_lateral() {
+        let sql = catalog_join("m", "s").split_whitespace().collect::<Vec<_>>().join(" ");
+        let fence = "SELECT canonical_catalog_key(m.upstream_model) AS model_key OFFSET 0 ) catalog_key ON true";
+        assert!(sql.contains(fence), "the key's fenced lateral is missing:\n{sql}");
+        assert_eq!(
+            sql.matches("canonical_catalog_key(").count(),
+            1,
+            "a lookup computes the key inline instead of reading `catalog_key.model_key`:\n{sql}"
+        );
+        // One read per lookup: the capability row, its reasoning flag, the price.
+        assert_eq!(sql.matches("model_key = catalog_key.model_key").count(), 3, "{sql}");
+        // The fence comes before every lookup that reads it.
+        let (fenced, lookups) = (sql.find(fence).unwrap_or(usize::MAX), sql.find("FROM model_catalog").unwrap_or(0));
+        assert!(fenced < lookups, "the key is computed after a lookup reads it:\n{sql}");
     }
 }

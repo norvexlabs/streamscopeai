@@ -10,10 +10,12 @@
 //! and starts the agent; then sweep the project and remove the run's files.
 
 pub mod config;
+mod images;
 pub mod init;
 mod plan;
 mod prepare;
 pub mod preflight;
+mod routing;
 pub mod sweep;
 
 use std::path::{Path, PathBuf};
@@ -28,9 +30,9 @@ use super::{guard, LaunchSpec};
 const RELAY_PORT: u16 = 3128;
 
 /// Launch `spec` in a container; the client's exit code.
-pub async fn launch(spec: LaunchSpec, verbose: bool) -> Result<i32> {
+pub async fn launch(mut spec: LaunchSpec, verbose: bool) -> Result<i32> {
     let root = spec.project_root.clone();
-    let config = read_config(&root)?;
+    let config = read_config(&root, spec.default_image.as_ref())?;
     for note in &config.notes {
         eprintln!("ssai: {note}");
     }
@@ -55,6 +57,11 @@ pub async fn launch(spec: LaunchSpec, verbose: bool) -> Result<i32> {
         let npm = super::profiles::agent_for(&spec.command).and_then(|a| a.npm_package);
         tokio::task::spawn_blocking(move || prepare::prepare(&root, &config, &command, npm, false)).await??
     };
+    // `network: gateway` in sandbox.json narrows the run, unless `--network` said otherwise.
+    if spec.network.or(config.network) == Some(super::NetworkChoice::Gateway) {
+        spec.destinations.posture =
+            spec.destinations.posture.narrower(streamscope_client_templates::destination::Posture::Gateway);
+    }
     eprintln!(
         "ssai: sandbox=docker — rootless podman {}, image {}, the project at {}, egress only to {}{}",
         facts.version,
@@ -92,12 +99,27 @@ pub async fn launch(spec: LaunchSpec, verbose: bool) -> Result<i32> {
     result
 }
 
-fn read_config(root: &Path) -> Result<config::DockerConfig> {
+/// The project's `sandbox.json`; without one, the workspace's default image
+/// (`default_image`), said; without either, refused naming the file.
+fn read_config(
+    root: &Path,
+    default_image: Option<&streamscope_client_templates::sandbox_image::DefaultImage>,
+) -> Result<config::DockerConfig> {
     let file = root.join(config::SANDBOX_FILE);
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && default_image.is_some() => {
+            let default = default_image.context("checked above")?;
+            let mut config = config::from_profile_default(default)?;
+            config.notes.push(format!(
+                "no {} here — the image is your organisation's default for this workspace, {}",
+                config::SANDBOX_FILE,
+                default.image
+            ));
+            return Ok(config);
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "--sandbox docker needs {} naming the image — e.g. {} or {}",
+            "--sandbox docker needs {} naming the image, or a default image your administrator sets on the workspace — e.g. {} or {}",
             file.display(),
             config::example(r#"{"image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04"}"#),
             config::example(r#"{"devcontainer": ".devcontainer/devcontainer.json"}"#)
@@ -327,6 +349,9 @@ async fn run_container(
     if !plan::mountable(&binary.to_string_lossy()) {
         bail!("{} holds a `:` or `,`, which podman cannot mount — move `ssai` to a plain path", binary.display());
     }
+    // Where each file is in the container, by its original path: the copies
+    // below replace the paths the mounts read from.
+    let mounted: Vec<(PathBuf, String)> = files.clone();
     for (i, (from, _)) in files.iter_mut().enumerate() {
         if config.docker && from.is_file() {
             *from = copy_into(&run.run, from, &format!("file-{i}"), None)?;
@@ -385,19 +410,24 @@ async fn run_container(
         }
         lookup(&user_env, key).filter(|v| !v.is_empty())
     };
-    let mut env = super::sandbox_env_with(spec, RELAY_PORT, Some(plan::INIT_BINARY), &inherited);
-    let host_root = root.to_string_lossy().into_owned();
+    // With an engine inside, the proxy is the relay on the routing stub's
+    // address (`routing.rs`), which the engine's containers reach too: a tool
+    // that copies the variable into a container (kind) hands it a working
+    // proxy, never `127.0.0.1`, the container's own loopback.
+    let relay_host = if config.docker { routing::STUB.to_string() } else { "127.0.0.1".to_string() };
+    let mut env = super::sandbox_env_with(spec, (&relay_host, RELAY_PORT), Some(plan::INIT_BINARY), &inherited);
     for (_, v) in env.iter_mut() {
-        if let Some(to) = rebased.iter().find(|(from, _)| from == v).map(|(_, to)| to.clone()) {
+        if let Some(to) = host_to_container(&rebased, &[], root, &workspace, v) {
             *v = to;
-        } else if let Some(rest) = v.strip_prefix(&host_root)
-            && (rest.is_empty() || rest.starts_with('/'))
-        {
-            // A path under the project (a project config dir): its place in
-            // the container.
-            *v = format!("{}{rest}", workspace.trim_end_matches('/'));
         }
     }
+    // A config the container does not have is reported by init as one OpenCode
+    // does not load there.
+    let opencode = spec.opencode.as_ref().map(|launch| {
+        let shown = launch.config.to_string_lossy().into_owned();
+        let config = host_to_container(&rebased, &mounted, root, &workspace, &shown).unwrap_or(shown);
+        init::OpencodeCheck { provider: launch.provider.clone(), config, global: launch.global }
+    });
     // A `--ca-file` bundle: in the run dir, every trust-store variable on
     // it — first, so a user's own `-e` for one of them still wins.
     if let Some(pem) = &spec.ca_bundle {
@@ -454,6 +484,7 @@ async fn run_container(
         engine: config.docker,
         exit_file: format!("{}/exit", plan::SOCK_MOUNT),
         tty,
+        opencode,
     };
     let start_file = run.run.join(plan::START_FILE);
     {
@@ -475,7 +506,6 @@ async fn run_container(
         "a git folder of this project has a `:` or `,` in its path, which podman cannot mount — use --sandbox native",
     )?;
 
-    let key = project_key(root, &spec.command);
     let mut suffix = [0u8; 4];
     rand::rng().fill_bytes(&mut suffix);
     let facts = plan::RunFacts {
@@ -491,9 +521,9 @@ async fn run_container(
         run_dir: run.run.clone(),
         sock_dir: run.sock.clone(),
         files,
-        home_volume: format!("ssai-home-{key}"),
+        home_volume: home_volume(root, &spec.command),
         home,
-        engine_volume: config.docker.then(|| format!("ssai-engine-{}", project_key(root, ""))),
+        engine_volume: config.docker.then(|| engine_volume(root)),
         limits: config.limits.clone(),
         tty,
         project_mounts,
@@ -599,6 +629,20 @@ fn file_mounts(spec: &LaunchSpec, home: &str, host_home: Option<&Path>) -> Resul
     Ok(out)
 }
 
+/// Where host path `host` is in the container: a value `rebased` names, a
+/// file `mounts` mounts, or a path under the project `root`, under the
+/// `workspace`. `None` for anything else.
+fn host_to_container(rebased: &[(String, String)], mounts: &[(PathBuf, String)], root: &Path, workspace: &str, host: &str) -> Option<String> {
+    if let Some((_, to)) = rebased.iter().find(|(from, _)| from == host) {
+        return Some(to.clone());
+    }
+    if let Some((_, to)) = mounts.iter().find(|(from, _)| from.as_os_str() == host) {
+        return Some(to.clone());
+    }
+    let rest = host.strip_prefix(root.to_string_lossy().as_ref())?;
+    (rest.is_empty() || rest.starts_with('/')).then(|| format!("{}{rest}", workspace.trim_end_matches('/')))
+}
+
 /// A copy of `from` in the run dir, named `name`: with `mode`, or the
 /// original's (a 0600 key stays 0600, or ssh refuses it).
 fn copy_into(run: &Path, from: &Path, name: &str, mode: Option<u32>) -> Result<PathBuf> {
@@ -613,13 +657,28 @@ fn copy_into(run: &Path, from: &Path, name: &str, mode: Option<u32>) -> Result<P
     Ok(to)
 }
 
-/// A short stable key for the project (and client): its volumes' names.
-fn project_key(root: &Path, client: &str) -> String {
+/// A short stable key for the project, leading its volumes' names.
+fn project_key(root: &Path) -> String {
     let mut h = Sha256::new();
     h.update(root.as_os_str().as_encoded_bytes());
     h.update([0]);
-    h.update(client.as_bytes());
     hex::encode(&h.finalize()[..8])
+}
+
+/// `ssai-home-<project key>`: what every home volume of the project's clients
+/// starts with, then `-<client key>`.
+fn home_volume_prefix(root: &Path) -> String {
+    format!("ssai-home-{}", project_key(root))
+}
+
+/// The agent's home for `client` (its launch command) in the project.
+fn home_volume(root: &Path, client: &str) -> String {
+    format!("{}-{}", home_volume_prefix(root), hex::encode(&Sha256::digest(client.as_bytes())[..4]))
+}
+
+/// The engine's cache (`/var/lib/docker`) of the project.
+fn engine_volume(root: &Path) -> String {
+    format!("ssai-engine-{}", project_key(root))
 }
 
 /// Sweep the project under `podman unshare` (see [`sweep`]); `container_root`
@@ -795,13 +854,34 @@ fn live_run_on(root: &Path, boot: &str, project: &Path) -> bool {
 }
 
 /// `ssai sandbox prepare`: (re)build the project's images.
-pub fn prepare_project(root: &Path, command: &str) -> Result<()> {
-    let config = read_config(root)?;
+pub fn prepare_project(
+    root: &Path,
+    command: &str,
+    default_image: Option<&streamscope_client_templates::sandbox_image::DefaultImage>,
+) -> Result<()> {
+    let config = read_config(root, default_image)?;
+    for note in &config.notes {
+        eprintln!("ssai: {note}");
+    }
     preflight::run(config.docker, config.limits.cpus.is_some())?;
     let npm = super::profiles::agent_for(command).and_then(|a| a.npm_package);
     let prepared = prepare::prepare(root, &config, command, npm, true)?;
     eprintln!("ssai: the docker sandbox's image for {command} is {}", prepared.image);
     Ok(())
+}
+
+/// `ssai sandbox status`: each project's images and volumes, with sizes.
+pub fn status() -> Result<()> {
+    images::status()
+}
+
+/// `ssai sandbox prune --project`: remove one project's images and volumes;
+/// refused while a run is live on it.
+pub fn prune_project(root: &Path) -> Result<()> {
+    if records_root().is_ok_and(|r| live_run_on(&r, &boot_id(), root)) {
+        bail!("a `--sandbox docker` run is still running on {} — end it first, then prune", root.display());
+    }
+    images::prune_project(root)
 }
 
 /// `ssai sandbox prune`: remove every docker-tier volume and image of this
@@ -826,27 +906,11 @@ pub fn prune() -> Result<()> {
         .filter(|n| n.starts_with("ssai-home-") || n.starts_with("ssai-engine-"))
         .map(str::to_string)
         .collect();
-    let images = run(&["images", "--format", "{{.Repository}}:{{.Tag}}"]).context("list podman images")?;
-    let tags: Vec<String> = String::from_utf8_lossy(&images.stdout)
-        .lines()
-        .filter(|t| t.starts_with("localhost/ssai-agent-") || t.starts_with("localhost/ssai-base:"))
-        .map(str::to_string)
-        .collect();
     let removed = |args: &[&str]| run(args).is_ok_and(|o| o.status.success());
     let volumes = names.iter().filter(|n| removed(&["volume", "rm", "-f", n])).count();
-    let mut images = tags.iter().filter(|t| removed(&["rmi", "-f", t])).count();
-    // Agent layers a rebuild left untagged carry their label, not a name.
-    let base_label = format!("label={}", prepare::BASE_LABEL);
-    let untagged = run(&["images", "-q", "--filter", &base_label]).context("list podman images")?;
-    // One line per tag: an image tagged twice is listed twice.
-    let ids: Vec<String> = String::from_utf8_lossy(&untagged.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let untagged_removed = ids.iter().filter(|id| removed(&["rmi", "-f", id])).count();
-    images += untagged_removed;
+    // The images by the one rule (`images`), without force: one a container
+    // of the developer's uses, or named by them too, stays.
+    let (images, kept) = images::prune_all()?;
     // The cached user ids go with the images; the build records stay: they
     // are what a changed recipe or reference is compared with, and a prune
     // must not let the next run build or pull unasked.
@@ -854,12 +918,11 @@ pub fn prune() -> Result<()> {
         let _ = std::fs::remove_dir_all(cache.join("sandbox-ids"));
     }
     eprintln!("ssai: removed {volumes} sandbox volume(s) and {images} image(s)");
-    if volumes < names.len() || images < tags.len() + ids.len() {
-        bail!(
-            "{} volume(s) and {} image(s) could not be removed",
-            names.len() - volumes,
-            tags.len() + ids.len() - images
-        );
+    if kept > 0 {
+        eprintln!("ssai: kept {kept} image(s) a container uses or you named too");
+    }
+    if volumes < names.len() {
+        bail!("{} volume(s) could not be removed", names.len() - volumes);
     }
     Ok(())
 }
@@ -869,6 +932,19 @@ pub fn prune() -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_host_path_is_found_where_the_container_has_it() {
+        let rebased = [("/home/dev/ca.pem".to_string(), "/run/ssai-files/0-ca.pem".to_string())];
+        let mounts = [(PathBuf::from("/home/dev/.config/opencode/opencode.json"), "/home/agent/.config/opencode/opencode.json".to_string())];
+        let at = |host: &str| host_to_container(&rebased, &mounts, Path::new("/home/dev/app"), "/workspaces/app/", host);
+        assert_eq!(at("/home/dev/ca.pem").as_deref(), Some("/run/ssai-files/0-ca.pem"));
+        assert_eq!(at("/home/dev/.config/opencode/opencode.json").as_deref(), Some("/home/agent/.config/opencode/opencode.json"));
+        assert_eq!(at("/home/dev/app/.opencode/opencode.json").as_deref(), Some("/workspaces/app/.opencode/opencode.json"));
+        assert_eq!(at("/home/dev/app").as_deref(), Some("/workspaces/app"));
+        assert_eq!(at("/home/dev/apple/x"), None);
+        assert_eq!(at("/home/dev/other.json"), None);
+    }
+
     fn spec(home_files: Vec<PathBuf>) -> LaunchSpec {
         LaunchSpec {
             command: "codex".into(),
@@ -877,13 +953,42 @@ mod tests {
             cwd: PathBuf::from("/p"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: vec![],
             ca_files: vec![],
             ca_bundle: None,
             home_files,
             client_files: vec![],
             private_project: false,
+            opencode: None,
         }
+    }
+
+    #[test]
+    fn a_project_without_sandbox_json_takes_the_profile_default_and_its_own_file_wins() {
+        use streamscope_client_templates::sandbox_image::DefaultImage;
+        let root = std::env::temp_dir().join(format!("ssai-default-image-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(root.join(".streamscopeai")).unwrap();
+        let default = DefaultImage { image: "ghcr.io/team/dev:1".into(), docker: true, memory: Some("8g".into()), cpus: Some(2.0) };
+        // No file, no default: refused, naming the file.
+        let err = read_config(&root, None).unwrap_err();
+        assert!(format!("{err:#}").contains("sandbox.json naming the image"), "{err:#}");
+        // No file: the default, whole, and said.
+        let c = read_config(&root, Some(&default)).unwrap();
+        assert_eq!(c.source, config::ImageSource::Image("ghcr.io/team/dev:1".into()));
+        assert!(c.docker);
+        assert_eq!((c.limits.memory.as_deref(), c.limits.cpus, c.limits.pids), (Some("8g"), Some(2.0), config::DEFAULT_PIDS));
+        assert!(c.notes.iter().any(|n| n.contains("your organisation's default")), "{:?}", c.notes);
+        // A default the rules refuse is refused here too.
+        let bad = DefaultImage { image: "dir:/etc".into(), ..default.clone() };
+        assert!(read_config(&root, Some(&bad)).is_err());
+        // The project's own file wins whole.
+        std::fs::write(root.join(config::SANDBOX_FILE), config::example(r#"{"image": "ubuntu:24.04"}"#)).unwrap();
+        let c = read_config(&root, Some(&default)).unwrap();
+        assert_eq!(c.source, config::ImageSource::Image("ubuntu:24.04".into()));
+        assert!(!c.docker && c.limits.memory.is_none() && c.notes.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

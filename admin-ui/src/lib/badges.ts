@@ -209,7 +209,7 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   modified_not_applied: {
     label: 'Not applied',
     tooltip: () =>
-      'Policy produced a rewrite or a refusal that did not reach the wire — the submitting enforcement point is verdict-only, the analyzed answer had already reached the client, or the block was a signed thinking block the provider requires back unchanged',
+      'Policy produced a rewrite or a refusal that did not reach the wire — the submitting enforcement point is verdict-only, the analyzed answer had already reached the client, the block was a signed thinking block the provider requires back unchanged, a request script made an edit the request has no place for, or a script reshaping the conversation rebuilt a turn without content it could not see (an image, thinking, a signature)',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
     iconName: 'pencil',
   },
@@ -224,6 +224,12 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
     },
     classes: 'bg-(--warning)/10 text-(--warning) border border-(--warning)',
     iconName: 'arrowDown',
+  },
+  refusal: {
+    label: 'Refusal',
+    tooltip: () => 'The model refused: the answer is its refusal, not a reply',
+    classes: 'bg-(--warning)/10 text-(--warning) border border-(--warning)',
+    iconName: 'shield',
   },
   json_healed: {
     label: 'JSON Healed',
@@ -649,6 +655,8 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
       const why: Record<string, string> = {
         tool_calls: 'the response contains tool calls, which the cache does not store',
         generated_media: 'the response contains generated media, which the cache does not store',
+        citations: 'the response cites sources, which the cache does not store',
+        refusal: 'the response is the model\'s refusal, which the cache does not store',
         error_status: 'the request ended in an error',
         incomplete_response: 'the response was cut short (client disconnect or stream timeout)',
         zero_completion: 'the upstream returned no completion tokens',

@@ -6,6 +6,7 @@
   import CodeSnippet from '#lib/components/CodeSnippet.svelte';
   import Callout from '#lib/components/Callout.svelte';
   import McpConnectBanner from '#lib/components/portal/McpConnectBanner.svelte';
+  import SandboxRunHelp from '#lib/components/portal/SandboxRunHelp.svelte';
   import { serversNeedingConnection } from '#lib/mcp/connectionState.js';
   import SelectInput from '#lib/components/forms/SelectInput.svelte';
   import Tabs from '#lib/components/Tabs.svelte';
@@ -894,6 +895,7 @@
         format="shell"
         instructions={m.portal_qs_cli_run_instructions()}
       />
+      <SandboxRunHelp />
     </div>
 
     <div class="space-y-2">

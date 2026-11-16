@@ -1601,8 +1601,17 @@ impl BlockAccumulator {
             .filter(|_| was_tool_use && !block.buffered.iter().any(|b| is_item_done(b.raw_sse.as_ref())));
         block.signed = block.block_type == BlockType::Thinking
             && block.trailing.iter().any(|f| thinking_signature(f).is_some());
-        let trailing = std::mem::take(&mut block.trailing);
+        let mut trailing = std::mem::take(&mut block.trailing);
+        let text_block = block.block_type == BlockType::Text;
         let mut out = self.process_completed_block_inner(block);
+        // A text a script rewrote (its events rebuilt) loses the sources the
+        // stream sent while it was held (Anthropic: `text_delta`, then each
+        // `citations_delta`; Responses: each `output_text.annotation.added`
+        // before the text's `done`), which would still quote or place what it
+        // took out.
+        if text_block && out.iter().any(|e| e.raw_sse.is_none() && matches!(e.domain_event, Some(DomainEvent::TextDelta(_)))) {
+            trailing.retain(|frame| !is_citation_frame(frame));
+        }
         // Withheld whole: no client is given any part of it — the audit, which
         // reads the stream's own events, still records the call — and it is
         // said once, here; its done, if it comes, adds no second word.
@@ -3518,6 +3527,21 @@ pub enum VisibleModeOutcome {
     Error(String),
 }
 
+/// Whether a frame names a source a text cites: an Anthropic
+/// `citations_delta`, a Responses `output_text.annotation.added`.
+fn is_citation_frame(frame: &SseEvent) -> bool {
+    const RESPONSES_ANNOTATION: &str = "response.output_text.annotation.added";
+    match frame.event_type.as_deref() {
+        Some("content_block_delta") => serde_json::from_str::<serde_json::Value>(&frame.data)
+            .is_ok_and(|v| v.pointer("/delta/type").and_then(serde_json::Value::as_str) == Some("citations_delta")),
+        Some(RESPONSES_ANNOTATION) => true,
+        // A server that names the event in its data only.
+        None => serde_json::from_str::<serde_json::Value>(&frame.data)
+            .is_ok_and(|v| v.get("type").and_then(serde_json::Value::as_str) == Some(RESPONSES_ANNOTATION)),
+        _ => false,
+    }
+}
+
 /// Source for a `url_citation` annotation: a single URL+title pair pulled
 /// from a dispatched visible-mode result. Used by both streaming
 /// (`ResponsesResponseBuilder`) and non-streaming
@@ -4087,6 +4111,20 @@ pub fn redact_pii_in_response_json(
         }
     }
 
+    /// Each cited source's title and quote, which the response scan reads
+    /// apart (`TransformState::response_pii_inputs`), wherever the source's
+    /// members sit ([`crate::audit::cited_source_mut`]).
+    fn redact_citations(citations: Option<&mut serde_json::Value>, pii: &crate::guardrail::PiiSettings) {
+        for citation in citations.and_then(|c| c.as_array_mut()).into_iter().flatten() {
+            let source = crate::audit::cited_source_mut(citation);
+            for key in crate::audit::CITATION_TITLE_KEYS.into_iter().chain(["cited_text"]) {
+                if let Some(field) = source.get_mut(key) {
+                    redact_in(field, pii);
+                }
+            }
+        }
+    }
+
     // Both visible output AND reasoning/thinking text are masked: the audit scan
     // runs over `full_response_content()` (which concatenates reasoning + prose),
     // so the wire must cover the same surface or an enforce "block" would be a
@@ -4113,6 +4151,7 @@ pub fn redact_pii_in_response_json(
                         // The joined pass runs only where there are several
                         // slots: one slot alone is its whole channel.
                         let carries = |v: &serde_json::Value| v.as_str().is_some_and(|t| !t.is_empty());
+                        let text_before = crate::api::chat::content_text(message.get("content")).map(std::borrow::Cow::into_owned);
                         let mut text_slots = 0;
                         for slot in crate::api::chat::text_slots_mut(message) {
                             text_slots += usize::from(carries(slot));
@@ -4142,6 +4181,19 @@ pub fn redact_pii_in_response_json(
                         {
                             crate::api::chat::set_message_reasoning(message, &m);
                         }
+                        // The refusal the audit reads as the answer's text
+                        // (`content::whole_answer_text`), and each annotation's
+                        // title — or none, where the mask changed the text
+                        // their offsets point into.
+                        if let Some(refusal) = message.get_mut("refusal") {
+                            redact_in(refusal, pii);
+                        }
+                        if crate::api::chat::content_text(message.get("content")).map(std::borrow::Cow::into_owned) != text_before
+                            && let Some(fields) = message.as_object_mut()
+                        {
+                            fields.remove("annotations");
+                        }
+                        redact_citations(message.get_mut("annotations"), pii);
                     }
                 }
             }
@@ -4154,6 +4206,9 @@ pub fn redact_pii_in_response_json(
                             if let Some(text) = block.get_mut("text") {
                                 redact_in(text, pii);
                             }
+                            // Each source's title and quote, which the response
+                            // scan reads apart (`TransformState::response_pii_inputs`).
+                            redact_citations(block.get_mut("citations"), pii);
                         }
                         // A signed block is masked too, though the API then
                         // refuses it back: enforce is the operator's "never let
@@ -4177,11 +4232,30 @@ pub fn redact_pii_in_response_json(
                                 item.get_mut("content").and_then(|c| c.as_array_mut())
                             {
                                 for part in parts {
-                                    if part.get("type").and_then(|t| t.as_str())
-                                        == Some("output_text")
-                                        && let Some(text) = part.get_mut("text")
-                                    {
-                                        redact_in(text, pii);
+                                    match part.get("type").and_then(|t| t.as_str()) {
+                                        Some("output_text") => {
+                                            // Its annotations place sources by
+                                            // offsets into the text: a masked
+                                            // text keeps none.
+                                            let before = part.get("text").cloned();
+                                            if let Some(text) = part.get_mut("text") {
+                                                redact_in(text, pii);
+                                            }
+                                            if part.get("text") != before.as_ref()
+                                                && let Some(fields) = part.as_object_mut()
+                                            {
+                                                fields.remove("annotations");
+                                            }
+                                            redact_citations(part.get_mut("annotations"), pii);
+                                        }
+                                        // The refusal the audit reads as the
+                                        // answer's text.
+                                        Some("refusal") => {
+                                            if let Some(text) = part.get_mut("refusal") {
+                                                redact_in(text, pii);
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -4417,6 +4491,13 @@ pub fn apply_response_scripts_json(
                             &mut badges, &mut program_outcomes, &mut step_diffs, &mut injection_blocks, &mut originals,
                         )
                     {
+                        // A rewritten text's annotations go with it: they
+                        // place a source in the text it took out.
+                        if new_ctx.content != cur_text
+                            && let Some(fields) = message.as_object_mut()
+                        {
+                            fields.remove("annotations");
+                        }
                         crate::api::chat::set_content_text(message, new_ctx.content);
                     }
 
@@ -4487,6 +4568,13 @@ pub fn apply_response_scripts_json(
                                 "text", &cur, None, None, None, false,
                                 &mut badges, &mut program_outcomes, &mut step_diffs, &mut injection_blocks, &mut originals,
                             ) {
+                                // A rewritten text's citations go with it: their
+                                // quotes would still carry what it took out.
+                                if new_ctx.content != cur
+                                    && let Some(fields) = block.as_object_mut()
+                                {
+                                    fields.remove("citations");
+                                }
                                 block["text"] = serde_json::Value::String(new_ctx.content);
                             }
                         }
@@ -4599,6 +4687,14 @@ pub fn apply_response_scripts_json(
                                             "text", &cur, None, None, None, false,
                                             &mut badges, &mut program_outcomes, &mut step_diffs, &mut injection_blocks, &mut originals,
                                         ) {
+                                            // A rewritten text's annotations go
+                                            // with it: they place a source in
+                                            // the text it took out.
+                                            if new_ctx.content != cur
+                                                && let Some(fields) = part.as_object_mut()
+                                            {
+                                                fields.remove("annotations");
+                                            }
                                             part["text"] = serde_json::Value::String(new_ctx.content);
                                         }
                                     }
@@ -4711,6 +4807,22 @@ mod tests {
         assert_eq!(text, "your ssn is [REDACTED:US_SSN] ok");
         // The non-text block is untouched.
         assert_eq!(resp["content"][1]["type"], "tool_use");
+    }
+
+    /// Each source's title and quote are masked beside the text that cites it,
+    /// as the response scan reads them apart; one with nothing found is kept.
+    #[test]
+    fn redact_pii_response_anthropic_masks_each_citations_quote() {
+        let mut resp = json!({"content": [{"type": "text", "text": "per the record", "citations": [
+            {"type": "char_location", "cited_text": "ssn 123-45-6789", "document_index": 0, "document_title": "HR", "start_char_index": 0, "end_char_index": 15},
+            {"type": "web_search_result_location", "cited_text": "nothing here", "encrypted_index": "e", "title": "ssn 123-45-6789", "url": "https://x.example"},
+        ]}]});
+        redact_pii_in_response_json(&mut resp, crate::api::sse::ApiVersion::AnthropicMessages, &enabled_pii());
+        assert_eq!(resp["content"][0]["citations"][0]["cited_text"], "ssn [REDACTED:US_SSN]");
+        assert_eq!(resp["content"][0]["citations"][0]["document_title"], "HR");
+        assert_eq!(resp["content"][0]["citations"][1]["cited_text"], "nothing here");
+        assert_eq!(resp["content"][0]["citations"][1]["title"], "ssn [REDACTED:US_SSN]");
+        assert_eq!(resp["content"][0]["text"], "per the record");
     }
 
     #[test]
@@ -5948,6 +6060,156 @@ mod tests {
             panic!("expected TextDelta, got {:?}", output[0].domain_event);
         }
         assert!(acc.stats.scripts_applied > 0);
+    }
+
+    /// A whole answer's text a script rewrites loses its sources; one it leaves
+    /// as it was keeps them.
+    #[test]
+    fn a_rewritten_whole_text_loses_its_citations() {
+        let meta = make_block_meta();
+        let cited = || json!({"content": [{"type": "text", "text": "this is secret data", "citations": [
+            {"type": "char_location", "cited_text": "secret data", "document_index": 0, "document_title": null, "start_char_index": 0, "end_char_index": 11}]}]});
+        let run = |source: &str| {
+            let program = make_response_program_with_source("p", "text", source);
+            let mut resp = cited();
+            apply_response_scripts_json(&mut resp, crate::api::sse::ApiVersion::AnthropicMessages, std::slice::from_ref(&program),
+                &ScriptEngine::new(), &meta, false, ScriptFailMode::Open);
+            resp
+        };
+        let rewritten = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
+        assert_eq!(rewritten["content"][0], json!({"type": "text", "text": "[FILTERED]"}));
+        assert_eq!(run(r#"fn transform(ctx) { ctx }"#), cited());
+    }
+
+    /// A streamed text a script rewrites loses the sources sent after it (the
+    /// spec's order: `text_delta`, then `citations_delta`), held with the block;
+    /// a text no script changes keeps them, in place behind it.
+    #[test]
+    fn a_rewritten_streamed_text_loses_its_held_citations() {
+        let cite = SseEvent {
+            event_type: Some("content_block_delta".into()),
+            data: json!({"type": "content_block_delta", "index": 0, "delta": {"type": "citations_delta",
+                "citation": {"type": "char_location", "cited_text": "secret data", "document_index": 0, "document_title": null,
+                "start_char_index": 0, "end_char_index": 11}}}).to_string(),
+            id: None,
+        };
+        let stop = SseEvent { event_type: Some("content_block_stop".into()), data: r#"{"type":"content_block_stop","index":0}"#.into(), id: None };
+        let run = |source: &str| {
+            let programs = vec![make_response_program_with_source("p", "text", source)];
+            let interests = BlockInterests { buffer_tool_blocks: false, buffer_text_blocks: true, buffer_thinking_blocks: false };
+            let mut acc = BlockAccumulator::new(interests, vec![], Default::default(), programs, Some(Arc::new(ScriptEngine::new())),
+                Some(make_block_meta()), false, ScriptFailMode::Open, vec![], false, false, crate::api::sse::ApiVersion::AnthropicMessages);
+            let text = SseEvent {
+                event_type: Some("content_block_delta".into()),
+                data: r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"this is secret data"}}"#.into(),
+                id: None,
+            };
+            let mut out = acc.process(DomainEvent::TextDelta("this is secret data".into()), Some(text));
+            out.extend(acc.process_raw(cite.clone(), false));
+            out.extend(acc.process_raw(stop.clone(), false));
+            out.extend(acc.process(DomainEvent::Done { finish_reason: None, native_finish_reason: None }, None));
+            out.iter().filter_map(|e| e.raw_sse.as_ref()).map(|f| f.data.clone()).collect::<Vec<_>>()
+        };
+        let rewritten = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
+        assert!(rewritten.iter().all(|f| !f.contains("citations_delta")), "{rewritten:?}");
+        assert!(rewritten.iter().any(|f| f.contains("content_block_stop")), "{rewritten:?}");
+        let kept = run(r#"fn transform(ctx) { ctx }"#);
+        assert!(kept.iter().any(|f| f.contains("citations_delta")), "{kept:?}");
+    }
+
+    /// A Responses text a script rewrites loses the annotations the stream
+    /// sent while it was held (`output_text.annotation.added`); one no script
+    /// changes keeps them, behind it.
+    #[test]
+    fn a_rewritten_streamed_responses_text_loses_its_held_annotations() {
+        let added = SseEvent {
+            event_type: Some("response.output_text.annotation.added".into()),
+            data: json!({"type": "response.output_text.annotation.added", "item_id": "m", "output_index": 0, "content_index": 0,
+                "annotation_index": 0, "annotation": {"type": "url_citation", "url": "https://x.example", "title": "t",
+                "start_index": 0, "end_index": 4}}).to_string(),
+            id: None,
+        };
+        let done = SseEvent {
+            event_type: Some("response.output_text.done".into()),
+            data: r#"{"type":"response.output_text.done","item_id":"m","output_index":0,"content_index":0,"text":"this is secret data"}"#.into(),
+            id: None,
+        };
+        let run = |source: &str| {
+            let programs = vec![make_response_program_with_source("p", "text", source)];
+            let interests = BlockInterests { buffer_tool_blocks: false, buffer_text_blocks: true, buffer_thinking_blocks: false };
+            let mut acc = BlockAccumulator::new(interests, vec![], Default::default(), programs, Some(Arc::new(ScriptEngine::new())),
+                Some(make_block_meta()), false, ScriptFailMode::Open, vec![], false, false, crate::api::sse::ApiVersion::Responses);
+            let text = SseEvent {
+                event_type: Some("response.output_text.delta".into()),
+                data: r#"{"type":"response.output_text.delta","item_id":"m","output_index":0,"content_index":0,"delta":"this is secret data"}"#.into(),
+                id: None,
+            };
+            let mut out = acc.process(DomainEvent::TextDelta("this is secret data".into()), Some(text));
+            out.extend(acc.process_raw(added.clone(), false));
+            out.extend(acc.process_raw(done.clone(), false));
+            out.extend(acc.process(DomainEvent::Done { finish_reason: None, native_finish_reason: None }, None));
+            out.iter().filter_map(|e| e.raw_sse.as_ref()).map(|f| f.data.clone()).collect::<Vec<_>>()
+        };
+        let rewritten = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
+        assert!(rewritten.iter().all(|f| !f.contains("annotation.added")), "{rewritten:?}");
+        assert!(rewritten.iter().any(|f| f.contains("output_text.done")), "{rewritten:?}");
+        let kept = run(r#"fn transform(ctx) { ctx }"#);
+        assert!(kept.iter().any(|f| f.contains("annotation.added")), "{kept:?}");
+    }
+
+    /// A whole OpenAI answer's refusal and its annotations' titles — Chat
+    /// nests a source under `url_citation` — are masked where the response
+    /// scan reads them; a member with nothing found is kept, and annotations
+    /// beside a text the mask changed are not.
+    #[test]
+    fn redact_pii_response_openai_masks_refusals_and_annotation_titles() {
+        let mut chat = json!({"choices": [{"message": {"content": "per the record", "refusal": "ssn 123-45-6789",
+            "annotations": [{"type": "url_citation", "url_citation": {"url": "https://x.example", "title": "ssn 123-45-6789"}}]}}]});
+        redact_pii_in_response_json(&mut chat, crate::api::sse::ApiVersion::ChatCompletions, &enabled_pii());
+        assert_eq!(chat["choices"][0]["message"]["refusal"], "ssn [REDACTED:US_SSN]");
+        assert_eq!(chat["choices"][0]["message"]["annotations"][0]["url_citation"]["title"], "ssn [REDACTED:US_SSN]");
+        assert_eq!(chat["choices"][0]["message"]["annotations"][0]["url_citation"]["url"], "https://x.example");
+        let mut responses = json!({"output": [{"type": "message", "content": [
+            {"type": "output_text", "text": "ok", "annotations": [{"type": "file_citation", "file_id": "f", "filename": "ssn 123-45-6789.pdf", "index": 0},
+                {"type": "url_citation", "url": "https://x.example", "title": "plain", "start_index": 0, "end_index": 1}]},
+            {"type": "refusal", "refusal": "ssn 123-45-6789"}]}]});
+        redact_pii_in_response_json(&mut responses, crate::api::sse::ApiVersion::Responses, &enabled_pii());
+        let parts = &responses["output"][0]["content"];
+        assert_eq!(parts[0]["annotations"][0]["filename"], "ssn [REDACTED:US_SSN].pdf");
+        assert_eq!(parts[0]["annotations"][1]["title"], "plain");
+        assert_eq!(parts[1]["refusal"], "ssn [REDACTED:US_SSN]");
+        // A text the mask changed keeps no annotations: their offsets point
+        // into the text it took out.
+        let mut masked = json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "ssn 123-45-6789",
+            "annotations": [{"type": "url_citation", "url": "https://x.example", "title": "t", "start_index": 0, "end_index": 3}]}]}]});
+        redact_pii_in_response_json(&mut masked, crate::api::sse::ApiVersion::Responses, &enabled_pii());
+        assert!(masked["output"][0]["content"][0].get("annotations").is_none(), "{masked}");
+        let mut chat_masked = json!({"choices": [{"message": {"content": "ssn 123-45-6789",
+            "annotations": [{"type": "url_citation", "url_citation": {"url": "https://x.example", "title": "t"}}]}}]});
+        redact_pii_in_response_json(&mut chat_masked, crate::api::sse::ApiVersion::ChatCompletions, &enabled_pii());
+        assert!(chat_masked["choices"][0]["message"].get("annotations").is_none(), "{chat_masked}");
+    }
+
+    /// A whole OpenAI answer's text a script rewrites loses its annotations;
+    /// one it leaves as it was keeps them.
+    #[test]
+    fn a_rewritten_whole_openai_text_loses_its_annotations() {
+        let meta = make_block_meta();
+        let run = |mut resp: serde_json::Value, version, source: &str| {
+            let program = make_response_program_with_source("p", "text", source);
+            apply_response_scripts_json(&mut resp, version, std::slice::from_ref(&program), &ScriptEngine::new(), &meta, false, ScriptFailMode::Open);
+            resp
+        };
+        let rewrite = r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#;
+        let keep = r#"fn transform(ctx) { ctx }"#;
+        let chat = json!({"choices": [{"message": {"role": "assistant", "content": "this is secret data",
+            "annotations": [{"type": "url_citation", "url_citation": {"url": "https://x.example", "title": "t"}}]}}]});
+        assert!(run(chat.clone(), crate::api::sse::ApiVersion::ChatCompletions, rewrite)["choices"][0]["message"].get("annotations").is_none());
+        assert_eq!(run(chat.clone(), crate::api::sse::ApiVersion::ChatCompletions, keep), chat);
+        let responses = json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "this is secret data",
+            "annotations": [{"type": "url_citation", "url": "https://x.example", "title": "t", "start_index": 0, "end_index": 4}]}]}]});
+        assert!(run(responses.clone(), crate::api::sse::ApiVersion::Responses, rewrite)["output"][0]["content"][0].get("annotations").is_none());
+        assert_eq!(run(responses.clone(), crate::api::sse::ApiVersion::Responses, keep), responses);
     }
 
     #[test]
@@ -11813,7 +12075,7 @@ mod tests {
             arguments: String::new(),
             server_tool: false,
         });
-        crate::pipeline::response_pipeline::record_builtins_not_carried(&response, crate::api::sse::ApiVersion::Responses, &mut state);
+        crate::pipeline::response_pipeline::record_calls_not_carried(&response, crate::api::sse::ApiVersion::Responses, &mut state);
         let blocks: Vec<String> = state.response_injection_blocks.iter().map(|b| format!("{} {}", b.transform, b.content)).collect();
         assert_eq!(blocks.len(), 1, "{blocks:?}");
         assert!(blocks[0].starts_with(TransformState::NOT_CARRIED) && blocks[0].contains("tool call 4:"), "{blocks:?}");

@@ -79,6 +79,18 @@ pub enum Tier {
     Docker,
 }
 
+/// What a developer asks of a run's network: the workspace's policy, or
+/// the gateway only. It only ever narrows the workspace's posture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkChoice {
+    Gateway,
+    Policy,
+}
+
+/// A project's container-sandbox file, relative to its root.
+pub const DOCKER_SANDBOX_FILE: &str = ".streamscopeai/sandbox.json";
+
 /// Everything needed to launch one confined client.
 pub struct LaunchSpec {
     pub command: String,
@@ -89,8 +101,17 @@ pub struct LaunchSpec {
     pub cwd: PathBuf,
     /// Gateway proxy origins (`scheme://host[:port]`) — always reachable.
     pub proxy_origins: Vec<String>,
-    /// What else the client may reach: the workspace's destination lists.
+    /// What else the client may reach: the workspace's destination lists,
+    /// under its posture (narrowed to the gateway by `--network gateway`).
     pub destinations: streamscope_client_templates::destination::Policy,
+    /// `--network`, when given: it wins over the project's sandbox.json (read
+    /// by the container tier, Linux only; the posture already carries it).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub network: Option<NetworkChoice>,
+    /// The workspace's default container image, for a project without a
+    /// `sandbox.json` (read by the container tier, Linux only).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub default_image: Option<streamscope_client_templates::sandbox_image::DefaultImage>,
     /// Extra env for the client (CA vars, per-agent quirks, user `-e`). The
     /// proxy vars are added by the native launcher once the guard port is known.
     pub env: Vec<(String, String)>,
@@ -120,6 +141,21 @@ pub struct LaunchSpec {
     /// to the developer without asking (`--private-project`).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub private_project: bool,
+    /// An OpenCode client's gateway provider key and provisioned main config,
+    /// for the launch to be judged ([`crate::opencode_global::at_launch`]): by
+    /// `ssai run` itself, or under the docker tier by the agent in the
+    /// container, since the host cannot read the container's home.
+    pub opencode: Option<OpencodeLaunch>,
+}
+
+/// What an OpenCode client was provisioned with, for its launch to be judged.
+pub struct OpencodeLaunch {
+    /// The provider key its config registers the gateway under.
+    pub provider: String,
+    /// Its main config, canonical.
+    pub config: PathBuf,
+    /// A global provisioning (the home's config), whose own pins are judged too.
+    pub global: bool,
 }
 
 /// The trust-store variables a combined bundle answers: the three that
@@ -329,9 +365,17 @@ fn print_sandbox_banner(spec: &LaunchSpec, tier: Tier) {
     }
 }
 
-/// The banner's account of the destination lists, empty when none applies.
+/// The banner's account of the posture and the destination lists, empty
+/// when the gateway alone is reached.
 fn destinations_note(policy: &streamscope_client_templates::destination::Policy) -> String {
+    use streamscope_client_templates::destination::Posture;
     let (allow, block) = (policy.allow.len(), policy.block.len());
+    match policy.posture {
+        Posture::Gateway => return String::new(),
+        Posture::Open if block == 0 => return " and any other destination".to_string(),
+        Posture::Open => return format!(" and any destination but {block} blocked"),
+        Posture::Listed => {}
+    }
     match (allow, block) {
         (0, 0) => String::new(),
         (a, 0) => format!(" and {a} allowed destination(s)"),
@@ -378,6 +422,27 @@ pub fn podman_init(start_file: &Path) -> Result<()> {
     }
 }
 
+/// `ssai __opencode-check --provider <key> --config <path> [--global]`: run
+/// by a docker-sandbox container's init as the agent user, in the agent's
+/// working directory and environment, so it reads only what the agent can.
+pub fn opencode_check(provider: &str, config: &Path, global: bool) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let cwd = std::env::current_dir().context("read the working directory")?;
+        let home = std::env::var_os("HOME").map(PathBuf::from).context("HOME is not set")?;
+        let user_dir = crate::opencode_global::config_dir_in(&|k| std::env::var(k).ok(), &home, &cwd);
+        for warning in crate::opencode_global::at_launch(provider, config, global, &user_dir, &cwd) {
+            eprintln!("ssai: {warning}");
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (provider, config, global);
+        bail!("__opencode-check runs only in a Linux container")
+    }
+}
+
 /// `ssai __sandbox-sweep <root> [--container-root-uid <id>] [--container-root-gid <id>]`,
 /// under `podman unshare`.
 pub fn podman_sweep(root: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<()> {
@@ -393,24 +458,46 @@ pub fn podman_sweep(root: &Path, uid: Option<u32>, gid: Option<u32>) -> Result<(
 }
 
 /// `ssai sandbox prepare`: (re)build the project's docker-sandbox images for
-/// the client launched as `command`.
-pub fn podman_prepare(root: &Path, command: &str) -> Result<()> {
+/// the client launched as `command` (`default_image`: the workspace's, for a
+/// project without a `sandbox.json`).
+pub fn podman_prepare(
+    root: &Path,
+    command: &str,
+    default_image: Option<&streamscope_client_templates::sandbox_image::DefaultImage>,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        podman::prepare_project(root, command)
+        podman::prepare_project(root, command, default_image)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (root, command);
+        let _ = (root, command, default_image);
         bail!("the docker sandbox runs on Linux only")
     }
 }
 
-/// `ssai sandbox prune`: remove every docker-sandbox volume and image.
-pub fn podman_prune() -> Result<()> {
+/// `ssai sandbox prune`: remove every docker-sandbox volume and image, or
+/// (`project`) one project's.
+pub fn podman_prune(project: Option<&Path>) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        podman::prune()
+        match project {
+            Some(root) => podman::prune_project(root),
+            None => podman::prune(),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = project;
+        bail!("the docker sandbox runs on Linux only")
+    }
+}
+
+/// `ssai sandbox status`: the docker sandbox's images and volumes, per project.
+pub fn podman_status() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        podman::status()
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -476,24 +563,24 @@ async fn spawn_unconfined(spec: &LaunchSpec) -> Result<i32> {
 /// ssh setting of the user's own is left as it is.
 fn sandbox_env(spec: &LaunchSpec, guard_port: u16, inherited: &dyn Fn(&str) -> Option<String>) -> Vec<(String, String)> {
     let exe = std::env::current_exe().ok().map(|e| e.to_string_lossy().into_owned());
-    sandbox_env_with(spec, guard_port, exe.as_deref(), inherited)
+    sandbox_env_with(spec, ("127.0.0.1", guard_port), exe.as_deref(), inherited)
 }
 
 /// [`sandbox_env`] with the `ssai` binary the client's git runs for SSH
 /// named: its path as the client sees it.
 fn sandbox_env_with(
     spec: &LaunchSpec,
-    guard_port: u16,
+    (guard_host, guard_port): (&str, u16),
     exe: Option<&str>,
     inherited: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
-    let proxy = format!("http://127.0.0.1:{guard_port}");
     // `PWD` names the launch directory, as a shell would set it: a client that
     // takes its working directory from `$PWD` (OpenCode does, before `cwd()`)
     // would otherwise work in whatever directory `ssai` was started
     // from, outside the confinement root.
     let mut env = vec![("PWD".to_string(), spec.cwd.to_string_lossy().into_owned())];
     env.extend(spec.env.iter().cloned());
+    let proxy = format!("http://{guard_host}:{guard_port}");
     for k in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
         env.push((k.to_string(), proxy.clone()));
     }
@@ -511,7 +598,7 @@ fn sandbox_env_with(
     // the user's own options. Its exemptions are the `NO_PROXY` loopback ones
     // (its default exempts every loopback name, a gateway's too).
     let java_proxy = format!(
-        "-Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort={guard_port} -Dhttp.proxyHost=127.0.0.1 \
+        "-Dhttps.proxyHost={guard_host} -Dhttps.proxyPort={guard_port} -Dhttp.proxyHost={guard_host} \
          -Dhttp.proxyPort={guard_port} -Dhttp.nonProxyHosts={}",
         exempt.iter().map(|n| if n.contains(':') { format!("[{n}]") } else { n.to_string() }).collect::<Vec<_>>().join("|")
     );
@@ -1509,12 +1596,15 @@ mod tests {
             cwd: PathBuf::from("/p"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         }
     }
 
@@ -1531,12 +1621,15 @@ mod tests {
             cwd: PathBuf::from("/p"),
             proxy_origins: vec![],
             destinations: Default::default(),
+            network: None,
+            default_image: None,
             env: vec![("SSL_CERT_FILE".into(), "/mine.pem".into())],
             ca_files: vec![],
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
             private_project: false,
+            opencode: None,
         };
         point_at_ca_bundle(&mut spec, Path::new("/root/run.pem"));
         // `Command::env` keeps the last value of a key.
@@ -1658,8 +1751,13 @@ mod tests {
         let p = Policy {
             allow: DestinationSet::parse(&["a.lan", "b.lan"]).unwrap(),
             block: DestinationSet::parse(&["c.lan"]).unwrap(),
+            ..Policy::default()
         };
         assert_eq!(destinations_note(&p), " and 2 allowed destination(s), 1 blocked");
+        use streamscope_client_templates::destination::Posture;
+        assert_eq!(destinations_note(&Policy { posture: Posture::Open, ..p.clone() }), " and any destination but 1 blocked");
+        assert_eq!(destinations_note(&Policy { posture: Posture::Open, ..Policy::default() }), " and any other destination");
+        assert_eq!(destinations_note(&Policy { posture: Posture::Gateway, ..p }), "");
     }
 
     /// The engine plan puts the attach arguments where the profile says, with

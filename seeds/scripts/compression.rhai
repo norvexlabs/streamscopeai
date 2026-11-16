@@ -75,13 +75,13 @@ fn transform(ctx) {
         "",
     ].join("\n") + last_user_content;
 
-    // Replace all messages with a single compressed user message
-    ctx.messages = [];
-    ctx.messages.push(#{
-        role: "user",
-        content: compressed_prompt,
-        tool_call_id: ()
-    });
+    // Keep only the last user message, its text the compressed prompt: its
+    // own map, so an image beside the text goes with it — unless the
+    // message shares its turn with tool results this drops, which rebuilds
+    // the turn from its text.
+    let last_user = ctx.messages[last_user_idx];
+    last_user.content = compressed_prompt;
+    ctx.messages = [last_user];
 
     ctx.metadata["compression"] = "applied";
     ctx.labels.push("compressed");

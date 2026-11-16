@@ -13,7 +13,7 @@ use crate::state::{
     gateway_bundle_file, gateway_ca_file, resolve_scope, ClientAccessRecord, ManagedClient, Manifest,
     ManifestScope, Paths, WorkspaceManifest,
 };
-use streamscope_client_templates::destination::{DestinationSet, Policy};
+use streamscope_client_templates::destination::{DestinationSet, Policy, Posture};
 
 /// How old the record of what the workspace offers may be before `ssai run`
 /// asks the gateway again.
@@ -34,6 +34,11 @@ pub struct RunArgs {
     /// Podman container, Linux), learn, off.
     #[arg(long, default_value = "auto")]
     pub sandbox: String,
+    /// What the sandbox may reach besides the gateway: `policy` (the
+    /// workspace's, the default) or `gateway` (the gateway only). Wins over
+    /// `network` in the project's sandbox.json.
+    #[arg(long, value_parser = ["gateway", "policy"])]
+    pub network: Option<String>,
     /// Surface the egress guard's per-connection denial lines (blocked domains,
     /// etc.). Off by default so they can't corrupt the client's terminal UI.
     #[arg(long, short = 'v')]
@@ -97,10 +102,21 @@ pub async fn run(args: RunArgs) -> Result<()> {
     }
     // Only a confined run reads the lists: `--sandbox off` applies none, so a
     // block entry this build cannot read does not refuse it.
-    let destinations = match choice {
+    if args.network.is_some() && choice == SandboxChoice::Off {
+        bail!("`--network` narrows the sandbox, and `--sandbox off` runs without one — drop one of them");
+    }
+    let network = match args.network.as_deref() {
+        Some("gateway") => Some(sandbox::NetworkChoice::Gateway),
+        Some(_) => Some(sandbox::NetworkChoice::Policy),
+        None => None,
+    };
+    let mut destinations = match choice {
         SandboxChoice::Off => Policy::default(),
         _ => access.as_ref().map(destinations_of).transpose()?.unwrap_or_default(),
     };
+    if network == Some(sandbox::NetworkChoice::Gateway) {
+        destinations.posture = destinations.posture.narrower(Posture::Gateway);
+    }
 
     let command = resolved.command;
     let proxy_origins = resolved.proxy_origins;
@@ -182,15 +198,32 @@ pub async fn run(args: RunArgs) -> Result<()> {
         cwd,
         proxy_origins,
         destinations,
+        network,
+        default_image: access.as_ref().and_then(|a| a.sandbox.settings.default_image.clone()),
         env,
         ca_files,
         ca_bundle,
         home_files: resolved.home_files,
         client_files: resolved.client_files,
         private_project: args.private_project,
+        opencode: resolved.opencode,
     };
 
     let tier = sandbox::select_tier(choice)?;
+    // What OpenCode loads in the launch this run starts, judged from where it
+    // starts. Under the docker tier the container's init has it judged inside;
+    // the Windows sandbox starts the client as an account with a home of its
+    // own, which `ssai run` does not judge.
+    let judged_here = match tier {
+        sandbox::Tier::Docker => false,
+        sandbox::Tier::Native | sandbox::Tier::Learn => !cfg!(windows),
+        sandbox::Tier::Off => true,
+    };
+    if judged_here && let Some(launch) = &spec.opencode {
+        for warning in crate::opencode_global::at_launch_here(launch, &spec.env, &spec.cwd) {
+            eprintln!("ssai: {warning}");
+        }
+    }
 
     let code = sandbox::launch(spec, tier, args.verbose).await?;
     std::process::exit(code);
@@ -214,6 +247,9 @@ struct ResolvedClient {
     /// The directory holding the client's main config, when the client was
     /// provisioned into this project.
     project_config_dir: Option<PathBuf>,
+    /// An OpenCode client's gateway, for its launch to be judged: by `ssai run`
+    /// itself, or under the docker tier by the agent in the container.
+    opencode: Option<sandbox::OpencodeLaunch>,
     /// A globally provisioned client's files (under the home).
     home_files: Vec<PathBuf>,
     /// Every file the client was provisioned with, either scope.
@@ -292,6 +328,11 @@ fn resolve_client(client: &str, host: Option<&str>) -> Result<ResolvedClient> {
             client_access: ws.client_access.clone(),
             confine_root,
             project_config_dir,
+            opencode: crate::opencode_global::gateway_of(managed).map(|(provider, config)| sandbox::OpencodeLaunch {
+                provider,
+                config: crate::opencode_global::canonical(&config),
+                global: !*is_project,
+            }),
             // A global client's config lives under the home, which the
             // docker tier does not mount: it mounts these files instead.
             home_files: if *is_project { Vec::new() } else { files.clone() },
@@ -310,6 +351,23 @@ fn resolve_client(client: &str, host: Option<&str>) -> Result<ResolvedClient> {
          Provision it first: ssai provision [--local] --client {client}",
         if provisioned.is_empty() { "none".to_string() } else { provisioned.join(", ") }
     )
+}
+
+/// What `ssai sandbox prepare` prepares for `client`, resolved as `run`
+/// resolves it (`host` as `--host`): the root the run confines to, the
+/// launch command, and — for a root without a `sandbox.json` — the default
+/// image the client's workspace sets.
+pub(crate) async fn sandbox_target(
+    client: &str,
+    host: Option<&str>,
+) -> Result<(PathBuf, String, Option<streamscope_client_templates::sandbox_image::DefaultImage>)> {
+    let resolved = resolve_client(client, host)?;
+    let default_image = if resolved.confine_root.join(sandbox::DOCKER_SANDBOX_FILE).exists() {
+        None
+    } else {
+        current_access(&resolved).await.and_then(|a| a.sandbox.settings.default_image)
+    };
+    Ok((resolved.confine_root.clone(), resolved.command.clone(), default_image))
 }
 
 /// What the client's workspace offers: the record, asked again when it is
@@ -380,7 +438,7 @@ fn destinations_of(access: &ClientAccess) -> Result<Policy> {
             "your administrator blocks a destination this ssai cannot read ({err}) — update it: ssai update"
         )
     })?;
-    Ok(Policy { allow, block })
+    Ok(Policy { allow, block, posture: access.sandbox.settings.network })
 }
 
 /// The files `managed` was provisioned with, as canonical paths on disk (a
@@ -401,16 +459,10 @@ fn provisioned_files(managed: &ManagedClient, project_root: Option<&Path>) -> Ve
         .collect()
 }
 
-/// The directory holding `managed`'s main config, when it is a directory of
-/// its own inside the project (`<root>/.opencode`). Never the project root
-/// itself: a client that read the root as its user-config directory would
-/// load the repository's `plugins/`, `agents/`, … as its own (a project still
-/// on a root-level config gets no override).
-/// `project_root` is the canonical root; the recorded path is resolved the same
-/// way, so a project reached through a symlink still compares equal.
+/// The user config dir `run` hands `managed` in the project at `project_root`
+/// ([`sandbox::profiles::project_config_dir`] of its main config).
 fn config_dir_of(managed: &ManagedClient, project_root: &Path) -> Option<PathBuf> {
-    let dir = dunce::canonicalize(Path::new(&managed.files.first()?.path).parent()?).ok()?;
-    (dir != project_root && dir.starts_with(project_root)).then_some(dir)
+    sandbox::profiles::project_config_dir(Path::new(&managed.files.first()?.path), project_root)
 }
 
 /// Resolve `p` to its canonical real path. Load-bearing on macOS: Seatbelt's

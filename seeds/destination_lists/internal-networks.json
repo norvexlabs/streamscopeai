@@ -1,0 +1,22 @@
+{
+  "key": "internal-networks",
+  "name": "Internal networks",
+  "description": "Private, shared, loopback, link-local, reserved and multicast address ranges, IPv4 and IPv6. Blocked on a new profile set to Internet; to let it reach an internal service, remove its range. An internal service on a public or global IPv6 address, or reached through a NAT64 prefix, is not covered: add it here.",
+  "entries": [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "::1",
+    "fc00::/7",
+    "fe80::/10",
+    "192.0.0.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "::/96"
+  ]
+}

@@ -91,6 +91,10 @@ FROM source AS checks
 # workspace without them, so do not "align" the two by dropping it here.
 RUN cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+# The CLI's tests ask a real git what a commit would do with a file it writes a
+# key into: the check is git's own answer, so no stand-in can test it.
+RUN apk add --no-cache -q git
+
 # Run all workspace tests (fails the build if any test fails). `--all-features` for the
 # same reason as the clippy step above — a feature-gated test that no gate runs is a test
 # that does not exist.

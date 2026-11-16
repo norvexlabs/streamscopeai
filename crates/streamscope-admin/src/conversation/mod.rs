@@ -53,6 +53,9 @@ impl CarriedMedia {
     }
 }
 
+/// A source a message's text cites, as the console shows it.
+pub use streamscope_core::audit::Citation;
+
 #[derive(Debug, Serialize, Clone, ToSchema)]
 pub struct TurnMetadata {
     /// Orchestrating LLM `gateway_audit.request_id` for this turn. Surfaced
@@ -223,6 +226,10 @@ pub enum ConversationEvent {
         /// shield banner. Empty when the message was clean.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         guardrails: Vec<streamscope_core::proxy::content::GuardrailStepDiff>,
+        /// The sources the message's text cites — an Anthropic text's
+        /// `citations`, from the client's history or the answer as captured.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        citations: Vec<Citation>,
     },
 
     #[serde(rename = "tool_call")]
@@ -359,6 +366,14 @@ pub enum ConversationEvent {
         /// Document title
         #[serde(skip_serializing_if = "Option::is_none")]
         title: Option<String>,
+        /// A document's context: text the client sent beside it for the model
+        /// to read (an Anthropic document's `context`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        /// The detail the client asked the model to read a file at (a
+        /// Responses `input_file`'s `detail`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         /// Approximate size in bytes
         #[serde(skip_serializing_if = "Option::is_none")]
         size_bytes: Option<usize>,
@@ -396,22 +411,23 @@ pub enum ConversationEvent {
         metadata: Option<TurnMetadata>,
     },
 
-    /// Framework-injected volatile block (e.g. `<system-reminder>…`,
-    /// `<available-deferred-tools>…`, `<local-command-*>…`,
-    /// `<command-*>…`) that was embedded inline inside a user or
-    /// assistant text block. The event builder splits prose from these
-    /// blocks so the session UI can render the prose as a normal bubble
-    /// and the reminder as a collapsed card — matches the Anthropic-
-    /// style collapse seen in other LLM consoles.
+    /// Framework-injected volatile block (`<system-reminder>…`,
+    /// `<available-deferred-tools>…`, `<local-command-*>…`, `<command-*>…`
+    /// that begins a line, through its matching close) found in a user or
+    /// assistant text block. The event builder splits the prose from these
+    /// blocks so the session view renders the prose as a normal bubble and
+    /// the block as a collapsed card; a tag the text only mentions stays
+    /// prose.
     ///
-    /// `content` carries the full raw block including opening and
-    /// closing tags so the UI shows exactly what the framework injected.
-    /// `raw`, when present, is attached to the first emitted event for
-    /// the parent message (same single-shot rule as `ConversationEvent::Message`).
+    /// `label` names the family, as a code the UI names; `content` carries
+    /// the full raw block including opening and closing tags so the UI shows
+    /// exactly what the framework injected. `raw`, when present, is attached to the first emitted event
+    /// for the parent message (same single-shot rule as
+    /// `ConversationEvent::Message`).
     #[serde(rename = "framework_reminder")]
     FrameworkReminder {
         role: String,
-        label: String,
+        label: streamscope_core::proxy::content::VolatileLabel,
         content: String,
         turn: i32,
         is_new: bool,

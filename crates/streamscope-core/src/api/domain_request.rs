@@ -15,7 +15,8 @@ use crate::api::domain::{
 };
 use crate::api::messages::{
     AnthropicContent, AnthropicMessage, AnthropicTool, CacheControl, ContentBlock, ImageSource,
-    MessagesRequest, SystemBlock, SystemPrompt, ThinkingConfig, ToolResultBlock, ToolResultContent,
+    MessagesRequest, SystemBlock, SystemPrompt, ThinkingConfig, ToolResultBlock, ToolResultContent, block_citations,
+    citations_extra,
 };
 use crate::api::gemini::{
     GeminiContent, GeminiFunctionCallData, GeminiFunctionDecl,
@@ -75,8 +76,8 @@ pub struct DomainRequest {
     pub parallel_tool_calls: Option<bool>,
     pub stream: Option<bool>,
     pub max_output_tokens: Option<u32>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
     /// What the client asked of the model's reasoning; `None` when it asked
     /// nothing, and the target's own default applies.
     pub reasoning: Option<ReasoningRequest>,
@@ -117,6 +118,10 @@ pub struct DomainSystemBlock {
     /// (see `lift_leading_telemetry`). Re-emitted or dropped per-target by
     /// `render_system_block`. Empty for protocols that have no recognizers yet.
     pub client_metadata: Vec<ClientMetadata>,
+    /// The sources the block's text cites, as the client sent them (an
+    /// Anthropic system block's `citations`): Anthropic's walk sends them
+    /// back, any other names them (`anthropic_system_parts`).
+    pub citations: Vec<Value>,
 }
 
 /// Outbound target for `DomainRequest::to_*`. Drives per-variant telemetry policy.
@@ -456,6 +461,13 @@ pub enum DomainContentBlock {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// The sources the text cites, each as the client sent it (an Anthropic
+        /// `TextCitationParam`: a quote, `cited_text`, and where it is from).
+        /// Only Anthropic has a channel for them: its walk sends them back, any
+        /// other names them. An edit of the text drops them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[schema(value_type = Vec<Object>)]
+        citations: Vec<Value>,
     },
     Image {
         data: String,
@@ -517,6 +529,11 @@ pub enum DomainContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[schema(value_type = Option<Object>)]
         nested_content: Option<Value>,
+        /// The detail the model is to read the file at, as the client set it
+        /// (a Responses `input_file`'s `detail`). Only Responses has a place
+        /// for it: its walk sends it, any other names it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     Thinking {
         thinking: String,
@@ -548,6 +565,10 @@ pub enum DomainContentBlock {
         filename: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// The detail the model is to read the file at — see
+        /// [`DomainContentBlock::Document`]'s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     /// Streamscope-synthesized reference to a stored media blob.
     ///
@@ -598,6 +619,69 @@ impl DomainContentBlock {
     /// so future changes to the variant's fields only touch this helper.
     pub fn unknown(v: Value) -> Self {
         Self::Unknown { value: v }
+    }
+
+    /// The block's prompt-cache breakpoint field, on a kind that has one.
+    fn breakpoint_mut(&mut self) -> Option<&mut Option<CacheControl>> {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::Image { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::Document { cache_control, .. }
+            | Self::Audio { cache_control, .. }
+            | Self::File { cache_control, .. }
+            | Self::BlobRef { cache_control, .. } => Some(cache_control),
+            _ => None,
+        }
+    }
+
+    /// The block's own prompt-cache breakpoint, if it marks one.
+    fn breakpoint(&self) -> Option<&CacheControl> {
+        match self {
+            Self::Text { cache_control, .. }
+            | Self::Image { cache_control, .. }
+            | Self::ToolUse { cache_control, .. }
+            | Self::Document { cache_control, .. }
+            | Self::Audio { cache_control, .. }
+            | Self::File { cache_control, .. }
+            | Self::BlobRef { cache_control, .. } => cache_control.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The breakpoint a marker sent in the block's place keeps: its own, or —
+    /// for a part the parser kept as the client's — its `cache_control` (a
+    /// Responses part's `prompt_cache_breakpoint` goes with the part, which is
+    /// named).
+    fn marker_breakpoint(&self) -> Option<CacheControl> {
+        match self {
+            Self::Unknown { value } => value.get("cache_control").and_then(|c| serde_json::from_value(c.clone()).ok()),
+            b => b.breakpoint().cloned(),
+        }
+    }
+
+    /// How many prompt-cache breakpoints the block marks: its own, those of
+    /// the blocks it holds, or — for a part the parser kept as the client's —
+    /// the one that part marks.
+    fn breakpoints(&self) -> usize {
+        match self {
+            Self::ToolResult { content, .. } => content.iter().map(Self::breakpoints).sum(),
+            b => usize::from(b.marker_breakpoint().is_some()),
+        }
+    }
+
+    /// Whether the Anthropic walk leaves the block out, its breakpoint with
+    /// it — what [`DomainRequest::anthropic_tool_result`] skips in a tool
+    /// result: an empty text, which Anthropic refuses, and an empty text
+    /// document — the predicate that walk skips by. (Anything else it does
+    /// not carry goes as a marker keeping the breakpoint, in a tool result and
+    /// a message alike.)
+    fn anthropic_leaves_out(&self, in_tool_result: bool) -> bool {
+        match self {
+            Self::Text { text, .. } => in_tool_result && text.is_empty(),
+            Self::Document { data, media_type, .. } => in_tool_result && data.is_empty() && media_type.starts_with("text/"),
+            _ => false,
+        }
     }
 
     /// A thinking block's signature where `target` can verify it — only the
@@ -788,7 +872,7 @@ pub struct DomainMediaParams {
     pub language: Option<String>,
     /// Transcription / translation sampling temperature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     /// Any remaining provider-specific params we haven't modeled yet.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schema(value_type = Object)]
@@ -814,9 +898,9 @@ pub struct DomainRequestMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -904,8 +988,8 @@ pub fn domain_request_meta_from_stored(
 
     if let Some(Value::Object(params)) = request_params {
         // Fields common to multiple protocols — claim the canonical name.
-        meta.temperature = params.get("temperature").and_then(|v| v.as_f64()).map(|f| f as f32);
-        meta.top_p = params.get("top_p").and_then(|v| v.as_f64()).map(|f| f as f32);
+        meta.temperature = params.get("temperature").and_then(|v| v.as_f64());
+        meta.top_p = params.get("top_p").and_then(|v| v.as_f64());
         meta.stream = params.get("stream").and_then(|v| v.as_bool());
         meta.store = params.get("store").and_then(|v| v.as_bool());
         meta.response_format = params.get("response_format").cloned();
@@ -1429,6 +1513,12 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    /// Above `high` (`xhigh` / `XHIGH`): kept as asked, sent as `high` by
+    /// every walk ([`effort_to_str`]).
+    XHigh,
+    /// The deepest (`max`): kept as asked, sent as `high` by every walk
+    /// ([`effort_to_str`]).
+    Max,
 }
 
 // ─── Helpers ───
@@ -1441,15 +1531,18 @@ fn effort_to_budget(effort: &ReasoningEffort) -> u32 {
 /// `reasoning_effort` and Responses' `reasoning.effort` (`none | minimal | low
 /// | medium | high | xhigh | max`), Anthropic's `output_config.effort` (`low |
 /// medium | high | xhigh | max`), Gemini's `thinkingLevel` (`MINIMAL | LOW |
-/// MEDIUM | HIGH`, written lowercase in its REST examples) — or `None` for
-/// `none`, a request NOT to reason. The domain keeps three levels: `minimal`
-/// is the lowest, and anything above `medium` is `High`. Every parser reads
-/// effort through here, so one spelling means one thing on every inbound path.
+/// MEDIUM | HIGH | XHIGH`, written lowercase in its REST examples) — or `None`
+/// for `none`, a request NOT to reason. `minimal` is the lowest level, `xhigh`
+/// and `max` keep their own, and a spelling none of the specs names reads as
+/// `High`. Every parser reads effort through here, so one spelling means one
+/// thing on every inbound path.
 fn effort_level(s: &str) -> Option<ReasoningEffort> {
     match s.to_ascii_lowercase().as_str() {
         "none" => None,
         "minimal" | "low" => Some(ReasoningEffort::Low),
         "medium" => Some(ReasoningEffort::Medium),
+        "xhigh" => Some(ReasoningEffort::XHigh),
+        "max" => Some(ReasoningEffort::Max),
         _ => Some(ReasoningEffort::High),
     }
 }
@@ -1463,7 +1556,13 @@ fn effort_to_str(effort: &ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::Low => "low",
         ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
+        // Every protocol spells both, but each model takes its own subset
+        // (Anthropic: `xhigh` only on some of the models that take `max`;
+        // OpenAI: "not all reasoning models support every value"), and no
+        // walk knows which: a translation sends `high`, which every model
+        // that reasons takes, and names the narrowing
+        // ([`DomainRequest::not_carried_to`]).
+        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
     }
 }
 
@@ -1606,8 +1705,8 @@ fn anthropic_display(show: Option<bool>) -> Option<String> {
 struct AnthropicReasoningPlan {
     thinking: Option<ThinkingConfig>,
     effort: Option<&'static str>,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     tool_choice: Option<Value>,
     dropped: Vec<String>,
 }
@@ -1860,6 +1959,30 @@ fn extra_not_carried(key: &str, value: &Value) -> Vec<String> {
     vec![format!("parameter {name}")]
 }
 
+/// Whether the Responses walk sends `block` as an `input_file`, the one part
+/// with a place for a file's `detail` — the one reading the walk
+/// ([`domain_to_responses_input_parts`]) and the naming of a lost `detail`
+/// ([`DomainRequest::not_carried_to`]) share. A text document goes as its
+/// text, a document with no bytes as its name, a file by an image URL as an
+/// image, a file with no locator as its name.
+fn responses_sends_input_file(block: &DomainContentBlock) -> bool {
+    match block {
+        DomainContentBlock::Document { data, media_type, .. } => {
+            !media_type.starts_with("text/") && (media_type == "document/url" || !data.is_empty())
+        }
+        DomainContentBlock::File { file_id, url, media_type, .. } => {
+            file_id.is_some() || (url.is_some() && !media_type.as_deref().is_some_and(|m| m.starts_with("image/")))
+        }
+        _ => false,
+    }
+}
+
+/// The objects of a list a client or an upstream wrote — none where it is no
+/// list.
+fn object_list(value: Option<&Value>) -> Vec<Value> {
+    value.and_then(Value::as_array).into_iter().flatten().filter(|v| v.is_object()).cloned().collect()
+}
+
 fn extract_text_content(content: &MessageContent) -> String {
     match content {
         MessageContent::Text(t) => t.clone(),
@@ -1880,7 +2003,7 @@ fn anthropic_image(source: &ImageSource, cache_control: &Option<CacheControl>) -
     if source.r#type == "file" {
         // A file source states no media type; the block says it is an image,
         // which is what every walk renders a file as.
-        return DomainContentBlock::File {
+        return DomainContentBlock::File { detail: None,
             file_id: source.file_id.clone(),
             url: None,
             media_type: Some(source.media_type.clone()).filter(|s| !s.is_empty()).or_else(|| Some("image/*".to_string())),
@@ -1906,7 +2029,7 @@ fn anthropic_document(
     cache_control: &Option<CacheControl>,
 ) -> DomainContentBlock {
     if source.r#type == "file" {
-        return DomainContentBlock::File {
+        return DomainContentBlock::File { detail: None,
             file_id: source.file_id.clone(),
             url: None,
             media_type: Some(source.media_type.clone()).filter(|s| !s.is_empty()),
@@ -1920,7 +2043,7 @@ fn anthropic_document(
         "text" => (source.data.clone(), "text/plain".to_string(), None),
         _ => (source.data.clone(), source.media_type.clone(), None),
     };
-    DomainContentBlock::Document {
+    DomainContentBlock::Document { detail: None,
         data,
         media_type,
         title: title.clone(),
@@ -1936,17 +2059,19 @@ fn anthropic_document(
 /// does not model as it was sent.
 fn anthropic_tool_result_content(content: &Option<ToolResultContent>) -> Vec<DomainContentBlock> {
     match content {
-        None => vec![DomainContentBlock::Text { text: String::new(), cache_control: None }],
-        Some(ToolResultContent::Text(t)) => vec![DomainContentBlock::Text { text: t.clone(), cache_control: None }],
+        None => vec![DomainContentBlock::Text { text: String::new(), cache_control: None, citations: Vec::new() }],
+        Some(ToolResultContent::Text(t)) => vec![DomainContentBlock::Text { text: t.clone(), cache_control: None, citations: Vec::new() }],
         Some(ToolResultContent::Blocks(blocks)) => blocks
             .iter()
             .map(|b| match b {
-                ToolResultBlock::Text { text, cache_control } => {
-                    DomainContentBlock::Text { text: text.clone(), cache_control: cache_control.clone() }
-                }
+                ToolResultBlock::Text { text, cache_control, extra } => DomainContentBlock::Text {
+                    text: text.clone(),
+                    cache_control: cache_control.clone(),
+                    citations: block_citations(extra),
+                },
                 ToolResultBlock::Image { source, cache_control, .. } => anthropic_image(source, cache_control),
-                ToolResultBlock::Document { source, cache_control } => {
-                    anthropic_document(source, &None, &None, &None, cache_control)
+                ToolResultBlock::Document { source, title, context, citations, cache_control } => {
+                    anthropic_document(source, title, context, citations, cache_control)
                 }
                 ToolResultBlock::Unknown(v) => {
                     detect_synthetic_block(v).unwrap_or_else(|| DomainContentBlock::Unknown { value: v.clone() })
@@ -1957,27 +2082,50 @@ fn anthropic_tool_result_content(content: &Option<ToolResultContent>) -> Vec<Dom
 }
 
 /// The members of an Anthropic message's blocks the domain does not model —
-/// a tool result's `toolset_name`, an image's `transformations` — each as a
-/// [`DomainRequest::history_parts`] entry, so a walk that leaves them behind
-/// names them.
-fn anthropic_history_parts(msg: &AnthropicMessage) -> Vec<Value> {
+/// a text's `citations`, a call's `caller`, a tool result's `toolset_name`, an
+/// image's `transformations` — each as a [`DomainRequest::history_parts`]
+/// entry, so a walk that leaves them behind names them.
+pub(crate) fn anthropic_history_parts(msg: &AnthropicMessage) -> Vec<Value> {
     let AnthropicContent::Blocks(blocks) = &msg.content else {
         return Vec::new();
     };
     let role = msg.role.as_str();
     let mut out = Vec::new();
     let mut members = |extra: &BTreeMap<String, Value>| {
-        out.extend(extra.iter().filter(|(_, v)| !asks_nothing(v)).map(|(k, _)| history_entry(role, k)));
+        out.extend(extra.iter().filter(|(k, v)| member_is_lost(k, v)).map(|(k, _)| history_entry(role, k)));
     };
+    // A document by file reference is read as a file, which keeps no
+    // context or citation settings; a content document's texts are read as
+    // its raw content, which another walk renders without their citations.
+    let file_members = |source: &ImageSource, context: &Option<String>, citations: &Option<Value>| {
+        let nested_cited = source.content.iter().flatten().any(|b| matches!(b, ContentBlock::Text { extra, .. }
+            if extra.iter().any(|(k, v)| k == "citations" && member_is_lost(k, v))));
+        (source.r#type == "file")
+            .then(|| [("context", settings_lost(context.as_deref(), &None)), ("citations", settings_lost(None, citations))])
+            .into_iter()
+            .flatten()
+            .chain(nested_cited.then_some(("citations", true)))
+            .filter(|(_, set)| *set)
+            .map(|(k, _)| history_entry(role, k))
+            .collect::<Vec<_>>()
+    };
+    let mut files = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Image { extra, .. } => members(extra),
+            ContentBlock::Text { extra, .. } | ContentBlock::ToolUse { extra, .. } | ContentBlock::Image { extra, .. } => {
+                members(extra)
+            }
+            ContentBlock::Document { source, context, citations, .. } => files.extend(file_members(source, context, citations)),
             ContentBlock::ToolResult { content, extra, .. } => {
                 members(extra);
                 if let Some(ToolResultContent::Blocks(inner)) = content {
                     for b in inner {
-                        if let ToolResultBlock::Image { extra, .. } = b {
-                            members(extra);
+                        match b {
+                            ToolResultBlock::Text { extra, .. } | ToolResultBlock::Image { extra, .. } => members(extra),
+                            ToolResultBlock::Document { source, context, citations, .. } => {
+                                files.extend(file_members(source, context, citations))
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1985,7 +2133,33 @@ fn anthropic_history_parts(msg: &AnthropicMessage) -> Vec<Value> {
             _ => {}
         }
     }
+    out.extend(files);
     out
+}
+
+/// Whether leaving out an Anthropic block's member `key` loses something: not
+/// when it asks nothing ([`asks_nothing`]), nor for a call's `caller` at the
+/// spec's default, `{"type": "direct"}` — the model called it, as every call
+/// on every other protocol is called; Anthropic states it on every call of an
+/// answer, so a client sends it back on every call. The one test of every
+/// reader of the blocks' `extra` maps.
+pub(crate) fn member_is_lost(key: &str, value: &Value) -> bool {
+    !asks_nothing(value) && !(key == "caller" && value.get("type").and_then(Value::as_str) == Some("direct"))
+}
+
+/// The members of an Anthropic system prompt's blocks beside their text (a
+/// block's `citations`), each as a system-role [`DomainRequest::history_parts`]
+/// entry, so a translation that leaves them behind names them.
+fn anthropic_system_parts(system: Option<&SystemPrompt>) -> Vec<Value> {
+    let Some(SystemPrompt::Blocks(blocks)) = system else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .flat_map(|b| b.extra.iter())
+        .filter(|(k, v)| member_is_lost(k, v))
+        .map(|(k, _)| history_entry("system", k))
+        .collect()
 }
 
 /// Repair tool call/response pairing for ChatCompletions output.
@@ -2150,6 +2324,7 @@ fn convert_anthropic_message(msg: &AnthropicMessage, out: &mut Vec<DomainMessage
                 content: vec![DomainContentBlock::Text {
                     text: text.clone(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             });
         }
@@ -2161,10 +2336,12 @@ fn convert_anthropic_message(msg: &AnthropicMessage, out: &mut Vec<DomainMessage
                         ContentBlock::Text {
                             text,
                             cache_control,
+                            extra,
                         } => {
                             content.push(DomainContentBlock::Text {
                                 text: text.clone(),
                                 cache_control: cache_control.clone(),
+                                citations: block_citations(extra),
                             });
                         }
                         ContentBlock::ToolUse {
@@ -2172,6 +2349,7 @@ fn convert_anthropic_message(msg: &AnthropicMessage, out: &mut Vec<DomainMessage
                             name,
                             input,
                             cache_control,
+                            ..
                         } => {
                             content.push(DomainContentBlock::ToolUse {
                                 id: id.clone(),
@@ -2228,10 +2406,12 @@ fn convert_anthropic_message(msg: &AnthropicMessage, out: &mut Vec<DomainMessage
                         ContentBlock::Text {
                             text,
                             cache_control,
+                            extra,
                         } => {
                             user_content.push(DomainContentBlock::Text {
                                 text: text.clone(),
                                 cache_control: cache_control.clone(),
+                                citations: block_citations(extra),
                             });
                         }
                         ContentBlock::Image {
@@ -2419,6 +2599,7 @@ fn convert_chat_content_to_domain(content: Option<&MessageContent>) -> Vec<Domai
             vec![DomainContentBlock::Text {
                 text: text.clone(),
                 cache_control: None,
+                citations: Vec::new(),
             }]
         }
         Some(MessageContent::Parts(parts)) => parts
@@ -2427,6 +2608,7 @@ fn convert_chat_content_to_domain(content: Option<&MessageContent>) -> Vec<Domai
                 ContentPart::Text { text, .. } => DomainContentBlock::Text {
                     text: text.clone(),
                     cache_control: None,
+                    citations: Vec::new(),
                 },
                 ContentPart::ImageUrl { image_url, .. } => {
                     if let Some((media_type, data)) = split_data_uri(&image_url.url) {
@@ -2572,9 +2754,156 @@ pub(crate) fn gemini_text_data(text: &str) -> String {
     gemini_text_blob_data(text)
 }
 
+/// A Responses input part with the prompt-cache breakpoint it marks
+/// ([`responses_part_breakpoint`]).
+fn responses_input_part(part: &Value) -> DomainContentBlock {
+    let mut block = parse_responses_content_part(part);
+    if let Some(breakpoint) = responses_part_breakpoint(part)
+        && let Some(slot) = block.breakpoint_mut()
+    {
+        *slot = Some(breakpoint);
+    }
+    block
+}
+
+/// The domain breakpoint a Responses `input_text` / `input_image` /
+/// `input_file` part's `prompt_cache_breakpoint` (`mode: "explicit"`) marks:
+/// "the exact end of a reusable prompt prefix", as Anthropic's `cache_control`
+/// marks the end of its block. It states no lifetime — Anthropic's default:
+/// a Responses `ttl` (`30m` | `12h`, a minimum) has no Anthropic equivalent
+/// every Anthropic server takes, and one stated by the client is named
+/// ([`settle_responses_breakpoints`]).
+fn responses_part_breakpoint(part: &Value) -> Option<CacheControl> {
+    let kind = part.get("type").and_then(Value::as_str)?;
+    if !RESPONSES_BREAKPOINT_PARTS.contains(&kind) {
+        return None;
+    }
+    part.get("prompt_cache_breakpoint")
+        .filter(|b| b.is_object() && b.get("mode").is_none_or(|m| m == "explicit"))
+        .map(|_| CacheControl::ephemeral())
+}
+
+/// The Responses input parts that carry a `prompt_cache_breakpoint`.
+const RESPONSES_BREAKPOINT_PARTS: &[&str] = &["input_text", "input_image", "input_file"];
+
+/// How many explicit breakpoints a Responses request writes (the latest
+/// four), and how many an Anthropic request may carry at all.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Settle a Responses conversation's prompt-cache breakpoints: only the
+/// latest [`MAX_CACHE_BREAKPOINTS`] are written ("writes up to the latest four
+/// explicit breakpoints"), and Anthropic refuses a request carrying more, so
+/// the earlier ones are cleared; each cleared one, and each lifetime the
+/// client stated, is named in `history_parts`. `input`, from item `from` on, is what
+/// `messages` were read from; `default_ttl` is the request's
+/// `prompt_cache_options.ttl`.
+fn settle_responses_breakpoints(
+    input: &ResponseInput,
+    from: usize,
+    default_ttl: Option<&str>,
+    messages: &mut [DomainMessage],
+    history_parts: &mut Vec<Value>,
+) {
+    let entry = |kind: &str, role: &str| serde_json::json!({"kind": kind, "role": role});
+    // The parts the conversion read, by role: a lifetime the client stated
+    // goes with no other protocol's breakpoint.
+    let mut parts: Vec<(&str, &Value)> = Vec::new();
+    match input {
+        ResponseInput::Text(_) => {}
+        ResponseInput::Messages(msgs) => {
+            for msg in tail(msgs, from) {
+                if let MessageContent::Parts(ps) = &msg.content {
+                    parts.extend(ps.iter().filter_map(|p| match p {
+                        ContentPart::Unknown(v) => Some((msg.role.as_str(), v)),
+                        _ => None,
+                    }));
+                }
+            }
+        }
+        ResponseInput::Raw(items) => {
+            for item in tail(items, from) {
+                // The items `convert_raw_items_to_domain` reads parts of: a
+                // tool result's `output`, a message's `content`.
+                let kind = item.get("type").and_then(Value::as_str);
+                let role = item.get("role").and_then(Value::as_str);
+                let (role, list) = match kind {
+                    Some("function_call_output" | "custom_tool_call_output") => ("tool", item.get("output")),
+                    Some("message") => (role.unwrap_or("user"), item.get("content")),
+                    _ => match role {
+                        Some(role) => (role, item.get("content")),
+                        None => continue,
+                    },
+                };
+                parts.extend(list.and_then(Value::as_array).into_iter().flatten().map(|p| (role, p)));
+            }
+        }
+    }
+    for (role, part) in parts {
+        if responses_part_breakpoint(part).is_none() {
+            continue;
+        }
+        let ttl = part
+            .get("prompt_cache_breakpoint")
+            .and_then(|b| b.get("ttl"))
+            .and_then(Value::as_str)
+            .or(default_ttl);
+        if let Some(ttl) = ttl {
+            history_parts.push(entry(&format!("prompt_cache_breakpoint ttl {ttl}"), role));
+        }
+    }
+    // A system or developer message's breakpoints go nowhere a block is
+    // marked (Anthropic folds the message into its system text, and names
+    // them), so the four are counted among the other messages'.
+    // Counted as the Anthropic walk writes them, and cleared as counted: a
+    // block's own breakpoint, but not one on a block the walk leaves out
+    // ([`DomainContentBlock::anthropic_leaves_out`]), and the `cache_control`
+    // a marker keeps for a part the parser kept as the client's (its
+    // Responses breakpoint goes with the part, which is named).
+    let marks = |b: &DomainContentBlock, in_tool: bool| match b {
+        DomainContentBlock::Unknown { .. } => b.marker_breakpoint().is_some(),
+        b => b.breakpoint().is_some() && !b.anthropic_leaves_out(in_tool),
+    };
+    let counted = |m: &DomainMessage| !matches!(m.role, DomainRole::System);
+    let in_tool = |m: &DomainMessage| matches!(m.role, DomainRole::Tool { .. });
+    let total: usize = messages
+        .iter()
+        .filter(|m| counted(m))
+        .map(|m| m.content.iter().filter(|b| marks(b, in_tool(m))).count())
+        .sum();
+    let mut excess = total.saturating_sub(MAX_CACHE_BREAKPOINTS);
+    for message in messages.iter_mut().filter(|m| counted(m)) {
+        let in_tool = in_tool(message);
+        let role = match message.role {
+            DomainRole::User => "user",
+            DomainRole::Assistant => "assistant",
+            DomainRole::System => "system",
+            DomainRole::Tool { .. } => "tool",
+        };
+        for block in &mut message.content {
+            if excess == 0 {
+                return;
+            }
+            if !marks(block, in_tool) {
+                continue;
+            }
+            let cleared = match block {
+                DomainContentBlock::Unknown { value } => {
+                    value.as_object_mut().and_then(|part| part.remove("cache_control")).is_some()
+                }
+                block => block.breakpoint_mut().is_some_and(|slot| slot.take().is_some()),
+            };
+            if cleared {
+                excess -= 1;
+                history_parts.push(entry("prompt_cache_breakpoint beyond the latest four", role));
+            }
+        }
+    }
+}
+
 /// Parse a Responses API content part (JSON Value) into a domain block.
 /// Used by both `convert_chat_content_to_domain` (for Unknown parts) and
-/// `convert_raw_items_to_domain` (for message content arrays).
+/// `convert_raw_items_to_domain` (for message content arrays, through
+/// [`responses_input_part`]).
 fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
     let ct = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ct {
@@ -2583,6 +2912,9 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                 DomainContentBlock::Text {
                     text: text.to_string(),
                     cache_control: None,
+                    // An `output_text`'s annotations place sources in its
+                    // text. Only the console reads them; no walk sends them on.
+                    citations: if ct == "output_text" { object_list(part.get("annotations")) } else { Vec::new() },
                 }
             } else {
                 DomainContentBlock::Unknown { value: part.clone() }
@@ -2625,6 +2957,9 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
             None => DomainContentBlock::Unknown { value: part.clone() },
         },
         "input_file" => {
+            // Its `detail` rides the file or document it is read as; a file
+            // read as an image has none.
+            let detail = part.get("detail").and_then(Value::as_str).map(String::from);
             let file_id = part
                 .get("file_id")
                 .and_then(|x| x.as_str())
@@ -2661,10 +2996,21 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                 if mime.starts_with("text/")
                     && let Some(bytes) = decode_proto_bytes(b64)
                 {
-                    return text_file_document(mime, bytes, filename)
-                        .unwrap_or_else(|| DomainContentBlock::Unknown { value: part.clone() });
+                    return match text_file_document(mime, bytes, filename) {
+                        Some(DomainContentBlock::Document { data, media_type, title, .. }) => DomainContentBlock::Document {
+                            data,
+                            media_type,
+                            title,
+                            context: None,
+                            citations: None,
+                            cache_control: None,
+                            nested_content: None,
+                            detail,
+                        },
+                        _ => DomainContentBlock::Unknown { value: part.clone() },
+                    };
                 }
-                return DomainContentBlock::Document {
+                return DomainContentBlock::Document { detail: detail.clone(),
                     data: b64.to_string(),
                     media_type: mime.to_string(),
                     title: filename,
@@ -2674,7 +3020,7 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                     nested_content: None,
                 };
             }
-            DomainContentBlock::File {
+            DomainContentBlock::File { detail,
                 file_id,
                 url: file_url,
                 media_type: None,
@@ -2701,7 +3047,7 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                 }
             }
             None => match part.get("file_id").and_then(Value::as_str) {
-                Some(id) => DomainContentBlock::File {
+                Some(id) => DomainContentBlock::File { detail: None,
                     file_id: Some(id.to_string()),
                     url: None,
                     media_type: None,
@@ -2713,7 +3059,7 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
         },
         // Mistral's document by URL, with its file name.
         "document_url" => match part.get("document_url").and_then(Value::as_str) {
-            Some(url) => DomainContentBlock::Document {
+            Some(url) => DomainContentBlock::Document { detail: None,
                 data: url.to_string(),
                 media_type: "document/url".to_string(),
                 title: part.get("document_name").and_then(Value::as_str).map(str::to_string),
@@ -2744,16 +3090,16 @@ fn message_role_to_domain(role: &str) -> DomainRole {
 }
 
 /// The Responses input item types (the spec's `Item` union and
-/// `item_reference`, fetched 2026-09-27). An item of one of these types that the
+/// `item_reference`, fetched 2026-11-16). An item of one of these types that the
 /// domain has no meaning for rides an assistant turn as
 /// [`DomainContentBlock::Unknown`], and only the Responses walk can send it.
 const RESPONSES_ITEM_TYPES: &[&str] = &[
     "additional_tools", "apply_patch_call", "apply_patch_call_output", "code_interpreter_call",
-    "compaction", "computer_call", "computer_call_output", "configuration_update", "custom_tool_call",
-    "custom_tool_call_output", "file_search_call", "function_call", "function_call_output",
+    "compaction", "compaction_trigger", "computer_call", "computer_call_output", "configuration_update",
+    "custom_tool_call", "custom_tool_call_output", "file_search_call", "function_call", "function_call_output",
     "image_generation_call", "item_reference", "local_shell_call", "local_shell_call_output",
-    "mcp_approval_request", "mcp_approval_response", "mcp_call", "mcp_list_tools", "message",
-    "reasoning", "shell_call", "shell_call_output", "tool_search_call", "tool_search_output",
+    "mcp_approval_request", "mcp_approval_response", "mcp_call", "mcp_list_tools", "message", "program",
+    "program_output", "reasoning", "shell_call", "shell_call_output", "tool_search_call", "tool_search_output",
     "web_search_call",
 ];
 
@@ -2769,6 +3115,31 @@ pub fn unknown_part_kind(value: &Value) -> &str {
         .or_else(|| value.as_object()?.keys().map(String::as_str).find(|k| !crate::api::gemini::is_part_member(k)))
         .filter(|kind| kind.len() <= 64 && kind.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c)))
         .unwrap_or("unknown")
+}
+
+/// A Responses item of programmatic tool calling or compaction, as a reader
+/// shows it: the `program` the model ran (its `call_id` and JavaScript `code`),
+/// the `program_output` answering it (its `call_id` and `result`), and the
+/// client's `compaction_trigger`. Each is carried as it came
+/// ([`DomainContentBlock::Unknown`]); this is the one reading of them.
+#[derive(Debug, PartialEq)]
+pub enum ProgramItem<'a> {
+    Program { call_id: &'a str, code: &'a str },
+    Output { call_id: &'a str, result: &'a str },
+    CompactionTrigger,
+}
+
+impl<'a> ProgramItem<'a> {
+    /// `item` read as one of these; `None` when it is not one.
+    pub fn of(item: &'a Value) -> Option<Self> {
+        let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or_default();
+        match item.get("type").and_then(Value::as_str)? {
+            "program" => Some(Self::Program { call_id: text("call_id"), code: text("code") }),
+            "program_output" => Some(Self::Output { call_id: text("call_id"), result: text("result") }),
+            "compaction_trigger" => Some(Self::CompactionTrigger),
+            _ => None,
+        }
+    }
 }
 
 /// A Responses `computer_call_output`'s screenshot as the block a reader shows:
@@ -2787,7 +3158,7 @@ pub fn computer_screenshot_block(value: &Value) -> Option<DomainContentBlock> {
         return Some(parse_responses_content_part(&serde_json::json!({"type": "input_image", "image_url": url})));
     }
     let file_id = output.get("file_id").and_then(Value::as_str)?;
-    Some(DomainContentBlock::File { file_id: Some(file_id.to_string()), url: None, media_type: None, filename: None, cache_control: None })
+    Some(DomainContentBlock::File { detail: None, file_id: Some(file_id.to_string()), url: None, media_type: None, filename: None, cache_control: None })
 }
 
 /// One label per distinct kind, in order of first appearance, with how many
@@ -2962,6 +3333,31 @@ fn user_media_labelled(target: ApiVersion, dialect: crate::api::mistral::ChatDia
     }
 }
 
+/// For each raw Responses item, the messages of the whole conversion it is
+/// read into: new ones, or the message before it that it joins (a call item
+/// joins the assistant message before it) — none where it is read into
+/// nothing. [`convert_raw_items_to_domain`] carries nothing from one item to
+/// the next but the messages so far, so converting the items one at a time
+/// onto one list is the whole conversion.
+pub(crate) fn responses_item_messages(items: &[Value]) -> Vec<Vec<usize>> {
+    let mut out = Vec::new();
+    items
+        .iter()
+        .map(|item| {
+            let before = out.len();
+            let joined = out.last().map(|m: &DomainMessage| m.content.len());
+            convert_raw_items_to_domain(std::slice::from_ref(item), &mut out);
+            if out.len() > before {
+                (before..out.len()).collect()
+            } else if out.last().map(|m| m.content.len()) != joined {
+                vec![before - 1]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
 fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
     for item in items {
         let item_type = item
@@ -3016,23 +3412,25 @@ fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
                 // `input_text` / `input_image` / `input_file` parts read by the
                 // one Responses part parser.
                 let content = match item.get("output") {
-                    Some(Value::String(s)) => vec![DomainContentBlock::Text { text: s.clone(), cache_control: None }],
+                    Some(Value::String(s)) => vec![DomainContentBlock::Text { text: s.clone(), cache_control: None, citations: Vec::new() }],
                     // A part with no `type` (off-spec data) is read as its JSON.
                     Some(Value::Array(parts)) => parts
                         .iter()
                         .map(|p| match p.get("type") {
-                            Some(_) => parse_responses_content_part(p),
+                            Some(_) => responses_input_part(p),
                             None => DomainContentBlock::Text {
                                 text: serde_json::to_string(p).unwrap_or_default(),
                                 cache_control: None,
+                                citations: Vec::new(),
                             },
                         })
                         .collect(),
                     Some(other) => vec![DomainContentBlock::Text {
                         text: serde_json::to_string(other).unwrap_or_default(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
-                    None => vec![DomainContentBlock::Text { text: String::new(), cache_control: None }],
+                    None => vec![DomainContentBlock::Text { text: String::new(), cache_control: None, citations: Vec::new() }],
                 };
                 out.push(DomainMessage {
                     role: DomainRole::Tool {
@@ -3051,12 +3449,13 @@ fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
                 let mut content = Vec::new();
                 if let Some(content_arr) = item.get("content").and_then(|c| c.as_array()) {
                     for part in content_arr {
-                        content.push(parse_responses_content_part(part));
+                        content.push(responses_input_part(part));
                     }
                 } else if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
                     content.push(DomainContentBlock::Text {
                         text: text.to_string(),
                         cache_control: None,
+                        citations: Vec::new(),
                     });
                 }
                 if !content.is_empty() {
@@ -3090,6 +3489,7 @@ fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
                         content.push(DomainContentBlock::Text {
                             text: text.to_string(),
                             cache_control: None,
+                            citations: Vec::new(),
                         });
                     } else if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
                         // The spec's message without its optional `type`: a
@@ -3097,11 +3497,12 @@ fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
                         // `text`.
                         for part in parts {
                             if part.get("type").is_some() {
-                                content.push(parse_responses_content_part(part));
+                                content.push(responses_input_part(part));
                             } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                 content.push(DomainContentBlock::Text {
                                     text: text.to_string(),
                                     cache_control: None,
+                                    citations: Vec::new(),
                                 });
                             }
                         }
@@ -3173,13 +3574,15 @@ fn anthropic_conversation(items: &[AnthropicMessage]) -> Vec<DomainMessage> {
             // Read as a tool result's content is: its text, images and
             // documents, and any other block as sent.
             let content = match &msg.content {
-                AnthropicContent::Text(t) => vec![DomainContentBlock::Text { text: t.clone(), cache_control: None }],
+                AnthropicContent::Text(t) => vec![DomainContentBlock::Text { text: t.clone(), cache_control: None, citations: Vec::new() }],
                 AnthropicContent::Blocks(blocks) => blocks
                     .iter()
                     .map(|b| match b {
-                        ContentBlock::Text { text, cache_control } => {
-                            DomainContentBlock::Text { text: text.clone(), cache_control: cache_control.clone() }
-                        }
+                        ContentBlock::Text { text, cache_control, extra } => DomainContentBlock::Text {
+                            text: text.clone(),
+                            cache_control: cache_control.clone(),
+                            citations: block_citations(extra),
+                        },
                         ContentBlock::Image { source, cache_control, .. } => anthropic_image(source, cache_control),
                         ContentBlock::Document { source, title, context, citations, cache_control } => {
                             anthropic_document(source, title, context, citations, cache_control)
@@ -3263,6 +3666,7 @@ fn chat_conversation(items: &[Message]) -> ChatConversation {
                     content: vec![DomainContentBlock::Text {
                         text,
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 });
             }
@@ -3274,9 +3678,15 @@ fn chat_conversation(items: &[Message]) -> ChatConversation {
             if let Some(c) = &msg.content {
                 let text = extract_text_content(c);
                 if !text.is_empty() {
+                    // The message's `annotations` place sources in its text:
+                    // they ride it, as an `output_text`'s ride its part. Only
+                    // the console reads them; no walk sends them on, and a
+                    // translation names them (`annotations on an assistant
+                    // message`).
                     content.push(DomainContentBlock::Text {
                         text,
                         cache_control: None,
+                        citations: object_list(msg.extra.get("annotations")),
                     });
                 }
             }
@@ -3326,6 +3736,7 @@ fn chat_conversation(items: &[Message]) -> ChatConversation {
                 content: vec![DomainContentBlock::Text {
                     text,
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             });
         } else {
@@ -3353,12 +3764,25 @@ fn responses_conversation(input: &ResponseInput, from: usize) -> Vec<DomainMessa
                 content: vec![DomainContentBlock::Text {
                     text: text.clone(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             });
         }
         ResponseInput::Messages(msgs) => {
             for msg in tail(msgs, from) {
-                let content = convert_chat_content_to_domain(Some(&msg.content));
+                let mut content = convert_chat_content_to_domain(Some(&msg.content));
+                // One block per part: a Responses part (a `ContentPart::Unknown`
+                // to the Chat reader) marks its breakpoint here.
+                if let MessageContent::Parts(parts) = &msg.content {
+                    for (part, block) in parts.iter().zip(content.iter_mut()) {
+                        if let ContentPart::Unknown(v) = part
+                            && let Some(breakpoint) = responses_part_breakpoint(v)
+                            && let Some(slot) = block.breakpoint_mut()
+                        {
+                            *slot = Some(breakpoint);
+                        }
+                    }
+                }
                 if !content.is_empty() {
                     messages.push(DomainMessage {
                         role: message_role_to_domain(&msg.role),
@@ -3390,7 +3814,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
         for (idx, part) in content.parts.iter().enumerate() {
             match part {
                 GeminiPart::Text { text } | GeminiPart::ThoughtText { thought: false, text, .. } => {
-                    content_blocks.push(DomainContentBlock::Text { text: text.clone(), cache_control: None });
+                    content_blocks.push(DomainContentBlock::Text { text: text.clone(), cache_control: None, citations: Vec::new() });
                 }
                 GeminiPart::ThoughtText { thought: true, text, thought_signature } => {
                     content_blocks.push(DomainContentBlock::Thinking {
@@ -3412,7 +3836,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
                     content_blocks.push(DomainContentBlock::Unknown { value: serde_json::to_value(part).unwrap_or(Value::Null) });
                 }
                 GeminiPart::FileData { file_data, .. } => {
-                    content_blocks.push(DomainContentBlock::File {
+                    content_blocks.push(DomainContentBlock::File { detail: None,
                         file_id: None,
                         url: Some(file_data.file_uri.clone()),
                         media_type: file_data.mime_type.clone(),
@@ -3441,17 +3865,18 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
             }
         }
 
-        // Emit the main content message (if any non-functionResponse parts)
-        if !content_blocks.is_empty() {
-            let role = if is_model {
-                DomainRole::Assistant
-            } else {
-                DomainRole::User
-            };
-            messages.push(DomainMessage {
-                role,
-                content: content_blocks,
-            });
+        // The main content message (if any non-functionResponse parts). A
+        // user content's function responses go before it: every protocol
+        // reads a call's result right after the call, so text a client sent
+        // beside its results follows them.
+        let main = (!content_blocks.is_empty()).then_some(DomainMessage {
+            role: if is_model { DomainRole::Assistant } else { DomainRole::User },
+            content: content_blocks,
+        });
+        let mut main_after = None;
+        match main {
+            Some(m) if is_model => messages.push(m),
+            other => main_after = other,
         }
 
         // Emit each functionResponse as a separate Tool-role message: its
@@ -3462,7 +3887,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
             } else {
                 serde_json::to_string(&fr.response).unwrap_or_default()
             };
-            let mut content = vec![DomainContentBlock::Text { text, cache_control: None }];
+            let mut content = vec![DomainContentBlock::Text { text, cache_control: None, citations: Vec::new() }];
             content.extend(fr.parts.iter().map(gemini_function_response_part));
             messages.push(DomainMessage {
                 role: DomainRole::Tool {
@@ -3473,6 +3898,7 @@ fn gemini_conversation(items: &[GeminiContent]) -> Vec<DomainMessage> {
                 content,
             });
         }
+        messages.extend(main_after);
     }
     messages
 }
@@ -3492,6 +3918,10 @@ pub(crate) struct GeminiCallIds {
     calls: std::collections::HashMap<PartAt, String>,
     /// Each response's call id, and the place of the call it answers.
     responses: std::collections::HashMap<PartAt, (String, Option<PartAt>)>,
+    /// Every id this reading made up — for a call the client sent without
+    /// one, or a response that has none and answers no call (its function's
+    /// name) — with the function it names.
+    generated: std::collections::HashMap<String, String>,
 }
 
 /// A part's place in Gemini `contents`: `(content, part)`.
@@ -3499,7 +3929,7 @@ type PartAt = (usize, usize);
 
 impl GeminiCallIds {
     pub(crate) fn of(contents: &[GeminiContent]) -> Self {
-        let mut ids = Self { calls: Default::default(), responses: Default::default() };
+        let mut ids = Self { calls: Default::default(), responses: Default::default(), generated: Default::default() };
         // An empty id names nothing, like an absent one.
         let named = |id: &Option<String>| id.clone().filter(|id| !id.is_empty());
         let mut unanswered: Vec<(&str, String, PartAt)> = Vec::new();
@@ -3523,6 +3953,7 @@ impl GeminiCallIds {
                             .find(|id| !taken.contains(id))
                             .unwrap_or_default();
                         taken.insert(id.clone());
+                        ids.generated.insert(id.clone(), function_call.name.clone());
                         id
                     });
                     unanswered.push((function_call.name.as_str(), id.clone(), (turn, idx)));
@@ -3538,7 +3969,13 @@ impl GeminiCallIds {
                     };
                     let answered = position.map(|at| unanswered.remove(at));
                     let call = answered.as_ref().map(|(_, _, at)| *at);
-                    let id = own.or(answered.map(|(_, id, _)| id)).unwrap_or_else(|| response.name.clone());
+                    let id = own.or(answered.map(|(_, id, _)| id)).unwrap_or_else(|| {
+                        // A name that is also an id the client sent is the client's.
+                        if !taken.contains(&response.name) {
+                            ids.generated.insert(response.name.clone(), response.name.clone());
+                        }
+                        response.name.clone()
+                    });
                     ids.responses.insert((turn, idx), (id, call));
                 }
             }
@@ -3555,6 +3992,12 @@ impl GeminiCallIds {
     /// answers — its function's name where it answers none.
     pub(crate) fn response(&self, content: usize, part: usize) -> &str {
         self.responses.get(&(content, part)).map_or("", |(id, _)| id.as_str())
+    }
+
+    /// Every id this reading made up, with the function it names: an id the
+    /// client never sent, so never one to write back to it.
+    pub(crate) fn generated(self) -> std::collections::HashMap<String, String> {
+        self.generated
     }
 
     /// Where the call the response at part `part` of content `content`
@@ -3575,7 +4018,7 @@ impl GeminiCallIds {
 /// ([`DomainContentBlock::Unknown`]) — sent back on a re-render of the client's
 /// own request, named on a translation.
 fn text_file_document(mt: &str, bytes: Vec<u8>, title: Option<String>) -> Option<DomainContentBlock> {
-    Some(DomainContentBlock::Document {
+    Some(DomainContentBlock::Document { detail: None,
         data: String::from_utf8(bytes).ok()?,
         media_type: mt.to_string(),
         title,
@@ -3642,7 +4085,7 @@ fn gemini_inline_block(mt: &str, data: &str) -> Option<DomainContentBlock> {
     match kind {
         "text" => text_file_document(mt, decode_proto_bytes(data)?, None),
         "audio" => Some(DomainContentBlock::Audio { data: standard(data)?, format: subtype.to_string(), cache_control: None }),
-        "application" => Some(DomainContentBlock::Document {
+        "application" => Some(DomainContentBlock::Document { detail: None,
             data: standard(data)?,
             media_type: mt.to_string(),
             title: None,
@@ -3693,7 +4136,7 @@ fn gemini_function_response_part(part: &Value) -> DomainContentBlock {
         if !modelled || mt.is_some_and(|m| m.starts_with("video/")) {
             return unknown();
         }
-        return DomainContentBlock::File {
+        return DomainContentBlock::File { detail: None,
             file_id: None,
             url: Some(uri.to_string()),
             media_type: mt.map(str::to_string),
@@ -4179,7 +4622,7 @@ fn domain_to_responses_input_parts(blocks: &[DomainContentBlock]) -> Vec<Value> 
         DomainContentBlock::File { file_id: None, url: Some(url), media_type: Some(mt), .. } if mt.starts_with("image/") => {
             Some(serde_json::json!({"type": "input_image", "image_url": url}))
         }
-        DomainContentBlock::File { file_id, url, filename, .. } => {
+        DomainContentBlock::File { file_id, url, filename, detail, .. } => {
             // The spec locates a file by `file_id`, `file_url`
             // or `file_data`. A part carrying none of them is
             // unusable, so name the file rather than emit one
@@ -4192,10 +4635,11 @@ fn domain_to_responses_input_parts(blocks: &[DomainContentBlock]) -> Vec<Value> 
                 if let Some(id) = file_id { obj["file_id"] = Value::String(id.clone()); }
                 if let Some(u) = url { obj["file_url"] = Value::String(u.clone()); }
                 if let Some(f) = filename { obj["filename"] = Value::String(f.clone()); }
+                if let Some(d) = detail { obj["detail"] = Value::String(d.clone()); }
                 Some(obj)
             }
         }
-        DomainContentBlock::Document { data, media_type, title, .. } => {
+        DomainContentBlock::Document { data, media_type, title, detail, .. } => {
             // Responses carries a document natively as
             // `input_file` — the API extracts its text (and, for
             // a PDF, its page images) itself. Only plain text is
@@ -4205,18 +4649,22 @@ fn domain_to_responses_input_parts(blocks: &[DomainContentBlock]) -> Vec<Value> 
             if media_type.starts_with("text/") {
                 Some(serde_json::json!({"type": "input_text", "text": data}))
             } else if media_type == "document/url" {
-                Some(serde_json::json!({"type": "input_file", "file_url": data}))
+                let mut obj = serde_json::json!({"type": "input_file", "file_url": data});
+                if let Some(d) = detail { obj["detail"] = Value::String(d.clone()); }
+                Some(obj)
             } else if data.is_empty() {
                 // A `content`-sourced document carries no bytes of
                 // its own; name it rather than emit an empty file.
                 let label = title.as_deref().unwrap_or("untitled");
                 Some(serde_json::json!({"type": "input_text", "text": format!("[Document: {label}]")}))
             } else {
-                Some(serde_json::json!({
+                let mut obj = serde_json::json!({
                     "type": "input_file",
                     "filename": title.as_deref().unwrap_or("document"),
                     "file_data": format!("data:{media_type};base64,{data}"),
-                }))
+                });
+                if let Some(d) = detail { obj["detail"] = Value::String(d.clone()); }
+                Some(obj)
             }
         }
         // Nothing is silently discarded: a placeholder rides as
@@ -4281,6 +4729,24 @@ fn assistant_media_marker(block: &DomainContentBlock) -> String {
     format!("[The assistant's {} here could not be carried to this model.]", media_block_kind(block))
 }
 
+/// Whether a walk to `target` keeps a document's title, as the document arms
+/// of `domain_to_chat_content`, `domain_to_responses_input_parts` and
+/// `domain_to_gemini_parts` render it: Anthropic's own `title`; a text document
+/// goes as its text everywhere else; Chat names every other document (its
+/// file name, Mistral's `document_name`, or the marker's label); Responses
+/// all but a URL's (`file_url` has no name); Gemini only the marker a bodiless
+/// or unlabelled one goes as (a blob or a file part has no name). Locked
+/// against the walks themselves by `the_title_predicate_reads_as_each_walk_renders`.
+fn document_title_carried(target: ApiVersion, data: &str, media_type: &str) -> bool {
+    match target {
+        ApiVersion::AnthropicMessages => true,
+        _ if media_type.starts_with("text/") => false,
+        ApiVersion::ChatCompletions => true,
+        ApiVersion::Responses => media_type != "document/url",
+        ApiVersion::GoogleGemini => data.is_empty() || media_type.is_empty(),
+    }
+}
+
 /// The text a user message's media goes as where the target refuses it
 /// ([`user_media_refused`]).
 fn user_media_marker(block: &DomainContentBlock) -> String {
@@ -4290,12 +4756,39 @@ fn user_media_marker(block: &DomainContentBlock) -> String {
 /// An Anthropic content block as a block of a tool result's content.
 fn tool_result_block_of(block: ContentBlock) -> ToolResultBlock {
     match block {
-        ContentBlock::Text { text, cache_control } => ToolResultBlock::Text { text, cache_control },
+        ContentBlock::Text { text, cache_control, extra } => ToolResultBlock::Text { text, cache_control, extra },
         ContentBlock::Image { source, cache_control, extra } => ToolResultBlock::Image { source, cache_control, extra },
-        ContentBlock::Document { source, cache_control, .. } => ToolResultBlock::Document { source, cache_control },
+        ContentBlock::Document { source, title, context, citations, cache_control } => {
+            ToolResultBlock::Document { source, title, context, citations, cache_control }
+        }
         ContentBlock::Unknown(v) => ToolResultBlock::Unknown(v),
         other => ToolResultBlock::Unknown(serde_json::to_value(other).unwrap_or(Value::Null)),
     }
+}
+
+/// Whether leaving out a document's `context` or `citations` settings loses
+/// something: a context that says nothing, or settings that turn nothing on
+/// (`{"enabled": false}`), do not.
+fn settings_lost(context: Option<&str>, citations: &Option<Value>) -> bool {
+    context.is_some_and(|c| !c.trim().is_empty())
+        || citations.as_ref().is_some_and(|c| c.get("enabled").and_then(Value::as_bool) == Some(true))
+}
+
+/// Whether Anthropic's walk cuts `name` to fit ([`anthropic_document_title`]).
+fn anthropic_title_cut(name: &str) -> bool {
+    !name.is_empty() && anthropic_document_title(Some(name)).as_deref() != Some(name)
+}
+
+/// A document's name as Anthropic takes it: 1 to 500 characters (the spec's
+/// `title` bounds), so an empty name is none and a longer one is cut — sent as
+/// it is, either would fail the whole request.
+fn anthropic_document_title(name: Option<&str>) -> Option<String> {
+    const MAX_CHARS: usize = 500;
+    let name = name.filter(|n| !n.is_empty())?;
+    Some(match name.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => name[..cut].to_string(),
+        None => name.to_string(),
+    })
 }
 
 fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<ContentBlock> {
@@ -4305,9 +4798,11 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
             DomainContentBlock::Text {
                 text,
                 cache_control,
+                citations,
             } => Some(ContentBlock::Text {
                 text: text.clone(),
                 cache_control: cache_control.clone(),
+                extra: citations_extra(citations),
             }),
             DomainContentBlock::Image {
                 data,
@@ -4326,9 +4821,11 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
                 citations,
                 cache_control,
                 nested_content,
+                // Named where it is lost (`not_carried_to`).
+                detail: _,
             } => Some(ContentBlock::Document {
                 source: domain_to_doc_source(data, media_type, nested_content),
-                title: title.clone(),
+                title: anthropic_document_title(title.as_deref()),
                 context: context.clone(),
                 citations: citations.clone(),
                 cache_control: cache_control.clone(),
@@ -4337,11 +4834,12 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
             // it: the capability gate normally keeps audio off this route, but
             // a gate is a filter and this is the last place the block exists,
             // so a silent drop here would be the only one left in any walk.
-            DomainContentBlock::Audio { format, .. } => Some(ContentBlock::Text {
+            DomainContentBlock::Audio { format, cache_control, .. } => Some(ContentBlock::Text {
                 text: format!(
                     "[Audio ({format}) omitted — the Messages API has no audio input channel]"
                 ),
-                cache_control: None,
+                cache_control: cache_control.clone(),
+                extra: BTreeMap::new(),
             }),
             DomainContentBlock::File {
                 file_id,
@@ -4349,6 +4847,7 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
                 media_type,
                 filename,
                 cache_control,
+                detail: _,
             } => {
                 let is_image = media_type.as_deref().is_some_and(|m| m.starts_with("image/"));
                 if let Some(fid) = file_id {
@@ -4366,7 +4865,7 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
                     } else {
                         Some(ContentBlock::Document {
                             source,
-                            title: filename.clone(),
+                            title: anthropic_document_title(filename.as_deref()),
                             context: None,
                             citations: None,
                             cache_control: cache_control.clone(),
@@ -4386,7 +4885,7 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
                     } else {
                         Some(ContentBlock::Document {
                             source,
-                            title: filename.clone(),
+                            title: anthropic_document_title(filename.as_deref()),
                             context: None,
                             citations: None,
                             cache_control: cache_control.clone(),
@@ -4518,14 +5017,16 @@ fn domain_to_anthropic_assistant_blocks(blocks: &[DomainContentBlock], rerenders
         .filter_map(|b| match b {
             // Media this walk does not send is a marker.
             b if assistant_media_dropped(ApiVersion::AnthropicMessages, b) => {
-                Some(ContentBlock::Text { text: assistant_media_marker(b), cache_control: None })
+                Some(ContentBlock::Text { text: assistant_media_marker(b), cache_control: None, extra: BTreeMap::new() })
             }
             DomainContentBlock::Text {
                 text,
                 cache_control,
+                citations,
             } => Some(ContentBlock::Text {
                 text: text.clone(),
                 cache_control: cache_control.clone(),
+                extra: citations_extra(citations),
             }),
             // A text file in the turn (a Gemini model turn's `text/*` blob)
             // is its text: an assistant turn has no document channel.
@@ -4533,7 +5034,7 @@ fn domain_to_anthropic_assistant_blocks(blocks: &[DomainContentBlock], rerenders
             DomainContentBlock::Document { data, media_type, cache_control, .. }
                 if media_type.starts_with("text/") && !data.is_empty() =>
             {
-                Some(ContentBlock::Text { text: data.clone(), cache_control: cache_control.clone() })
+                Some(ContentBlock::Text { text: data.clone(), cache_control: cache_control.clone(), extra: BTreeMap::new() })
             }
             DomainContentBlock::ToolUse {
                 id,
@@ -4546,6 +5047,7 @@ fn domain_to_anthropic_assistant_blocks(blocks: &[DomainContentBlock], rerenders
                 name: name.clone(),
                 input: input.clone(),
                 cache_control: cache_control.clone(),
+                extra: BTreeMap::new(),
             }),
             // A thinking block requires a signature Anthropic verifies; one
             // without (unsigned, the gateway's placeholder, another provider's)
@@ -4758,6 +5260,7 @@ pub fn domain_assistant_content_from_stored(
         out.push(DomainContentBlock::Text {
             text: t.to_string(),
             cache_control: None,
+            citations: Vec::new(),
         });
     }
     if let Some(tcs) = response_tool_calls.and_then(|v| v.as_array()) {
@@ -4986,14 +5489,15 @@ impl DomainRequest {
                 .map(|b| match b {
                     DomainContentBlock::Unknown { value } => DomainContentBlock::Text {
                         text: format!("[A `{}` part of this message could not be carried to this model.]", unknown_part_kind(value)),
-                        cache_control: value.get("cache_control").and_then(|c| serde_json::from_value(c.clone()).ok()),
+                        cache_control: b.marker_breakpoint(),
+                        citations: Vec::new(),
                     },
                     DomainContentBlock::Image { cache_control, .. }
                     | DomainContentBlock::Document { cache_control, .. }
                     | DomainContentBlock::File { cache_control, .. }
                         if user_media_refused(target, b) =>
                     {
-                        DomainContentBlock::Text { text: user_media_marker(b), cache_control: cache_control.clone() }
+                        DomainContentBlock::Text { text: user_media_marker(b), cache_control: cache_control.clone(), citations: Vec::new() }
                     }
                     other => other.clone(),
                 })
@@ -5129,22 +5633,29 @@ impl DomainRequest {
         let mut blocks = Vec::new();
         for block in content {
             match block {
-                // Anthropic refuses an empty text block.
-                DomainContentBlock::Text { text, .. } if text.is_empty() => {}
-                DomainContentBlock::Document { data, media_type, .. } if data.is_empty() && media_type.starts_with("text/") => {}
-                DomainContentBlock::Text { text, cache_control } => {
-                    blocks.push(ToolResultBlock::Text { text: text.clone(), cache_control: cache_control.clone() });
+                // Anthropic refuses an empty text block (and an empty text
+                // document is none): the one predicate the breakpoint count reads.
+                b if b.anthropic_leaves_out(true) => {}
+                DomainContentBlock::Text { text, cache_control, citations } => {
+                    blocks.push(ToolResultBlock::Text {
+                        text: text.clone(),
+                        cache_control: cache_control.clone(),
+                        extra: citations_extra(citations),
+                    });
                 }
                 b if self.tool_result_carries(b, ApiVersion::AnthropicMessages, upstream_model) => {
                     blocks.extend(domain_to_anthropic_user_blocks(std::slice::from_ref(b)).into_iter().map(tool_result_block_of));
                 }
-                b => blocks.push(ToolResultBlock::text(tool_result_marker(b))),
+                // The marker keeps the block's breakpoint where it stood.
+                b => blocks.push(ToolResultBlock::Text { text: tool_result_marker(b), cache_control: b.marker_breakpoint(), extra: BTreeMap::new() }),
             }
         }
         if blocks.is_empty() {
             return None;
         }
-        if blocks.iter().all(|b| matches!(b, ToolResultBlock::Text { cache_control: None, .. })) {
+        // Plain text when nothing but text rides the blocks: a breakpoint or a
+        // citation keeps them blocks.
+        if blocks.iter().all(|b| matches!(b, ToolResultBlock::Text { cache_control: None, extra, .. } if extra.is_empty())) {
             return Some(ToolResultContent::Text(self.tool_result_text(content, ApiVersion::AnthropicMessages, upstream_model)));
         }
         Some(ToolResultContent::Blocks(blocks))
@@ -5240,6 +5751,43 @@ impl DomainRequest {
         }
     }
 
+    /// How many of the request's prompt-cache breakpoints the walk to
+    /// `target` leaves behind. Only Anthropic marks one on a block
+    /// (`cache_control`), a marker in a block's place keeping it, and its walk
+    /// folds an in-array system message into its system text, without the
+    /// breakpoints of its blocks, and leaves out a block it cannot send
+    /// ([`DomainContentBlock::anthropic_leaves_out`]); no other walk
+    /// has a per-block channel (a Responses `prompt_cache_breakpoint` exists
+    /// only from `gpt-5.6` on, so a translation to Responses does not write
+    /// one). A re-render of the client's own request sends its breakpoints as
+    /// the client wrote them.
+    fn breakpoints_not_carried(&self, target: ApiVersion) -> usize {
+        if self.upstream.rerenders_client_request {
+            return 0;
+        }
+        let in_messages = self.messages.iter().map(|m| {
+            let blocks: usize = m.content.iter().map(DomainContentBlock::breakpoints).sum();
+            match (&m.role, target) {
+                (DomainRole::System, ApiVersion::AnthropicMessages) => blocks,
+                (role, ApiVersion::AnthropicMessages) => {
+                    let in_tool_result = matches!(role, DomainRole::Tool { .. });
+                    m.content.iter().filter(|b| b.breakpoint().is_some() && b.anthropic_leaves_out(in_tool_result)).count()
+                }
+                (DomainRole::Tool { cache_control, .. }, _) => blocks + usize::from(cache_control.is_some()),
+                _ => blocks,
+            }
+        });
+        if target == ApiVersion::AnthropicMessages {
+            return in_messages.sum();
+        }
+        let in_system = match &self.system_prompt {
+            Some(DomainSystemPrompt::Blocks(blocks)) => blocks.iter().filter(|b| b.cache_control.is_some()).count(),
+            _ => 0,
+        };
+        let in_tools = self.tools.iter().flatten().filter(|t| t.cache_control.is_some() && t.declared_on(target)).count();
+        in_messages.sum::<usize>() + in_system + in_tools
+    }
+
     /// What the walk to `target`, serving `upstream_model`, has no channel for
     /// — named for the audit row's translation badge, because a dropped part
     /// of a request otherwise leaves no trace (the row renders the INBOUND
@@ -5283,6 +5831,10 @@ impl DomainRequest {
             |kind| format!("{kind} in an assistant turn"),
         ));
         out.extend(self.thinking_not_carried(target));
+        out.extend(counted(
+            std::iter::repeat_n(String::new(), self.breakpoints_not_carried(target)),
+            |_| "prompt cache breakpoint".to_string(),
+        ));
         // Only Gemini signs a call, so every other walk leaves its signature
         // behind (`DomainContentBlock::ToolUse`).
         if target != ApiVersion::GoogleGemini {
@@ -5305,35 +5857,63 @@ impl DomainRequest {
                 .map(|b| media_block_kind(b).to_string()),
             |kind| format!("{kind} in a tool result"),
         ));
-        // An Anthropic tool result's document has no title, context or
-        // citation settings (`ToolResultBlock::Document`).
-        if target == ApiVersion::AnthropicMessages {
-            out.extend(counted(
-                self.messages
-                    .iter()
-                    .filter(|m| matches!(m.role, DomainRole::Tool { .. }))
-                    .flat_map(|m| &m.content)
-                    .filter(|b| self.tool_result_carries(b, target, upstream_model))
-                    .filter_map(|b| match b {
-                        DomainContentBlock::Document { title, context, citations, .. } => Some(
-                            [("title", title.is_some()), ("context", context.is_some()), ("citations", citations.is_some())]
-                                .into_iter()
-                                .filter(|(_, set)| *set)
-                                .map(|(k, _)| k.to_string())
-                                .collect::<Vec<_>>(),
-                        ),
-                        // A file rendered as a document goes without its name.
-                        DomainContentBlock::File { filename: Some(_), media_type, .. }
-                            if !media_type.as_deref().is_some_and(|m| m.starts_with("image/")) =>
-                        {
-                            Some(vec!["title".to_string()])
-                        }
-                        _ => None,
-                    })
-                    .flatten(),
-                |member| format!("{member} of a document in a tool result"),
-            ));
-        }
+        // What a walk leaves out of a document it sends (one it does not is
+        // named above): its title where the target has no place for it
+        // (`document_title_carried`), or past what Anthropic takes
+        // (`anthropic_document_title`), its context and citation settings
+        // anywhere but Anthropic.
+        out.extend(counted(
+            self.messages
+                .iter()
+                .filter(|m| matches!(m.role, DomainRole::User | DomainRole::Tool { .. }))
+                .flat_map(|m| m.content.iter().map(move |b| (m, b)))
+                .filter(|(m, b)| match m.role {
+                    DomainRole::Tool { .. } => self.tool_result_carries(b, target, upstream_model),
+                    _ => !user_media_refused(target, b),
+                })
+                .flat_map(|(m, b)| {
+                    let place = if matches!(m.role, DomainRole::Tool { .. }) { "in a tool result" } else { "in a user message" };
+                    // A file's detail reaches only a Responses `input_file`.
+                    let detail_lost = matches!(b, DomainContentBlock::File { detail: Some(_), .. } | DomainContentBlock::Document { detail: Some(_), .. })
+                        && !(target == ApiVersion::Responses && responses_sends_input_file(b));
+                    let mut lost: Vec<String> = Vec::new();
+                    if detail_lost {
+                        lost.push(format!("detail of a file {place}"));
+                    }
+                    let members = match b {
+                    // A file rendered as Anthropic's document: its name as the
+                    // title, cut to what Anthropic takes.
+                    DomainContentBlock::File { filename: Some(name), media_type, .. }
+                        if target == ApiVersion::AnthropicMessages
+                            && !media_type.as_deref().is_some_and(|m| m.starts_with("image/"))
+                            && anthropic_title_cut(name) =>
+                    {
+                        Some(vec![format!("title past 500 characters of a document {place}")])
+                    }
+                    DomainContentBlock::Document { data, media_type, title, context, citations, .. } => {
+                        Some(
+                            [
+                                ("title", title.is_some() && !document_title_carried(target, data, media_type)),
+                                (
+                                    "title past 500 characters",
+                                    target == ApiVersion::AnthropicMessages && title.as_deref().is_some_and(anthropic_title_cut),
+                                ),
+                                ("context", settings_lost(context.as_deref(), &None) && target != ApiVersion::AnthropicMessages),
+                                ("citation settings", settings_lost(None, citations) && target != ApiVersion::AnthropicMessages),
+                            ]
+                            .into_iter()
+                            .filter(|(_, lost)| *lost)
+                            .map(move |(k, _)| format!("{k} of a document {place}"))
+                            .collect::<Vec<_>>(),
+                        )
+                    }
+                    _ => None,
+                    };
+                    lost.extend(members.into_iter().flatten());
+                    lost
+                }),
+            str::to_string,
+        ));
         // A user message's part of the client's own protocol that a
         // translation leaves out (`user_content`) — named once per type.
         if !self.sends_unknown_user_parts() {
@@ -5469,9 +6049,20 @@ impl DomainRequest {
             _ => {}
         }
         // The plan the walk renders: without reasoning where the gate drops it.
+        let mut reasoning_sent = target_reasons;
         if target == ApiVersion::AnthropicMessages {
             let reasoning = self.reasoning.as_ref().filter(|_| target_reasons);
-            out.extend(self.anthropic_reasoning_plan(upstream_model, reasoning).dropped);
+            let plan = self.anthropic_reasoning_plan(upstream_model, reasoning);
+            reasoning_sent &= plan.thinking.is_some() || plan.effort.is_some();
+            out.extend(plan.dropped);
+        }
+        // A depth above `high` goes as `high` (`effort_to_str`), wherever the
+        // reasoning goes at all.
+        if reasoning_sent
+            && let Some(effort @ (ReasoningEffort::XHigh | ReasoningEffort::Max)) = self.reasoning_on().and_then(|r| r.effort.as_ref())
+        {
+            let asked = if *effort == ReasoningEffort::Max { "max" } else { "xhigh" };
+            out.push(format!("reasoning effort {asked} (sent as high: not every model takes it)"));
         }
         out
     }
@@ -5850,6 +6441,7 @@ impl DomainRequest {
                         text,
                         cache_control: None,
                         client_metadata,
+                        citations: Vec::new(),
                     }])
                 }
             }
@@ -5866,6 +6458,7 @@ impl DomainRequest {
                             text,
                             cache_control: b.cache_control.clone(),
                             client_metadata,
+                            citations: block_citations(&b.extra),
                         }
                     })
                     .collect(),
@@ -5873,7 +6466,10 @@ impl DomainRequest {
         });
 
         let messages = anthropic_conversation(tail(&req.messages, from));
-        let history_parts = tail(&req.messages, from).iter().flat_map(anthropic_history_parts).collect();
+        let history_parts = anthropic_system_parts(req.system.as_ref())
+            .into_iter()
+            .chain(tail(&req.messages, from).iter().flat_map(anthropic_history_parts))
+            .collect();
 
         let tools = req.tools.as_ref().map(|tools| {
             tools
@@ -6122,7 +6718,25 @@ impl DomainRequest {
             .filter(|s| !s.is_empty())
             .map(|s| DomainSystemPrompt::Text(s.clone()));
 
-        let messages = responses_conversation(&req.input, from);
+        let mut messages = responses_conversation(&req.input, from);
+        let mut history_parts = Vec::new();
+        settle_responses_breakpoints(
+            &req.input,
+            from,
+            req.extra.get("prompt_cache_options").and_then(|o| o.get("ttl")).and_then(Value::as_str),
+            &mut messages,
+            &mut history_parts,
+        );
+        // An `output_text`'s annotations ride its text for the console, and no
+        // walk sends them on: a translation names them, as a Chat message's.
+        history_parts.extend(
+            messages
+                .iter()
+                .filter(|m| matches!(m.role, DomainRole::Assistant))
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, DomainContentBlock::Text { citations, .. } if !citations.is_empty()))
+                .map(|_| history_entry("assistant", "annotations")),
+        );
 
         let tools = req.tools.as_ref().map(|tools| {
             tools
@@ -6221,7 +6835,7 @@ impl DomainRequest {
             top_p: req.top_p,
             reasoning,
             upstream: UpstreamFacts::default(),
-            history_parts: Vec::new(),
+            history_parts,
             stop_sequences: None,
             response_format,
             metadata: req.metadata.clone(),
@@ -6922,6 +7536,7 @@ impl DomainRequest {
                             r#type: "text".to_string(),
                             text,
                             cache_control: b.cache_control.clone(),
+                            extra: citations_extra(&b.citations),
                         }
                     })
                     .collect(),
@@ -6977,6 +7592,7 @@ impl DomainRequest {
                         r#type: "text".to_string(),
                         text: extra,
                         cache_control: None,
+                        extra: BTreeMap::new(),
                     });
                     SystemPrompt::Blocks(blocks)
                 }
@@ -7292,7 +7908,7 @@ impl DomainRequest {
                                 history_item_carried(ApiVersion::GoogleGemini, value).then(|| b.clone())
                             }
                             b if assistant_media_dropped(ApiVersion::GoogleGemini, b) => {
-                                Some(DomainContentBlock::Text { text: assistant_media_marker(b), cache_control: None })
+                                Some(DomainContentBlock::Text { text: assistant_media_marker(b), cache_control: None, citations: Vec::new() })
                             }
                             b => Some(b.clone()),
                         })
@@ -7451,13 +8067,11 @@ impl DomainRequest {
             let presence_penalty = self
                 .extra
                 .get("gemini_presence_penalty")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32);
+                .and_then(|v| v.as_f64());
             let frequency_penalty = self
                 .extra
                 .get("gemini_frequency_penalty")
-                .and_then(|v| v.as_f64())
-                .map(|v| v as f32);
+                .and_then(|v| v.as_f64());
             let seed = self
                 .extra
                 .get("gemini_seed")
@@ -7601,7 +8215,7 @@ impl DomainRequest {
                         (!text.is_empty())
                             .then(|| DomainMessage {
                                 role: DomainRole::System,
-                                content: vec![DomainContentBlock::Text { text, cache_control: None }],
+                                content: vec![DomainContentBlock::Text { text, cache_control: None, citations: Vec::new() }],
                             })
                             .into_iter()
                             .collect()
@@ -7736,7 +8350,7 @@ impl DomainRequest {
             cache_control: None,
             thought_signature: c.thought_signature.clone(),
         };
-        let text = |text: &str| DomainContentBlock::Text { text: text.to_string(), cache_control: None };
+        let text = |text: &str| DomainContentBlock::Text { text: text.to_string(), cache_control: None, citations: Vec::new() };
         let has_thinking = parts.iter().any(|p| matches!(p, RoundPart::Thinking(_)));
         if has_thinking && let Some(content) = Self::round_as_produced(parts, preamble, calls, call, text) {
             self.messages.push(DomainMessage { role: DomainRole::Assistant, content });
@@ -7820,6 +8434,7 @@ impl DomainRequest {
                 content: vec![DomainContentBlock::Text {
                     text: text.clone(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             });
         }
@@ -8069,7 +8684,7 @@ mod tests {
         dr.messages.push(DomainMessage {
             role: DomainRole::Assistant,
             content: vec![
-                DomainContentBlock::Text { text: "Let me check.".into(), cache_control: None },
+                DomainContentBlock::Text { text: "Let me check.".into(), cache_control: None, citations: Vec::new() },
                 DomainContentBlock::ToolUse {
                     id: "c1".into(), name: "weather".into(),
                     input: serde_json::json!({"loc": "SF"}),
@@ -8082,7 +8697,7 @@ mod tests {
         // Must have a matching tool response (repair pass strips orphaned tool_calls)
         dr.messages.push(DomainMessage {
             role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-            content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None }],
+            content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None, citations: Vec::new() }],
         });
         let cc = dr.to_chat_completions();
         let asst = &cc.messages[1];
@@ -8102,7 +8717,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Hi".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Hi".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Assistant,
                     content: vec![DomainContentBlock::ToolUse {
                         id: "c1".into(), name: "weather".into(),
@@ -8112,7 +8727,7 @@ mod tests {
                         thought_signature: None,
                     }] },
                 DomainMessage { role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None, citations: Vec::new() }] },
             ],
             ..empty_domain_request()
         };
@@ -8129,10 +8744,10 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Hi".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Hi".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Assistant,
                     content: vec![
-                        DomainContentBlock::Text { text: "I'll check.".into(), cache_control: None },
+                        DomainContentBlock::Text { text: "I'll check.".into(), cache_control: None, citations: Vec::new() },
                         DomainContentBlock::ToolUse {
                             id: "orphan".into(), name: "tool".into(),
                             input: serde_json::json!({}),
@@ -8142,7 +8757,7 @@ mod tests {
                         },
                     ] },
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Never mind".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Never mind".into(), cache_control: None, citations: Vec::new() }] },
             ],
             ..empty_domain_request()
         };
@@ -8160,7 +8775,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Go".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Go".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Assistant,
                     content: vec![DomainContentBlock::ToolUse {
                         id: "c1".into(), name: "read".into(),
@@ -8170,9 +8785,9 @@ mod tests {
                         thought_signature: None,
                     }] },
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Also this".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Also this".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "result".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "result".into(), cache_control: None, citations: Vec::new() }] },
             ],
             ..empty_domain_request()
         };
@@ -8195,7 +8810,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Go".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Go".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Assistant,
                     content: vec![DomainContentBlock::ToolUse {
                         id: "c1".into(), name: "read".into(),
@@ -8205,9 +8820,9 @@ mod tests {
                         thought_signature: None,
                     }] },
                 DomainMessage { role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "first".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "first".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Again".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Again".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Assistant,
                     content: vec![DomainContentBlock::ToolUse {
                         id: "c1".into(), name: "read".into(),
@@ -8217,7 +8832,7 @@ mod tests {
                         thought_signature: None,
                     }] },
                 DomainMessage { role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "second".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "second".into(), cache_control: None, citations: Vec::new() }] },
             ],
             ..empty_domain_request()
         };
@@ -8233,12 +8848,12 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![
                 DomainMessage { role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Q".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "Q".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage {
                     role: DomainRole::Assistant,
                     content: vec![
                         DomainContentBlock::Thinking { thinking: "hmm".into(), signature: None, signed_by: None },
-                        DomainContentBlock::Text { text: "Answer".into(), cache_control: None },
+                        DomainContentBlock::Text { text: "Answer".into(), cache_control: None, citations: Vec::new() },
                     ],
                 },
             ],
@@ -8258,7 +8873,7 @@ mod tests {
                 role: DomainRole::User,
                 content: vec![
                     DomainContentBlock::Image { data: "abc".into(), media_type: "image/png".into(), cache_control: None },
-                    DomainContentBlock::Text { text: "Describe".into(), cache_control: None },
+                    DomainContentBlock::Text { text: "Describe".into(), cache_control: None, citations: Vec::new() },
                 ],
             }],
             ..empty_domain_request()
@@ -8488,7 +9103,7 @@ mod tests {
         dr.messages.push(DomainMessage {
             role: DomainRole::Assistant,
             content: vec![
-                DomainContentBlock::Text { text: "Checking.".into(), cache_control: None },
+                DomainContentBlock::Text { text: "Checking.".into(), cache_control: None, citations: Vec::new() },
                 DomainContentBlock::ToolUse {
                     id: "c1".into(), name: "weather".into(),
                     input: serde_json::json!({"loc": "SF"}),
@@ -8500,7 +9115,7 @@ mod tests {
         });
         dr.messages.push(DomainMessage {
             role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-            content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None }],
+            content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None, citations: Vec::new() }],
         });
         let rr = dr.to_responses();
         match &rr.input {
@@ -8716,6 +9331,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: "skill catalog".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 },
                 DomainMessage {
@@ -8723,6 +9339,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: "hi".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 },
             ],
@@ -8745,6 +9362,7 @@ mod tests {
                 content: vec![DomainContentBlock::Text {
                     text: "skill catalog".into(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             }],
             ..empty_domain_request()
@@ -8765,7 +9383,7 @@ mod tests {
         DomainMessage {
             role: DomainRole::User,
             content: vec![
-                DomainContentBlock::Text { text: "look".into(), cache_control: None },
+                DomainContentBlock::Text { text: "look".into(), cache_control: None, citations: Vec::new() },
                 DomainContentBlock::Image {
                     data: "AAAA".into(),
                     media_type: "image/png".into(),
@@ -8776,14 +9394,14 @@ mod tests {
                     format: "wav".into(),
                     cache_control: None,
                 },
-                DomainContentBlock::File {
+                DomainContentBlock::File { detail: None,
                     file_id: Some("file-1".into()),
                     url: None,
                     media_type: None,
                     filename: Some("f.pdf".into()),
                     cache_control: None,
                 },
-                DomainContentBlock::Document {
+                DomainContentBlock::Document { detail: None,
                     data: "Q0M=".into(),
                     media_type: "application/pdf".into(),
                     title: Some("spec.pdf".into()),
@@ -8853,7 +9471,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Text { text: "look".into(), cache_control: None },
+                    DomainContentBlock::Text { text: "look".into(), cache_control: None, citations: Vec::new() },
                     DomainContentBlock::Image {
                         data: "AAAA".into(),
                         media_type: "image/png".into(),
@@ -8888,7 +9506,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::File {
+                    DomainContentBlock::File { detail: None,
                         file_id: None,
                         url: Some("https://x/f.pdf".into()),
                         media_type: None,
@@ -8900,7 +9518,7 @@ mod tests {
                         media_type: "image/url".into(),
                         cache_control: None,
                     },
-                    DomainContentBlock::Document {
+                    DomainContentBlock::Document { detail: None,
                         data: "plain words".into(),
                         media_type: "text/plain".into(),
                         title: None,
@@ -8909,7 +9527,7 @@ mod tests {
                         cache_control: None,
                         nested_content: None,
                     },
-                    DomainContentBlock::Document {
+                    DomainContentBlock::Document { detail: None,
                         data: "https://x/d.pdf".into(),
                         media_type: "document/url".into(),
                         title: None,
@@ -8941,7 +9559,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::File {
+                content: vec![DomainContentBlock::File { detail: None,
                     file_id: None,
                     url: None,
                     media_type: Some("application/pdf".into()),
@@ -9031,8 +9649,8 @@ mod tests {
         // when the model declares PDF support, so replacing it with its title
         // discarded the content for a model declared able to read it.
         let dr = user_turn(vec![
-            DomainContentBlock::Text { text: "read this".into(), cache_control: None },
-            DomainContentBlock::Document {
+            DomainContentBlock::Text { text: "read this".into(), cache_control: None, citations: Vec::new() },
+            DomainContentBlock::Document { detail: None,
                 data: "Q0M=".into(),
                 media_type: "application/pdf".into(),
                 title: Some("spec.pdf".into()),
@@ -9060,7 +9678,7 @@ mod tests {
                 media_type: "image/png".into(),
                 cache_control: None,
             },
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: "plain words".into(),
                 media_type: "text/plain".into(),
                 title: None,
@@ -9069,7 +9687,7 @@ mod tests {
                 cache_control: None,
                 nested_content: None,
             },
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: "https://x/d.pdf".into(),
                 media_type: "document/url".into(),
                 title: None,
@@ -9089,7 +9707,7 @@ mod tests {
     fn to_chat_locates_a_file_by_id_and_names_one_it_cannot_carry() {
         // `file.file_id` is the Chat Completions locator; a URL-only reference
         // has no channel here and is named instead of vanishing.
-        let by_id = user_turn(vec![DomainContentBlock::File {
+        let by_id = user_turn(vec![DomainContentBlock::File { detail: None,
             file_id: Some("file-1".into()),
             url: None,
             media_type: None,
@@ -9101,7 +9719,7 @@ mod tests {
                 && v["file"]["file_id"] == "file-1"
                 && v["file"]["filename"] == "f.pdf");
 
-        let by_url = user_turn(vec![DomainContentBlock::File {
+        let by_url = user_turn(vec![DomainContentBlock::File { detail: None,
             file_id: None,
             url: Some("https://x/f.pdf".into()),
             media_type: None,
@@ -9149,7 +9767,7 @@ mod tests {
         // `inlineData.data` is base64 and its `mimeType` a real media type, so a
         // URL-sourced document belongs in `fileData` — the same split as Image.
         let dr = user_turn(vec![
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: "https://x/d.pdf".into(),
                 media_type: "document/url".into(),
                 title: None,
@@ -9158,7 +9776,7 @@ mod tests {
                 cache_control: None,
                 nested_content: None,
             },
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: "Q0M=".into(),
                 media_type: "application/pdf".into(),
                 title: None,
@@ -9168,7 +9786,7 @@ mod tests {
                 nested_content: None,
             },
             // Raw prose, NOT base64 — `inlineData.data` would reject it.
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: "plain words".into(),
                 media_type: "text/plain".into(),
                 title: None,
@@ -9180,7 +9798,7 @@ mod tests {
             // Either half missing makes an unusable `inlineData` pair, so both
             // are covered separately: bytes with no declared type, and a
             // declared type with no bytes (the `content`-sourced shape).
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: "Q0M=".into(),
                 media_type: String::new(),
                 title: Some("Untyped".into()),
@@ -9189,7 +9807,7 @@ mod tests {
                 cache_control: None,
                 nested_content: None,
             },
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: String::new(),
                 media_type: "application/pdf".into(),
                 title: Some("Appendix".into()),
@@ -9451,8 +10069,8 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::Assistant,
                 content: vec![
-                    DomainContentBlock::Text { text: String::new(), cache_control: None },
-                    DomainContentBlock::Text { text: "real".into(), cache_control: None },
+                    DomainContentBlock::Text { text: String::new(), cache_control: None, citations: Vec::new() },
+                    DomainContentBlock::Text { text: "real".into(), cache_control: None, citations: Vec::new() },
                 ],
             }],
             ..empty_domain_request()
@@ -9543,6 +10161,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: "done".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 },
                 DomainMessage {
@@ -9551,6 +10170,7 @@ mod tests {
                         DomainContentBlock::Text {
                             text: "what is this?".into(),
                             cache_control: None,
+                            citations: Vec::new(),
                         },
                         DomainContentBlock::Image {
                             data: "AAAA".into(),
@@ -9651,6 +10271,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: "sunny".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 },
                 text_msg(DomainRole::System, "note"),
@@ -9706,6 +10327,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: "Extra.".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 },
                 DomainMessage {
@@ -9713,6 +10335,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: "hi".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 },
             ],
@@ -9736,6 +10359,7 @@ mod tests {
                 content: vec![DomainContentBlock::Text {
                     text: "Extra system.".into(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             }],
             ..empty_domain_request()
@@ -9924,17 +10548,17 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![
                 DomainMessage { role: DomainRole::User, content: vec![
-                    DomainContentBlock::Text { text: "Weather?".into(), cache_control: None }] },
+                    DomainContentBlock::Text { text: "Weather?".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::Assistant, content: vec![
-                    DomainContentBlock::Text { text: "Checking.".into(), cache_control: None },
+                    DomainContentBlock::Text { text: "Checking.".into(), cache_control: None, citations: Vec::new() },
                     DomainContentBlock::ToolUse { id: "c1".into(), name: "weather".into(),
                         input: serde_json::json!({"loc": "SF"}),
                         input_raw: None,
                         cache_control: None, thought_signature: None }] },
                 DomainMessage { role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None }] },
+                    content: vec![DomainContentBlock::Text { text: "72F".into(), cache_control: None, citations: Vec::new() }] },
                 DomainMessage { role: DomainRole::User, content: vec![
-                    DomainContentBlock::Text { text: "Thanks!".into(), cache_control: None }] },
+                    DomainContentBlock::Text { text: "Thanks!".into(), cache_control: None, citations: Vec::new() }] },
             ],
             ..empty_domain_request()
         };
@@ -9958,7 +10582,7 @@ mod tests {
                 role: DomainRole::User,
                 content: vec![
                     DomainContentBlock::Image { data: "abc".into(), media_type: "image/png".into(), cache_control: None },
-                    DomainContentBlock::Text { text: "Describe".into(), cache_control: None },
+                    DomainContentBlock::Text { text: "Describe".into(), cache_control: None, citations: Vec::new() },
                 ],
             }],
             ..empty_domain_request()
@@ -9987,7 +10611,7 @@ mod tests {
     fn test_to_anthropic_cache_control() {
         let mut dr = simple_domain_request("Hi");
         dr.system_prompt = Some(DomainSystemPrompt::Blocks(vec![
-            DomainSystemBlock { text: "Block 1".into(), cache_control: Some(CacheControl::ephemeral()), client_metadata: Vec::new() },
+            DomainSystemBlock { text: "Block 1".into(), cache_control: Some(CacheControl::ephemeral()), client_metadata: Vec::new(), citations: Vec::new() },
         ]));
         let ar = dr.to_anthropic();
         match &ar.system {
@@ -10150,6 +10774,7 @@ mod tests {
             content: vec![DomainContentBlock::Text {
                 text: text.to_string(),
                 cache_control: None,
+                citations: Vec::new(),
             }],
         }
     }
@@ -10161,6 +10786,7 @@ mod tests {
                 content: vec![DomainContentBlock::Text {
                     text: user_text.to_string(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             }],
             ..empty_domain_request()
@@ -10333,7 +10959,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::Document {
+                content: vec![DomainContentBlock::Document { detail: None,
                     data: "JVBERi0=".into(),
                     media_type: "application/pdf".into(),
                     title: Some("Report".into()),
@@ -10368,7 +10994,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::Document {
+                content: vec![DomainContentBlock::Document { detail: None,
                     data: "https://example.com/doc.pdf".into(),
                     media_type: "document/url".into(),
                     title: Some("Online".into()),
@@ -10402,7 +11028,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::Document {
+                content: vec![DomainContentBlock::Document { detail: None,
                     data: "Hello world".into(),
                     media_type: "text/plain".into(),
                     title: None,
@@ -10435,7 +11061,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::Document {
+                content: vec![DomainContentBlock::Document { detail: None,
                     data: "JVBERi0=".into(),
                     media_type: "application/pdf".into(),
                     title: Some("Report".into()),
@@ -10906,6 +11532,7 @@ mod tests {
                     DomainContentBlock::Text {
                         text: "What do you hear?".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     },
                 ],
             }],
@@ -10967,7 +11594,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::File {
+                    DomainContentBlock::File { detail: None,
                         file_id: Some("file_abc123".into()),
                         url: None,
                         media_type: Some("image/png".into()),
@@ -10977,6 +11604,7 @@ mod tests {
                     DomainContentBlock::Text {
                         text: "Describe this".into(),
                         cache_control: None,
+                        citations: Vec::new(),
                     },
                 ],
             }],
@@ -11101,7 +11729,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::File {
+                content: vec![DomainContentBlock::File { detail: None,
                     file_id: Some("file_abc".into()),
                     url: None,
                     media_type: Some("application/pdf".into()),
@@ -11133,7 +11761,7 @@ mod tests {
         let dr = DomainRequest {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
-                content: vec![DomainContentBlock::File {
+                content: vec![DomainContentBlock::File { detail: None,
                     file_id: Some("file_xyz".into()),
                     url: None,
                     media_type: None,
@@ -11238,6 +11866,7 @@ mod tests {
                 content: vec![DomainContentBlock::Text {
                     text: "72F".to_string(),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
                 is_error: None,
             },
@@ -11273,7 +11902,7 @@ mod tests {
                 DomainMessage {
                     role: DomainRole::Assistant,
                     content: vec![
-                        DomainContentBlock::Text { text: "Let me check.".to_string(), cache_control: None },
+                        DomainContentBlock::Text { text: "Let me check.".to_string(), cache_control: None, citations: Vec::new() },
                         DomainContentBlock::ToolUse {
                             id: "call_abc".to_string(),
                             name: "search".to_string(),
@@ -11286,11 +11915,11 @@ mod tests {
                 },
                 DomainMessage {
                     role: DomainRole::Tool { tool_call_id: "call_abc".to_string(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "result data".to_string(), cache_control: None }],
+                    content: vec![DomainContentBlock::Text { text: "result data".to_string(), cache_control: None, citations: Vec::new() }],
                 },
                 DomainMessage {
                     role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "Thanks".to_string(), cache_control: None }],
+                    content: vec![DomainContentBlock::Text { text: "Thanks".to_string(), cache_control: None, citations: Vec::new() }],
                 },
             ],
             system_prompt: None,
@@ -11868,6 +12497,7 @@ mod tests {
             input: vec![DomainContentBlock::Text {
                 text: "hello world".into(),
                 cache_control: None,
+                citations: Vec::new(),
             }],
             output: vec![],
             output_structured: None,
@@ -11897,6 +12527,7 @@ mod tests {
             output: vec![DomainContentBlock::Text {
                 text: "hello there".into(),
                 cache_control: None,
+                citations: Vec::new(),
             }],
             output_structured: Some(serde_json::json!({"language": "en"})),
             job: None,
@@ -12498,6 +13129,7 @@ mod tests {
             content: vec![DomainContentBlock::Text {
                 text: "go".into(),
                 cache_control: None,
+                citations: Vec::new(),
             }],
         });
         dr.append_assistant_tool_calls(None, &[RoundCall::unsigned("tu_1", "web_search", serde_json::json!({"query":"rust"}))]);
@@ -13210,7 +13842,7 @@ mod tests {
         })));
         assert!(unforced.to_anthropic_for("claude-sonnet-4-5").thinking.is_some());
 
-        let sampled = |temperature: f32, top_p: f32| {
+        let sampled = |temperature: f64, top_p: f64| {
             DomainRequest::from_chat_completions(&chat(serde_json::json!({
                 "max_tokens": 8000, "reasoning_effort": "high", "temperature": temperature, "top_p": top_p,
             })))
@@ -13689,7 +14321,7 @@ mod tests {
         };
         let result = DomainMessage {
             role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-            content: vec![DomainContentBlock::Text { text: "ok".into(), cache_control: None }],
+            content: vec![DomainContentBlock::Text { text: "ok".into(), cache_control: None, citations: Vec::new() }],
         };
         let anthropic_result = DomainMessage {
             role: DomainRole::User,
@@ -13698,7 +14330,7 @@ mod tests {
         let signed = DomainContentBlock::Thinking { thinking: "t".into(), signature: Some("s".into()), signed_by: Some(ApiVersion::AnthropicMessages) };
         let unsigned = DomainContentBlock::Thinking { thinking: "t".into(), signature: None, signed_by: None };
         let redacted = DomainContentBlock::Unknown { value: serde_json::json!({"type": "redacted_thinking", "data": "x"}) };
-        let text = DomainContentBlock::Text { text: "let me look".into(), cache_control: None };
+        let text = DomainContentBlock::Text { text: "let me look".into(), cache_control: None, citations: Vec::new() };
         let sealed = |messages: Vec<DomainMessage>| DomainRequest { messages, ..empty_domain_request() }.final_assistant_turn_is_sealed();
 
         assert!(sealed(vec![user("q")]), "no turn in progress");
@@ -13723,7 +14355,7 @@ mod tests {
         // message starts a new one.
         let answer = || DomainMessage {
             role: DomainRole::Assistant,
-            content: vec![DomainContentBlock::Text { text: "done".into(), cache_control: None }],
+            content: vec![DomainContentBlock::Text { text: "done".into(), cache_control: None, citations: Vec::new() }],
         };
         assert!(!sealed(vec![
             user("q"), assistant(text.clone()), result.clone(), user("next"), assistant(signed.clone()), anthropic_result.clone(),
@@ -13744,6 +14376,112 @@ mod tests {
         assert_eq!(disabled.reasoning, Some(ReasoningRequest::Off));
         let neither = DomainRequest::from_anthropic(&anthropic(serde_json::json!({})));
         assert!(neither.reasoning.is_none());
+    }
+
+    /// `xhigh` and `max` — each model takes its own subset, which no walk
+    /// knows — reach every target as `high`, which every model that reasons
+    /// takes, and the narrowing is named; `high` itself names nothing.
+    #[test]
+    fn the_deepest_efforts_go_as_high_and_are_named() {
+        for effort in ["xhigh", "max", "high"] {
+            let dr = DomainRequest::from_chat_completions(&chat(serde_json::json!({"reasoning_effort": effort})));
+            let responses = DomainRequest::from_responses(
+                &serde_json::from_value(serde_json::json!({"model": "m", "input": "hi", "reasoning": {"effort": effort}})).unwrap(),
+            );
+            assert_eq!(responses.to_chat_completions().extra.get("reasoning_effort"), Some(&serde_json::json!("high")));
+            assert_eq!(dr.to_responses().reasoning.as_ref().and_then(|r| r.get("effort")), Some(&serde_json::json!("high")));
+            let anthropic = serde_json::to_value(dr.to_anthropic_for("claude-opus-5-5")).unwrap();
+            assert_eq!(anthropic["output_config"]["effort"], "high", "{anthropic}");
+            let gemini = serde_json::to_value(dr.to_gemini()).unwrap();
+            assert_eq!(gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high", "{gemini}");
+            for target in [ApiVersion::ChatCompletions, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini, ApiVersion::Responses] {
+                let named = dr.not_carried_to(target, "claude-opus-5-5", true);
+                assert_eq!(
+                    named.contains(&format!("reasoning effort {effort} (sent as high: not every model takes it)")),
+                    effort != "high",
+                    "{target:?}: {named:?}"
+                );
+                // A target that does not reason is told nothing about depth.
+                assert!(!dr.not_carried_to(target, "m", false).iter().any(|n| n.starts_with("reasoning effort")));
+            }
+        }
+    }
+
+    /// A file's `detail` reaches a Responses upstream on the `input_file` the
+    /// walk sends, and is named wherever it is lost: on another protocol, and
+    /// on a file Responses is sent as something else (a text file as its text).
+    #[test]
+    fn a_files_detail_reaches_responses_and_is_named_elsewhere() {
+        let request = |part: Value| {
+            DomainRequest::from_responses(
+                &serde_json::from_value(serde_json::json!({"model": "m", "input": [
+                    {"role": "user", "content": [{"type": "input_text", "text": "read"}, part]}]}))
+                .unwrap(),
+            )
+        };
+        let pdf = request(serde_json::json!({"type": "input_file", "file_id": "file-1", "detail": "low"}));
+        let sent = serde_json::to_value(pdf.to_responses()).unwrap();
+        assert_eq!(sent["input"][0]["content"][1], serde_json::json!({"type": "input_file", "file_id": "file-1", "detail": "low"}));
+        assert!(!pdf.not_carried_to(ApiVersion::Responses, "m", true).iter().any(|n| n.contains("detail")));
+        // Gemini has no channel for a file by id at all: the file itself is
+        // named there, not its detail.
+        for target in [ApiVersion::ChatCompletions, ApiVersion::AnthropicMessages] {
+            assert!(
+                pdf.not_carried_to(target, "m", true).contains(&"detail of a file in a user message".to_string()),
+                "{target:?}"
+            );
+        }
+        let text = request(serde_json::json!({"type": "input_file", "filename": "n.txt",
+            "file_data": "data:text/plain;base64,aGk=", "detail": "high"}));
+        assert_matches!(&text.messages[0].content[1], DomainContentBlock::Document { detail: Some(d), .. } if d == "high");
+        assert!(text.not_carried_to(ApiVersion::Responses, "m", true).contains(&"detail of a file in a user message".to_string()));
+        // Positive control: a file sent without one names nothing.
+        let plain = request(serde_json::json!({"type": "input_file", "file_id": "file-1"}));
+        assert!(!plain.not_carried_to(ApiVersion::AnthropicMessages, "m", true).iter().any(|n| n.contains("detail")));
+    }
+
+    /// An OpenAI history answer's annotations ride its text — a Responses
+    /// `output_text`'s, a Chat message's — for the console to show, and no
+    /// walk sends them on: Anthropic's has no shape for them (only its own
+    /// citations are written), and every translation names them where it
+    /// parsed them. The programmatic tool calling and compaction items read
+    /// as what they are.
+    #[test]
+    fn an_openai_histories_annotations_ride_its_text_and_no_walk_sends_them() {
+        let annotation = serde_json::json!({"type": "url_citation", "url": "https://x.example", "title": "t", "start_index": 0, "end_index": 1});
+        let responses = DomainRequest::from_responses(&serde_json::from_value(serde_json::json!({"model": "m", "input": [
+            {"role": "user", "content": "q"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "a", "annotations": [annotation.clone()]}]},
+            {"role": "user", "content": "r"}]})).unwrap());
+        assert_matches!(&responses.messages[1].content[0], DomainContentBlock::Text { citations, .. } if citations == &vec![annotation.clone()]);
+        let anthropic = serde_json::to_value(responses.to_anthropic()).unwrap();
+        assert!(anthropic["messages"][1]["content"][0].get("citations").is_none(), "{anthropic}");
+        for target in [ApiVersion::ChatCompletions, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini] {
+            assert!(responses.not_carried_to(target, "m", true).contains(&"annotations on an assistant message".to_string()), "{target:?}");
+        }
+
+        let chat_annotation = serde_json::json!({"type": "url_citation", "url_citation": {"url": "https://x.example", "title": "t"}});
+        let chat = DomainRequest::from_chat_completions(&chat(serde_json::json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a", "annotations": [chat_annotation.clone()]},
+            {"role": "user", "content": "r"}]})));
+        assert_matches!(&chat.messages[1].content[0], DomainContentBlock::Text { citations, .. } if citations == &vec![chat_annotation]);
+        assert!(serde_json::to_value(chat.to_anthropic()).unwrap()["messages"][1]["content"][0].get("citations").is_none());
+        assert!(chat.not_carried_to(ApiVersion::AnthropicMessages, "m", true).contains(&"annotations on an assistant message".to_string()));
+        // Positive control: an Anthropic citation in the same place still goes.
+        let cite = serde_json::json!({"type": "char_location", "cited_text": "a", "document_index": 0, "start_char_index": 0, "end_char_index": 1});
+        let mut mixed = responses.clone();
+        if let DomainContentBlock::Text { citations, .. } = &mut mixed.messages[1].content[0] {
+            citations.push(cite.clone());
+        }
+        assert_eq!(serde_json::to_value(mixed.to_anthropic()).unwrap()["messages"][1]["content"][0]["citations"], serde_json::json!([cite]));
+
+        assert_eq!(ProgramItem::of(&serde_json::json!({"type": "program", "call_id": "c", "code": "x()", "fingerprint": "f"})),
+            Some(ProgramItem::Program { call_id: "c", code: "x()" }));
+        assert_eq!(ProgramItem::of(&serde_json::json!({"type": "program_output", "call_id": "c", "result": "ok", "status": "completed"})),
+            Some(ProgramItem::Output { call_id: "c", result: "ok" }));
+        assert_eq!(ProgramItem::of(&serde_json::json!({"type": "compaction_trigger"})), Some(ProgramItem::CompactionTrigger));
+        assert_eq!(ProgramItem::of(&serde_json::json!({"type": "reasoning"})), None);
     }
 
     /// One spelling means one thing on every inbound path.
@@ -13768,7 +14506,9 @@ mod tests {
             ("low", Some(ReasoningEffort::Low)),
             ("medium", Some(ReasoningEffort::Medium)),
             ("high", Some(ReasoningEffort::High)),
-            ("xhigh", Some(ReasoningEffort::High)),
+            ("xhigh", Some(ReasoningEffort::XHigh)),
+            ("max", Some(ReasoningEffort::Max)),
+            ("unheard-of", Some(ReasoningEffort::High)),
         ] {
             assert_eq!(chat_effort(spelling), level, "chat {spelling}");
             assert_eq!(responses_effort(spelling), level, "responses {spelling}");
@@ -14435,13 +15175,14 @@ mod tests {
         let tool = chat["messages"].as_array().unwrap().iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool["content"], serde_json::json!(format!("shot\n{image}\n{document}")));
 
-        // The audit row names what a target left behind, and only that.
-        let named = ["image in a tool result", "document in a tool result"];
+        // The audit row names what a target left behind, and only that: the
+        // result's breakpoints only Anthropic marks.
+        let named = ["prompt cache breakpoint (×2)", "image in a tool result", "document in a tool result"];
         assert_eq!(dr.not_carried_to(ApiVersion::ChatCompletions, "m", true), named);
         assert_eq!(dr.not_carried_to(ApiVersion::GoogleGemini, "gemini-2.5-flash", true), named);
-        assert!(dr.not_carried_to(ApiVersion::GoogleGemini, "gemini-3-pro-preview", true).is_empty());
+        assert_eq!(dr.not_carried_to(ApiVersion::GoogleGemini, "gemini-3-pro-preview", true), ["prompt cache breakpoint (×2)"]);
         assert!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true).is_empty());
-        assert!(dr.not_carried_to(ApiVersion::Responses, "m", true).is_empty());
+        assert_eq!(dr.not_carried_to(ApiVersion::Responses, "m", true), ["prompt cache breakpoint (×2)"]);
     }
 
     #[test]
@@ -14763,10 +15504,18 @@ mod tests {
 
     #[test]
     fn a_blocks_unmodelled_members_are_named_where_the_domain_leaves_them() {
-        let dr = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [
-            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "f", "input": {}}]},
+        let cite = serde_json::json!([{"type": "web_search_result_location", "cited_text": "c", "encrypted_index": "e", "title": "t", "url": "https://x.example"}]);
+        let dr = DomainRequest::from_anthropic(&anthropic(serde_json::json!({
+            "system": [{"type": "text", "text": "s", "citations": cite}],
+            "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q", "citations": cite}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "a", "citations": cite},
+                {"type": "tool_use", "id": "c1", "name": "f", "input": {}, "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}},
+            ]},
             {"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "c1", "toolset_name": "browser", "content": [
+                    {"type": "text", "text": "r", "citations": cite},
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}, "transformations": {"oversized_image": "error"}},
                 ]},
                 {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}, "transformations": {"oversized_image": "error"}},
@@ -14774,7 +15523,35 @@ mod tests {
         ]})));
         let mut got = dr.not_carried_to(ApiVersion::Responses, "m", true);
         got.sort();
-        assert_eq!(got, ["toolset_name on a user message", "transformations on a user message (×2)"]);
+        assert_eq!(
+            got,
+            [
+                "caller on an assistant message",
+                "citations on a system message",
+                "citations on a user message (×2)",
+                "citations on an assistant message",
+                "toolset_name on a user message",
+                "transformations on a user message (×2)",
+            ]
+        );
+        // A document by file reference keeps no context or citation settings
+        // in the domain: named.
+        let file = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "document", "source": {"type": "file", "file_id": "f1"}, "context": "c", "citations": {"enabled": true}}]}]})));
+        let mut got = file.not_carried_to(ApiVersion::Responses, "m", true);
+        got.sort();
+        assert_eq!(got, ["citations on a user message", "context on a user message"]);
+        let nested = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": "t", "citations": cite}]}}]}]})));
+        assert!(nested.not_carried_to(ApiVersion::Responses, "m", true).contains(&"citations on a user message".to_string()));
+        // A member asking nothing (`null`, an empty list, a call's default
+        // caller) is no loss.
+        let quiet = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q", "citations": null}, {"type": "text", "text": "r", "citations": []}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c9", "name": "f", "input": {}, "caller": {"type": "direct"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c9", "content": "ok"}]},
+        ]})));
+        assert!(quiet.not_carried_to(ApiVersion::Responses, "m", true).is_empty());
     }
 
     #[test]
@@ -14857,12 +15634,12 @@ mod tests {
     #[test]
     fn a_tool_results_file_reference_locating_nothing_is_a_named_marker() {
         let mut dr = anthropic_tool_result_with_media();
-        dr.messages[2].content = vec![DomainContentBlock::File { file_id: None, url: None, media_type: None, filename: Some("x".into()), cache_control: None }];
+        dr.messages[2].content = vec![DomainContentBlock::File { detail: None, file_id: None, url: None, media_type: None, filename: Some("x".into()), cache_control: None }];
         let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
         assert_eq!(anthropic["messages"][2]["content"][0]["content"], "[A tool result's file could not be carried to this model.]");
-        for target in [ApiVersion::AnthropicMessages, ApiVersion::Responses] {
-            assert_eq!(dr.not_carried_to(target, "m", true), ["file in a tool result"], "{target:?}");
-        }
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["file in a tool result"]);
+        // The result's own breakpoint only Anthropic marks.
+        assert_eq!(dr.not_carried_to(ApiVersion::Responses, "m", true), ["prompt cache breakpoint", "file in a tool result"]);
     }
 
     // Anthropic tool_result content: a base64 document is a PDF; a text
@@ -14891,7 +15668,7 @@ mod tests {
         assert_eq!(chat["messages"][1]["content"], "{\"ok\":true}\nnotes\n[A tool result's inlineData could not be carried to this model.]");
 
         // A document Anthropic does not read as a PDF goes as a marker, named;
-        // its title on one it does is named.
+        // one it does keeps its name as its title.
         let resp: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": [
             {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "c1", "output": [
@@ -14905,13 +15682,10 @@ mod tests {
         let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
         assert_eq!(anthropic["messages"][1]["content"][0]["content"], serde_json::json!([
             {"type": "text", "text": "[A tool result's document could not be carried to this model.]"},
-            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}},
+            {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}, "title": "q3.pdf"},
             {"type": "text", "text": "{\"result\":42}"},
         ]));
-        assert_eq!(
-            dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true),
-            ["document in a tool result", "title of a document in a tool result"]
-        );
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["document in a tool result"]);
         assert!(dr.not_carried_to(ApiVersion::Responses, "m", true).is_empty());
     }
 
@@ -15115,19 +15889,19 @@ mod tests {
         let cases: [(DomainContentBlock, &str, &str, bool); 8] = [
             (DomainContentBlock::Image { data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }, "SU1H", "image", true),
             (DomainContentBlock::Audio { data: "QVVE".into(), format: "wav".into(), cache_control: None }, "QVVE", "audio", true),
-            (DomainContentBlock::Document { data: "UERG".into(), media_type: "application/pdf".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "UERG", "document", true),
-            (DomainContentBlock::Document { data: "plain words".into(), media_type: "text/plain".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "plain words", "document", true),
-            (DomainContentBlock::File { file_id: None, url: Some("gs://b/clip".into()), media_type: Some("image/png".into()), filename: None, cache_control: None }, "gs://b/clip", "file", true),
-            (DomainContentBlock::File { file_id: Some("file-9".into()), url: None, media_type: None, filename: None, cache_control: None }, "file-9", "file", false),
+            (DomainContentBlock::Document { detail: None, data: "UERG".into(), media_type: "application/pdf".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "UERG", "document", true),
+            (DomainContentBlock::Document { detail: None, data: "plain words".into(), media_type: "text/plain".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "plain words", "document", true),
+            (DomainContentBlock::File { detail: None, file_id: None, url: Some("gs://b/clip".into()), media_type: Some("image/png".into()), filename: None, cache_control: None }, "gs://b/clip", "file", true),
+            (DomainContentBlock::File { detail: None, file_id: Some("file-9".into()), url: None, media_type: None, filename: None, cache_control: None }, "file-9", "file", false),
             (DomainContentBlock::Stripped { media_type: Some("image/png".into()), size_bytes: Some(9), reason: Some("too_large".into()) }, "too_large", "media", false),
-            (DomainContentBlock::Document { data: String::new(), media_type: "application/pdf".into(), title: Some("Spec Title".into()), context: None, citations: None, cache_control: None, nested_content: None }, "Spec Title", "document", false),
+            (DomainContentBlock::Document { detail: None, data: String::new(), media_type: "application/pdf".into(), title: Some("Spec Title".into()), context: None, citations: None, cache_control: None, nested_content: None }, "Spec Title", "document", false),
         ];
         for (block, needle, kind, gemini_takes) in cases {
             let text_file = needle == "plain words";
             let dr = DomainRequest {
                 messages: vec![
                     text_msg(DomainRole::User, "q"),
-                    DomainMessage { role: DomainRole::Assistant, content: vec![DomainContentBlock::Text { text: "a".into(), cache_control: None }, block] },
+                    DomainMessage { role: DomainRole::Assistant, content: vec![DomainContentBlock::Text { text: "a".into(), cache_control: None, citations: Vec::new() }, block] },
                     text_msg(DomainRole::User, "next"),
                 ],
                 ..empty_domain_request()
@@ -15161,7 +15935,7 @@ mod tests {
     }
 
     fn document_of(data: &str, media_type: &str) -> DomainContentBlock {
-        DomainContentBlock::Document {
+        DomainContentBlock::Document { detail: None,
             data: data.into(),
             media_type: media_type.into(),
             title: None,
@@ -15181,7 +15955,7 @@ mod tests {
             messages: vec![DomainMessage { role: DomainRole::User, content: vec![block] }],
             ..empty_domain_request()
         };
-        let file = |file_id: Option<&str>, url: Option<&str>| DomainContentBlock::File {
+        let file = |file_id: Option<&str>, url: Option<&str>| DomainContentBlock::File { detail: None,
             file_id: file_id.map(str::to_string),
             url: url.map(str::to_string),
             media_type: None,
@@ -15206,7 +15980,7 @@ mod tests {
         }
         assert!(user_turn_wire(&by_url, ApiVersion::ChatCompletions).to_string().contains("[File: https://x/a.pdf]"));
         // An image by URL has Chat's image channel.
-        let image_ref = with(DomainContentBlock::File { file_id: None, url: Some("https://x/a.png".into()), media_type: Some("image/png".into()), filename: None, cache_control: None });
+        let image_ref = with(DomainContentBlock::File { detail: None, file_id: None, url: Some("https://x/a.png".into()), media_type: Some("image/png".into()), filename: None, cache_control: None });
         assert!(!named(&image_ref, ApiVersion::ChatCompletions, "file"));
         assert_eq!(user_turn_wire(&image_ref, ApiVersion::ChatCompletions)[0]["image_url"]["url"], "https://x/a.png");
 
@@ -15244,7 +16018,7 @@ mod tests {
         for target in [ApiVersion::AnthropicMessages, ApiVersion::Responses] {
             assert!(named(&with(file(None, Some("https://www.youtube.com/watch?v=x"))), target, "file"), "{target:?}");
         }
-        let heard = with(DomainContentBlock::File { file_id: None, url: Some("https://x/a.mp3".into()), media_type: Some("audio/mpeg".into()), filename: None, cache_control: None });
+        let heard = with(DomainContentBlock::File { detail: None, file_id: None, url: Some("https://x/a.mp3".into()), media_type: Some("audio/mpeg".into()), filename: None, cache_control: None });
         assert!(named(&heard, ApiVersion::Responses, "file"));
 
         // Nothing with no bytes of its own reaches Anthropic.
@@ -15269,7 +16043,7 @@ mod tests {
         assert!(!named(&store("HTTPS://x/a.pdf"), ApiVersion::Responses, "file"));
         // Anthropic reads a reference by URL as an image or a PDF: a stated type
         // can rule it out, and no stated type does not.
-        let typed = |mt: &str| with(DomainContentBlock::File { file_id: None, url: Some("https://x/a".into()), media_type: Some(mt.into()), filename: None, cache_control: None });
+        let typed = |mt: &str| with(DomainContentBlock::File { detail: None, file_id: None, url: Some("https://x/a".into()), media_type: Some(mt.into()), filename: None, cache_control: None });
         assert!(named(&typed("application/zip"), ApiVersion::AnthropicMessages, "file"));
         assert!(!named(&typed("application/pdf"), ApiVersion::AnthropicMessages, "file"));
         assert!(!named(&typed("image/png"), ApiVersion::AnthropicMessages, "file"));
@@ -15440,7 +16214,7 @@ mod tests {
             let dr = DomainRequest {
                 messages: vec![DomainMessage {
                     role: DomainRole::User,
-                    content: vec![DomainContentBlock::Text { text: "read this".into(), cache_control: None }, block.clone()],
+                    content: vec![DomainContentBlock::Text { text: "read this".into(), cache_control: None, citations: Vec::new() }, block.clone()],
                 }],
                 ..empty_domain_request()
             };
@@ -15495,7 +16269,7 @@ mod tests {
         );
         // Nested blocks are a document source of Anthropic's, whatever the
         // media type beside them.
-        let nested = turn(DomainContentBlock::Document {
+        let nested = turn(DomainContentBlock::Document { detail: None,
             data: String::new(),
             media_type: "application/x-nested".into(),
             title: None,
@@ -15544,7 +16318,7 @@ mod tests {
                 },
                 DomainMessage {
                     role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
-                    content: vec![DomainContentBlock::Text { text: "out".into(), cache_control: None }],
+                    content: vec![DomainContentBlock::Text { text: "out".into(), cache_control: None, citations: Vec::new() }],
                 },
                 DomainMessage { role: DomainRole::User, content: vec![document_of("QllURVM", "application/zip")] },
             ],
@@ -15614,7 +16388,7 @@ mod tests {
                 text_msg(DomainRole::User, "q"),
                 DomainMessage {
                     role: DomainRole::Assistant,
-                    content: vec![DomainContentBlock::Text { text: "The best answer is".into(), cache_control: None }, assistant.content[0].clone()],
+                    content: vec![DomainContentBlock::Text { text: "The best answer is".into(), cache_control: None, citations: Vec::new() }, assistant.content[0].clone()],
                 },
             ],
             ..empty_domain_request()
@@ -15631,7 +16405,7 @@ mod tests {
                 text_msg(DomainRole::User, "q"),
                 DomainMessage {
                     role: DomainRole::Assistant,
-                    content: vec![DomainContentBlock::Text { text: String::new(), cache_control: None }, assistant.content[0].clone()],
+                    content: vec![DomainContentBlock::Text { text: String::new(), cache_control: None, citations: Vec::new() }, assistant.content[0].clone()],
                 },
             ],
             ..empty_domain_request()
@@ -15801,8 +16575,197 @@ mod tests {
         serde_json::to_value(dr.to_gemini_for("gemini-2.5-flash")).unwrap()["contents"][0]["parts"][0].clone()
     }
 
+    /// The title predicate the naming reads says what each walk does: a title
+    /// it carries appears in the rendering, one it does not, nowhere.
     #[test]
-    fn a_files_name_left_behind_in_an_anthropic_tool_result_is_named() {
+    fn the_title_predicate_reads_as_each_walk_renders() {
+        const MARK: &str = "TitleMarkQ7";
+        let docs = [
+            ("text", "text/plain", "plain words"),
+            ("pdf", "application/pdf", "JVBERi0="),
+            ("url", "document/url", "https://docs.example/a.pdf"),
+            ("bodiless", "application/pdf", ""),
+            ("unlabelled", "", "QUJD"),
+        ];
+        for (name, media_type, data) in docs {
+            let dr = DomainRequest {
+                messages: vec![DomainMessage {
+                    role: DomainRole::User,
+                    content: vec![DomainContentBlock::Document { detail: None,
+                        data: data.into(),
+                        media_type: media_type.into(),
+                        title: Some(MARK.into()),
+                        context: None,
+                        citations: None,
+                        cache_control: None,
+                        nested_content: None,
+                    }],
+                }],
+                ..DomainRequest::from_chat_completions(&chat(serde_json::json!({})))
+            };
+            let rendered = [
+                (ApiVersion::ChatCompletions, serde_json::to_string(&dr.to_chat_completions()).unwrap()),
+                (ApiVersion::Responses, serde_json::to_string(&dr.to_responses()).unwrap()),
+                (ApiVersion::GoogleGemini, serde_json::to_string(&dr.to_gemini_for("gemini-2.5-flash")).unwrap()),
+                (ApiVersion::AnthropicMessages, serde_json::to_string(&dr.to_anthropic()).unwrap()),
+            ];
+            for (target, body) in rendered {
+                // A document the target refuses goes as a marker, named whole —
+                // the naming reads no title of it.
+                if user_media_refused(target, &dr.messages[0].content[0]) {
+                    continue;
+                }
+                assert_eq!(
+                    document_title_carried(target, data, media_type),
+                    body.contains(MARK),
+                    "{name} → {target:?}: {body}"
+                );
+            }
+            // The same document in a tool result, where the walk carries it.
+            let block = dr.messages[0].content[0].clone();
+            let mut tool = dr.clone();
+            tool.messages = vec![
+                DomainMessage {
+                    role: DomainRole::Assistant,
+                    content: vec![DomainContentBlock::ToolUse {
+                        id: "c1".into(),
+                        name: "f".into(),
+                        input: serde_json::json!({}),
+                        input_raw: None,
+                        cache_control: None,
+                        thought_signature: None,
+                    }],
+                },
+                DomainMessage {
+                    role: DomainRole::Tool { tool_call_id: "c1".into(), is_error: None, cache_control: None },
+                    content: vec![DomainContentBlock::Text { text: "r".into(), cache_control: None, citations: Vec::new() }, block.clone()],
+                },
+            ];
+            let rendered = [
+                (ApiVersion::ChatCompletions, serde_json::to_string(&tool.to_chat_completions()).unwrap()),
+                (ApiVersion::Responses, serde_json::to_string(&tool.to_responses()).unwrap()),
+                (ApiVersion::GoogleGemini, serde_json::to_string(&tool.to_gemini_for("gemini-3-pro")).unwrap()),
+                (ApiVersion::AnthropicMessages, serde_json::to_string(&tool.to_anthropic()).unwrap()),
+            ];
+            for (target, body) in rendered {
+                let model = if target == ApiVersion::GoogleGemini { "gemini-3-pro" } else { "m" };
+                if !tool.tool_result_carries(&block, target, model) {
+                    continue;
+                }
+                assert_eq!(
+                    document_title_carried(target, data, media_type),
+                    body.contains(MARK),
+                    "{name} in a tool result → {target:?}: {body}"
+                );
+            }
+        }
+    }
+
+    /// A document's name reaches Anthropic within the spec's 1–500 characters:
+    /// an empty one is none, a longer one is cut on a character boundary.
+    #[test]
+    fn a_documents_title_is_fitted_to_what_anthropic_takes() {
+        assert_eq!(anthropic_document_title(None), None);
+        assert_eq!(anthropic_document_title(Some("")), None);
+        assert_eq!(anthropic_document_title(Some("q3.pdf")).as_deref(), Some("q3.pdf"));
+        let at = "é".repeat(500);
+        assert_eq!(anthropic_document_title(Some(&at)).as_deref(), Some(at.as_str()));
+        let over = format!("{at}é");
+        assert_eq!(anthropic_document_title(Some(&over)).as_deref(), Some(at.as_str()));
+    }
+
+    /// A document's title, context and citation settings reach Anthropic; a
+    /// walk to another protocol names each it leaves out — title only where
+    /// it has no file name for it — in a user message as in a tool result.
+    #[test]
+    fn a_documents_members_are_named_where_a_walk_leaves_them_out() {
+        let doc = |media: serde_json::Value| {
+            let mut d = serde_json::json!({"type": "document", "title": "Notes", "context": "from the wiki", "citations": {"enabled": true}});
+            d["source"] = media;
+            d
+        };
+        let pdf = serde_json::json!({"type": "base64", "media_type": "application/pdf", "data": "JVBE"});
+        let text = serde_json::json!({"type": "text", "media_type": "text/plain", "data": "notes"});
+        let dr = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [
+            {"role": "user", "content": [doc(pdf.clone()), {"type": "text", "text": "read"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "f", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": [doc(text)]}]},
+        ]})));
+        assert!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true).is_empty());
+        let named = |target| {
+            let mut got = dr.not_carried_to(target, "m", true);
+            got.retain(|n| n.contains("of a document"));
+            got.sort();
+            got
+        };
+        assert_eq!(
+            named(ApiVersion::Responses),
+            [
+                "citation settings of a document in a tool result",
+                "citation settings of a document in a user message",
+                "context of a document in a tool result",
+                "context of a document in a user message",
+                "title of a document in a tool result",
+            ]
+        );
+        // Settings that turn nothing on and a context that says nothing are no
+        // loss.
+        let quiet = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "document", "context": " ", "citations": {"enabled": false},
+             "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}}]}]})));
+        assert!(quiet.not_carried_to(ApiVersion::Responses, "m", true).is_empty());
+        // A name past what Anthropic takes is cut, and named.
+        let long = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "document", "title": "x".repeat(501), "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBE"}}]}]})));
+        assert_eq!(long.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["title past 500 characters of a document in a user message"]);
+        let file: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": [{"type": "message", "role": "user",
+            "content": [{"type": "input_file", "file_id": "file-1", "filename": "y".repeat(501)}]}]}))
+        .unwrap();
+        assert_eq!(
+            DomainRequest::from_responses(&file).not_carried_to(ApiVersion::AnthropicMessages, "m", true),
+            ["title past 500 characters of a document in a user message"]
+        );
+        assert_eq!(
+            named(ApiVersion::GoogleGemini),
+            [
+                "citation settings of a document in a tool result",
+                "citation settings of a document in a user message",
+                "context of a document in a tool result",
+                "context of a document in a user message",
+                "title of a document in a tool result",
+                "title of a document in a user message",
+            ]
+        );
+    }
+
+    /// A text's citations ride the domain both ways: read from an Anthropic
+    /// client, sent back on Anthropic's walk — in a message and in a tool
+    /// result, whose text then stays blocks — and named on another's.
+    #[test]
+    fn a_texts_citations_ride_the_domain_to_anthropic_and_are_named_elsewhere() {
+        let cite = serde_json::json!([{"type": "char_location", "cited_text": "a", "document_index": 0, "document_title": null,
+            "start_char_index": 0, "end_char_index": 1}]);
+        let dr = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "text", "text": "per a", "citations": cite}, {"type": "tool_use", "id": "c1", "name": "f", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": [{"type": "text", "text": "r", "citations": cite}]}]},
+        ]})));
+        assert_matches!(&dr.messages[1].content[0], DomainContentBlock::Text { citations, .. } if *citations == cite.as_array().unwrap().clone());
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert_eq!(wire["messages"][1]["content"][0]["citations"], cite);
+        // A system block's ride the domain as a message text's do.
+        let sys = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"system": [{"type": "text", "text": "s", "citations": cite}]})));
+        assert_eq!(serde_json::to_value(sys.to_anthropic()).unwrap()["system"][0]["citations"], cite);
+        assert_eq!(wire["messages"][2]["content"][0]["content"], serde_json::json!([{"type": "text", "text": "r", "citations": cite}]));
+        let chat = serde_json::to_value(dr.to_chat_completions()).unwrap();
+        assert!(!chat.to_string().contains("cited_text"), "{chat}");
+        let named = dr.not_carried_to(ApiVersion::ChatCompletions, "m", true);
+        assert!(named.iter().any(|n| n.starts_with("citations on an assistant message")), "{named:?}");
+        assert!(named.iter().any(|n| n.starts_with("citations on a user message")), "{named:?}");
+    }
+
+    #[test]
+    fn a_files_name_reaches_an_anthropic_tool_result_as_its_documents_title() {
         let resp: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": [
             {"type": "function_call", "call_id": "c1", "name": "read", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "c1", "output": [
@@ -15811,7 +16774,12 @@ mod tests {
         ]}))
         .unwrap();
         let dr = DomainRequest::from_responses(&resp);
-        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["title of a document in a tool result"]);
+        let anthropic = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert_eq!(
+            anthropic["messages"][1]["content"][0]["content"],
+            serde_json::json!([{"type": "document", "source": {"type": "file", "file_id": "file-1"}, "title": "q3.pdf"}])
+        );
+        assert!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true).is_empty());
     }
 
     #[test]
@@ -15819,7 +16787,7 @@ mod tests {
         let mut dr = anthropic_tool_result_with_media();
         dr.messages[2].content = vec![
             DomainContentBlock::Image { data: "AAAA".into(), media_type: "image/heic".into(), cache_control: None },
-            DomainContentBlock::Document {
+            DomainContentBlock::Document { detail: None,
                 data: String::new(),
                 media_type: String::new(),
                 title: None,
@@ -15831,8 +16799,9 @@ mod tests {
         ];
         // Anthropic reads four image types; a nested document is its own.
         assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["image in a tool result"]);
-        // Responses has no `input_file` for a document with no bytes.
-        assert_eq!(dr.not_carried_to(ApiVersion::Responses, "m", true), ["document in a tool result"]);
+        // Responses has no `input_file` for a document with no bytes, nor a
+        // breakpoint the walk writes.
+        assert_eq!(dr.not_carried_to(ApiVersion::Responses, "m", true), ["prompt cache breakpoint", "document in a tool result"]);
         let responses = serde_json::to_value(dr.to_responses()).unwrap();
         let output = responses["input"].as_array().unwrap().iter().find(|i| i["type"] == "function_call_output").unwrap();
         assert_eq!(output["output"][1], serde_json::json!({"type": "input_text", "text": "[A tool result's document could not be carried to this model.]"}));
@@ -15853,5 +16822,204 @@ mod tests {
             {"type": "text", "text": "[A tool result's media could not be carried to this model.]"},
         ]));
         assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["media in a tool result"]);
+    }
+
+    // The Responses reference (fetched 2026-11-15): `prompt_cache_breakpoint`
+    // (`{mode: "explicit", ttl?: "30m" | "12h"}`) on `input_text`,
+    // `input_image` and `input_file`, in a message's `content` and a
+    // `function_call_output.output`; "Each request can write up to four
+    // breakpoints", `prompt_cache_options.ttl` defaults to `30m`. Anthropic
+    // (fetched 2026-11-15): `cache_control: {type: "ephemeral", ttl?: "5m" |
+    // "1h"}` on text, image, document and a tool result's blocks, up to four
+    // per request.
+    #[test]
+    fn a_responses_breakpoint_reaches_anthropic_as_a_cache_control() {
+        let bp = serde_json::json!({"mode": "explicit"});
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": [
+                {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "context", "prompt_cache_breakpoint": bp},
+                    {"type": "input_image", "image_url": "https://x/a.png", "prompt_cache_breakpoint": bp},
+                    {"type": "input_text", "text": "question"}]},
+                {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": [
+                    {"type": "input_text", "text": "ok", "prompt_cache_breakpoint": {"mode": "explicit", "ttl": "30m"}}]},
+            ],
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+        }))
+        .unwrap();
+        let dr = DomainRequest::from_responses(&req);
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        let breakpoint = serde_json::json!({"type": "ephemeral"});
+        let user = &wire["messages"][0]["content"];
+        assert_eq!(user[0]["cache_control"], breakpoint, "{wire}");
+        assert_eq!(user[1]["type"], "image");
+        assert_eq!(user[1]["cache_control"], breakpoint, "{wire}");
+        // Control: a part without a breakpoint marks none.
+        assert!(user[2].get("cache_control").is_none(), "{wire}");
+        let result = &wire["messages"][2]["content"][0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["content"][0]["cache_control"], breakpoint, "{wire}");
+        // The lifetime the client stated goes with no Anthropic breakpoint.
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["prompt_cache_breakpoint ttl 30m on a tool message"]);
+        // No other target has a per-block channel: each breakpoint is named.
+        for target in [ApiVersion::ChatCompletions, ApiVersion::GoogleGemini] {
+            assert_eq!(
+                dr.not_carried_to(target, "m", true),
+                ["prompt cache breakpoint (×3)", "prompt_cache_breakpoint ttl 30m on a tool message"],
+                "{target:?}"
+            );
+        }
+        // A part of the typed message list reads the same.
+        let typed: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "context", "prompt_cache_breakpoint": bp}]}]}))
+        .unwrap();
+        assert_matches!(typed.input, ResponseInput::Messages(_));
+        let wire = serde_json::to_value(DomainRequest::from_responses(&typed).to_anthropic()).unwrap();
+        assert_eq!(wire["messages"][0]["content"][0]["cache_control"], breakpoint, "{wire}");
+    }
+
+    #[test]
+    fn only_the_latest_four_responses_breakpoints_are_carried_and_a_stated_lifetime_is_named() {
+        let part = |n: usize| serde_json::json!({"type": "input_text", "text": format!("p{n}"), "prompt_cache_breakpoint": {"mode": "explicit"}});
+        let request = |extra: serde_json::Value| -> ResponsesRequest {
+            let mut body = serde_json::json!({"model": "m", "input": [
+                {"type": "message", "role": "user", "content": (0..6).map(part).collect::<Vec<_>>()}]});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let dr = DomainRequest::from_responses(&request(serde_json::json!({})));
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        let marked: Vec<bool> = wire["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.get("cache_control").is_some())
+            .collect();
+        assert_eq!(marked, [false, false, true, true, true, true], "{wire}");
+        assert_eq!(
+            dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true),
+            ["prompt_cache_breakpoint beyond the latest four on a user message (×2)"]
+        );
+
+        // A lifetime the client stated — the part's own, or the request's —
+        // goes with no Anthropic breakpoint; one it did not state is not named.
+        let mut long = serde_json::to_value(request(serde_json::json!({"prompt_cache_options": {"ttl": "12h"}}))).unwrap();
+        long["input"][0]["content"][5]["prompt_cache_breakpoint"]["ttl"] = "30m".into();
+        let long: ResponsesRequest = serde_json::from_value(long).unwrap();
+        let named = DomainRequest::from_responses(&long).not_carried_to(ApiVersion::AnthropicMessages, "m", true);
+        assert!(named.contains(&"prompt_cache_breakpoint ttl 12h on a user message (×5)".to_string()), "{named:?}");
+        assert!(named.contains(&"prompt_cache_breakpoint ttl 30m on a user message".to_string()), "{named:?}");
+        // A breakpoint of another mode than the spec's is no breakpoint read.
+        let other = serde_json::json!({"type": "input_text", "text": "x", "prompt_cache_breakpoint": {"mode": "other"}});
+        assert!(responses_part_breakpoint(&other).is_none());
+    }
+
+    #[test]
+    fn a_breakpoint_on_a_folded_system_message_is_named_and_a_rerender_names_none() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "developer", "content": [
+                {"type": "input_text", "text": "rules", "prompt_cache_breakpoint": {"mode": "explicit"}}]},
+            {"type": "message", "role": "user", "content": "hi"}]}))
+        .unwrap();
+        let mut dr = DomainRequest::from_responses(&req);
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        assert_eq!(wire["system"], "rules", "{wire}");
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["prompt cache breakpoint"]);
+        dr.upstream.rerenders_client_request = true;
+        assert!(dr.not_carried_to(ApiVersion::Responses, "m", true).is_empty());
+    }
+
+    #[test]
+    fn an_anthropic_breakpoint_is_named_where_the_walk_has_no_channel_for_it() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]}))
+        .unwrap();
+        let dr = DomainRequest::from_anthropic(&req);
+        for target in [ApiVersion::ChatCompletions, ApiVersion::Responses, ApiVersion::GoogleGemini] {
+            assert_eq!(dr.not_carried_to(target, "m", true), ["prompt cache breakpoint (×2)"], "{target:?}");
+        }
+        assert!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true).is_empty());
+    }
+
+    #[test]
+    fn a_gemini_text_beside_an_image_reaches_another_protocol() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "contents": [{"role": "user", "parts": [
+                {"text": "what is this?", "inlineData": {"mimeType": "image/png", "data": "iVBO"},
+                 "videoMetadata": {"fps": 1.0}}]}],
+        }))
+        .unwrap();
+        let dr = DomainRequest::from_gemini(&req);
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        let content = &wire["messages"][0]["content"];
+        assert_eq!(content[0], serde_json::json!({"type": "text", "text": "what is this?"}), "{wire}");
+        assert_eq!(content[1]["type"], "image", "{wire}");
+        assert_eq!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true), ["videoMetadata on a user message"]);
+        // The same-protocol forward sends the text as its own part, and the
+        // blob's part with its members.
+        let sent = serde_json::to_value(&req).unwrap();
+        assert_eq!(sent["contents"][0]["parts"], serde_json::json!([
+            {"text": "what is this?"},
+            {"inlineData": {"mimeType": "image/png", "data": "iVBO"}, "videoMetadata": {"fps": 1.0}},
+        ]));
+    }
+
+
+    #[test]
+    fn a_responses_breakpoint_on_a_part_kept_as_sent_goes_with_it_and_one_anthropic_cannot_send_is_named() {
+        let bp = serde_json::json!({"mode": "explicit"});
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "rules", "prompt_cache_breakpoint": bp}]},
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "a", "prompt_cache_breakpoint": bp},
+                {"type": "input_text", "text": "b", "prompt_cache_breakpoint": bp},
+                {"type": "input_text", "text": "c", "prompt_cache_breakpoint": bp},
+                {"type": "input_text", "text": "d", "prompt_cache_breakpoint": bp},
+                // A part the parser keeps as the client's is named, its
+                // breakpoint with it, and counts for none of the four.
+                {"type": "input_image", "file_id": "file-1", "prompt_cache_breakpoint": bp}]},
+            {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": [
+                {"type": "input_text", "text": "", "prompt_cache_breakpoint": bp},
+                {"type": "input_text", "text": "ok"}]},
+        ]}))
+        .unwrap();
+        let dr = DomainRequest::from_responses(&req);
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        let user = wire["messages"][0]["content"].as_array().unwrap();
+        // Neither the developer breakpoint nor the empty result text's —
+        // which the walk leaves out — is among the four: every user one is sent.
+        let marked: Vec<bool> = user.iter().map(|b| b.get("cache_control").is_some()).collect();
+        assert_eq!(marked, [true, true, true, true, false], "{wire}");
+        assert_eq!(
+            dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true),
+            [
+                // The developer message's, and the empty result text's.
+                "prompt cache breakpoint (×2)",
+                "user content part input_image",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_gemini_text_beside_a_function_response_follows_the_result() {
+        let req: GeminiRequest = serde_json::from_value(serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "go"}]},
+            {"role": "model", "parts": [{"functionCall": {"name": "f", "args": {}}}]},
+            {"role": "user", "parts": [{"text": "here it is", "functionResponse": {"name": "f", "response": {"ok": true}}}]},
+        ]}))
+        .unwrap();
+        let dr = DomainRequest::from_gemini(&req);
+        let wire = serde_json::to_value(dr.to_anthropic()).unwrap();
+        let after_call = &wire["messages"][2]["content"];
+        assert_eq!(after_call[0]["type"], "tool_result", "{wire}");
+        assert!(serde_json::to_string(&wire).unwrap().contains("here it is"), "{wire}");
+        let chat = serde_json::to_value(dr.to_chat_completions()).unwrap();
+        assert_eq!(chat["messages"][2]["role"], "tool", "{chat}");
     }
 }

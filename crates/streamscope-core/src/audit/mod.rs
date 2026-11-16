@@ -389,6 +389,10 @@ pub struct AuditRecord {
     pub response_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub response_tool_calls: Option<serde_json::Value>,
+    /// The sources the answer's text cites, as a client of the answer's own
+    /// protocol is sent them — stored on the turn beside its text.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub response_citations: Vec<Citation>,
 
     // Session detection (optional — populated when content_logging_enabled)
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -606,6 +610,7 @@ impl Default for AuditRecord {
             transform_diff: None,
             response_content: None,
             response_tool_calls: None,
+            response_citations: Vec::new(),
             conversation_session_id: None,
             turn_number: None,
             parent_request_id: None,
@@ -786,12 +791,144 @@ pub trait AuditForwarderTrait: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, anyhow::Error>> + Send + '_>>;
 }
 
+/// A source an answer's or a message's text cites: the quote, and where it is
+/// from, read from an Anthropic `TextCitation` or an OpenAI annotation (a
+/// Responses `output_text` annotation, a Chat message's `url_citation`) — the
+/// shape a turn records its answer's in (`response_citations`) and the console
+/// shows.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+pub struct Citation {
+    /// Where the quote is located, by the spec's kind: `char_location`
+    /// (characters of a document), `page_location` (pages of a PDF),
+    /// `content_block_location` (blocks of a content document),
+    /// `web_search_result_location` (a page a web search found),
+    /// `search_result_location` (blocks of a search result the client sent);
+    /// OpenAI's `url_citation` (a web page), `file_citation` and
+    /// `container_file_citation` (a file), `file_path` (a file the answer
+    /// made). Another kind a spec adds is shown by its name.
+    pub kind: String,
+    /// The text quoted from the source; empty for an OpenAI annotation, which
+    /// quotes nothing.
+    pub cited_text: String,
+    /// The cited document's, page's or search result's title, or the cited
+    /// file's name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The cited file's id (an OpenAI file or container file annotation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// The cited page's URL, or the search result's source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The cited document's place among the request's documents, or the
+    /// search result's among its search results (0-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_index: Option<i64>,
+    /// The quote's first character, page or block, in the unit `kind` names
+    /// (characters and blocks 0-based, pages 1-based).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+    /// The quote's end, exclusive in every unit (the spec's `end_*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+}
+
+/// A cited source's title as the upstream or the client wrote it: a document's
+/// `document_title`, else a page's or a search result's `title`, else a file's
+/// `filename` — the one reading the guardrails, the response scan and the
+/// console share.
+pub fn citation_title(citation: &serde_json::Value) -> Option<&str> {
+    let source = cited_source(citation);
+    CITATION_TITLE_KEYS.iter().find_map(|k| source.get(*k).and_then(serde_json::Value::as_str))
+}
+
+/// The members a cited source's title may be under, in the order
+/// [`citation_title`] reads them, inside [`cited_source`] — every reader and
+/// writer of a title goes by this list.
+pub const CITATION_TITLE_KEYS: [&str; 3] = ["document_title", "title", "filename"];
+
+/// The object that describes a cited source: a Chat annotation's
+/// `url_citation` (Chat nests it, `{type: "url_citation", url_citation:
+/// {url, title, …}}`), the citation itself otherwise (Anthropic's and the
+/// Responses annotations are flat). Every reader of a citation's members reads
+/// them here.
+pub fn cited_source(citation: &serde_json::Value) -> &serde_json::Value {
+    citation.get("url_citation").filter(|inner| inner.is_object()).unwrap_or(citation)
+}
+
+/// The kinds of citation the Anthropic Messages API defines (its
+/// `TextCitationParam` union) — the only ones its walk writes; anything else
+/// a domain text carries (an OpenAI client's annotations, a kind no spec
+/// names) has no Anthropic shape.
+pub const ANTHROPIC_CITATION_KINDS: [&str; 5] =
+    ["char_location", "page_location", "content_block_location", "web_search_result_location", "search_result_location"];
+
+/// Whether a citation is of a kind the Messages API defines
+/// ([`ANTHROPIC_CITATION_KINDS`]).
+pub fn is_anthropic_citation(citation: &serde_json::Value) -> bool {
+    citation.get("type").and_then(serde_json::Value::as_str).is_some_and(|k| ANTHROPIC_CITATION_KINDS.contains(&k))
+}
+
+/// [`cited_source`], to write in place (the response PII mask).
+pub fn cited_source_mut(citation: &mut serde_json::Value) -> &mut serde_json::Value {
+    if citation.get("url_citation").is_some_and(serde_json::Value::is_object) {
+        &mut citation["url_citation"]
+    } else {
+        citation
+    }
+}
+
+impl Citation {
+    /// A citation as the upstream or the client wrote it, its kind empty where
+    /// it names none. `None` for a value that is no object.
+    pub fn from_wire(value: &serde_json::Value) -> Option<Self> {
+        if !value.is_object() {
+            return None;
+        }
+        let kind = value.get("type").and_then(serde_json::Value::as_str).unwrap_or_default().to_string();
+        let value = cited_source(value);
+        let text = |key: &str| value.get(key).and_then(serde_json::Value::as_str).map(str::to_string);
+        let number = |keys: &[&str]| keys.iter().find_map(|k| value.get(*k).and_then(serde_json::Value::as_i64));
+        // An OpenAI annotation's `start_index` / `end_index` place it in the
+        // answer's own text, not in the source: no place in the source is read.
+        Some(Self {
+            kind,
+            cited_text: text("cited_text").unwrap_or_default(),
+            title: citation_title(value).map(str::to_string),
+            file_id: text("file_id"),
+            url: text("url").or_else(|| text("source")),
+            document_index: number(&["document_index", "search_result_index"]),
+            start: number(&["start_char_index", "start_page_number", "start_block_index"]),
+            end: number(&["end_char_index", "end_page_number", "end_block_index"]),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An OpenAI annotation reads as the console shows a source: Chat's
+    /// nested `url_citation` as the Responses flat one, a file by its name and
+    /// id, and no place in the source read from offsets into the answer.
+    #[test]
+    fn an_openai_annotation_reads_as_a_shown_source() {
+        let chat = Citation::from_wire(&serde_json::json!({"type": "url_citation", "url_citation": {
+            "url": "https://x.example", "title": "Page", "start_index": 0, "end_index": 3}})).unwrap();
+        let responses = Citation::from_wire(&serde_json::json!({"type": "url_citation", "url": "https://x.example",
+            "title": "Page", "start_index": 0, "end_index": 3})).unwrap();
+        assert_eq!(chat, responses);
+        assert_eq!((chat.kind.as_str(), chat.title.as_deref(), chat.url.as_deref(), chat.start, chat.end),
+            ("url_citation", Some("Page"), Some("https://x.example"), None, None));
+        let file = Citation::from_wire(&serde_json::json!({"type": "file_citation", "file_id": "file-1", "filename": "a.pdf", "index": 2})).unwrap();
+        assert_eq!((file.title.as_deref(), file.file_id.as_deref()), (Some("a.pdf"), Some("file-1")));
+        assert!(!is_anthropic_citation(&serde_json::json!({"type": "file_path", "file_id": "f", "index": 0})));
+        assert!(!is_anthropic_citation(&serde_json::json!({"type": "some_provider_annotation"})));
+        assert!(is_anthropic_citation(&serde_json::json!({"type": "web_search_result_location", "url": "https://x.example"})));
+    }
 
     #[tokio::test]
     async fn an_audit_record_counts_from_its_send_until_its_writer_forwards_it() {

@@ -35,6 +35,7 @@ pub(crate) struct TraceTurn {
     pub(crate) transform_diff: RawJson,
     pub(crate) response_content: Option<String>,
     pub(crate) response_tool_calls: Option<serde_json::Value>,
+    pub(crate) response_citations: Option<serde_json::Value>,
     pub(crate) request_size_bytes: Option<i32>,
     pub(crate) response_size_bytes: Option<i32>,
     pub(crate) event_type: String,
@@ -52,7 +53,7 @@ pub(crate) async fn turn(
          is_baseline, message_hashes, message_count, \
          tools_available_hash, tools_effective_hash, \
          request_params, system_prompt_hash, transform_diff, response_content, \
-         response_tool_calls, request_size_bytes, response_size_bytes, event_type, \
+         response_tool_calls, response_citations, request_size_bytes, response_size_bytes, event_type, \
          api_version \
          FROM conversation_turns_resolved WHERE request_id = $1 LIMIT 1",
     )

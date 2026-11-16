@@ -32,6 +32,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use super::destination_lists::DestinationMode;
+use streamscope_client_templates::destination::Posture;
+use streamscope_client_templates::sandbox_image::DefaultImage;
 use super::portal_auth::PortalUser;
 use super::portal_manager::MemberOf;
 use super::portal_pages::{HiddenPages, PortalPage};
@@ -69,18 +71,38 @@ pub struct AttachedDestinationList {
 }
 
 /// The sandbox settings, resolved (an unset setting reads its default).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct SandboxSettings {
     /// Refuse `ssai run --sandbox off` (and `learn`). Default `false`.
     pub require_sandbox: bool,
     /// Allow `ssai run --sandbox docker`. Default `true`.
     pub docker_tier: bool,
+    /// What the sandbox may reach besides the gateway, before any list:
+    /// `gateway` (nothing), `listed` (what an allow list names) or `open`
+    /// (everything a block list does not name). Unset reads `listed`; a
+    /// profile created from the seed or reset to it (a new tenant's Default
+    /// included) is `open` with the Internal networks list blocked — or
+    /// `listed`, with nothing attached, when the tenant deleted that list.
+    pub network: Posture,
+    /// The container sandbox's image for a project without its own
+    /// `.streamscopeai/sandbox.json`, with its engine and limits; a project's
+    /// file replaces it whole. Unset: such a project is refused.
+    pub default_image: Option<DefaultImage>,
 }
 
 impl Default for SandboxSettings {
     fn default() -> Self {
-        Self { require_sandbox: false, docker_tier: true }
+        Self { require_sandbox: false, docker_tier: true, network: Posture::Listed, default_image: None }
     }
+}
+
+/// The posture a profile created from the seed gets.
+const SEED_POSTURE: Posture = Posture::Open;
+
+/// A stored posture; NULL (a row that never set one) reads `listed`. The
+/// column's CHECK admits only the three spellings.
+fn posture_of_column(v: Option<&str>) -> Posture {
+    v.and_then(Posture::parse).unwrap_or(Posture::Listed)
 }
 
 /// `GET /api/v1/admin/profiles/{id}/client-access`.
@@ -124,6 +146,12 @@ pub struct SandboxSettingsPatch {
     pub require_sandbox: Option<bool>,
     #[serde(default)]
     pub docker_tier: Option<bool>,
+    #[serde(default)]
+    pub network: Option<Posture>,
+    /// The default container image, set whole; `null` removes it.
+    #[serde(default, deserialize_with = "super::double_option::deserialize")]
+    #[schema(value_type = Option<DefaultImage>)]
+    pub default_image: Option<Option<DefaultImage>>,
 }
 
 /// What the sandbox of a workspace's developers may reach, flattened from
@@ -280,23 +308,47 @@ pub async fn update_profile_client_access(
         .await
         .map_err(write_failed("write destinations"))?;
     }
-    // A field absent leaves its column as it is (a new row: NULL, the default).
+    // A field absent leaves its column as it is (a new row: NULL, the
+    // default); the default image's four columns are written together, all
+    // NULL when it is removed.
     if let Some(settings) = &body.settings
-        && (settings.require_sandbox.is_some() || settings.docker_tier.is_some())
+        && (settings.require_sandbox.is_some()
+            || settings.docker_tier.is_some()
+            || settings.network.is_some()
+            || settings.default_image.is_some())
     {
+        let image = settings.default_image.as_ref().map(Option::as_ref);
+        if let Some(Some(image)) = image {
+            image.validate().map_err(|e| {
+                ApiError::bad_request(format!("default_image: {e}")).code(ApiErrorCode::SandboxDefaultImageInvalid)
+            })?;
+        }
+        let set = image.flatten();
         sqlx::query(
-            "INSERT INTO client_access_sandbox (tenant_id, profile_id, require_sandbox, docker_tier) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO client_access_sandbox (tenant_id, profile_id, require_sandbox, docker_tier, network_posture, \
+               default_image, default_docker, default_memory, default_cpus) \
+             VALUES ($1, $2, $3, $4, $5, $7, $8, $9, $10) \
              ON CONFLICT (tenant_id, profile_id) DO UPDATE SET \
                require_sandbox = CASE WHEN $3::boolean IS NULL THEN client_access_sandbox.require_sandbox \
                                       ELSE $3 END, \
                docker_tier = CASE WHEN $4::boolean IS NULL THEN client_access_sandbox.docker_tier ELSE $4 END, \
+               network_posture = CASE WHEN $5::text IS NULL THEN client_access_sandbox.network_posture ELSE $5 END, \
+               default_image = CASE WHEN $6 THEN $7 ELSE client_access_sandbox.default_image END, \
+               default_docker = CASE WHEN $6 THEN $8 ELSE client_access_sandbox.default_docker END, \
+               default_memory = CASE WHEN $6 THEN $9 ELSE client_access_sandbox.default_memory END, \
+               default_cpus = CASE WHEN $6 THEN $10 ELSE client_access_sandbox.default_cpus END, \
                updated_at = now()",
         )
         .bind(tenant_id)
         .bind(id)
         .bind(settings.require_sandbox)
         .bind(settings.docker_tier)
+        .bind(settings.network.map(Posture::as_str))
+        .bind(image.is_some())
+        .bind(set.map(|d| d.image.trim()))
+        .bind(set.map(|d| d.docker))
+        .bind(set.and_then(|d| d.memory.as_deref()))
+        .bind(set.and_then(|d| d.cpus))
         .execute(&mut *tx)
         .await
         .map_err(write_failed("write sandbox settings"))?;
@@ -521,6 +573,9 @@ pub(crate) async fn effective_client_access(conn: &mut Scoped, member: MemberOf)
 }
 
 fn policy(allow: Vec<String>, block: Vec<String>, settings: SandboxSettings) -> SandboxPolicy {
+    // Gateway only: the lists stay attached but nothing is allowed, which a
+    // CLI that does not read the posture enforces too.
+    let allow = if settings.network == Posture::Gateway { Vec::new() } else { allow };
     let mut h = Sha256::new();
     for (tag, entries) in [("allow", &allow), ("block", &block)] {
         h.update(tag.as_bytes());
@@ -531,6 +586,20 @@ fn policy(allow: Vec<String>, block: Vec<String>, settings: SandboxSettings) -> 
         h.update([1]);
     }
     h.update([u8::from(settings.require_sandbox), u8::from(settings.docker_tier)]);
+    // `listed` contributes no bytes: a listed profile's revision depends on
+    // its lists and flags alone.
+    if settings.network != Posture::Listed {
+        h.update(settings.network.as_str().as_bytes());
+    }
+    // No default image contributes no bytes either.
+    if let Some(d) = &settings.default_image {
+        h.update(b"\0default_image");
+        for part in [d.image.as_str(), if d.docker { "docker" } else { "" }, d.memory.as_deref().unwrap_or("")] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part.as_bytes());
+        }
+        h.update(d.cpus.map_or([0; 8], f64::to_le_bytes));
+    }
     let revision = h.finalize().iter().take(12).map(|b| format!("{b:02x}")).collect();
     SandboxPolicy { allow, block, settings, revision }
 }
@@ -553,18 +622,25 @@ async fn ensure_client_access_profile(conn: &mut Scoped, id: Uuid) -> Result<boo
     }
 }
 
+type SettingsRow =
+    (Option<bool>, Option<bool>, Option<String>, Option<String>, Option<bool>, Option<String>, Option<f64>);
+
 async fn load_settings(conn: &mut Scoped, profile_id: Uuid) -> Result<SandboxSettings, ApiError> {
-    let row: Option<(Option<bool>, Option<bool>)> =
-        sqlx::query_as("SELECT require_sandbox, docker_tier FROM client_access_sandbox WHERE profile_id = $1")
-            .bind(profile_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(read_failed("load sandbox settings"))?;
-    let (require_sandbox, docker_tier) = row.unwrap_or_default();
+    let row: Option<SettingsRow> = sqlx::query_as(
+        "SELECT require_sandbox, docker_tier, network_posture, default_image, default_docker, default_memory, default_cpus \
+         FROM client_access_sandbox WHERE profile_id = $1",
+    )
+    .bind(profile_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(read_failed("load sandbox settings"))?;
+    let (require_sandbox, docker_tier, network, image, docker, memory, cpus) = row.unwrap_or_default();
     let default = SandboxSettings::default();
     Ok(SandboxSettings {
         require_sandbox: require_sandbox.unwrap_or(default.require_sandbox),
         docker_tier: docker_tier.unwrap_or(default.docker_tier),
+        network: posture_of_column(network.as_deref()),
+        default_image: image.map(|image| DefaultImage { image, docker: docker.unwrap_or(false), memory, cpus }),
     })
 }
 
@@ -619,8 +695,10 @@ async fn load_hidden_pages(conn: &mut Scoped, profile_id: Uuid) -> Result<Vec<Po
     Ok(HiddenPages::new(sessions, requests).into_vec())
 }
 
-/// Seed a profile's content: every live client offered, no destination list
-/// attached, the settings at their defaults, no portal page hidden (the seed
+/// Seed a profile's content: every live client offered, the sandbox open
+/// with the Internal networks list blocked (`listed` when the tenant has no
+/// such list),
+/// the other settings at their defaults, no portal page hidden (the seed
 /// adapter — create-from-seed and reset-to-seed).
 /// Returns the number of clients offered.
 pub(crate) async fn apply_seed(conn: &mut Scoped, tenant_id: Uuid, profile_id: Uuid) -> Result<i64, ApiError> {
@@ -632,7 +710,40 @@ pub(crate) async fn apply_seed(conn: &mut Scoped, tenant_id: Uuid, profile_id: U
     ] {
         sqlx::query(clear).bind(profile_id).execute(&mut *conn).await.map_err(write_failed("clear for seed"))?;
     }
+    seed_sandbox(conn, tenant_id, profile_id).await.map_err(write_failed("seed the sandbox"))?;
     seed_members(conn, tenant_id, profile_id).await.map_err(write_failed("seed clients"))
+}
+
+/// A seeded profile's sandbox: the Internal networks list attached as block
+/// and [`SEED_POSTURE`] — or, when the tenant has no such list (deleted, or
+/// its seed did not load), `listed`: an open sandbox with nothing blocked
+/// would reach the company network.
+async fn seed_sandbox(conn: &mut Scoped, tenant_id: Uuid, profile_id: Uuid) -> Result<(), sqlx::Error> {
+    let attached = sqlx::query(
+        "INSERT INTO client_access_destinations (tenant_id, profile_id, list_id, mode) \
+         SELECT $1, $2, l.id, 'block' FROM ( \
+           SELECT id FROM destination_lists \
+           WHERE tenant_id = $1 AND seed_key = $3 AND NOT suppressed FOR SHARE) l \
+         ON CONFLICT (tenant_id, profile_id, list_id) DO NOTHING",
+    )
+    .bind(tenant_id)
+    .bind(profile_id)
+    .bind(super::destination_lists::INTERNAL_NETWORKS_SEED)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let posture = if attached > 0 { SEED_POSTURE } else { Posture::Listed };
+    // Two resets of one profile at once: the later one's rows already exist.
+    sqlx::query(
+        "INSERT INTO client_access_sandbox (tenant_id, profile_id, network_posture) VALUES ($1, $2, $3) \
+         ON CONFLICT (tenant_id, profile_id) DO UPDATE SET network_posture = EXCLUDED.network_posture",
+    )
+        .bind(tenant_id)
+        .bind(profile_id)
+        .bind(posture.as_str())
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }
 
 /// Copy `source_id`'s whole content onto `dest_id`, a profile with none yet
@@ -667,8 +778,10 @@ pub(crate) async fn copy_content(
            INSERT INTO client_access_portal (tenant_id, profile_id, hide_sessions, hide_requests) \
            SELECT $1, $3, hide_sessions, hide_requests FROM client_access_portal \
            WHERE tenant_id = $1 AND profile_id = $2) \
-         INSERT INTO client_access_sandbox (tenant_id, profile_id, require_sandbox, docker_tier) \
-         SELECT $1, $3, require_sandbox, docker_tier FROM client_access_sandbox \
+         INSERT INTO client_access_sandbox (tenant_id, profile_id, require_sandbox, docker_tier, network_posture, \
+           default_image, default_docker, default_memory, default_cpus) \
+         SELECT $1, $3, require_sandbox, docker_tier, network_posture, \
+           default_image, default_docker, default_memory, default_cpus FROM client_access_sandbox \
          WHERE tenant_id = $1 AND profile_id = $2",
     )
     .bind(tenant_id)
@@ -779,6 +892,7 @@ pub(crate) async fn create_default_profile(conn: &mut Scoped, tenant_id: Uuid) -
     .bind(tenant_id)
     .fetch_one(&mut *conn)
     .await?;
+    seed_sandbox(conn, tenant_id, profile_id).await?;
     seed_members(conn, tenant_id, profile_id).await.map(drop)
 }
 
@@ -819,6 +933,11 @@ mod tests {
                 vec!["b.lan:443".into()],
                 SandboxSettings { docker_tier: false, ..SandboxSettings::default() },
             ),
+            policy(
+                vec!["a.lan:443".into()],
+                vec!["b.lan:443".into()],
+                SandboxSettings { network: Posture::Open, ..SandboxSettings::default() },
+            ),
         ];
         for p in moved {
             assert_ne!(base.revision, p.revision, "{p:?}");
@@ -826,6 +945,28 @@ mod tests {
         // An entry moved from allow to block is a different policy.
         let swapped = policy(vec!["b.lan:443".into()], vec!["a.lan:443".into()], SandboxSettings::default());
         assert_ne!(base.revision, swapped.revision);
+    }
+
+    #[test]
+    fn the_revision_moves_with_every_field_of_the_default_image() {
+        let image = DefaultImage { image: "ubuntu:24.04".into(), docker: false, memory: None, cpus: None };
+        let with = |d: DefaultImage| {
+            policy(vec![], vec![], SandboxSettings { default_image: Some(d), ..SandboxSettings::default() }).revision
+        };
+        let none = policy(vec![], vec![], SandboxSettings::default()).revision;
+        let base = with(image.clone());
+        assert_ne!(none, base, "setting one");
+        let others = [
+            with(DefaultImage { image: "ubuntu:26.04".into(), ..image.clone() }),
+            with(DefaultImage { docker: true, ..image.clone() }),
+            with(DefaultImage { memory: Some("8g".into()), ..image.clone() }),
+            with(DefaultImage { cpus: Some(2.0), ..image.clone() }),
+            with(DefaultImage { cpus: Some(4.0), ..image.clone() }),
+        ];
+        for (i, other) in others.iter().enumerate() {
+            assert_ne!(&base, other, "field {i}");
+        }
+        assert_eq!(base, with(image), "the same default, the same revision");
     }
 
     #[test]

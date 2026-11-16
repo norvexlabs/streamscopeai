@@ -44,6 +44,11 @@ pub const WITHHELD_NOTICE: &str = "\n[Part of a tool call's arguments arrived af
 /// named: no protocol's call can go without a name.
 pub const NAMELESS_CALL_NOTICE: &str = "\n[A tool call arrived without a name, and was not delivered.]\n";
 
+/// The notice a client of another protocol is given in place of the calls of
+/// a Responses turn that ended `failed` or `cancelled`: a turn that did not
+/// complete is no call to run.
+pub const FAILED_TURN_NOTICE: &str = "\n[The model's turn did not complete; its tool calls were not delivered.]\n";
+
 /// Why a client's emitter did not give it a call's bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Withheld {
@@ -54,6 +59,9 @@ pub enum Withheld {
     NotCarried(crate::api::domain::ClientBuiltin),
     /// A call the stream never named: the client is told in its place.
     Nameless,
+    /// A call of a Responses turn that ended `failed` or `cancelled`
+    /// ([`FAILED_TURN_NOTICE`]).
+    FailedTurn,
 }
 
 impl Withheld {
@@ -65,6 +73,7 @@ impl Withheld {
             Self::Late => WITHHELD_NOTICE,
             Self::NotCarried(builtin) => builtin.not_carried_notice(),
             Self::Nameless => NAMELESS_CALL_NOTICE,
+            Self::FailedTurn => FAILED_TURN_NOTICE,
         }
     }
 }
@@ -180,6 +189,22 @@ pub struct TransformState {
     /// sits ([`crate::proxy::content::other_answers_text`]) — read by the
     /// response PII scan beside the first, which `accumulated_text` holds.
     pub other_answers: Vec<(String, String)>,
+    /// The sources the answer's text cites (an Anthropic answer's `citations`),
+    /// each as the upstream wrote it, where the client is sent them (its own
+    /// protocol): streamed, read frame by frame
+    /// ([`crate::api::sse::StreamParser::take_citations`]); whole,
+    /// [`crate::proxy::content::answer_citations`]. Recorded on the turn and
+    /// read by the response PII scan ([`Self::response_pii_inputs`]).
+    pub answer_citations: Vec<serde_json::Value>,
+    /// The answer cited a source, whether or not the client was sent it: what
+    /// a stored answer, text and reasoning alone, could not replay.
+    pub answer_cited: bool,
+    /// The answer is the model's refusal (a Chat message's `refusal`, a
+    /// Responses `refusal` part), its text the answer's: streamed,
+    /// [`crate::api::sse::StreamParser::refused`]; whole,
+    /// [`crate::proxy::content::answer_refused`]. Recorded on the turn; a
+    /// stored answer would replay it as ordinary text.
+    pub answer_refused: bool,
     /// Accumulated reasoning/thinking content from streaming ReasoningDelta events.
     pub accumulated_reasoning: String,
     /// Accumulated tool calls reassembled from streaming ToolCallDelta events.
@@ -265,6 +290,9 @@ impl TransformState {
             response_guardrail_steps: Vec::new(),
             response_intercepted_tool_calls: Vec::new(),
             other_answers: Vec::new(),
+            answer_citations: Vec::new(),
+            answer_cited: false,
+            answer_refused: false,
             original_response_content: None,
             original_response_tool_calls: None,
             image_generation_count: 0,
@@ -380,12 +408,30 @@ impl TransformState {
         }
     }
 
+    /// The record that call `call` (a stream's call number), of a Responses
+    /// turn that ended `failed` or `cancelled`, was not carried to a client of
+    /// another protocol.
+    pub fn failed_turn_not_carried(call: usize) -> crate::proxy::content::InjectionBlock {
+        crate::proxy::content::InjectionBlock {
+            transform: Self::NOT_CARRIED.to_string(),
+            scope: "tool_use".to_string(),
+            field: "tool_call".to_string(),
+            action: "remove".to_string(),
+            content: if call == DomainEvent::NO_CALL {
+                "a call of a turn that did not complete was not carried to this client".to_string()
+            } else {
+                format!("tool call {call}: a call of a turn that did not complete was not carried to this client")
+            },
+        }
+    }
+
     /// Record what a client's emitter withheld of call `call`, and why.
     pub fn record_withheld(&mut self, call: usize, why: Withheld) {
         match why {
             Withheld::Late => self.record_arguments_withheld(call),
             Withheld::NotCarried(builtin) => self.record_injection_block(Self::not_carried(call, builtin)),
             Withheld::Nameless => self.record_injection_block(Self::nameless_not_carried(call)),
+            Withheld::FailedTurn => self.record_injection_block(Self::failed_turn_not_carried(call)),
         }
     }
 
@@ -415,17 +461,7 @@ impl TransformState {
         let event = event.as_tool_call_delta();
         match event.as_ref() {
             DomainEvent::FreeformCallEnd { .. } => {}
-            DomainEvent::TextDelta(text) => {
-                if self.first_token_at.is_none() {
-                    self.first_token_at = Some(std::time::Instant::now());
-                }
-                if self.accumulated_text.len() < MAX_ACCUMULATED_TEXT_BYTES {
-                    self.accumulated_text.push_str(text);
-                    if self.accumulated_text.len() >= MAX_ACCUMULATED_TEXT_BYTES {
-                        self.accumulated_text.push_str(ACCUMULATOR_TRUNCATED_MARKER);
-                    }
-                }
-            }
+            DomainEvent::TextDelta(text) => self.accumulate_text(text),
             DomainEvent::ReasoningDelta(text) => {
                 if self.first_token_at.is_none() {
                     self.first_token_at = Some(std::time::Instant::now());
@@ -556,13 +592,43 @@ impl TransformState {
         }
     }
 
+    /// Add a piece of the answer's text to the record: the first marks the
+    /// first token, and the record keeps at most `MAX_ACCUMULATED_TEXT_BYTES`,
+    /// marked where it was cut. Every piece of text goes through here — a
+    /// `TextDelta`, and a Chat refusal, which no event carries
+    /// ([`crate::api::sse::StreamParser::take_refusal`]).
+    pub fn accumulate_text(&mut self, text: &str) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(std::time::Instant::now());
+        }
+        if self.accumulated_text.len() < MAX_ACCUMULATED_TEXT_BYTES {
+            self.accumulated_text.push_str(text);
+            if self.accumulated_text.len() >= MAX_ACCUMULATED_TEXT_BYTES {
+                self.accumulated_text.push_str(ACCUMULATOR_TRUNCATED_MARKER);
+            }
+        }
+    }
+
     /// What the response PII scan reads: the answer, then a whole answer's
-    /// other choices, each named by where it sits; none that is blank. The
-    /// one list both the row's scan (`finalize_audit`) and `/v1/analyze`'s
-    /// verdict read.
+    /// other choices, each named by where it sits, then the title and quote of
+    /// each source the answer cites (`citations[n].title`, `citations[n]`, the whole-answer mask's
+    /// reach: [`crate::pipeline::response_blocks::redact_pii_in_response_json`]);
+    /// none that is blank. The one list both the row's scan (`finalize_audit`)
+    /// and `/v1/analyze`'s verdict read.
     pub fn response_pii_inputs(&self) -> Vec<crate::guardrail::GuardrailInput> {
+        // Every member the whole-answer mask masks, each its own input.
+        let quotes = self.answer_citations.iter().enumerate().flat_map(|(n, citation)| {
+            let source = crate::audit::cited_source(citation);
+            crate::audit::CITATION_TITLE_KEYS
+                .into_iter()
+                .filter_map(move |key| {
+                    source.get(key).and_then(serde_json::Value::as_str).map(|t| (format!("citations[{n}].{key}"), t.to_string()))
+                })
+                .chain(source.get("cited_text").and_then(serde_json::Value::as_str).map(|q| (format!("citations[{n}]"), q.to_string())))
+        });
         std::iter::once((String::new(), self.full_response_content()))
             .chain(self.other_answers.iter().cloned())
+            .chain(quotes)
             .filter(|(_, text)| !text.trim().is_empty())
             .map(|(target, classifiable)| crate::guardrail::GuardrailInput {
                 id: "response".to_string(),
@@ -682,6 +748,31 @@ impl TransformState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The response scan reads each cited source's quote apart, named by its
+    /// place — where the whole-answer mask reaches it — and no quote that is
+    /// absent or blank.
+    #[test]
+    fn the_response_scan_reads_each_cited_sources_quote() {
+        let mut state = TransformState::new(crate::api::sse::ApiVersion::AnthropicMessages);
+        state.accumulated_text = "per the record".to_string();
+        state.answer_citations = vec![
+            serde_json::json!({"type": "char_location", "cited_text": "ssn 123-45-6789"}),
+            serde_json::json!({"type": "char_location", "cited_text": "  "}),
+            serde_json::json!({"type": "web_search_result_location", "url": "https://x.example"}),
+            serde_json::json!({"type": "web_search_result_location", "cited_text": "page", "title": "Jane's page"}),
+        ];
+        let read: Vec<(String, String)> = state.response_pii_inputs().into_iter().map(|i| (i.target, i.classifiable)).collect();
+        assert_eq!(
+            read,
+            [
+                (String::new(), "per the record".to_string()),
+                ("citations[0]".to_string(), "ssn 123-45-6789".to_string()),
+                ("citations[3].title".to_string(), "Jane's page".to_string()),
+                ("citations[3]".to_string(), "page".to_string()),
+            ]
+        );
+    }
 
     /// A call whose late arguments were withheld and which then goes missing
     /// for having no name is told both — once each, the second in the call's

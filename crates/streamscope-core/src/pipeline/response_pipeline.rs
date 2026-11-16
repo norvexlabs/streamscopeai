@@ -1029,6 +1029,9 @@ pub struct ResponsePipeline {
     /// What the response side needs to know about the client's own tools
     /// (`ClientToolFacts::of`), resolved like `wants_structured_output`.
     pub client_tools: crate::api::domain_request::ClientToolFacts,
+    /// Whether a Chat client asked for the stream's usage
+    /// ([`ApiRequest::chat_usage_asked`], read before the request phase).
+    pub chat_usage_asked: bool,
     // Passthrough-only
     pub debug_echo: Option<String>,
     /// Original `ApiRequest`. Required (when intercept bindings are active) by
@@ -1155,7 +1158,8 @@ impl ResponsePipeline {
             self.meta.estimated_input_tokens,
             self.max_output_tokens,
         )
-        .with_client_tools(&self.client_tools);
+        .with_client_tools(&self.client_tools)
+        .with_chat_usage(self.chat_usage_asked);
 
         // JSON healing flags — resolved before `self.debug_echo` is moved out
         // below (a partial move blocks the `&self` method call afterwards).
@@ -1403,6 +1407,23 @@ impl ResponsePipeline {
 
                                 // Parse upstream SSE into domain events
                                 let mut domain_events = stream_parser.parse(&event);
+                                // The sources the answer cites, kept as each
+                                // frame is read — where the client is sent
+                                // them; a translated one is told they were not
+                                // carried (`unread_parts`, below).
+                                let cited = stream_parser.take_citations();
+                                local_state.answer_cited |= !cited.is_empty();
+                                if client_api_version == upstream_api_version {
+                                    local_state.answer_citations.extend(cited);
+                                }
+                                // A Chat refusal's text, which no event
+                                // carries, is the answer's; a translated
+                                // client is told it was not carried.
+                                local_state.answer_refused |= stream_parser.refused();
+                                let refusal = stream_parser.take_refusal();
+                                if !refusal.is_empty() {
+                                    local_state.accumulate_text(&refusal);
+                                }
                                 // A pass-through client reads the frame: it is
                                 // given the ids the parser gave its Gemini
                                 // calls, as every other reader is.
@@ -4314,7 +4335,18 @@ impl ResponsePipeline {
             // Passthrough — use (possibly healed/normalized) JSON as-is
             response_json
         } else {
-            record_builtins_not_carried(&response_json, self.upstream_api_version, &mut transform_state);
+            record_calls_not_carried(&response_json, self.upstream_api_version, &mut transform_state);
+            // The sources an Anthropic answer cites have no channel on the
+            // client's protocol, as on a stream ([`StreamParser::unread_parts`]):
+            // named, and neither recorded nor scanned as the client's.
+            if transform_state.answer_cited {
+                transform_state.badges.add_not_carried(crate::api::chat::answer_parts_not_carried(["citation"]));
+            }
+            // A Chat refusal is no content the translation reads, as on a
+            // stream (the Chat parser makes it no event).
+            if transform_state.answer_refused && self.upstream_api_version == ApiVersion::ChatCompletions {
+                transform_state.badges.add_not_carried(crate::api::chat::answer_parts_not_carried(["refusal"]));
+            }
             translate_non_streaming(
                 &response_json,
                 self.client_api_version,
@@ -4516,6 +4548,21 @@ impl EventEmitter {
                 Self::Gemini(translate::GeminiResponseBuilder::new(model.to_string()))
             }
         }
+    }
+
+    /// Tell a Chat stream whether its client asked for usage
+    /// (`stream_options.include_usage`, read before the gateway asks the
+    /// upstream for it): a client that did not is sent neither the usage chunk
+    /// nor a `usage` member on any other, as the spec has it.
+    pub fn with_chat_usage(mut self, asked: bool) -> Self {
+        match &mut self {
+            Self::Passthrough { api_version: ApiVersion::ChatCompletions, position, .. } => {
+                position.chat_usage_withheld = !asked;
+            }
+            Self::ChatCompletions(builder) => builder.withhold_usage(!asked),
+            _ => {}
+        }
+        self
     }
 
     /// Tell a translated leg what it needs to know about the client's own
@@ -5628,6 +5675,9 @@ pub struct CachedServe {
     pub context_window: Option<i32>,
     pub client_context_window: Option<i32>,
     pub max_output_tokens: u32,
+    /// Whether a Chat client asked for the stream's usage — see
+    /// [`ResponsePipeline::chat_usage_asked`].
+    pub chat_usage_asked: bool,
 }
 
 /// Serve a request entirely from the response cache — no upstream call.
@@ -5660,6 +5710,7 @@ pub async fn serve_cached_response(
         context_window,
         client_context_window,
         max_output_tokens,
+        chat_usage_asked,
     } = serve;
     let request_id = meta.request_id;
     let is_streaming = meta.is_streaming;
@@ -5735,7 +5786,8 @@ pub async fn serve_cached_response(
             client_context_window,
             meta.estimated_input_tokens,
             max_output_tokens,
-        );
+        )
+        .with_chat_usage(chat_usage_asked);
         let mut chunks: Vec<Bytes> = Vec::new();
         for event in cached_events(&entry) {
             chunks.extend(emitter.process_streaming_event(&event, None));
@@ -5760,6 +5812,10 @@ pub async fn serve_cached_response(
         let body = if entry.protocol == client_api_version {
             entry.body.clone()
         } else {
+            // What the translation withholds is recorded, as on the proxied
+            // answer (a hit records no call list, so a record names no call
+            // number).
+            record_calls_not_carried(&entry.body, entry.protocol, &mut ts);
             translate_non_streaming(
                 &entry.body,
                 client_api_version,
@@ -5985,6 +6041,12 @@ pub fn cache_store_payload(
     // holding anything else must not be reduced to that on replay.
     if !ts.accumulated_tool_calls.is_empty() {
         return Err("tool_calls");
+    }
+    if ts.answer_cited {
+        return Err("citations");
+    }
+    if ts.answer_refused {
+        return Err("refusal");
     }
     if ts.image_generation_count > 0 {
         return Err("generated_media");
@@ -6449,6 +6511,15 @@ fn extract_response_content_for_audit(
         transform_state.accumulated_text = text;
     }
     transform_state.other_answers = crate::proxy::content::other_answers_text(response_json, upstream_version);
+    // The sources the answer cites: noted always, recorded only where the
+    // client — `transform_state.api_version` — is sent them, as a stream reads
+    // them.
+    let cited = crate::proxy::content::answer_citations(response_json, upstream_version);
+    transform_state.answer_cited = !cited.is_empty();
+    if transform_state.api_version == upstream_version {
+        transform_state.answer_citations = cited;
+    }
+    transform_state.answer_refused = crate::proxy::content::answer_refused(response_json, upstream_version);
     // A Chat answer's calls as the record keeps them; the other protocols'
     // are captured by `extract_upstream_response`.
     if upstream_version == ApiVersion::ChatCompletions
@@ -6459,25 +6530,32 @@ fn extract_response_content_for_audit(
     }
 }
 
-/// Record on the audit row each call to a Responses built-in tool in an answer
-/// translated for a client of another protocol, which is told in its place
-/// that it was not carried — under the number the row records that call by
-/// (matched by its id), so the record names the call it is about.
-pub(crate) fn record_builtins_not_carried(response_json: &serde_json::Value, upstream_version: ApiVersion, state: &mut TransformState) {
+/// Record on the audit row each call of a Responses answer translated for a
+/// client of another protocol that the client is told in its place was not
+/// carried — a call to a Responses built-in tool, and every function or custom
+/// call of a turn that ended `failed` or `cancelled`
+/// ([`translate::responses_turn_failed`]) — under the number the row records
+/// that call by (matched by its id), so the record names the call it is about.
+pub(crate) fn record_calls_not_carried(response_json: &serde_json::Value, upstream_version: ApiVersion, state: &mut TransformState) {
     if upstream_version != ApiVersion::Responses {
         return;
     }
+    let failed = translate::responses_turn_failed(response_json);
     let output = response_json.get("output").and_then(|o| o.as_array()).into_iter().flatten();
     for item in output {
-        let Some(builtin) = crate::api::domain::ClientBuiltin::of_item(item) else {
-            continue;
+        let why = match crate::api::domain::ClientBuiltin::of_item(item) {
+            Some(builtin) => crate::pipeline::response::Withheld::NotCarried(builtin),
+            None if failed && matches!(item.get("type").and_then(|t| t.as_str()), Some("function_call" | "custom_tool_call")) => {
+                crate::pipeline::response::Withheld::FailedTurn
+            }
+            None => continue,
         };
         // An id the item does not state names no recorded call.
         let id = crate::api::domain::tool_call_item(item).and_then(|call| call.call_id).filter(|id| !id.is_empty());
         let number = id
             .and_then(|id| state.accumulated_tool_calls.iter().find(|call| !call.server_tool && call.id == id))
             .map_or(DomainEvent::NO_CALL, |call| call.index);
-        state.record_withheld(number, crate::pipeline::response::Withheld::NotCarried(builtin));
+        state.record_withheld(number, why);
     }
 }
 
@@ -7209,6 +7287,10 @@ pub struct PassthroughPosition {
     /// forwarded or written — save a Chat stream's `[DONE]`, which ends a Chat
     /// stream after its error chunk as the Chat builder's does.
     ended_by_error: bool,
+    /// Chat Completions: the client did not ask for usage
+    /// (`stream_options.include_usage`), which the gateway asks the upstream
+    /// for on its own account — see [`chat_usage_admit`].
+    chat_usage_withheld: bool,
     /// The calls whose later arguments the client was not sent — a custom
     /// call's text after its end, arguments of no call: told once per call.
     withheld: crate::pipeline::response::WithheldCalls,
@@ -7438,7 +7520,7 @@ impl PassthroughPosition {
             }
             // What a Chat chunk tells a chunk the gateway writes is read by
             // `observe_chat` on the path that can write one.
-            ApiVersion::ChatCompletions => Admit::Send,
+            ApiVersion::ChatCompletions => chat_usage_admit(self.chat_usage_withheld, event),
             ApiVersion::GoogleGemini => self.admit_gemini(event),
         }
     }
@@ -7875,12 +7957,12 @@ impl PassthroughPosition {
                     return false;
                 }
                 "response.content_part.added" => {
-                    let text = v.get("part").and_then(part_text).unwrap_or_default().to_string();
+                    let text = v.get("part").and_then(crate::api::responses::part_text).unwrap_or_default().to_string();
                     self.responses_text.insert((oi, Content, part_index(v, "content_index")), (text, false));
                     return false;
                 }
                 "response.reasoning_summary_part.added" => {
-                    let text = v.get("part").and_then(part_text).unwrap_or_default().to_string();
+                    let text = v.get("part").and_then(crate::api::responses::part_text).unwrap_or_default().to_string();
                     self.responses_text.insert((oi, Summary, part_index(v, "summary_index")), (text, false));
                     return false;
                 }
@@ -8171,9 +8253,41 @@ fn call_text_field(item: &serde_json::Value) -> Option<&'static str> {
     }
 }
 
-/// The text a Responses content part carries, whichever field holds it.
-fn part_text(part: &serde_json::Value) -> Option<&str> {
-    json_str(part, "text").or_else(|| json_str(part, "refusal"))
+/// A Chat chunk as a client that did not ask for usage is sent it: without a
+/// `usage` that carries counts, and not at all when that is all it carries —
+/// the usage chunk, whose `choices` is empty (or, from some servers, absent).
+/// A chunk with no `usage`, or a `null` one (what every other chunk carries
+/// once usage is asked for), passes untouched and unparsed — the check a
+/// forwarded frame pays is a scan; so does every chunk when the client asked.
+/// An empty-`choices` chunk carrying something else (an Azure
+/// `prompt_filter_results`) is no usage chunk.
+fn chat_usage_admit(withheld: bool, event: &SseEvent) -> Admit {
+    if !withheld || !carries_counted_usage(&event.data) {
+        return Admit::Send;
+    }
+    let Ok(mut chunk) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+        return Admit::Send;
+    };
+    let Some(object) = chunk.as_object_mut() else {
+        return Admit::Send;
+    };
+    if object.remove("usage").is_none_or(|usage| usage.is_null()) {
+        return Admit::Send;
+    }
+    if object.get("choices").is_none_or(|c| c.as_array().is_some_and(Vec::is_empty)) {
+        return Admit::Drop;
+    }
+    serde_json::to_string(&chunk).map_or(Admit::Send, Admit::Rewrite)
+}
+
+/// Whether a chunk's text names a `usage` member that may carry counts: one
+/// whose value is not `null`. A scan, not a parse — an occurrence it cannot
+/// rule out (the word quoted inside a string) is left to the parse.
+fn carries_counted_usage(data: &str) -> bool {
+    data.match_indices("\"usage\"").any(|(at, key)| {
+        let rest = data[at + key.len()..].trim_start();
+        !rest.strip_prefix(':').is_some_and(|value| value.trim_start().starts_with("null"))
+    })
 }
 
 /// Send one frame to a pass-through client, after [`PassthroughPosition`] has
@@ -8911,6 +9025,9 @@ pub fn assemble_audit_record(
     if healing_applied {
         all_badges.add_json_healed();
     }
+    if state.answer_refused {
+        all_badges.add_refusal();
+    }
     // Mirror the request-side rule: any response-side injection_block (script
     // rewrite, fail-closed suppression) emits the unified `Modified` chip.
     if !state.response_injection_blocks.is_empty() {
@@ -9169,6 +9286,7 @@ pub fn assemble_audit_record(
         } else {
             None
         },
+        response_citations: state.answer_citations.iter().filter_map(crate::audit::Citation::from_wire).collect(),
         response_tool_calls: if state.accumulated_tool_calls.is_empty() {
             None
         } else {
@@ -10120,6 +10238,7 @@ mod tests {
                 content: vec![DomainContentBlock::Text {
                     text: format!("user msg {i}"),
                     cache_control: None,
+                    citations: Vec::new(),
                 }],
             });
         }
@@ -10145,6 +10264,7 @@ mod tests {
                     content: vec![DomainContentBlock::Text {
                         text: format!("result {s} {r}"),
                         cache_control: None,
+                        citations: Vec::new(),
                     }],
                 });
             }
@@ -10733,6 +10853,7 @@ mod tests {
             content: vec![DomainContentBlock::Text {
                 text: "r".into(),
                 cache_control: None,
+                citations: Vec::new(),
             }],
         });
         // [User, A_a, A_b, T_b]
@@ -11138,6 +11259,66 @@ mod tests {
             },
         ] {
             out.extend(emitter.process_streaming_event(&event, None));
+        }
+    }
+
+    /// A Chat client is sent the stream's usage only when it asked for it
+    /// (`stream_options.include_usage`): the usage chunk (`choices: []`, or
+    /// none) is not sent, and no other chunk carries counts — on the
+    /// pass-through and on a translated leg alike. A chunk carrying usage
+    /// beside a choice keeps the choice; an empty-`choices` chunk carrying
+    /// something else (Azure's prompt filter results) is not usage.
+    #[test]
+    fn a_chat_client_that_did_not_ask_for_usage_is_sent_none() {
+        let chunk = |data: serde_json::Value| crate::api::sse::SseEvent { event_type: None, data: data.to_string(), id: None };
+        let frames = [
+            chunk(serde_json::json!({"id": "c1", "choices": [], "prompt_filter_results": [{"prompt_index": 0}]})),
+            chunk(serde_json::json!({"id": "c1", "choices": [{"index": 0, "delta": {"content": "Hi"}}], "usage": null})),
+            chunk(serde_json::json!({"id": "c1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})),
+            chunk(serde_json::json!({"id": "c1", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})),
+            chunk(serde_json::json!({"id": "c1", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})),
+        ];
+        for asked in [false, true] {
+            let mut emitter = super::EventEmitter::new(
+                super::ApiVersion::ChatCompletions, super::ApiVersion::ChatCompletions, "m", "req-1", None, None, 0, 0,
+            )
+            .with_chat_usage(asked);
+            let out: Vec<bytes::Bytes> = frames.iter().flat_map(|f| emitter.forward_frame(f)).collect();
+            let sent: Vec<serde_json::Value> = decode(&out).into_iter().map(|(_, d)| d).collect();
+            if asked {
+                let expected: Vec<serde_json::Value> = frames.iter().map(|f| serde_json::from_str(&f.data).unwrap()).collect();
+                assert_eq!(sent, expected, "positive control: a client that asked is sent every chunk as it came");
+                continue;
+            }
+            assert_eq!(sent.len(), 3, "a usage chunk, with empty or absent choices, is not sent: {sent:?}");
+            assert!(sent.iter().all(|c| c.get("usage").is_none_or(serde_json::Value::is_null)), "{sent:?}");
+            assert_eq!(sent[1]["usage"], serde_json::Value::Null, "a null usage is left as it came, unparsed");
+            assert_eq!(sent[0]["prompt_filter_results"][0]["prompt_index"], 0);
+            assert_eq!(sent[1]["choices"][0]["delta"]["content"], "Hi");
+            assert_eq!(sent[2]["choices"][0]["finish_reason"], "stop");
+        }
+
+        // A translated leg writes the usage chunk itself, only when asked.
+        for asked in [false, true] {
+            let mut emitter = super::EventEmitter::new(
+                super::ApiVersion::ChatCompletions, super::ApiVersion::AnthropicMessages, "m", "req-1", None, None, 0, 0,
+            )
+            .with_chat_usage(asked);
+            let mut out = Vec::new();
+            out.extend(emitter.process_streaming_event(&crate::api::domain::DomainEvent::TextDelta("Hi".to_string()), None));
+            out.extend(emitter.process_streaming_event(
+                &crate::api::domain::DomainEvent::Done { finish_reason: Some(crate::api::domain::FinishReason::Stop), native_finish_reason: None },
+                None,
+            ));
+            out.extend(emitter.process_streaming_event(
+                &crate::api::domain::DomainEvent::Usage(crate::api::domain::Usage { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2, ..Default::default() }),
+                None,
+            ));
+            out.extend(emitter.flush());
+            let text: String = out.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+            assert!(text.contains("[DONE]"), "the stream ends either way: {text}");
+            assert_eq!(text.contains("\"usage\""), asked, "{text}");
         }
     }
 
@@ -11916,5 +12097,16 @@ mod tests {
         assert_eq!(store(&answer(false, FinishReason::Length), &streamed, None), Err("incomplete_response"));
         // A body is read whole: the stream's end is not its question.
         assert_eq!(store(&answer(false, FinishReason::Stop), &whole, Some(&body)), Ok(()));
+        // An answer that cited a source — sent to the client or not — has
+        // more than text and reasoning to replay.
+        let mut cited = answer(true, FinishReason::Stop);
+        cited.answer_cited = true;
+        assert_eq!(store(&cited, &streamed, None), Err("citations"));
+        assert_eq!(store(&cited, &whole, Some(&body)), Err("citations"));
+        // A refusal replayed would reach the client as ordinary text.
+        let mut refused = answer(true, FinishReason::Stop);
+        refused.answer_refused = true;
+        assert_eq!(store(&refused, &streamed, None), Err("refusal"));
+        assert_eq!(store(&refused, &whole, Some(&body)), Err("refusal"));
     }
 }

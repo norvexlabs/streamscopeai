@@ -141,8 +141,8 @@ while condition { ... }
 | Field | Type | Writable | Example |
 |-------|------|----------|---------|
 | `ctx.system_prompt` | String or `()` | Yes | `ctx.system_prompt = "Be safe.\n" + ctx.system_prompt;` |
-| `ctx.messages` | Array of maps | Yes | Each: `#{role: "user", content: "text", tool_call_id: (), tool_calls: []}` — the conversation only; the system prompt is `ctx.system_prompt` on every protocol |
-| `msg.tool_calls` | Array of maps | Yes (assistant) | Each: `#{id: "call_1", name: "search", arguments_json: "{\"q\":\"...\"}"}`; filter it to drop a call, rewrite `arguments_json` (raw JSON string) to change one |
+| `ctx.messages` | Array of maps | Yes | Each: `#{role: "user", content: "text", tool_call_id: (), tool_calls: [], origin: 0}` — the conversation only; the system prompt is `ctx.system_prompt` on every protocol. `origin` says which message of the request it is: keep or move the map itself (never rebuild it) and it is written back over that message, keeping what the script cannot see (images, signatures); a map you build (no `origin`) is a new message, so edit a message's fields on its own map (`m.content = …`) rather than rebuilding it |
+| `msg.tool_calls` | Array of maps | Yes (assistant) | Each: `#{id: "call_1", name: "search", arguments_json: "{\"q\":\"...\"}"}`; filter it to drop a call, rewrite `arguments_json` (raw JSON string) to change one (on the Responses API a turn whose calls are separate items takes argument edits only) |
 | `ctx.tools` | Array of maps | Yes | Each: `#{name: "Bash", description: "...", parameters_json: "..."}`; a provider-hosted tool (no function name) also carries `kind` (its type, e.g. `"web_search"`) and `config_json` (its configuration) |
 | `ctx.model` | String | Yes | `ctx.model = "gpt-4o-mini";` |
 | `ctx.user_id` | String | Read-only | |

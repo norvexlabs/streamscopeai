@@ -5,6 +5,268 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.54]
+
+- **An OpenAI client is answered as the Chat Completions and Responses APIs define it.** A streaming
+  Chat client that did not ask for usage (`stream_options.include_usage`) is no longer sent the extra
+  usage chunk, whose empty `choices` broke clients reading the first choice of every chunk; one that
+  asked still gets it. The rest of a client's `stream_options` (`include_obfuscation`) now reaches the
+  upstream. A negative `seed` is accepted. `temperature`, `top_p` and the penalties reach the upstream
+  exactly as written on every path, never as `0.699999988`. An upstream's output limit now also caps
+  `max_completion_tokens`, not only the older `max_tokens`. A Responses request that names no
+  `model` or no `input` — one relying on a stored prompt or conversation — is refused with an error
+  saying why, instead of a parse error.
+- **Newer request settings are carried or named on a translation.** A reasoning effort of `xhigh` or
+  `max` is sent to another protocol as `high`, which every reasoning model accepts, and the audit row
+  now says so. A file's `detail` reaches a Responses upstream and is named where it is lost. The newest
+  Responses input items (`program`, `program_output`, `compaction_trigger`) are recognised and named on
+  a translation rather than read as unknown. A Responses refusal now reaches a client of another
+  protocol as text instead of an empty answer.
+- **Sessions and the audit show what an OpenAI answer cites, and when the model refused.** An answer's
+  annotations — a Responses answer's web pages and files, streamed or not, a Chat answer's web pages —
+  are recorded and shown in the **Sources** list, as are those of an answer sent back in a
+  conversation's history; a response PII guardrail reads and masks their titles, a response script that
+  rewrites the text drops the annotations pointing into it, and such an answer is not stored in the
+  response cache. An answer that is the model's refusal is recorded with the refusal as its text (a Chat
+  refusal was recorded as an empty answer) and badged **Refusal**; it is not stored in the response cache,
+  and a response PII guardrail now masks it. In a conversation's history, a program the model ran and its
+  output show as a tool call and its result, a compaction request as a compaction, and a file the
+  detail it was sent with.
+- The database image takes the current rebuild of the official PostgreSQL 18.7 Alpine 3.24 image, with
+  its latest OS package updates.
+
+## [2026.11.53]
+
+- **An Anthropic request reaches Anthropic with every block member the Messages API defines.** Forwarded
+  to an Anthropic upstream, a request lost a text block's `citations` (in a message, a tool result or
+  the system prompt), a tool call's `caller` and `toolset_name`, and a tool result document's `title`,
+  `context` and `citations` settings — so a conversation's web-search and document citations, and a
+  programmatic tool call's link to the code that made it, were gone on the next turn. They now travel
+  as sent. A translated request names each one it cannot carry on the audit row. The inbound guardrail
+  screens a tool result document's name and context like a message's. Any rewrite of a text — by the
+  guardrail, a script or a tool-policy redaction — drops that text's citations. A document name sent
+  to Anthropic is kept within the 500 characters it accepts, and an empty one is left out, instead of
+  failing the request. A notice the gateway adds to the system prompt goes beside the client's own
+  blocks, which keep their cache breakpoints.
+- **Sessions and the audit show what an answer cites.** A message that cites sources — an Anthropic
+  answer's web-search or document citations, streamed or not, or such an answer sent back in a
+  conversation's history — carries a collapsed **Sources** list with each source's title or link, where
+  the quote is, and the quote; a document shows the context sent beside it. A response PII guardrail
+  now reads each quoted source too, and masks it in an answer that is not streamed; a response script
+  that rewrites an answer's text drops the citations quoting it. Such an answer is not stored in the response
+  cache. A request translated for another
+  protocol names the citations its client was not sent.
+
+## [2026.11.52]
+
+- **Git works in a submodule under the Windows sandbox.** A commit or any other git command inside a
+  submodule's folder failed with "dubious ownership"; with Git for Windows 2.46 or later, every
+  repository in the project is now trusted for the run.
+- **`ssai restore` keeps a gateway key out of git.** A restored file holding a gateway key the CLI
+  recorded is checked like a provisioned one: refused when git tracks it, kept out of commits when it is untracked. Refusing a
+  tracked file your clone marks `skip-worktree` or `assume-unchanged` now says so — git does not promise
+  that either mark keeps a change out of a commit.
+
+## [2026.11.51]
+
+- **On macOS, a sandboxed tool can write to `/dev/null`.** Under `ssai run`, every write to `/dev/null`,
+  `/dev/zero`, `/dev/tty`, `/dev/stdout`, `/dev/stderr` or `/dev/fd/<n>` was refused, so `git commit`
+  failed and every `2>/dev/null` in an agent's shell command failed the command instead of hiding its
+  errors. Those devices are now writable; nothing else under `/dev` is.
+- **`ssai provision` and `ssai status` read every OpenCode 2 setting that takes it off the gateway.**
+  They now name an agent a Markdown file pins to another provider, a config loaded after the gateway's
+  that sets the default `model` elsewhere (every agent without a model of its own runs there — a
+  repository's root `opencode.json` does this under `ssai run`), and a deny in OpenCode's top-level
+  `policies`. A project config kept in a folder other than `.opencode` is judged the way `ssai run`
+  launches it, and `status` run from a shell inside that project's `ssai run` judges plain `opencode`
+  from your own config folder. `ssai run opencode` now prints the same warnings as it starts, judged from the folder
+  you start it in — so a config there that a global provisioning's `status` cannot see is named too.
+  Under `--sandbox docker`, whose home your machine does not read, the run checks the OpenCode configs it
+  loads inside the container, with the agent's own permissions.
+- **A global OpenCode provisioning lifts a deny of every provider in OpenCode's top-level `policies`.**
+  Its provider rules — the gateway's allow and the deny of OpenCode's own hosted provider — now go in
+  that list as well as in `experimental.policies`, so a `deny` on `*` there no longer hides the gateway
+  from plain `opencode`.
+
+## [2026.11.50]
+
+- **An MCP notification subscription answers for each server on its own.** When a client opens a
+  `subscriptions/listen` stream, the gateway's acknowledgement answers for each route separately, so two
+  routes to one server no longer vouch for each other's resources, and once a server's own stream has
+  acknowledged what it agreed to deliver, later subscriptions leave out what it declined. A server's own acknowledgement no longer reaches other
+  subscribers as a stray notification.
+- **The CLI keeps your keys and sign-in tokens out of every git commit.** When your home directory is a
+  git repository, `ssai login`, `provision` and `sync` add the CLI's own settings folder and each tool
+  config they write your key into to that repository's `.git/info/exclude` (read by your clone alone)
+  and say so; any command refreshing your sign-in does the same. They refuse — before signing in or
+  asking for a key — when git already tracks one of those files, when a rule in that repository's
+  `.gitignore` brings them back, or when a git repository is above it but git cannot answer for it (git
+  not installed, a broken repository). A `--dry-run` or `--print` in a project now keeps its
+  `.streamscopeai` folder git-ignored too.
+
+## [2026.11.49]
+
+- **A Responses client's prompt-cache breakpoints reach an Anthropic model.** A `prompt_cache_breakpoint`
+  on a message part or a tool result's part is sent to an Anthropic upstream as a cache breakpoint at
+  the same place, of Anthropic's default lifetime, the latest four of them; earlier ones and a lifetime
+  the client stated are named on the request's translation badge. A cache breakpoint a target has no place for — any breakpoint sent
+  to Chat Completions, Gemini or Responses from another protocol — is now named there too, instead of
+  being left out silently. Moving a breakpoint from one turn to the next no longer splits a Responses
+  session.
+- **A Gemini prompt written beside an image in the same part reaches the model.** The text is sent as a
+  part of its own, read by inbound screening and shown in the audit like any prompt.
+- **A Gemini client's text sent with a tool's result reaches another protocol's model.** Text in the
+  same turn as a function response is now sent after the result, where it came before it and an
+  Anthropic or Chat Completions model refused the request.
+- **A Responses turn that failed or was cancelled no longer hands its tool calls to a client of
+  another protocol.** A Chat Completions, Anthropic or Gemini client receiving such a turn,
+  non-streamed, gets its text and a notice in place of the calls, with a stop that claims no tool call,
+  and the audit row records each call as not carried.
+
+## [2026.11.48]
+
+- **Inbound screening reads a Gemini conversation's tool results.** A code execution result's output and a
+  built-in tool's response that a client sends back in its history are now screened like the results of
+  other tools the server ran. An enforce edit replaces only that text: the code, the call and what pairs
+  the result with it stay as sent.
+
+## [2026.11.47]
+
+- **The portal explains how the sandbox works.** Under the Quickstart's run step, a short expandable
+  reference lists the run modes (the default sandbox, `--sandbox docker`, `--sandbox off`), what a run
+  can reach and what to do when something is blocked, the commands that keep a container up to date,
+  and the other options. The step's own line no longer says every run uses the native sandbox.
+- **`ssai sandbox status` lists only projects that still exist.** A project whose folder was deleted is
+  no longer listed; the images and volumes the sandbox made for it show under "Not used by a project".
+
+## [2026.11.46]
+
+- **The experts read text written in a framework's tag form.** A block shaped like context a client
+  injects (`<system-reminder>`, a slash-command echo) is shown to the experts in a section of its own,
+  each distinct block once per session, so instructions written in that form no longer go unread by
+  them, in a share of what they read set aside for it.
+- **A request script's message edits keep everything the script does not see.** Each message a script
+  is given now carries `origin`, the message of the request it is, and is written back over that
+  message: an edit keeps the message's images, its `name`, thinking blocks, the calls' signatures and
+  every item around it as sent. A script that drops, adds, moves or copies messages keeps every turn
+  whose messages it kept together, edited in place; a turn it split or partly dropped is rebuilt from
+  what it wrote, shown as **Not applied** on the request where that lost something the script cannot
+  see. A map the script builds itself is a new message. The seeded compression script now keeps the
+  last user message's images. On the OpenAI Responses API, an edit is now applied, and reasoning and
+  shell items are kept. On Gemini, a call the client sent without an id is never written back with one.
+
+## [2026.11.45]
+
+- **A default container image per Portal & clients profile.** With **Allow the container sandbox** on,
+  the profile's Sandbox section sets the image `ssai run --sandbox docker` uses in a project that has no
+  `.streamscopeai/sandbox.json` of its own, with its Docker engine switch and its memory and CPU limits.
+  A project's own file still replaces it whole; without either, the run is refused as before. The
+  sandbox adds the tool to the image itself, as for any image.
+- **The container sandbox's disk use is visible and freed per project.** `ssai sandbox status` lists
+  each project's image, tool layers and volumes with their sizes, what no project uses any more, and
+  what a prune would free; `ssai sandbox prune --project` removes one project's — the registry image
+  the sandbox pulled for it included — and `ssai sandbox prune` everything the sandbox made. An image
+  you had before, or named yourself, is never removed.
+- **Editing a lifecycle command no longer rebuilds a dev container image with features.** The Dev
+  Container CLI now builds it from what the build reads (the image or Dockerfile, the features, their
+  order and lockfile, the users), so a changed `postStartCommand`, `postCreateCommand` or variable runs at
+  the next run with no `ssai sandbox prepare`, and `initializeCommand` beside features is noted instead of
+  refused.
+
+## [2026.11.44]
+
+- **The container sandbox's Docker engine just works.** With `"docker": true`, plain `docker run`,
+  `docker build`, compose, Testcontainers and kind reach what the sandbox allows, with no proxy
+  setting: every connection made in the container, the engine's own containers and builds
+  included, is taken to the sandbox's guard by name, and what it refuses is named after the run.
+  An image without Docker Engine (such as `mcr.microsoft.com/devcontainers/javascript-node:22`) gets
+  one from its own distribution instead of failing to start `dockerd`.
+- **The container sandbox no longer needs Node.js in the image**: the tools it installs run on a
+  pinned Node.js runtime of the sandbox's own, verified against its published checksum, which
+  leaves the image's own `node` to the project.
+- **The sandbox's network has three settings**, on a Portal & clients profile's Sandbox section:
+  **Internet** (every destination a blocked list does not name), **Allowed lists only** (what an
+  allowed list names, as before) and **Gateway only**. A new organization's Default, and a profile
+  created fresh, start on **Internet** with a new seeded **Internal networks** list blocked — the
+  private, shared, loopback and link-local address ranges stay out of reach; existing profiles
+  keep **Allowed lists only**.
+  A developer can narrow a run to the gateway alone with `ssai run --network gateway` (for the
+  container sandbox also `"network": "gateway"` in the project's `sandbox.json`), and the run's
+  banner names the setting.
+- The database image moves to PostgreSQL 18.7 (the official Alpine 3.24 build; CloudNativePG's 18.7 image on
+  Kubernetes), carrying the zlib, Kerberos and libxslt security fixes.
+- **Fixed: on PostgreSQL 18.7, configuration changes could take seconds to reach the gateways** — an external
+  database that had moved to 18.7 matched each model to its catalog entry by reading the organization's whole
+  model catalog, once per route. The request log also finds each request's session directly now, instead of
+  comparing against every session of the organization.
+
+## [2026.11.43]
+
+- **Fixed: a session's system prompt could be shown cut short**, in the console and the portal:
+  a prompt that mentions a framework tag in its own text — Claude Code's describes its
+  `<system-reminder>` blocks — ended at that mention, and the session's analysis read the same
+  shortened prompt. The system prompt is now shown, and analysed, exactly as sent. Elsewhere a
+  framework block is only a tag that begins a line, through its closing tag, so a message that
+  mentions such a tag is shown as written. A request's detail view now shows these block cards
+  too, and their names are translated in the portal. A user message starting `[SYSTEM` or
+  `[SUGGESTION MODE` is shown as the message it is. A conversation in progress across the upgrade
+  may continue as a new session when its messages mention such a tag, start with an unclosed one,
+  or carry one inside a line.
+- **BREAKING: a session conversation's `framework_reminder` event names its block with a code**
+  (`system_reminder`, `deferred_tools`, `local_command`, `command`, `session_context`) instead of
+  a display name ("System Reminder", …), on the console, portal and request-detail APIs.
+- **Fixed: inbound PII screening missed what a user wrote after mentioning a framework tag**
+  ("why does `<system-reminder>` show up? …"); the rest of the message is screened again.
+
+## [2026.11.42]
+
+- **BREAKING: a workspace's OIDC auto-membership pattern matches a whole group name.** `IT` now
+  joins members of `IT` alone, no longer of `IT-Admins` or `SECURITY`: write `IT.*` for "starts
+  with" or `.*IT.*` for "contains". A pattern anchored on one side only now matches whole too
+  (`^eng-` matches `eng-` alone: write `eng-.*`), and a provider that sends several groups as one
+  string no longer matches part of it. Memberships already granted are kept. A stored pattern
+  that begins with an embedded option such as `(?i)` now joins nobody: rewrite it (`[Rr][Dd]` for
+  `(?i)rd`). Saving a rule refuses a pattern that is not a valid regular expression, a blank
+  value, and a claim name without a pattern or the reverse (a rule is cleared with `null`); the
+  workspace page lists example patterns.
+- **Fixed: one broken workspace OIDC rule stopped every workspace's auto-membership**, and so did
+  a U+0000 anywhere in the ID token: the whole sync failed at each sign-in, silently. Each rule
+  is now judged alone, on its own claim's values.
+
+## [2026.11.41]
+
+- **Fixed: a gateway could lose audit records while one very long agent session flooded it.** A
+  session of thousands of turns made the gateway's local buffer of audit records — what it holds
+  until the control plane has them — lock up for over an hour: records of every organisation on
+  that gateway were lost, and the buffer grew far past its size cap. A write to the buffer now
+  waits its turn instead of failing, none waits behind a whole batch or a long read, and sending
+  costs only what is sent, so the buffer drains and its size cap holds.
+
+## [2026.11.40]
+
+- **Open Code Review is a supported client.** `ssai provision` detects `ocr` and writes its
+  configuration for the gateway (OpenAI-compatible by default, Anthropic Messages and Responses
+  variants, MCP servers included), as does the portal Quickstart; its traffic is named Open Code
+  Review in the audit, its MCP calls included; `ssai run` runs it in the sandbox on Linux, macOS and
+  Windows. On an organisation that existed before this release it arrives **disabled**, flagged
+  **new**, on each Portal & clients profile: enable it where it should be offered.
+- **Fixed: on Windows, most clients started under the sandbox without their configuration.**
+  Qwen Code, OpenCode, Crush, the Continue CLI, Mistral Vibe, Aider and Open Code Review read the
+  configuration `provision` wrote into your profile only from their home folder, which under the
+  sandbox is the sandbox account's — so they started unconfigured (OpenCode fell back to its own
+  hosted model). Each is now pointed at its folder in your profile, which alone is granted. A
+  Python tool installed with uv or pipx (Aider, Vibe) now starts under the sandbox. Known limits on
+  Windows, in the Admin Guide: Aider needs a git identity set in the project, Mistral Vibe stops at
+  its first session, and Open Code Review's `review` needs a project outside your profile.
+  On Linux, Mistral Vibe now gets a Python tool's grants under the sandbox (uv's and pipx's
+  folders), where it was given a Node tool's.
+
+- **Fixed: some MCP calls were recorded with no client application.** A modern MCP client's
+  discovery and notification-stream requests, which the gateway answers itself, and requests the
+  gateway refused before forwarding, and the sampling an upstream asked of a call, carried no app
+  in the audit even when the client named itself with `X-App-Id`. They now carry the app the
+  request names, as its forwarded calls do.
+
 ## [2026.11.39]
 
 - **Fixed (security): a conversation could show another user's message.** When two users of an

@@ -30,7 +30,9 @@
   import McpCallEvent from '#lib/components/events/McpCallEvent.svelte';
   import ToolResultEvent from '#lib/components/events/ToolResultEvent.svelte';
   import ToolsChangedEvent from '#lib/components/events/ToolsChangedEvent.svelte';
+  import FrameworkReminderEvent from '#lib/components/events/FrameworkReminderEvent.svelte';
   import MediaEvent from '#lib/components/events/MediaEvent.svelte';
+  import CitationList from '#lib/components/events/CitationList.svelte';
   import StoredMedia from '#lib/components/events/StoredMedia.svelte';
   import WebCallEvent from '#lib/components/events/WebCallEvent.svelte';
   import A2aCallEvent from '#lib/components/events/A2aCallEvent.svelte';
@@ -251,26 +253,6 @@
     return renderMd(text, hljs);
   }
 
-  /** Known framework-injected metadata block prefixes (XML-tagged, not real user content). */
-  const METADATA_BLOCK_TAGS: [string, () => string][] = [
-    ['<available-deferred-tools>', () => m.conv_meta_deferred_tools()],
-    ['<system-reminder>', () => m.conv_meta_system_reminder()],
-    ['<session_context>', () => m.conv_meta_session_context()],
-    ['<local-command-', () => m.conv_meta_local_command()],
-    ['<command-', () => m.conv_meta_command()],
-    ['[SUGGESTION MODE', () => m.conv_meta_suggestion_mode()],
-    ['[SYSTEM', () => m.conv_meta_system_block()],
-  ];
-
-  /** Detect framework-injected metadata and return its label, or null for real content. */
-  function detectMetadataBlock(content: string | null | undefined): string | null {
-    if (!content) return null;
-    const trimmed = content.trimStart();
-    for (const [prefix, label] of METADATA_BLOCK_TAGS) {
-      if (trimmed.startsWith(prefix)) return label();
-    }
-    return null;
-  }
 </script>
 
 <!-- Linked child-session card. Rendered either right after the exact spawn call
@@ -703,32 +685,14 @@
             {/if}
           </div>
 
-        <!-- Framework reminder: inline-split volatile block (<system-reminder>, etc.)
-             — backend splits these out of user/assistant prose so we render a
-             collapsed card instead of polluting the message bubble. Shares the
-             visual pattern of the legacy whole-message `meta-${idx}` card below. -->
+        <!-- Framework reminder: a volatile block (<system-reminder>, etc.) the
+             backend split out of a message's text — a collapsed card instead
+             of part of the message bubble. -->
         {:else if event.type === 'framework_reminder'}
           {#if !event.is_new && !showPrior}
             <!-- Hidden prior reminder -->
           {:else}
-            <div class="rounded-xl border border-dashed border-(--text-secondary) bg-(--bg-secondary)/30 overflow-hidden {!event.is_new ? 'opacity-40' : ''}">
-              <button
-                onclick={() => toggleBlock(`fwr-${idx}`)}
-                class="w-full flex items-center gap-2 px-4 py-2 text-left hover:bg-(--bg-elevated) transition-colors"
-              >
-                <span class="inline-block text-[10px] transition-transform {expandedBlocks[`fwr-${idx}`] ? 'rotate-90' : ''} text-(--text-secondary)">&#9654;</span>
-                <span class="text-[10px] font-semibold uppercase tracking-wider text-(--text-secondary)">{event.label}</span>
-                <span class="text-[10px] text-(--text-secondary)">{m.conv_n_chars({ count: event.content?.length ?? 0 })}</span>
-                {#if !event.is_new}
-                  <span class="text-[9px] px-1.5 py-0.5 rounded-sm bg-(--bg-secondary) text-(--text-secondary) font-medium">{m.conv_prior()}</span>
-                {/if}
-              </button>
-              {#if expandedBlocks[`fwr-${idx}`]}
-                <div class="px-4 pb-3 text-sm text-(--text-primary)">
-                  <pre class="whitespace-pre-wrap font-mono text-xs">{event.content}</pre>
-                </div>
-              {/if}
-            </div>
+            <FrameworkReminderEvent {event} prior={!event.is_new} />
           {/if}
 
         <!-- Message -->
@@ -736,32 +700,10 @@
           {#if !event.is_new && !showPrior}
             <!-- Hidden prior message -->
           {:else}
-            <!-- Framework metadata block: collapsed like system prompt -->
-            {@const metaLabel = event.role === 'user' ? detectMetadataBlock(event.content) : null}
-            {#if metaLabel}
-              <div class="rounded-xl border border-dashed border-(--text-secondary) bg-(--bg-secondary)/30 overflow-hidden {!event.is_new ? 'opacity-40' : ''}">
-                <button
-                  onclick={() => toggleBlock(`meta-${idx}`)}
-                  class="w-full flex items-center gap-2 px-4 py-2 text-left hover:bg-(--bg-elevated) transition-colors"
-                >
-                  <span class="inline-block text-[10px] transition-transform {expandedBlocks[`meta-${idx}`] ? 'rotate-90' : ''} text-(--text-secondary)">&#9654;</span>
-                  <span class="text-[10px] font-semibold uppercase tracking-wider text-(--text-secondary)">{metaLabel}</span>
-                  <span class="text-[10px] text-(--text-secondary)">{m.conv_n_chars({ count: event.content?.length ?? 0 })}</span>
-                  {#if !event.is_new}
-                    <span class="text-[9px] px-1.5 py-0.5 rounded-sm bg-(--bg-secondary) text-(--text-secondary) font-medium">{m.conv_prior()}</span>
-                  {/if}
-                </button>
-                {#if expandedBlocks[`meta-${idx}`]}
-                  <div class="px-4 pb-3 text-sm text-(--text-primary)">
-                    <pre class="whitespace-pre-wrap font-mono text-xs">{event.content}</pre>
-                  </div>
-                {/if}
-              </div>
-
             <!-- User message: left-aligned blue bubble. When the inbound-prompt
                  guardrail flagged this message, wrap it in a shield border +
                  banner — the request-phase sibling of the web ToolResult card. -->
-            {:else if event.role === 'user'}
+            {#if event.role === 'user'}
               {@const gs = event.guardrails ?? []}
               <div class="flex justify-start {!event.is_new ? 'opacity-40' : ''}">
                 <div
@@ -784,6 +726,7 @@
                         <pre class="whitespace-pre-wrap font-mono text-xs">{event.content}</pre>
                       {/if}
                     </div>
+                    <CitationList citations={event.citations ?? []} />
                   </div>
                   {#each gs as g}
                     <GuardrailBanner guardrail={g} />
@@ -830,6 +773,7 @@
                       <pre class="whitespace-pre-wrap font-mono text-xs">{event.content}</pre>
                     {/if}
                   </div>
+                  <CitationList citations={event.citations ?? []} />
 
                 </div>
               </div>

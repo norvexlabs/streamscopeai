@@ -1414,6 +1414,9 @@ async fn proxy_handler_inner(
     // tool-result with a placeholder before the model sees it). One shared
     // entry point with the out-of-band `/v1/analyze` RPC so both apply
     // identical policy in identical order.
+    // Read before the request phase asks the upstream for it on the gateway's
+    // own account.
+    let chat_usage_asked = api_request.chat_usage_asked();
     let mut phase = match crate::pipeline::run_request_phase(
         &mut api_request,
         &ctx.user,
@@ -1492,22 +1495,25 @@ async fn proxy_handler_inner(
     // Ensure the model in the request body matches the resolved upstream model.
     api_request.set_model(upstream_target.model.clone());
 
-    // Clamp client max_tokens to upstream's max_output_tokens if it exceeds it.
-    if let Some(upstream_max) = upstream_target.max_output_tokens
-        && let Some(client_max) = api_request.max_tokens()
-            && client_max > upstream_max as u32 {
-                api_request.set_max_tokens(upstream_max as u32);
-                injection_blocks.push(content::InjectionBlock {
-                    transform: "max_tokens_clamp".to_string(),
-                    scope: "params".to_string(),
-                    field: "max_tokens".to_string(),
-                    action: "clamp".to_string(),
-                    content: format!("{client_max} → {upstream_max}"),
-                });
-                // Mirror the in-pipeline gating: any injection block triggers
-                // the unified `Modified` chip.
-                badges.add_modified();
-            }
+    // Clamp every output cap the client set above the upstream's
+    // max_output_tokens.
+    if let Some(upstream_max) = upstream_target.max_output_tokens {
+        let clamped = api_request.clamp_output_caps(upstream_max as u32);
+        for (field, client_max) in &clamped {
+            injection_blocks.push(content::InjectionBlock {
+                transform: "max_tokens_clamp".to_string(),
+                scope: "params".to_string(),
+                field: (*field).to_string(),
+                action: "clamp".to_string(),
+                content: format!("{client_max} → {upstream_max}"),
+            });
+        }
+        // Mirror the in-pipeline gating: any injection block triggers
+        // the unified `Modified` chip.
+        if !clamped.is_empty() {
+            badges.add_modified();
+        }
+    }
 
     let is_streaming = api_request.is_streaming();
 
@@ -2337,6 +2343,7 @@ async fn proxy_handler_inner(
                 context_window: actual_target.context_window,
                 client_context_window: actual_target.client_context_window,
                 max_output_tokens: max_out,
+                chat_usage_asked,
             },
             meta,
             &state,
@@ -2431,6 +2438,7 @@ async fn proxy_handler_inner(
         healing_enabled: actual_target.healing_enabled,
         wants_structured_output,
         client_tools,
+        chat_usage_asked,
         debug_echo: debug_echo_str,
         api_request: api_request_for_pipeline,
         forward,

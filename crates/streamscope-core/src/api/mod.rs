@@ -395,26 +395,50 @@ pub(crate) fn replace_builtin_output(item: &mut Value, text: String) {
 
 /// A result a tool the SERVER ran left in a request's history — what a stateless
 /// client sends back, and a client can forge: the model reads it as the
-/// tool's. A closed list by item type; no claim about any other (a Gemini
-/// `codeExecutionResult`, a Responses `mcp_list_tools`). The fields of a Responses item or an Anthropic block that hold it,
-/// the call beside it left out (`arguments`, `code`, `queries`): that is the
-/// model's. `None` for anything else, a client-run tool's result among them
+/// tool's. A closed list by item type; no claim about any other (a Responses
+/// `mcp_list_tools`, a `tool_search_output`; a Gemini part has its own list,
+/// [`gemini_server_run_fields`]). The JSON pointers, from the item, to what
+/// holds it — a Responses item's or an Anthropic block's fields — the call
+/// beside it left out (`arguments`, `code`, `queries`): that is the model's.
+/// `None` for anything else, a client-run tool's result among them
 /// ([`BuiltinOutput`], a `tool_result`).
 fn server_run_fields(item: &Value) -> Option<&'static [&'static str]> {
     let kind = item.get("type").and_then(Value::as_str)?;
     Some(match kind {
-        "mcp_call" => &["output", "error"],
-        "code_interpreter_call" => &["outputs"],
-        "file_search_call" => &["results"],
-        "mcp_approval_response" => &["reason"],
-        "computer_call_output" => &["output", "acknowledged_safety_checks"],
+        "mcp_call" => &["/output", "/error"],
+        "code_interpreter_call" => &["/outputs"],
+        "file_search_call" => &["/results"],
+        "mcp_approval_response" => &["/reason"],
+        "computer_call_output" => &["/output", "/acknowledged_safety_checks"],
         // Anthropic's server tools, each `<tool>_tool_result` with a `content`
         // (a client tool's plain `tool_result` is no such type).
         // A search a client supplies as a block, the model reading it as text.
-        "search_result" => &["content", "title"],
-        other if other.ends_with("_tool_result") => &["content"],
+        "search_result" => &["/content", "/title"],
+        other if other.ends_with("_tool_result") => &["/content"],
         _ => return None,
     })
+}
+
+/// A Gemini part holding a result of a tool the server ran: a
+/// `codeExecutionResult`'s `output` (the code's stdout or error), a
+/// `toolResponse`'s `response` (a built-in tool's output), under either
+/// proto3 spelling — every spelling's pointer, so a part carrying two has each
+/// read (a pointer the part does not hold reads nothing). Their objects' other
+/// members (`outcome`, `id`, `toolType`) say how it ended and which call it
+/// answers; the call beside it (`executableCode`, `toolCall`) is the model's.
+/// Read on the Gemini path alone: another protocol's item carrying such a
+/// member is none.
+fn gemini_server_run_fields(part: &Value) -> Option<&'static [&'static str]> {
+    const RESULTS: &[&str] = &[
+        "/codeExecutionResult/output",
+        "/code_execution_result/output",
+        "/toolResponse/response",
+        "/tool_response/response",
+    ];
+    ["codeExecutionResult", "code_execution_result", "toolResponse", "tool_response"]
+        .iter()
+        .any(|member| part.get(*member).is_some_and(Value::is_object))
+        .then_some(RESULTS)
 }
 
 /// Whether a key of a server-run result names no text: an id, a kind, a link,
@@ -450,28 +474,15 @@ fn visit_text_leaves(value: &mut Value, visit: &mut impl FnMut(&mut String)) {
 /// The result [`server_run_fields`] names, as the inbound guardrail reads it:
 /// its strings, by line. `None` when `item` holds none, or is no such result.
 pub fn server_run_text(item: &Value) -> Option<String> {
-    let fields = server_run_fields(item)?;
-    let mut own = item.clone();
-    let mut read = Vec::new();
-    for field in fields {
-        if let Some(v) = own.get_mut(*field) {
-            visit_text_leaves(v, &mut |text| read.push(text.clone()));
-        }
-    }
-    (!read.is_empty()).then(|| read.join("\n"))
+    read_held(item, server_run_fields(item)?, visit_item_text)
 }
 
 /// Write `text` over every string [`server_run_text`] read: none of the original
 /// stays, and no field the spec requires goes empty. Everything else — the ids,
 /// the call — stays as it came.
 pub(crate) fn set_server_run_text(item: &mut Value, text: &str) {
-    let Some(fields) = server_run_fields(item) else {
-        return;
-    };
-    for field in fields {
-        if let Some(v) = item.get_mut(*field) {
-            visit_text_leaves(v, &mut |leaf| *leaf = text.to_string());
-        }
+    if let Some(fields) = server_run_fields(item) {
+        write_held(item, fields, text, visit_item_text);
     }
 }
 
@@ -482,9 +493,83 @@ pub fn is_server_run_result(item: &Value) -> bool {
 
 /// The call a server-run result answers, for the finding that names it.
 pub fn server_run_call_id(item: &Value) -> String {
+    call_id_in(item)
+}
+
+/// A Gemini part's server-run result ([`gemini_server_run_fields`]): EVERY
+/// string under it, by line. A `toolResponse.response` is an object whose keys
+/// the client picks, so no key name says it holds no text (an item's results
+/// have keys their provider fixes, [`is_structural_key`]).
+pub fn gemini_server_run_text(part: &Value) -> Option<String> {
+    read_held(part, gemini_server_run_fields(part)?, visit_every_string)
+}
+
+/// [`set_server_run_text`] for a Gemini part.
+pub(crate) fn set_gemini_server_run_text(part: &mut Value, text: &str) {
+    if let Some(fields) = gemini_server_run_fields(part) {
+        write_held(part, fields, text, visit_every_string);
+    }
+}
+
+/// Whether a Gemini part holds a server-run result ([`gemini_server_run_fields`]).
+pub fn is_gemini_server_run_result(part: &Value) -> bool {
+    gemini_server_run_fields(part).is_some()
+}
+
+/// The call a Gemini part's server-run result answers: the `id` inside the
+/// first of its result objects that names one.
+pub fn gemini_server_run_call_id(part: &Value) -> String {
+    gemini_server_run_fields(part)
+        .into_iter()
+        .flatten()
+        .filter_map(|pointer| pointer.rsplit_once('/'))
+        .filter_map(|(object, _)| part.pointer(object))
+        .map(call_id_in)
+        .find(|id| !id.is_empty())
+        .unwrap_or_default()
+}
+
+/// [`visit_text_leaves`] as a [`Visitor`].
+fn visit_item_text(value: &mut Value, visit: &mut dyn FnMut(&mut String)) {
+    visit_text_leaves(value, &mut |text: &mut String| visit(text));
+}
+
+/// Every non-empty string under `value`, in order, whatever its key.
+fn visit_every_string(value: &mut Value, visit: &mut dyn FnMut(&mut String)) {
+    match value {
+        Value::String(text) if !text.is_empty() => visit(text),
+        Value::Array(items) => items.iter_mut().for_each(|v| visit_every_string(v, visit)),
+        Value::Object(obj) => obj.values_mut().for_each(|v| visit_every_string(v, visit)),
+        _ => {}
+    }
+}
+
+/// How a reader walks the strings under one of its fields.
+type Visitor = fn(&mut Value, &mut dyn FnMut(&mut String));
+
+fn read_held(item: &Value, fields: &[&str], walk: Visitor) -> Option<String> {
+    let mut own = item.clone();
+    let mut read = Vec::new();
+    for field in fields {
+        if let Some(v) = own.pointer_mut(field) {
+            walk(v, &mut |text| read.push(text.clone()));
+        }
+    }
+    (!read.is_empty()).then(|| read.join("\n"))
+}
+
+fn write_held(item: &mut Value, fields: &[&str], text: &str, walk: Visitor) {
+    for field in fields {
+        if let Some(v) = item.pointer_mut(field) {
+            walk(v, &mut |leaf| *leaf = text.to_string());
+        }
+    }
+}
+
+fn call_id_in(held: &Value) -> String {
     ["call_id", "tool_use_id", "approval_request_id", "id"]
         .into_iter()
-        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .find_map(|key| held.get(key).and_then(Value::as_str))
         .unwrap_or("")
         .to_string()
 }
@@ -647,6 +732,27 @@ pub enum ApiRequest {
     GoogleGemini(GeminiRequest),
 }
 
+/// Why a Responses body that names no `model` or no `input` is refused, in
+/// words the client can act on. The spec makes both optional — a stored
+/// `prompt` template or a `conversation` may supply them — but the gateway
+/// routes by the model and its guardrails and audit read the input, so a
+/// prompt or conversation held by the provider does not run through it.
+/// `None` for a body that names both (its error is some other one).
+fn responses_member_missing(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let object = value.as_object()?;
+    let missing: Vec<&str> =
+        ["model", "input"].into_iter().filter(|key| object.get(*key).is_none_or(Value::is_null)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "a Responses request through this gateway must carry {}: a stored prompt or conversation the provider \
+         fills in is not supported, because the gateway routes by the model and its guardrails and audit read the input",
+        missing.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(" and "),
+    ))
+}
+
 impl ApiRequest {
     /// The request as its wire JSON — what a same-protocol forward sends.
     pub fn wire_value(&self) -> Option<Value> {
@@ -680,8 +786,9 @@ impl ApiRequest {
                 Ok(Self::ChatCompletions(req))
             }
             ApiVersion::Responses => {
-                let req: ResponsesRequest = serde_json::from_slice(body)
-                    .map_err(|e| AppError::BadRequest(format!("invalid JSON: {e}")))?;
+                let req: ResponsesRequest = serde_json::from_slice(body).map_err(|e| {
+                    AppError::BadRequest(responses_member_missing(body).unwrap_or_else(|| format!("invalid JSON: {e}")))
+                })?;
                 Ok(Self::Responses(req))
             }
             ApiVersion::AnthropicMessages => {
@@ -729,31 +836,56 @@ impl ApiRequest {
         }
     }
 
-    /// Get the max output tokens requested by the client.
-    pub fn max_tokens(&self) -> Option<u32> {
+    /// Whether a Chat Completions client asked for the stream's usage
+    /// (`stream_options.include_usage: true`) — read before the request phase,
+    /// which asks the upstream for it on the gateway's own account. `false`
+    /// for every other protocol, where usage is not optional.
+    pub fn chat_usage_asked(&self) -> bool {
         match self {
-            Self::ChatCompletions(req) => req.max_tokens,
-            Self::Responses(req) => req.max_output_tokens,
-            Self::AnthropicMessages(req) => Some(req.max_tokens),
-            Self::GoogleGemini(req) => req
-                .generation_config
+            Self::ChatCompletions(req) => req
+                .stream_options
                 .as_ref()
-                .and_then(|gc| gc.max_output_tokens),
+                .and_then(|o| o.get("include_usage"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            _ => false,
         }
     }
 
-    /// Set the max output tokens on the request (clamp to upstream limit).
-    pub fn set_max_tokens(&mut self, val: u32) {
+    /// Lower every output cap the client set above `limit` to it, and name
+    /// each one lowered with the value the client sent. Every field the
+    /// client's protocol caps output with is read: a Chat client may send
+    /// `max_completion_tokens`, `max_tokens` (deprecated), or both.
+    pub fn clamp_output_caps(&mut self, limit: u32) -> Vec<(&'static str, u32)> {
+        let mut clamped = Vec::new();
+        let mut clamp = |field: &'static str, cap: &mut u32| {
+            if *cap > limit {
+                clamped.push((field, *cap));
+                *cap = limit;
+            }
+        };
         match self {
-            Self::ChatCompletions(req) => req.max_tokens = Some(val),
-            Self::Responses(req) => req.max_output_tokens = Some(val),
-            Self::AnthropicMessages(req) => req.max_tokens = val,
+            Self::ChatCompletions(req) => {
+                if let Some(cap) = req.max_completion_tokens.as_mut() {
+                    clamp("max_completion_tokens", cap);
+                }
+                if let Some(cap) = req.max_tokens.as_mut() {
+                    clamp("max_tokens", cap);
+                }
+            }
+            Self::Responses(req) => {
+                if let Some(cap) = req.max_output_tokens.as_mut() {
+                    clamp("max_output_tokens", cap);
+                }
+            }
+            Self::AnthropicMessages(req) => clamp("max_tokens", &mut req.max_tokens),
             Self::GoogleGemini(req) => {
-                req.generation_config
-                    .get_or_insert_with(Default::default)
-                    .max_output_tokens = Some(val);
+                if let Some(cap) = req.generation_config.as_mut().and_then(|gc| gc.max_output_tokens.as_mut()) {
+                    clamp("generationConfig.maxOutputTokens", cap);
+                }
             }
         }
+        clamped
     }
 
     /// Collect tool function names from the request (if any tools are defined).
@@ -1746,10 +1878,12 @@ impl ApiRequest {
                         req.system =
                             Some(SystemPrompt::Text(format!("{existing}\n\n{text}")));
                     }
+                    // A block of its own after the client's, which keep their
+                    // breakpoints and citations.
                     Some(SystemPrompt::Blocks(_)) => {
-                        let existing_text = req.system.as_ref().unwrap().to_text();
-                        req.system =
-                            Some(SystemPrompt::Text(format!("{existing_text}\n\n{text}")));
+                        if let Some(SystemPrompt::Blocks(blocks)) = &mut req.system {
+                            blocks.push(messages::SystemBlock::text(text.to_string()));
+                        }
                     }
                     None => {
                         req.system = Some(SystemPrompt::Text(text.to_string()));
@@ -1981,6 +2115,79 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use sse::ApiVersion;
+
+    /// Every output cap the client set is held to the limit — a Chat client's
+    /// `max_completion_tokens` as well as its deprecated `max_tokens` — and a
+    /// cap at the limit, or one the client did not set, is left alone.
+    #[test]
+    fn every_output_cap_the_client_set_is_held_to_the_limit() {
+        let chat = |body: &str| ApiRequest::parse(ApiVersion::ChatCompletions, &Bytes::from(body.to_string())).unwrap();
+        let caps = |req: &ApiRequest| match req {
+            ApiRequest::ChatCompletions(r) => (r.max_completion_tokens, r.max_tokens),
+            _ => unreachable!(),
+        };
+        let msgs = r#""messages":[{"role":"user","content":"hi"}]"#;
+
+        let mut both = chat(&format!(r#"{{"model":"m",{msgs},"max_completion_tokens":9000,"max_tokens":8001}}"#));
+        assert_eq!(both.clamp_output_caps(8000), vec![("max_completion_tokens", 9000), ("max_tokens", 8001)]);
+        assert_eq!(caps(&both), (Some(8000), Some(8000)));
+
+        let mut at_limit = chat(&format!(r#"{{"model":"m",{msgs},"max_completion_tokens":8000}}"#));
+        assert!(at_limit.clamp_output_caps(8000).is_empty(), "a cap at the limit is not lowered");
+        assert_eq!(caps(&at_limit), (Some(8000), None), "a cap the client did not set stays unset");
+
+        let mut unset = chat(&format!(r#"{{"model":"m",{msgs}}}"#));
+        assert!(unset.clamp_output_caps(1).is_empty());
+        assert_eq!(caps(&unset), (None, None));
+    }
+
+    /// A sampling value is sent back as the client wrote it — `0.7`, never
+    /// the nearest single-precision value (`0.699999988079071`) — on every
+    /// path that renders the request from its typed body, and a negative
+    /// `seed` (the spec's is int64) is a valid request.
+    #[test]
+    fn a_sampling_value_and_a_negative_seed_render_as_the_client_wrote_them() {
+        let req = ApiRequest::parse(
+            ApiVersion::ChatCompletions,
+            &Bytes::from(
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"temperature":0.7,"top_p":0.9,"frequency_penalty":0.1,"presence_penalty":-0.3,"seed":-42}"#,
+            ),
+        )
+        .unwrap();
+        let wire = req.wire_value().unwrap();
+        for (key, value) in [("temperature", 0.7), ("top_p", 0.9), ("frequency_penalty", 0.1), ("presence_penalty", -0.3)] {
+            assert_eq!(wire[key].as_f64(), Some(value), "{key}: {wire}");
+            assert_eq!(wire[key].to_string(), value.to_string(), "{key}");
+        }
+        assert_eq!(wire["seed"], -42);
+        let responses = ApiRequest::parse(
+            ApiVersion::Responses,
+            &Bytes::from(r#"{"model":"m","input":"hi","temperature":0.7,"top_p":0.3}"#),
+        )
+        .unwrap();
+        let wire = responses.wire_value().unwrap();
+        assert_eq!((wire["temperature"].to_string().as_str(), wire["top_p"].to_string().as_str()), ("0.7", "0.3"));
+    }
+
+    /// A Responses request with no `model` or no `input` (a stored prompt or
+    /// conversation the provider would fill in) is refused with an error that
+    /// names what is missing and why — not a parse error. Positive control: a
+    /// body naming both parses, and a body broken otherwise keeps its own error.
+    #[test]
+    fn a_responses_request_without_model_or_input_is_refused_by_name() {
+        let parse = |body: &str| ApiRequest::parse(ApiVersion::Responses, &Bytes::from(body.to_string()));
+        let message = |body: &str| match parse(body) {
+            Err(AppError::BadRequest(m)) => m,
+            other => panic!("expected a 400 for {body}: {:?}", other.map(|_| ())),
+        };
+        let prompt_only = message(r#"{"prompt":{"id":"pmpt_1"}}"#);
+        assert!(prompt_only.contains("`model` and `input`") && prompt_only.contains("stored prompt"), "{prompt_only}");
+        let conversation = message(r#"{"model":"m","conversation":"conv_1"}"#);
+        assert!(conversation.contains("`input`") && !conversation.contains("`model`"), "{conversation}");
+        assert!(message(r#"{"model":null,"input":"hi"}"#).contains("`model`"));
+        assert!(parse(r#"{"model":"m","input":"hi"}"#).is_ok(), "positive control");
+        assert!(message(r#"{"model":"m","input":"hi","stream":"yes"}"#).starts_with("invalid JSON"));
+    }
 
     #[test]
     fn own_items_replace_only_a_rendering_that_opens_with_their_own() {
@@ -2587,6 +2794,24 @@ mod tests {
         } else {
             panic!("expected ChatCompletions variant");
         }
+    }
+
+    #[test]
+    fn a_system_prompt_added_beside_an_anthropic_clients_blocks_keeps_theirs() {
+        let cite = serde_json::json!([{"type": "char_location", "cited_text": "a", "document_index": 0, "document_title": null,
+            "start_char_index": 0, "end_char_index": 1}]);
+        let body = serde_json::json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
+            "system": [{"type": "text", "text": "client", "cache_control": {"type": "ephemeral"}, "citations": cite}]});
+        let mut req = ApiRequest::parse(ApiVersion::AnthropicMessages, &Bytes::from(body.to_string())).unwrap();
+        req.append_system_prompt("last");
+        let wire: serde_json::Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+        assert_eq!(
+            wire["system"],
+            serde_json::json!([
+                {"type": "text", "text": "client", "cache_control": {"type": "ephemeral"}, "citations": cite},
+                {"type": "text", "text": "last"},
+            ])
+        );
     }
 
     #[test]
@@ -3401,16 +3626,93 @@ mod server_run_result_properties {
         }
     }
 
+    proptest! {
+        /// A Gemini server-run part: every string under its output is read and
+        /// none survives a write, and what pairs it with its call or says how it
+        /// ended stays — under either proto3 spelling.
+        #[test]
+        fn a_gemini_results_output_is_read_and_written_and_its_call_kept(
+            payload in tree(),
+            path in proptest::collection::vec("[a-z]{3,6}x", 0..4),
+            hidden in "[A-Z]{9,12}",
+            snake in any::<bool>(),
+        ) {
+            let mut nested = json!({"keep": payload, "hidden": hidden});
+            for key in path.iter().rev() {
+                nested = json!({ key: [nested] });
+            }
+            let (code, tool) = if snake { ("code_execution_result", "tool_response") } else { ("codeExecutionResult", "toolResponse") };
+            for (mut part, keep) in [
+                (json!({code: {"outcome": "OUTCOME_OK", "id": "the-id", "output": hidden}}), ("outcome", "OUTCOME_OK")),
+                (json!({tool: {"toolType": "URL_CONTEXT", "id": "the-id", "response": nested.clone()}}), ("toolType", "URL_CONTEXT")),
+            ] {
+                let member = part.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_default();
+                prop_assert!(super::is_gemini_server_run_result(&part));
+                prop_assert_eq!(super::gemini_server_run_call_id(&part), "the-id");
+                let read = super::gemini_server_run_text(&part).unwrap_or_default();
+                prop_assert!(read.contains(&hidden), "{read} of {part}");
+                super::set_gemini_server_run_text(&mut part, "W");
+                prop_assert!(!part.to_string().contains(&hidden));
+                prop_assert_eq!(part[&member]["id"].as_str(), Some("the-id"));
+                prop_assert_eq!(part[&member][keep.0].as_str(), Some(keep.1));
+            }
+        }
+    }
+
+    /// A Gemini part carrying a result under both proto3 spellings has both
+    /// read and both written, so neither rides through unread.
+    #[test]
+    fn a_gemini_part_with_two_spellings_has_both_read() {
+        let mut part = json!({"codeExecutionResult": {"output": "first"}, "code_execution_result": {"output": "SECOND"}});
+        assert_eq!(super::gemini_server_run_text(&part).as_deref(), Some("first\nSECOND"));
+        super::set_gemini_server_run_text(&mut part, "W");
+        assert!(!part.to_string().contains("SECOND") && !part.to_string().contains("first"));
+        let only_snake = json!({"tool_response": {"id": "the-id", "response": {"text": "x"}}});
+        assert_eq!(super::gemini_server_run_call_id(&only_snake), "the-id");
+        let id_on_the_second = json!({"codeExecutionResult": {"output": "a"}, "code_execution_result": {"id": "e1", "output": "b"}});
+        assert_eq!(super::gemini_server_run_call_id(&id_on_the_second), "e1");
+    }
+
+    /// A Gemini tool response's keys are the client's: a string under a key an
+    /// item's result would hold no text in (`status`, `url`, `code`, base64
+    /// `data`) is read all the same, and none survives a write.
+    #[test]
+    fn a_gemini_tool_response_is_read_whatever_its_keys() {
+        let mut part = json!({"toolResponse": {"toolType": "URL_CONTEXT", "id": "u1", "response":
+            {"status": "S1", "url": "S2", "code": "S3", "x": {"type": "base64", "data": "S4"}}}});
+        let read = super::gemini_server_run_text(&part).unwrap_or_default();
+        for hidden in ["S1", "S2", "S3", "S4"] {
+            assert!(read.contains(hidden), "{hidden} unread in {read}");
+        }
+        super::set_gemini_server_run_text(&mut part, "W");
+        assert!(["S1", "S2", "S3", "S4"].iter().all(|h| !part.to_string().contains(h)), "{part}");
+        assert_eq!(part["toolResponse"]["id"], "u1");
+        assert_eq!(part["toolResponse"]["toolType"], "URL_CONTEXT");
+    }
+
     /// A client-run tool's result and everything else is not this reader's: the
     /// names the two kinds differ by, on both sides.
     #[test]
     fn only_a_server_run_result_is_one() {
-        for kind in ["tool_result", "function_call_output", "shell_call_output", "web_search_call", "reasoning", "message", "text", "image"] {
+        for kind in ["tool_result", "function_call_output", "shell_call_output", "web_search_call", "mcp_list_tools", "tool_search_output", "tool_search_call", "reasoning", "message", "text", "image"] {
             assert!(!is_server_run_result(&json!({"type": kind})), "{kind}");
         }
         for kind in ["mcp_tool_result", "code_execution_tool_result", "bash_code_execution_tool_result", "a_future_tool_result"] {
             assert!(is_server_run_result(&json!({"type": kind})), "{kind}");
         }
         assert!(!is_server_run_result(&json!({"content": "no type"})));
+        // A Gemini part: the results of tools the server ran, never the calls,
+        // a client-run function's response, or a member that is no object —
+        // and only on the Gemini path: another protocol's item carrying such
+        // a member is no server-run result.
+        for part in [json!({"executableCode": {"code": "x"}}), json!({"toolCall": {"toolType": "URL_CONTEXT"}}),
+                     json!({"functionResponse": {"name": "f", "response": {}}}), json!({"text": "t"}), json!({"codeExecutionResult": "x"})] {
+            assert!(!super::is_gemini_server_run_result(&part), "{part}");
+        }
+        for part in [json!({"codeExecutionResult": {}}), json!({"code_execution_result": {}}), json!({"toolResponse": {}}), json!({"tool_response": {}})] {
+            assert!(super::is_gemini_server_run_result(&part), "{part}");
+            assert!(!is_server_run_result(&part), "{part}");
+        }
+        assert!(!is_server_run_result(&json!({"role": "user", "content": "hi", "toolResponse": {"response": {"x": "y"}}})));
     }
 }

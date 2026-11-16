@@ -88,6 +88,9 @@ pub async fn run(args: SyncArgs) -> Result<()> {
 }
 
 async fn sync_once(args: &SyncArgs) -> Result<()> {
+    // Before the gateway is asked for anything: no commit may pick up the
+    // tokens and keys the run records.
+    crate::state::keep_global_state_out_of_git()?;
     let session = session::open(args.host.as_deref()).await?;
     let api = &session.api;
     // First, so a sync this build can no longer make still names the fix.
@@ -100,6 +103,7 @@ async fn sync_once(args: &SyncArgs) -> Result<()> {
     // Whether this manifest is a project's: its clients with a project form
     // are written at their project-local path.
     let in_project = paths.project_root().is_some();
+    crate::state::keep_project_state_out_of_git(&paths)?;
     let mut manifest = Manifest::load(&paths)?;
     // What a backup run of this sync restores the manifest to.
     let manifest_before = manifest.clone();

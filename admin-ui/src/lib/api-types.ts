@@ -62,6 +62,7 @@ export type ConversationResponse = components['schemas']['ConversationResponse']
  * fields (`metadata`, `raw`, `turn`) that the session-replay derivations scan
  * across all events without narrowing. */
 export type ConversationEvent = components['schemas']['ConversationEvent'];
+export type Citation = components['schemas']['Citation'];
 /** Metadata is present on message, tool_call, and media_api_call variants —
  * this guard lets cross-variant scans (e.g. building a turn → metadata map)
  * pull it safely. Dropping `media_api_call` silently loses model/cost/latency

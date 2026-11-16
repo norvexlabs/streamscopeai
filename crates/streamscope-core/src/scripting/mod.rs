@@ -856,12 +856,14 @@ mod tests {
                     content: "How can I help?".to_string(),
                     tool_call_id: None,
                     tool_calls: vec![],
+                    origin: None,
                 },
                 RhaiMessage {
                     role: "user".to_string(),
                     content: "Hello!".to_string(),
                     tool_call_id: None,
                     tool_calls: vec![],
+                    origin: None,
                 },
             ],
             tools: vec![
@@ -1323,6 +1325,7 @@ mod tests {
                         content: "Email me at test@example.com".to_string(),
                         tool_call_id: None,
                         tool_calls: vec![],
+                        origin: None,
                     }],
                     ..sample_ctx()
                 },
@@ -1345,6 +1348,7 @@ mod tests {
                 content: format!("message {i} with some padding text to make it longer for token estimation purposes here"),
                 tool_call_id: None,
                 tool_calls: vec![],
+                origin: None,
             })
             .collect();
         ctx.metadata

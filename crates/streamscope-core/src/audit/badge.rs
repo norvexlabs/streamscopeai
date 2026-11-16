@@ -106,6 +106,10 @@ pub enum AuditBadge {
     /// Upstream returned malformed JSON; gateway repaired it.
     JsonHealed,
 
+    /// The answer is the model's refusal (a Chat message's `refusal`, a
+    /// Responses `refusal` part): its text is the refusal, not an answer.
+    Refusal,
+
     /// Tool policy blocked one or more tool calls.
     /// `phase=request` for name-match blocks, `phase=response` for argument-match blocks.
     ToolBlocked {
@@ -463,6 +467,7 @@ impl AuditBadge {
             Self::ModifiedNotApplied => "modified_not_applied",
             Self::Compressed => "compressed",
             Self::JsonHealed => "json_healed",
+            Self::Refusal => "refusal",
             Self::ToolBlocked { .. } => "tool_blocked",
             Self::ToolBlockedOverflow { .. } => "tool_blocked_overflow",
             Self::ToolBlockNotApplied { .. } => "tool_block_not_applied",
@@ -531,6 +536,7 @@ pub struct BadgeBuilder {
     modified_not_applied: bool,
     compressed: bool,
     json_healed: bool,
+    refusal: bool,
     catchall: bool,
     sanitized_tool_names: u32,
     response_sanitized_tool_names: u32,
@@ -618,6 +624,7 @@ impl BadgeBuilder {
             AuditBadge::ModifiedNotApplied => self.modified_not_applied = true,
             AuditBadge::Compressed => self.compressed = true,
             AuditBadge::JsonHealed => self.json_healed = true,
+            AuditBadge::Refusal => self.refusal = true,
             AuditBadge::Catchall => self.catchall = true,
             AuditBadge::SanitizedToolNames { count } => {
                 self.sanitized_tool_names = self.sanitized_tool_names.saturating_add(count);
@@ -890,6 +897,11 @@ impl BadgeBuilder {
         self.json_healed = true;
     }
 
+    /// The answer is the model's refusal.
+    pub fn add_refusal(&mut self) {
+        self.refusal = true;
+    }
+
     pub fn add_sanitized_tool_names(&mut self, count: u32) {
         if count > 0 {
             self.sanitized_tool_names = self.sanitized_tool_names.saturating_add(count);
@@ -1028,6 +1040,9 @@ impl BadgeBuilder {
         }
         if other.json_healed {
             self.json_healed = true;
+        }
+        if other.refusal {
+            self.refusal = true;
         }
         if other.catchall {
             self.catchall = true;
@@ -1187,6 +1202,7 @@ impl BadgeBuilder {
             && !self.modified_not_applied
             && !self.compressed
             && !self.json_healed
+            && !self.refusal
             && !self.catchall
             && self.sanitized_tool_names == 0
             && self.response_sanitized_tool_names == 0
@@ -1246,6 +1262,9 @@ impl BadgeBuilder {
         }
         if self.json_healed {
             out.push(AuditBadge::JsonHealed);
+        }
+        if self.refusal {
+            out.push(AuditBadge::Refusal);
         }
         if !self.tool_blocked_request.is_empty() {
             out.push(AuditBadge::ToolBlocked {
@@ -1616,6 +1635,7 @@ mod tests {
             AuditBadge::ModifiedNotApplied => {}
             AuditBadge::Compressed => {}
             AuditBadge::JsonHealed => {}
+            AuditBadge::Refusal => {}
             AuditBadge::ToolBlocked { .. } => {}
             AuditBadge::ToolBlockedOverflow { .. } => {}
             AuditBadge::ToolBlockNotApplied { .. } => {}
@@ -1670,6 +1690,7 @@ mod tests {
             AuditBadge::ModifiedNotApplied,
             AuditBadge::Compressed,
             AuditBadge::JsonHealed,
+            AuditBadge::Refusal,
             AuditBadge::ToolBlocked {
                 phase: Phase::Request,
                 count: 1,
@@ -2045,6 +2066,7 @@ mod tests {
             modified_not_applied: true,
             compressed: true,
             json_healed: true,
+            refusal: true,
             catchall: true,
             sanitized_tool_names: 3,
             response_sanitized_tool_names: 4,

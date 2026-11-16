@@ -234,53 +234,399 @@ pub fn ensure_gitignored(root: &Path, entries: &[String]) -> Result<Vec<String>>
     Ok(missing)
 }
 
-/// Whether git reports `path` tracked. A `.gitignore` line does nothing for a
-/// tracked file, so a key written into one reaches its next commit. Anything
-/// git does not answer as tracked — no repository above it, no git to ask, a
-/// repository git refuses — reads as untracked.
-pub fn git_tracks(path: &Path) -> bool {
-    // The nearest directory that exists (the file's own may not yet), with its
-    // symlinks resolved: a directory linked into a repository is in it.
-    let Some(existing) = path.parent().and_then(|p| p.ancestors().find(|d| d.is_dir())) else {
-        return false;
-    };
-    let (Ok(dir), Ok(rest)) = (dunce::canonicalize(existing), path.strip_prefix(existing)) else {
-        return false;
-    };
-    // No repository above it: no git to start (a stub git would offer to
-    // install itself).
-    if !dir.ancestors().any(|d| d.join(".git").exists()) {
-        return false;
+/// What a commit in the repository holding `target` would do with it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GitExposure {
+    /// No repository above it.
+    Outside,
+    /// Untracked and ignored: no commit picks it up.
+    Ignored,
+    /// Untracked and not ignored: `git add -A` would commit it.
+    Exposed,
+    /// Tracked: its next commit carries what is written into it. A
+    /// `.gitignore` line does nothing for it.
+    Tracked,
+    /// Tracked, and every tracked path it names marked `skip-worktree` or
+    /// `assume-unchanged` in this clone's index (by the user, a sparse
+    /// checkout or `core.ignoreStat`). Refused like [`Self::Tracked`]: git's
+    /// own FAQ says neither mark keeps a change out of git — only the refusal
+    /// names the mark.
+    Marked,
+    /// A repository is above it, but git could not say (git missing, a
+    /// repository git refuses).
+    Unknown(String),
+}
+
+/// A file the CLI writes a secret into, or one of its state directories with
+/// the entries it writes there — a name ending in `/` a directory of its own
+/// (the backups). A state directory is judged by those entries, never by a
+/// stand-in: an ignore rule may treat names differently (`!*.json`), and a
+/// file of the user's beside them (a certificate kept in a dotfiles
+/// repository) is not ours to judge.
+#[derive(Clone, Copy)]
+pub enum GitTarget<'a> {
+    File(&'a Path),
+    State { dir: &'a Path, entries: &'a [&'a str] },
+}
+
+/// What the CLI writes in its global state directory (the installer's
+/// certificates beside them are not its to judge).
+const GLOBAL_STATE: &[&str] = &[
+    "hosts.json",
+    "tool-keys.json",
+    "tool-keys.json.lock",
+    "manifest.json",
+    "manifest.json.old",
+    "backups/",
+    "sandbox-user.json",
+    "sandbox-grants.json",
+    "sandbox-profile.json",
+    "update-check.json",
+    "sandbox-run.lock",
+];
+/// What it writes in a project's.
+const PROJECT_STATE: &[&str] = &["manifest.json", "manifest.json.old", "backups/"];
+
+impl GitTarget<'_> {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(p) | Self::State { dir: p, .. } => p,
+        }
     }
-    // A read-only probe: no fsmonitor (a repository's own config would run it),
-    // so it may answer for a repository another user owns; the path taken
-    // literally, never as a glob; and the repository the one the walk above
-    // found — across a mount, never one this process was handed (a git hook's
-    // index or `GIT_DIR`).
-    std::process::Command::new("git")
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "safe.directory=*",
-            "--literal-pathspecs",
-            "ls-files",
-            "--error-unmatch",
-            "--",
-        ])
-        .arg(dir.join(rest))
-        .current_dir(&dir)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_CEILING_DIRECTORIES")
+}
+
+/// The directory to run git in for `path` (its nearest existing ancestor —
+/// itself included — symlinks resolved: a directory or file linked into a
+/// repository is in it) and `path` re-rooted there — or `None` when no `.git`
+/// is above it, so no git is started (a stub git would offer to install
+/// itself). A repository named only by `GIT_DIR` (a bare dotfiles repository
+/// used through an alias) has no `.git` above the file and is not seen.
+fn git_location(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let existing = path.ancestors().find(|d| d.exists())?;
+    let rest = path.strip_prefix(existing).ok()?;
+    let canonical = dunce::canonicalize(existing).ok()?;
+    // `join("")` would add a trailing separator, which names a directory.
+    let resolved = if rest.as_os_str().is_empty() { canonical } else { canonical.join(rest) };
+    // Git runs in the target itself when it is a directory — a state
+    // directory may be a repository's own top level — else in its parent.
+    let dir = resolved.ancestors().find(|d| d.is_dir())?.to_path_buf();
+    dir.ancestors().any(|d| d.join(".git").exists()).then_some((dir, resolved))
+}
+
+/// Every variable git reads to pick a repository, an index, an object store
+/// or a configuration instead of discovering them (`git rev-parse
+/// --local-env-vars`, plus the ceiling): a probe run from a git hook, or under
+/// a user's own settings, must answer for the repository above the file.
+pub(crate) const GIT_REPOSITORY_VARS: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+];
+
+/// A git probe in `dir`: no fsmonitor (a repository's own config would run
+/// it), so it may answer for a repository another user owns; and the
+/// repository the walk above found — across a mount, never one this process
+/// was handed.
+fn git_in(dir: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["-c", "core.fsmonitor=false", "-c", "safe.directory=*"])
+        .current_dir(dir)
         .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stdin(std::process::Stdio::null());
+    for var in GIT_REPOSITORY_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Why git failed, in its own words (its first line names the fix).
+fn git_failure(what: &str, out: &std::process::Output) -> String {
+    let said = String::from_utf8_lossy(&out.stderr);
+    match said.lines().find(|l| !l.trim().is_empty()) {
+        Some(line) => format!("git {what} exited with {}: {}", out.status, line.trim()),
+        None => format!("git {what} exited with {}", out.status),
+    }
+}
+
+/// Each entry git tracks of `paths` — for a directory, of what is in it —
+/// as whether this clone's index marks it `skip-worktree` or
+/// `assume-unchanged`.
+fn git_tracked(dir: &Path, paths: &[PathBuf]) -> Result<Vec<bool>, String> {
+    // Taken literally, never as globs (`check-ignore` below reads path names,
+    // not pathspecs, and refuses the flag). `-v` tags each entry: `S` for
+    // skip-worktree, a lowercase letter for assume-unchanged.
+    match git_in(dir).args(["--literal-pathspecs", "ls-files", "-v", "-z", "--"]).args(paths).output() {
+        Ok(out) if out.status.success() => Ok(out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| e[0] == b'S' || e[0].is_ascii_lowercase())
+            .collect()),
+        Ok(out) => Err(git_failure("ls-files", &out)),
+        Err(e) => Err(format!("git could not be run: {e}")),
+    }
+}
+
+/// Whether git ignores every one of `paths`.
+fn git_ignores_all(dir: &Path, paths: &[PathBuf]) -> Result<bool, String> {
+    // It names each ignored path once, on a line of its own (a name holding a
+    // newline comes back quoted on one); exit 1 is "none".
+    match git_in(dir).args(["check-ignore", "--"]).args(paths).output() {
+        Ok(out) if out.status.code() == Some(0) => {
+            Ok(out.stdout.split(|b| *b == b'\n').filter(|l| !l.is_empty()).count() == paths.len())
+        }
+        Ok(out) if out.status.code() == Some(1) => Ok(false),
+        Ok(out) => Err(git_failure("check-ignore", &out)),
+        Err(e) => Err(format!("git could not be run: {e}")),
+    }
+}
+
+/// Ask git what a commit would do with `target`: two git runs, whatever it
+/// holds.
+pub fn git_exposure(target: GitTarget) -> GitExposure {
+    let Some((dir, full)) = git_location(target.path()) else {
+        return GitExposure::Outside;
+    };
+    // What git is asked about: the file, or each entry of the state directory
+    // — a directory entry through two names inside it, as an ignore rule may
+    // tell names apart by their extension.
+    let (tracked, probes): (Vec<PathBuf>, Vec<PathBuf>) = match target {
+        GitTarget::File(_) => (vec![full.clone()], vec![full]),
+        GitTarget::State { entries, .. } => {
+            let mut tracked = Vec::new();
+            let mut probes = Vec::new();
+            for e in entries {
+                match e.strip_suffix('/') {
+                    Some(sub) => {
+                        let d = full.join(sub);
+                        probes.push(d.join("streamscopeai-probe.json"));
+                        probes.push(d.join("streamscopeai-probe"));
+                        tracked.push(d);
+                    }
+                    None => {
+                        tracked.push(full.join(e));
+                        probes.push(full.join(e));
+                    }
+                }
+            }
+            (tracked, probes)
+        }
+    };
+    let tracked = match git_tracked(&dir, &tracked) {
+        Ok(t) => t,
+        Err(why) => return GitExposure::Unknown(why),
+    };
+    if tracked.iter().any(|marked| !marked) {
+        return GitExposure::Tracked;
+    }
+    if !tracked.is_empty() {
+        return GitExposure::Marked;
+    }
+    match git_ignores_all(&dir, &probes) {
+        Ok(true) => GitExposure::Ignored,
+        Ok(false) => GitExposure::Exposed,
+        Err(why) => GitExposure::Unknown(why),
+    }
+}
+
+/// One line of an ignore file matching exactly `rel` (a path relative to the
+/// work tree, `/`-separated): anchored, every wildcard and the characters git
+/// reads specially escaped, a directory with its trailing `/`.
+fn exclude_pattern(rel: &str, dir: bool) -> String {
+    let mut out = String::from("/");
+    for (i, c) in rel.chars().enumerate() {
+        if matches!(c, '\\' | '*' | '?' | '[' | ' ') || (i == 0 && matches!(c, '!' | '#')) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    if dir {
+        out.push('/');
+    }
+    out
+}
+
+/// Ignore `target` in its repository's own `info/exclude` — read by this
+/// clone alone, never committed — and check that git now reads it ignored.
+fn exclude_locally(target: GitTarget) -> Result<()> {
+    let (dir, full) = git_location(target.path()).context("no repository above it")?;
+    let ask = |args: &[&str]| -> Result<String> {
+        let out = git_in(&dir).args(args).output().context("git could not be run")?;
+        anyhow::ensure!(out.status.success(), "{}", git_failure(&args.join(" "), &out));
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).to_string())
+    };
+    let top = dunce::canonicalize(ask(&["rev-parse", "--show-toplevel"])?)?;
+    let exclude = dir.join(ask(&["rev-parse", "--git-path", "info/exclude"])?);
+    let rel = full.strip_prefix(&top).with_context(|| format!("{} is outside {}", full.display(), top.display()))?;
+    let rel = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+    // A state directory is excluded entry by entry, never whole: a file of the
+    // user's beside them stays theirs to commit.
+    let lines: Vec<String> = match target {
+        GitTarget::File(_) => vec![exclude_pattern(&rel, false)],
+        GitTarget::State { entries, .. } => entries
+            .iter()
+            .map(|e| {
+                let name = e.trim_end_matches('/');
+                let path = if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+                exclude_pattern(&path, e.ends_with('/'))
+            })
+            .collect(),
+    };
+    let existing = match std::fs::read_to_string(&exclude) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", exclude.display())),
+    };
+    let missing: Vec<&String> = lines.iter().filter(|line| !existing.lines().any(|l| l == line.as_str())).collect();
+    if !missing.is_empty() {
+        // Appended, never rewritten: another process adding its own lines at
+        // the same time keeps them (a header written twice is harmless).
+        const HEADER: &str = "# streamscope: files holding a credential, kept out of this clone's commits";
+        let mut out = String::new();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            out.push('\n');
+        }
+        if !existing.lines().any(|l| l == HEADER) {
+            out.push_str(HEADER);
+            out.push('\n');
+        }
+        for line in missing {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if let Some(parent) = exclude.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude)
+            .and_then(|mut f| f.write_all(out.as_bytes()))
+            .with_context(|| format!("write {}", exclude.display()))?;
+    }
+    match git_exposure(target) {
+        GitExposure::Ignored => Ok(()),
+        // Most often an ignore file of the repository re-includes it (`!…`),
+        // which git reads over `info/exclude`.
+        GitExposure::Exposed => bail!(
+            "git still reads it as one a commit would pick up after {} — a rule in the repository's \
+             .gitignore that re-includes it (`!…`) overrides that file: ignore it there",
+            exclude.display()
+        ),
+        other => bail!("git reads it {other:?} after {}", exclude.display()),
+    }
+}
+
+/// Whether the project's own `.gitignore` reaches `file`: it is under `root`
+/// and no repository begins between them (a nested clone or a submodule
+/// reads its own ignore files, not the project's).
+pub fn covered_by_project_gitignore(root: &Path, file: &Path) -> bool {
+    // No repository above the file: there is nothing to be covered from.
+    let (Ok(root), Some((_, file))) = (dunce::canonicalize(root), git_location(file)) else {
+        return false;
+    };
+    file.starts_with(&root)
+        && !file
+            .ancestors()
+            .skip(1)
+            .take_while(|d| *d != root)
+            .any(|d| d.join(".git").exists())
+}
+
+/// Keep `target` — a file the CLI is about to write a secret into, or one of
+/// its state directories — out of every commit, before anything is written:
+/// refuse one git tracks or cannot answer for, and ignore an exposed one in
+/// its repository's `info/exclude`. `left_to_gitignore` is a file the run
+/// adds to its project's `.gitignore` once written, which covers it for
+/// everyone ([`covered_by_project_gitignore`]), so it is not excluded
+/// locally. A dry run only says what it would exclude. `remedy` ends a refusal: what the user can do instead.
+pub fn keep_out_of_git(target: GitTarget, what: &str, remedy: &str, left_to_gitignore: bool, dry_run: bool) -> Result<()> {
+    let shown = target.path().display();
+    match git_exposure(target) {
+        GitExposure::Outside | GitExposure::Ignored => Ok(()),
+        GitExposure::Marked => bail!(
+            "{shown} is tracked by git, so {what} could reach a commit — this clone's index marks it \
+             skip-worktree or assume-unchanged, which git does not promise keeps a change out of one — \
+             {remedy}"
+        ),
+        GitExposure::Tracked => {
+            bail!("{shown} is tracked by git, so {what} would reach its next commit — {remedy}")
+        }
+        GitExposure::Unknown(why) => bail!(
+            "{shown} is in a git repository git could not answer for ({why}), so {what} could not be \
+             kept out of a commit — fix git there, or {remedy}"
+        ),
+        GitExposure::Exposed if left_to_gitignore => Ok(()),
+        GitExposure::Exposed if dry_run => {
+            // stderr: a config printed on stdout is what a user redirects.
+            eprintln!("would add {shown} to its repository's .git/info/exclude (it would hold {what})");
+            Ok(())
+        }
+        GitExposure::Exposed => {
+            exclude_locally(target).with_context(|| format!("could not keep {shown} out of git, so {what} would reach its next commit"))?;
+            eprintln!("Added {shown} to its repository's .git/info/exclude (it holds {what}).");
+            Ok(())
+        }
+    }
+}
+
+/// Keep the CLI's global state directory — sign-in tokens, the device's
+/// gateway keys, the global manifest and its backups — out of every commit.
+/// `login`, `provision` and `sync` call it before they ask the gateway for
+/// anything and refuse on its error; opening a session, which rotates the
+/// tokens, calls it too and only warns, since refusing there would lose a
+/// token the gateway already rotated.
+pub fn keep_global_state_out_of_git() -> Result<()> {
+    // Once per process: a command checking it before it opens its session
+    // does not pay for it twice.
+    static KEPT_OUT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if KEPT_OUT.get().is_some() {
+        return Ok(());
+    }
+    // No home to resolve it from (a CI runner): nothing can be written there.
+    let Ok(dir) = config_dir() else {
+        return Ok(());
+    };
+    keep_out_of_git(
+        GitTarget::State { dir: &dir, entries: GLOBAL_STATE },
+        "your sign-in tokens and gateway keys",
+        &format!("take them out of the repository (`git rm -r --cached` the CLI's files in {})", dir.display()),
+        false,
+        false,
+    )?;
+    let _ = KEPT_OUT.set(());
+    Ok(())
+}
+
+/// The same for a project's state directory (`.streamscopeai/`), created with
+/// its `.gitignore` first, so a fresh project's needs nothing more. In every
+/// mode: a dry run still records the keys it was given.
+pub fn keep_project_state_out_of_git(paths: &Paths) -> Result<()> {
+    if paths.project_root().is_none() {
+        return Ok(());
+    }
+    paths.ensure()?;
+    keep_out_of_git(
+        GitTarget::State { dir: paths.base(), entries: PROJECT_STATE },
+        "your gateway keys",
+        &format!("take it out of the repository (`git rm -r --cached {}`)", paths.base().display()),
+        false,
+        false,
+    )
 }
 
 /// Resolve this invocation's manifest scope. An explicit `--global` forces the
@@ -801,7 +1147,7 @@ pub struct WorkspaceManifest {
 }
 
 /// A gateway's answer about what a workspace is offered, and when it came.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClientAccessRecord {
     #[serde(flatten)]
     pub access: crate::api::ClientAccess,
@@ -1652,5 +1998,295 @@ mod backup_tests {
         assert!(stored_name(&wide).len() <= 17 + STORED_NAME_TAIL);
         assert!(stored_name(&deep).ends_with("settings.json"));
         assert_ne!(stored_name(&deep), stored_name(&other));
+    }
+}
+
+#[cfg(test)]
+mod git_exposure_tests {
+    use super::*;
+
+    /// A fresh directory under the system temp dir (outside any repository),
+    /// removed when dropped.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch(name: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("ss-git-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dunce::canonicalize(&dir).unwrap())
+    }
+
+    /// Git in `dir`, whatever repository this test run was handed (a hook's
+    /// `GIT_DIR` would otherwise stage into it).
+    fn git(dir: &Path, args: &[&str]) {
+        let mut cmd = std::process::Command::new("git");
+        for var in GIT_REPOSITORY_VARS {
+            cmd.env_remove(var);
+        }
+        let ok = cmd.args(args).current_dir(dir).output().unwrap();
+        assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+    }
+
+    fn repo(name: &str) -> Scratch {
+        let dir = scratch(name);
+        git(&dir.0, &["init", "-q"]);
+        dir
+    }
+
+    fn file(path: &Path) -> GitExposure {
+        git_exposure(GitTarget::File(path))
+    }
+
+    /// The temp dir may itself sit in a repository (a `TMPDIR` under a
+    /// checkout, a Windows `%TEMP%` in a home repository): only then is
+    /// "outside any repository" not a thing a test can make there.
+    fn temp_is_outside_any_repository() -> bool {
+        git_location(&std::env::temp_dir().join("x")).is_none()
+    }
+
+    fn state(dir: &Path) -> GitExposure {
+        git_exposure(GitTarget::State { dir, entries: GLOBAL_STATE })
+    }
+
+    #[test]
+    fn each_answer_git_can_give_about_a_file_is_told_apart() {
+        let r = repo("classes");
+        let r = &r.0;
+        std::fs::write(r.join("tracked.json"), "{}").unwrap();
+        std::fs::write(r.join(".gitignore"), "ignored.json\n").unwrap();
+        git(r, &["add", "tracked.json"]);
+        assert_eq!(file(&r.join("tracked.json")), GitExposure::Tracked);
+        assert_eq!(file(&r.join("ignored.json")), GitExposure::Ignored);
+        assert_eq!(file(&r.join("untracked.json")), GitExposure::Exposed);
+        // Not written yet, in a directory not created yet.
+        assert_eq!(file(&r.join("a/b/new.json")), GitExposure::Exposed);
+        if temp_is_outside_any_repository() {
+            let outside = scratch("outside");
+            assert_eq!(file(&outside.0.join("x.json")), GitExposure::Outside);
+        }
+    }
+
+    /// A tracked file a clone marks skip-worktree or assume-unchanged is
+    /// refused like any tracked one (git does not promise the mark keeps a
+    /// change out), and the refusal names the mark; an unmarked one keeps the
+    /// plain refusal.
+    #[test]
+    fn a_tracked_file_marked_skip_worktree_is_refused_naming_the_mark() {
+        let r = repo("marks");
+        let r = &r.0;
+        for f in ["skip.json", "assume.json", "plain.json"] {
+            std::fs::write(r.join(f), "{}").unwrap();
+            git(r, &["add", f]);
+        }
+        git(r, &["update-index", "--skip-worktree", "skip.json"]);
+        git(r, &["update-index", "--assume-unchanged", "assume.json"]);
+        assert_eq!(file(&r.join("skip.json")), GitExposure::Marked);
+        assert_eq!(file(&r.join("assume.json")), GitExposure::Marked);
+        let e = keep_out_of_git(GitTarget::File(&r.join("skip.json")), "a key", "do X", false, false).unwrap_err();
+        assert!(format!("{e:#}").contains("marks it skip-worktree or assume-unchanged"), "{e:#}");
+        assert!(format!("{e:#}").ends_with("— do X"), "{e:#}");
+        // The control: the same file without a mark gets the plain refusal.
+        assert_eq!(file(&r.join("plain.json")), GitExposure::Tracked);
+        let e = keep_out_of_git(GitTarget::File(&r.join("plain.json")), "a key", "do X", false, false).unwrap_err();
+        assert!(!format!("{e:#}").contains("skip-worktree"), "{e:#}");
+        // A state directory with one marked and one unmarked tracked entry is
+        // plainly tracked.
+        let g = r.join("state");
+        std::fs::create_dir_all(&g).unwrap();
+        std::fs::write(g.join("manifest.json"), "{}").unwrap();
+        std::fs::write(g.join("hosts.json"), "{}").unwrap();
+        git(r, &["add", "state"]);
+        git(r, &["update-index", "--skip-worktree", "state/manifest.json"]);
+        assert_eq!(state(&g), GitExposure::Tracked);
+        git(r, &["update-index", "--skip-worktree", "state/hosts.json"]);
+        assert_eq!(state(&g), GitExposure::Marked);
+    }
+
+    #[test]
+    fn a_repository_git_cannot_answer_for_is_refused_and_no_repository_is_not() {
+        let r = scratch("broken");
+        // A `.git` git refuses: a gitfile pointing nowhere.
+        std::fs::write(r.0.join(".git"), "gitdir: /nonexistent/streamscope-test\n").unwrap();
+        assert!(matches!(file(&r.0.join("k.json")), GitExposure::Unknown(_)));
+        let e = keep_out_of_git(GitTarget::File(&r.0.join("k.json")), "a key", "do X", false, false).unwrap_err();
+        assert!(format!("{e:#}").contains("could not answer"), "{e:#}");
+        // In git's own words, which name the fix (worded per platform).
+        assert!(format!("{e:#}").contains("fatal:"), "{e:#}");
+        // The positive control: the same file in a repository git answers for.
+        let free = repo("answered");
+        keep_out_of_git(GitTarget::File(&free.0.join("k.json")), "a key", "do X", false, false).unwrap();
+    }
+
+    #[test]
+    fn a_tracked_file_is_refused_and_an_exposed_one_is_excluded_exactly() {
+        let r = repo("exclude");
+        let r = &r.0;
+        std::fs::write(r.join("t.json"), "{}").unwrap();
+        git(r, &["add", "t.json"]);
+        let e = keep_out_of_git(GitTarget::File(&r.join("t.json")), "a key", "do X", false, false).unwrap_err();
+        assert!(format!("{e:#}").contains("tracked by git"), "{e:#}");
+
+        // A name holding every character an ignore line reads specially (`*`
+        // and `?` are no file-name characters on Windows).
+        let odd = r.join("sub dir").join(if cfg!(windows) { "[k] #.json" } else { "[k]*?.json" });
+        keep_out_of_git(GitTarget::File(&odd), "a key", "do X", false, false).unwrap();
+        assert_eq!(file(&odd), GitExposure::Ignored);
+        // Exactly that file: a sibling the wildcards would have matched is not.
+        assert_eq!(file(&r.join("sub dir").join("k-other.json")), GitExposure::Exposed);
+        // Idempotent: a second run adds no second line.
+        keep_out_of_git(GitTarget::File(&odd), "a key", "do X", false, false).unwrap();
+        let exclude = std::fs::read_to_string(r.join(".git/info/exclude")).unwrap();
+        assert_eq!(exclude.lines().filter(|l| l.contains("k]")).count(), 1, "{exclude}");
+        // Nothing reaches what the repository commits.
+        assert!(!r.join(".gitignore").exists());
+    }
+
+    #[test]
+    fn a_dry_run_and_a_file_left_to_the_projects_gitignore_exclude_nothing() {
+        let r = repo("noexclude");
+        let f = r.0.join("k.json");
+        keep_out_of_git(GitTarget::File(&f), "a key", "do X", false, true).unwrap();
+        keep_out_of_git(GitTarget::File(&f), "a key", "do X", true, false).unwrap();
+        assert_eq!(file(&f), GitExposure::Exposed);
+    }
+
+    #[test]
+    fn a_state_directory_is_judged_by_the_files_the_cli_writes_there() {
+        let r = repo("statedir");
+        let r = &r.0;
+        let project = r.join(".streamscopeai");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".gitignore"), "*\n").unwrap();
+        git(r, &["add", "-f", ".streamscopeai/.gitignore"]);
+        // A committed `.gitignore` of `*` keeps it out for everyone.
+        let judged = |d: &Path| git_exposure(GitTarget::State { dir: d, entries: PROJECT_STATE });
+        assert_eq!(judged(&project), GitExposure::Ignored);
+        // One of its files committed is the leak.
+        std::fs::write(project.join("manifest.json"), "{}").unwrap();
+        git(r, &["add", "-f", ".streamscopeai/manifest.json"]);
+        assert_eq!(judged(&project), GitExposure::Tracked);
+        // So is a backup.
+        let other = r.join("other-state");
+        std::fs::create_dir_all(other.join("backups/run")).unwrap();
+        std::fs::write(other.join("backups/run/settings.json"), "{}").unwrap();
+        git(r, &["add", "-f", "other-state/backups/run/settings.json"]);
+        assert_eq!(judged(&other), GitExposure::Tracked);
+
+        // A directory nothing ignores has its entries excluded, and only them
+        // — before it exists, as on a first sign-in.
+        let global = r.join(".config").join("streamscopeai");
+        assert_eq!(state(&global), GitExposure::Exposed);
+        keep_out_of_git(GitTarget::State { dir: &global, entries: GLOBAL_STATE }, "tokens", "do X", false, false)
+            .unwrap();
+        assert_eq!(state(&global), GitExposure::Ignored);
+        assert_eq!(file(&r.join(".config").join("other.json")), GitExposure::Exposed);
+    }
+
+    #[test]
+    fn a_file_of_the_users_beside_the_state_is_not_ours_to_judge() {
+        // A certificate kept in a dotfiles repository does not put the tokens
+        // in a commit; the tokens beside it are still kept out.
+        let r = repo("usersfile");
+        let global = r.0.join(".config").join("streamscopeai");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("gateway-ca.pem"), "cert").unwrap();
+        git(&r.0, &["add", ".config/streamscopeai/gateway-ca.pem"]);
+        assert_eq!(state(&global), GitExposure::Exposed);
+        keep_out_of_git(GitTarget::State { dir: &global, entries: GLOBAL_STATE }, "tokens", "do X", false, false)
+            .unwrap();
+        assert_eq!(file(&global.join("hosts.json")), GitExposure::Ignored);
+        // A file of the user's added there later is still theirs to commit.
+        assert_eq!(file(&global.join("gateway-ca.d").join("extra.pem")), GitExposure::Exposed);
+    }
+
+    #[test]
+    fn a_rule_that_re_includes_the_state_is_refused_with_what_to_do() {
+        // A whitelist-style repository re-including the token file by name: a
+        // stand-in name would read ignored while the tokens are not.
+        let r = repo("whitelist");
+        std::fs::write(r.0.join(".gitignore"), "*\n!*/\n!hosts.json\n").unwrap();
+        let global = r.0.join(".config").join("streamscopeai");
+        assert_eq!(state(&global), GitExposure::Exposed);
+        let e = keep_out_of_git(GitTarget::State { dir: &global, entries: GLOBAL_STATE }, "tokens", "do X", false, false)
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("re-includes it"), "{e:#}");
+    }
+
+    #[test]
+    fn a_state_directory_that_is_a_repositorys_top_level_has_its_entries_excluded() {
+        let r = repo("toplevel");
+        keep_out_of_git(GitTarget::State { dir: &r.0, entries: GLOBAL_STATE }, "tokens", "do X", false, false).unwrap();
+        assert_eq!(state(&r.0), GitExposure::Ignored);
+    }
+
+    #[test]
+    fn a_file_in_a_nested_repository_is_excluded_in_that_repository() {
+        // A project's `.gitignore` does not reach a repository nested in it.
+        let outer = repo("nested-outer");
+        let inner = outer.0.join("vendor").join("tool");
+        std::fs::create_dir_all(&inner).unwrap();
+        git(&inner, &["init", "-q"]);
+        let key_file = inner.join(".env");
+        assert!(!covered_by_project_gitignore(&outer.0, &key_file));
+        assert!(covered_by_project_gitignore(&outer.0, &outer.0.join("vendor").join(".env")));
+        keep_out_of_git(GitTarget::File(&key_file), "a key", "do X", false, false).unwrap();
+        assert_eq!(file(&key_file), GitExposure::Ignored);
+        assert!(std::fs::read_to_string(inner.join(".git/info/exclude")).unwrap().contains("/.env"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_directory_linked_into_a_repository_is_judged_there() {
+        // GNU stow links `~/.config/streamscopeai` into a dotfiles worktree.
+        let dotfiles = repo("stow-dotfiles");
+        let home = scratch("stow-home");
+        let real = dotfiles.0.join("ssai");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(home.0.join(".config")).unwrap();
+        let linked = home.0.join(".config").join("streamscopeai");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert_eq!(state(&linked), GitExposure::Exposed);
+    }
+
+    #[test]
+    fn an_exclude_file_is_created_or_extended_on_a_line_of_its_own_under_one_header() {
+        // No exclude file yet.
+        let r = repo("excludefile");
+        let exclude = r.0.join(".git/info/exclude");
+        let _ = std::fs::remove_file(&exclude);
+        keep_out_of_git(GitTarget::File(&r.0.join("a.json")), "a key", "do X", false, false).unwrap();
+        assert_eq!(file(&r.0.join("a.json")), GitExposure::Ignored);
+        // One with no final newline: the next line must not join its last one.
+        std::fs::write(&exclude, "mine").unwrap();
+        keep_out_of_git(GitTarget::File(&r.0.join("b.json")), "a key", "do X", false, false).unwrap();
+        keep_out_of_git(GitTarget::File(&r.0.join("c.json")), "a key", "do X", false, false).unwrap();
+        let text = std::fs::read_to_string(&exclude).unwrap();
+        assert!(text.starts_with("mine\n"), "{text}");
+        assert!(text.lines().any(|l| l == "/b.json") && text.lines().any(|l| l == "/c.json"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("# streamscope")).count(), 1, "{text}");
+    }
+
+    #[test]
+    fn a_projects_state_is_kept_out_with_its_gitignore_and_refused_when_committed() {
+        let r = repo("projectstate");
+        let paths = Paths::for_scope(&ManifestScope::Project(r.0.clone())).unwrap();
+        keep_project_state_out_of_git(&paths).unwrap();
+        assert_eq!(std::fs::read_to_string(r.0.join(".streamscopeai/.gitignore")).unwrap(), "*\n");
+        std::fs::write(r.0.join(".streamscopeai/manifest.json"), "{}").unwrap();
+        git(&r.0, &["add", "-f", ".streamscopeai/manifest.json"]);
+        let e = keep_project_state_out_of_git(&paths).unwrap_err();
+        assert!(format!("{e:#}").contains("tracked by git"), "{e:#}");
+    }
+
+    #[test]
+    fn an_exclude_line_escapes_what_git_reads_specially() {
+        assert_eq!(exclude_pattern("a/b.json", false), "/a/b.json");
+        assert_eq!(exclude_pattern("d", true), "/d/");
+        assert_eq!(exclude_pattern("x y/[k]*?\\", false), "/x\\ y/\\[k]\\*\\?\\\\");
+        assert_eq!(exclude_pattern("!a#", false), "/\\!a#");
     }
 }

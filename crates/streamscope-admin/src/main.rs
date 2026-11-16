@@ -51,6 +51,21 @@ macro_rules! resolved_max_output_sql {
     };
 }
 
+/// The regex a workspace's OIDC rule runs, built from `$p` (a SQL text
+/// expression holding `oidc_claim_pattern`): the pattern anchored so it must
+/// match a claim value WHOLE (`^(?:` … `)$`) — `IT` is `IT`, never `IT-Admins`.
+/// The membership sync and the save-time check both build it here, so the
+/// pattern a save accepts is the one the sync compiles. The claim values are
+/// the subject, so none can step outside the anchors; the pattern is the
+/// tenant administrator's own, and keeping it inside them is the save check's
+/// work (it compiles the pattern as written too). Not a fence against that
+/// author, who may write `.*` outright.
+macro_rules! oidc_whole_value_sql {
+    ($p:literal) => {
+        concat!("('^(?:' || ", $p, " || ')$')")
+    };
+}
+
 /// The URL of the upstream server row `$s`: its primary endpoint's — the first
 /// ENABLED endpoint by `(position, created_at, id)` — or NULL when it has no
 /// enabled endpoint. The endpoint table is the one place a server's URLs are
@@ -1345,10 +1360,12 @@ async fn advance_cors_origins(
         // Audit types — typed shapes for the former Value fields
         routes::audit::ResponseFormat,
         conversation::ConversationEvent,
+        streamscope_core::proxy::content::VolatileLabel,
         conversation::ToolsChangeKind,
         conversation::DetectedSpawnPoint,
         routes::audit::ToolDefinitionBlobResponse,
         conversation::TurnMetadata,
+        conversation::Citation,
         routes::audit::AuditLogEntry,
         routes::audit::AuditLogRow,
         routes::audit::AuditKind,
@@ -1581,6 +1598,7 @@ async fn advance_cors_origins(
         routes::client_access_profiles::DestinationAttachment,
         routes::client_access_profiles::SandboxSettings,
         routes::client_access_profiles::SandboxSettingsPatch,
+        streamscope_client_templates::sandbox_image::DefaultImage,
         routes::client_access_profiles::SandboxPolicy,
         routes::client_access_profiles::WorkspaceClientAccess,
         routes::client_access_profiles::UpdateClientAccessRequest,

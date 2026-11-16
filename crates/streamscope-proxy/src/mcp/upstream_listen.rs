@@ -95,6 +95,11 @@ struct ListenerShared {
     /// live source, or the acknowledgement promises a client notifications
     /// nothing is listening for.
     settled: AtomicBool,
+    /// What the upstream's latest `notifications/subscriptions/acknowledged`
+    /// on this stream agreed to honor — the subset of what was asked. `None`
+    /// until one arrived, and always on a legacy `GET` channel, which has no
+    /// acknowledgement.
+    acked: std::sync::Mutex<Option<modern::SubscriptionFilter>>,
 }
 
 /// One upstream's listener. The stream itself lives in a spawned task.
@@ -280,6 +285,7 @@ impl UpstreamListenerMap {
             cancelled: AtomicBool::new(false),
             upstream_auth: ArcSwap::from(Arc::new(req.upstream_auth)),
             settled: AtomicBool::new(false),
+            acked: std::sync::Mutex::new(None),
         });
         let listener = Arc::new(UpstreamListener {
             shared: shared.clone(),
@@ -315,6 +321,12 @@ impl UpstreamListenerMap {
         if let Some(l) = self.listeners.get(key) {
             l.touch();
         }
+    }
+
+    /// What the upstream's latest acknowledgement on `key`'s stream agreed to
+    /// honor, if one arrived.
+    pub fn acknowledged(&self, key: &ListenerKey) -> Option<modern::SubscriptionFilter> {
+        self.listeners.get(key).and_then(|l| l.shared.acked.lock_or_poisoned().clone())
     }
 
     /// Drop listeners nobody has touched within the idle window.
@@ -662,14 +674,20 @@ async fn listen_once(
         buf.extend_from_slice(&bytes);
         loop {
             match decoder.decode(&mut buf) {
-                Ok(Some(ev)) => forward(&ev.data, transport.is_modern(), sink),
+                Ok(Some(ev)) => {
+                    if let Some(acked) = forward(&ev.data, transport.is_modern(), sink) {
+                        *shared.acked.lock_or_poisoned() = Some(acked);
+                    }
+                }
                 Ok(None) => break,
                 Err(e) => return Err(format!("SSE decode error: {e}")),
             }
         }
     }
-    if let Ok(Some(ev)) = decoder.decode_eof(&mut buf) {
-        forward(&ev.data, transport.is_modern(), sink);
+    if let Ok(Some(ev)) = decoder.decode_eof(&mut buf)
+        && let Some(acked) = forward(&ev.data, transport.is_modern(), sink)
+    {
+        *shared.acked.lock_or_poisoned() = Some(acked);
     }
     Ok(Unsupported::No)
 }
@@ -677,18 +695,21 @@ async fn listen_once(
 /// Hand one decoded event to the sink, if it is something a downstream
 /// subscriber could act on.
 ///
-/// The acknowledgement and the closing result of a modern `subscriptions/listen`
-/// describe *this* gateway-owned stream, not the upstream's state — relaying
+/// The acknowledgement (a `notifications/subscriptions/acknowledged`) and the
+/// closing result of a modern `subscriptions/listen` describe *this* gateway-owned stream, not the upstream's state — relaying
 /// either would put a `resultType` on a client's notification channel and, in
 /// the acknowledgement's case, tell the client its own subscription had just
 /// been confirmed by a server it never addressed.
-fn forward(raw: &str, modern_stream: bool, sink: &dyn UpstreamEventSink) {
+///
+/// Returns that acknowledgement's filter — what the upstream agreed to honor.
+fn forward(raw: &str, modern_stream: bool, sink: &dyn UpstreamEventSink) -> Option<modern::SubscriptionFilter> {
     let Ok(mut payload) = serde_json::from_str::<Value>(raw) else {
-        return;
+        return None;
     };
-    let Some(method) = payload.get("method").and_then(Value::as_str) else {
-        return;
-    };
+    let method = payload.get("method").and_then(Value::as_str)?;
+    if modern_stream && method == modern::METHOD_SUBSCRIPTIONS_ACKNOWLEDGED {
+        return Some(modern::SubscriptionFilter::parse(payload.get("params")));
+    }
     // A modern stream carries notifications and nothing else — that era
     // deleted server-initiated requests outright. One arriving here is a
     // non-conforming upstream, and relaying it would put a question on a
@@ -702,7 +723,7 @@ fn forward(raw: &str, modern_stream: bool, sink: &dyn UpstreamEventSink) {
             method = %method,
             "MCP listener: dropping a non-notification from a modern stream"
         );
-        return;
+        return None;
     }
     if modern_stream {
         // The upstream stamped its own subscription id, naming the stream the
@@ -729,6 +750,7 @@ fn forward(raw: &str, modern_stream: bool, sink: &dyn UpstreamEventSink) {
         }
     }
     sink.on_event(payload);
+    None
 }
 
 #[cfg(test)]
@@ -835,6 +857,19 @@ mod tests {
         // streams reconnecting into a draining audit channel while the process
         // goes away — and the docs claim shutdown closes them.
         assert!(shared.cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn the_map_reads_back_what_a_streams_upstream_acknowledged() {
+        let map = UpstreamListenerMap::new(4);
+        let sink: Arc<dyn UpstreamEventSink> = Arc::new(Collect(std::sync::Mutex::new(Vec::new())));
+        assert!(map.ensure(request(filter(true, &[])), sink));
+        assert_eq!(map.acknowledged(&nil_key()), None, "nothing acknowledged yet");
+        *map.listeners.get(&nil_key()).unwrap().shared.acked.lock_or_poisoned() = Some(filter(true, &["r"]));
+        assert_eq!(map.acknowledged(&nil_key()), Some(filter(true, &["r"])));
+        let mut other = nil_key();
+        other.upstream_id = Uuid::from_u128(1);
+        assert_eq!(map.acknowledged(&other), None, "no stream for that key");
     }
 
     #[tokio::test]
@@ -1254,6 +1289,61 @@ mod tests {
         let out = classify_non_stream_answer(resp, "text/html", Duration::from_secs(10)).await;
         let e = out.err().expect("an error page is not a statement about the method");
         assert!(e.contains("expected a stream") && !e.contains("did not end"), "{e}");
+        server.abort();
+    }
+
+    fn fresh_shared() -> ListenerShared {
+        ListenerShared {
+            cancelled: AtomicBool::new(false),
+            upstream_auth: ArcSwap::from(Arc::new(UpstreamAuth::none())),
+            settled: AtomicBool::new(false),
+            acked: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn modern_transport() -> ListenTransport {
+        ListenTransport::ModernListen {
+            client_capabilities: serde_json::json!({}),
+            client_info: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_upstreams_acknowledgement_is_recorded_and_not_relayed() {
+        // It is the subset the upstream agreed to honor (not what was asked),
+        // and it describes the gateway's own stream: no subscriber gets it.
+        let (url, server) = serve_once(
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"notifications\":{\"toolsListChanged\":true}}}\n\n",
+            true,
+        )
+        .await;
+        let shared = fresh_shared();
+        let sink = Collect(std::sync::Mutex::new(Vec::new()));
+        let mut asked = filter(true, &["r"]);
+        asked.prompts_list_changed = true;
+        let client = reqwest::Client::new();
+        let _ = listen_once(&client, &url, &UpstreamAuth::none(), &modern_transport(), &asked, &shared, &sink).await;
+        assert_eq!(*shared.acked.lock_or_poisoned(), Some(filter(true, &[])));
+        assert!(sink.0.lock_or_poisoned().is_empty(), "the acknowledgement was relayed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_notification_is_relayed_and_is_no_acknowledgement() {
+        // The positive control: the drop is the acknowledgement's alone.
+        let (url, server) = serve_once(
+            "text/event-stream",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+            true,
+        )
+        .await;
+        let shared = fresh_shared();
+        let sink = Collect(std::sync::Mutex::new(Vec::new()));
+        let client = reqwest::Client::new();
+        let _ = listen_once(&client, &url, &UpstreamAuth::none(), &modern_transport(), &filter(true, &[]), &shared, &sink).await;
+        assert_eq!(*shared.acked.lock_or_poisoned(), None);
+        assert_eq!(sink.0.lock_or_poisoned().len(), 1);
         server.abort();
     }
 }

@@ -72,6 +72,11 @@ pub struct RhaiMessage {
     /// Assistant tool calls (ToolUse / FunctionCall). Empty on non-assistant messages.
     /// Mutations are reconciled back to the native protocol on apply.
     pub tool_calls: Vec<RhaiToolCall>,
+    /// Which message of the request this one was read as (its index in the
+    /// messages the script was given): it travels with the message wherever
+    /// the script keeps or moves it, and is what the write-back writes it
+    /// over. `None` on a message the script made.
+    pub origin: Option<usize>,
 }
 
 impl RhaiMessage {
@@ -87,6 +92,9 @@ impl RhaiMessage {
         );
         let tc_array: rhai::Array = self.tool_calls.iter().map(|t| t.to_dynamic()).collect();
         map.insert("tool_calls".into(), Dynamic::from_array(tc_array));
+        if let Some(origin) = self.origin.and_then(|o| rhai::INT::try_from(o).ok()) {
+            map.insert("origin".into(), origin.into());
+        }
         Dynamic::from_map(map)
     }
 
@@ -120,6 +128,7 @@ impl RhaiMessage {
                     }
                 }),
             tool_calls,
+            origin: map.get("origin").and_then(|v| v.as_int().ok()).and_then(|o| usize::try_from(o).ok()),
         })
     }
 }
@@ -832,7 +841,12 @@ fn project(
     // downstream `compute_telemetry_drops` audit.
     let system_prompt = system_prompt_text(req, &domain);
 
-    let messages: Vec<RhaiMessage> = domain.messages.iter().map(domain_msg_to_rhai).collect();
+    let messages: Vec<RhaiMessage> = domain
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| RhaiMessage { origin: Some(i), ..domain_msg_to_rhai(m) })
+        .collect();
 
     // Build tools from domain tools. Mark tools whose wire `name` was
     // rewritten by the request-phase tool-policy `Substitute` action so
@@ -989,8 +1003,10 @@ pub fn scan_messages(req: &ApiRequest, start: usize) -> Option<Vec<ScanMessage>>
                 paired.push((item, part, domain_msg_to_rhai(m)));
             }
         }
-        if let ApiRequest::AnthropicMessages(r) = req {
-            results.extend(anthropic_pieces(&r.messages[item], item, piece, &tail, &mut result_from));
+        match req {
+            ApiRequest::AnthropicMessages(r) => results.extend(anthropic_pieces(&r.messages[item], item, piece, &tail, &mut result_from)),
+            ApiRequest::GoogleGemini(r) => results.extend(gemini_pieces(&r.contents[item], item, piece, &tail, &mut result_from)),
+            _ => {}
         }
     }
     if paired.len() != read.len() {
@@ -1025,72 +1041,143 @@ pub fn scan_messages(req: &ApiRequest, start: usize) -> Option<Vec<ScanMessage>>
 /// Whether a domain block is the one a piece came from.
 type BlockTest<'a> = dyn Fn(&DomainContentBlock) -> bool + 'a;
 
+/// Where a piece sits: the message of `tail` holding a block `holds` accepts,
+/// in order from `from` on (a result sent twice lands on each; a conversion
+/// places an item's tool messages first, so a block after one may sit before
+/// it), as its distance from the end; 0 when no message holds it.
+fn anchor_piece(tail: &[DomainMessage], from: &mut usize, holds: &BlockTest) -> usize {
+    let holding = |m: &DomainMessage| m.content.iter().any(holds);
+    let at = tail.iter().skip(*from).position(holding).map(|at| *from + at).or_else(|| tail.iter().position(holding));
+    if let Some(at) = at {
+        *from = at;
+    }
+    at.map_or(0, |at| tail.len() - 1 - at)
+}
+
+/// A result of a tool the server ran, `value` as the conversion keeps it (an
+/// unknown block), read as a tool message — piece `piece`, which it takes
+/// whether it holds text or not. `read` is the result's text and the call it
+/// answers, as its protocol's reader reads them; `None` when `value` is no such
+/// result, which takes no piece.
+fn server_run_piece(
+    value: &Value,
+    read: Option<(Option<String>, String)>,
+    item: usize,
+    piece: &mut usize,
+    tail: &[DomainMessage],
+    from: &mut usize,
+    out: &mut Vec<ScanMessage>,
+) {
+    let Some((text, call)) = read else {
+        return;
+    };
+    let reverse = anchor_piece(tail, from, &|b| matches!(b, DomainContentBlock::Unknown { value: v } if v == value));
+    if let Some(content) = text {
+        out.push(ScanMessage {
+            item,
+            part: *piece,
+            reverse,
+            message: RhaiMessage { role: "tool".to_string(), content, tool_call_id: Some(call.clone()), tool_calls: Vec::new(), origin: None },
+            // Named even when it names no call (a Gemini result's `id` is
+            // optional): a finding on it then gets a stub of its own rather
+            // than landing on the prose of the message it sits in.
+            held_call: Some(call),
+        });
+    }
+    *piece += 1;
+}
+
+/// An item's server-run result as [`server_run_piece`] takes it.
+fn item_result(value: &Value) -> Option<(Option<String>, String)> {
+    crate::api::is_server_run_result(value).then(|| (crate::api::server_run_text(value), crate::api::server_run_call_id(value)))
+}
+
+/// A Gemini part's server-run result as [`server_run_piece`] takes it.
+fn gemini_result(part: &Value) -> Option<(Option<String>, String)> {
+    crate::api::is_gemini_server_run_result(part)
+        .then(|| (crate::api::gemini_server_run_text(part), crate::api::gemini_server_run_call_id(part)))
+}
+
+/// The pieces of a Gemini content past its documents: each part holding a
+/// result of a tool the server ran (a `codeExecutionResult`, a
+/// `toolResponse`), in part order, as a tool message. Pieces count from `piece`
+/// by their place ([`set_gemini_piece_text`] walks them alike).
+fn gemini_pieces(content: &GeminiContent, item: usize, mut piece: usize, tail: &[DomainMessage], from: &mut usize) -> Vec<ScanMessage> {
+    let mut out = Vec::new();
+    for part in &content.parts {
+        if let GeminiPart::Unknown(value) = part {
+            server_run_piece(value, gemini_result(value), item, &mut piece, tail, from, &mut out);
+        }
+    }
+    out
+}
+
 /// The pieces of an Anthropic message past its documents, in block order: each
 /// result of a tool the server ran or of a search a client supplies, at the top
 /// or inside a tool result, as a tool message; and the name and context of a
-/// document by file reference, which the domain keeps as no document. Each is
+/// document by file reference, which the domain keeps as no document — as a
+/// user message, or inside a tool result as that result's. Each is
 /// anchored at the message of `tail` holding it, from `from` on. Pieces count
 /// from `piece` by their place ([`set_anthropic_piece_text`] walks them alike).
 fn anthropic_pieces(message: &AnthropicMessage, item: usize, mut piece: usize, tail: &[DomainMessage], from: &mut usize) -> Vec<ScanMessage> {
     let AnthropicContent::Blocks(blocks) = &message.content else {
         return Vec::new();
     };
-    let mut anchor = |holds: &BlockTest| {
-        let holding = |m: &DomainMessage| m.content.iter().any(holds);
-        // In order, so a result sent twice lands on each; a conversion places an
-        // item's tool messages first, so a block after one may sit before it.
-        let at = tail.iter().skip(*from).position(holding).map(|at| *from + at).or_else(|| tail.iter().position(holding));
-        if let Some(at) = at {
-            *from = at;
-        }
-        at.map_or(0, |at| tail.len() - 1 - at)
-    };
     let mut out = Vec::new();
-    let mut result = |value: &Value, piece: &mut usize, anchor: &mut dyn FnMut(&BlockTest) -> usize| {
-        if !crate::api::is_server_run_result(value) {
-            return;
-        }
-        let reverse = anchor(&|b| matches!(b, DomainContentBlock::Unknown { value: v } if v == value));
-        if let Some(content) = crate::api::server_run_text(value) {
-            let call = crate::api::server_run_call_id(value);
-            out.push(ScanMessage {
-                item,
-                part: *piece,
-                reverse,
-                message: RhaiMessage { role: "tool".to_string(), content, tool_call_id: Some(call.clone()), tool_calls: Vec::new() },
-                held_call: (!call.is_empty()).then_some(call),
-            });
+    // (piece, reverse, text, the tool result holding it).
+    let mut files: Vec<(usize, usize, String, Option<String>)> = Vec::new();
+    // A file reference's name and context, read where the model reads them.
+    let mut file = |source: &crate::api::messages::ImageSource,
+                    title: &Option<String>,
+                    context: &Option<String>,
+                    result: Option<&String>,
+                    piece: &mut usize,
+                    from: &mut usize| {
+        let read: Vec<&str> = title.iter().chain(context).map(String::as_str).collect();
+        let id = source.file_id.clone();
+        let reverse = anchor_piece(tail, from, &|b| matches!(b, DomainContentBlock::File { file_id, .. } if *file_id == id));
+        if message.role != "assistant" && read.iter().any(|t| !t.trim().is_empty()) {
+            files.push((*piece, reverse, read.join("\n"), result.cloned()));
         }
         *piece += 1;
     };
-    let mut files = Vec::new();
     for block in blocks {
         match block {
-            ContentBlock::Unknown(value) => result(value, &mut piece, &mut anchor),
-            ContentBlock::ToolResult { content: Some(crate::api::messages::ToolResultContent::Blocks(inner)), .. } => {
+            ContentBlock::Unknown(value) => server_run_piece(value, item_result(value), item, &mut piece, tail, from, &mut out),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content: Some(crate::api::messages::ToolResultContent::Blocks(inner)),
+                ..
+            } => {
                 for inner in inner {
-                    if let crate::api::messages::ToolResultBlock::Unknown(value) = inner {
-                        result(value, &mut piece, &mut anchor);
+                    match inner {
+                        crate::api::messages::ToolResultBlock::Unknown(value) => {
+                            server_run_piece(value, item_result(value), item, &mut piece, tail, from, &mut out)
+                        }
+                        crate::api::messages::ToolResultBlock::Document { source, title, context, .. } if source.r#type == "file" => {
+                            file(source, title, context, Some(tool_use_id), &mut piece, from)
+                        }
+                        _ => {}
                     }
                 }
             }
             ContentBlock::Document { source, title, context, .. } if source.r#type == "file" => {
-                let read: Vec<&str> = title.iter().chain(context).map(String::as_str).collect();
-                let id = source.file_id.clone();
-                let reverse = anchor(&|b| matches!(b, DomainContentBlock::File { file_id, .. } if *file_id == id));
-                if message.role != "assistant" && read.iter().any(|t| !t.trim().is_empty()) {
-                    files.push((piece, reverse, read.join("\n")));
-                }
-                piece += 1;
+                file(source, title, context, None, &mut piece, from)
             }
             _ => {}
         }
     }
-    out.extend(files.into_iter().map(|(part, reverse, content)| ScanMessage {
+    out.extend(files.into_iter().map(|(part, reverse, content, result)| ScanMessage {
         item,
         part,
         reverse,
-        message: RhaiMessage { role: "user".to_string(), content, tool_call_id: None, tool_calls: Vec::new() },
+        message: RhaiMessage {
+            role: if result.is_some() { "tool" } else { "user" }.to_string(),
+            content,
+            tool_call_id: result,
+            tool_calls: Vec::new(),
+            origin: None,
+        },
         held_call: None,
     }));
     out
@@ -1163,6 +1250,7 @@ fn held_outputs(req: &ApiRequest, start: usize, tail: &[DomainMessage]) -> Vec<S
                 content,
                 tool_call_id: Some(call_id.clone()),
                 tool_calls: Vec::new(),
+                origin: None,
             },
             held_call: Some(call_id),
         });
@@ -1278,8 +1366,26 @@ fn set_item_piece_text(req: &mut ApiRequest, item: usize, own: &[DomainMessage],
         }
         left -= documents;
     }
-    if let ApiRequest::AnthropicMessages(r) = req {
-        set_anthropic_piece_text(&mut r.messages[item], left, text);
+    match req {
+        ApiRequest::AnthropicMessages(r) => set_anthropic_piece_text(&mut r.messages[item], left, text),
+        ApiRequest::GoogleGemini(r) => set_gemini_piece_text(&mut r.contents[item], left, text),
+        _ => {}
+    }
+}
+
+/// Write `text` over the `n`-th piece [`gemini_pieces`] counts: a server-run
+/// result's strings, the part and its result's other members kept.
+fn set_gemini_piece_text(content: &mut GeminiContent, n: usize, text: &str) {
+    if let Some(value) = content
+        .parts
+        .iter_mut()
+        .filter_map(|p| match p {
+            GeminiPart::Unknown(value) if crate::api::is_gemini_server_run_result(value) => Some(value),
+            _ => None,
+        })
+        .nth(n)
+    {
+        crate::api::set_gemini_server_run_text(value, text);
     }
 }
 
@@ -1294,18 +1400,27 @@ fn set_anthropic_piece_text(message: &mut AnthropicMessage, mut n: usize, text: 
         n = n.wrapping_sub(1);
         hit
     };
-    for block in blocks {
+    for block in blocks.iter_mut() {
         match block {
             ContentBlock::Unknown(value) if crate::api::is_server_run_result(value) && take() => {
                 return crate::api::set_server_run_text(value, text);
             }
             ContentBlock::ToolResult { content: Some(crate::api::messages::ToolResultContent::Blocks(inner)), .. } => {
                 for inner in inner {
-                    if let crate::api::messages::ToolResultBlock::Unknown(value) = inner
-                        && crate::api::is_server_run_result(value)
-                        && take()
-                    {
-                        return crate::api::set_server_run_text(value, text);
+                    match inner {
+                        crate::api::messages::ToolResultBlock::Unknown(value)
+                            if crate::api::is_server_run_result(value) && take() =>
+                        {
+                            return crate::api::set_server_run_text(value, text);
+                        }
+                        crate::api::messages::ToolResultBlock::Document { source, title, context, .. }
+                            if source.r#type == "file" && take() =>
+                        {
+                            *title = None;
+                            *context = (!text.is_empty()).then(|| text.to_string());
+                            return;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1341,25 +1456,18 @@ fn set_document_text(req: &mut ApiRequest, item: usize, own: &[DomainMessage], p
             if is_tool && !role_is_tool {
                 if let Some(ContentBlock::ToolResult { content: Some(crate::api::messages::ToolResultContent::Blocks(inner)), .. }) =
                     blocks.iter_mut().filter(|b| matches!(b, ContentBlock::ToolResult { .. })).nth(k)
-                    && let Some(crate::api::messages::ToolResultBlock::Document { source, .. }) = inner
+                    && let Some(crate::api::messages::ToolResultBlock::Document { source, title, context, .. }) = inner
                         .iter_mut()
                         .filter(|b| matches!(b, crate::api::messages::ToolResultBlock::Document { source, .. } if source.r#type != "file"))
                         .nth(n)
                 {
-                    set_source_text(source, text);
+                    set_document_parts_text(source, title, context, text);
                 }
             } else if let Some(ContentBlock::Document { source, title, context, .. }) =
                 // The domain reads a file reference as no document: counted as it counts.
                 blocks.iter_mut().filter(|b| matches!(b, ContentBlock::Document { source, .. } if source.r#type != "file")).nth(n)
             {
-                // Read with the body, so gone with it. A body no text can land
-                // in keeps the text in the context the model reads beside it.
-                *title = None;
-                if set_source_text(source, text) {
-                    *context = None;
-                } else {
-                    *context = (!text.is_empty()).then(|| text.to_string());
-                }
+                set_document_parts_text(source, title, context, text);
             }
         }
         ApiRequest::GoogleGemini(r) => {
@@ -1402,6 +1510,23 @@ fn set_document_text(req: &mut ApiRequest, item: usize, own: &[DomainMessage], p
     }
 }
 
+/// Write `text` over what [`document_screen_text`] read of an Anthropic
+/// document — its name and context with its body, so they go with it. A body
+/// no text can land in keeps the text in the context the model reads beside it.
+fn set_document_parts_text(
+    source: &mut crate::api::messages::ImageSource,
+    title: &mut Option<String>,
+    context: &mut Option<String>,
+    text: &str,
+) {
+    *title = None;
+    if set_source_text(source, text) {
+        *context = None;
+    } else {
+        *context = (!text.is_empty()).then(|| text.to_string());
+    }
+}
+
 /// Write `text` as an Anthropic document source's text, where
 /// [`document_screen_text`] read it: a content source's text blocks, its images
 /// kept, or a text body, which becomes the spec's text source whatever spelled
@@ -1412,18 +1537,17 @@ fn set_source_text(source: &mut crate::api::messages::ImageSource, text: &str) -
             let mut blocks = source.content.take().unwrap_or_default();
             let mut written = false;
             blocks.retain_mut(|block| {
-                let ContentBlock::Text { text: t, .. } = block else {
+                if !matches!(block, ContentBlock::Text { .. }) {
                     return true;
-                };
+                }
                 if written {
                     return false;
                 }
-                written = true;
-                *t = text.to_string();
+                written = block.write_text(text);
                 true
             });
             if !written {
-                blocks.insert(0, ContentBlock::Text { text: text.to_string(), cache_control: None });
+                blocks.insert(0, ContentBlock::Text { text: text.to_string(), cache_control: None, extra: BTreeMap::new() });
             }
             source.content = Some(blocks);
         }
@@ -1486,7 +1610,7 @@ fn set_anthropic_item_text(msg: &mut AnthropicMessage, new_text: &str) {
     };
     let texts: Vec<usize> = (0..blocks.len()).filter(|&i| matches!(blocks[i], ContentBlock::Text { .. })).collect();
     let Some(&last) = texts.last() else {
-        blocks.push(ContentBlock::Text { text: new_text.to_string(), cache_control: None });
+        blocks.push(ContentBlock::Text { text: new_text.to_string(), cache_control: None, extra: BTreeMap::new() });
         return;
     };
     let keep = texts
@@ -1495,9 +1619,7 @@ fn set_anthropic_item_text(msg: &mut AnthropicMessage, new_text: &str) {
         .copied()
         .find(|&i| matches!(&blocks[i], ContentBlock::Text { cache_control: Some(_), .. }))
         .unwrap_or(last);
-    if let ContentBlock::Text { text, .. } = &mut blocks[keep] {
-        *text = new_text.to_string();
-    }
+    blocks[keep].write_text(new_text);
     let mut index = 0;
     blocks.retain(|_| {
         let kept = index == keep || !texts.contains(&index);
@@ -1542,33 +1664,43 @@ fn set_responses_item_text(item: &mut Value, text: &str) {
     };
     match item.get_mut(key) {
         Some(Value::Array(parts)) => {
-            let mut replaced = false;
             // A typed part reads as the protocol types it; an untyped item's,
-            // by its `text`.
-            parts.retain_mut(|part| {
-                // An output part with no `type` reads as its JSON text.
-                let is_text = if typed {
+            // by its `text`. An output part with no `type` reads as its JSON
+            // text.
+            let is_text = |part: &Value| {
+                if typed {
                     crate::api::domain_request::unknown_part_is_text(part) || (key == "output" && part.get("type").is_none())
                 } else {
                     part.get("text").is_some_and(Value::is_string)
-                };
-                if !is_text {
-                    return true;
                 }
-                if replaced {
-                    return false;
-                }
-                replaced = true;
-                if part.get("type").is_none() {
-                    // Read whole as its JSON, so written whole.
-                    *part = serde_json::json!({"type": "input_text", "text": text});
-                } else {
-                    part["text"] = Value::String(text.to_string());
-                }
-                true
-            });
-            if !replaced {
+            };
+            let Some(first) = parts.iter().position(is_text) else {
                 parts.push(serde_json::json!({"type": "input_text", "text": text}));
+                return;
+            };
+            // A removed text part's prompt-cache breakpoint (the latest) moves
+            // onto the part the text is written in, so the prefix still ends
+            // there.
+            let breakpoint = parts[first + 1..]
+                .iter()
+                .filter(|p| is_text(p))
+                .filter_map(|p| p.get("prompt_cache_breakpoint").filter(|b| !b.is_null()).cloned())
+                .next_back();
+            let mut at = 0;
+            parts.retain(|p| {
+                let keep = at <= first || !is_text(p);
+                at += 1;
+                keep
+            });
+            let part = &mut parts[first];
+            if part.get("type").is_none() {
+                // Read whole as its JSON, so written whole.
+                *part = serde_json::json!({"type": "input_text", "text": text});
+            } else {
+                part["text"] = Value::String(text.to_string());
+            }
+            if let Some(b) = breakpoint {
+                part["prompt_cache_breakpoint"] = b;
             }
         }
         _ => item[key] = Value::String(text.to_string()),
@@ -1584,9 +1716,7 @@ fn domain_msg_to_rhai(dm: &DomainMessage) -> RhaiMessage {
         DomainRole::Tool { .. } => "tool",
     };
     // A tool result's text blocks read as one text, as every walk sends a
-    // text-only result and as the native expansions read it
-    // (`anthropic_to_rhai_expansion`): a script that changes nothing must
-    // read as no change.
+    // text-only result: a script that changes nothing must read as no change.
     let separator = if matches!(dm.role, DomainRole::Tool { .. }) { "" } else { "\n" };
     let content = dm
         .content
@@ -1620,141 +1750,11 @@ fn domain_msg_to_rhai(dm: &DomainMessage) -> RhaiMessage {
         content,
         tool_call_id,
         tool_calls,
+        origin: None,
     }
 }
 
 // ── Helpers for apply_to_api_request ──
-
-/// Extract text content from a ChatCompletions message.
-fn chat_msg_text(msg: &Message) -> String {
-    match &msg.content {
-        Some(MessageContent::Text(t)) => t.clone(),
-        Some(MessageContent::Parts(parts)) => parts
-            .iter()
-            .filter_map(|p| match p {
-                crate::api::domain::ContentPart::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => String::new(),
-    }
-}
-
-/// Extract text content from an Anthropic message.
-fn anthropic_msg_text(msg: &AnthropicMessage) -> String {
-    match &msg.content {
-        AnthropicContent::Text(t) => t.clone(),
-        AnthropicContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
-
-/// A tool result's text, its text blocks joined — as the domain projection
-/// reads a tool message (`domain_msg_to_rhai`).
-fn tool_result_content_text(
-    content: &Option<crate::api::messages::ToolResultContent>,
-) -> String {
-    use crate::api::messages::{ToolResultBlock, ToolResultContent};
-    match content {
-        Some(ToolResultContent::Text(t)) => t.clone(),
-        Some(ToolResultContent::Blocks(blocks)) => blocks
-            .iter()
-            .filter_map(|b| match b {
-                ToolResultBlock::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-        None => String::new(),
-    }
-}
-
-/// Re-derive the Rhai expansion for a native Anthropic message.
-///
-/// Mirrors `convert_anthropic_message()` + `domain_msg_to_rhai()` but operates
-/// directly on native types. Used to build the rhai_idx→native_idx mapping
-/// for `sync_anthropic_messages`.
-fn anthropic_to_rhai_expansion(msg: &AnthropicMessage) -> Vec<RhaiMessage> {
-    match &msg.content {
-        AnthropicContent::Text(text) => vec![RhaiMessage {
-            role: msg.role.clone(),
-            content: text.clone(),
-            tool_call_id: None,
-            tool_calls: vec![],
-        }],
-        AnthropicContent::Blocks(blocks) => {
-            let mut result = Vec::new();
-            let mut text_parts: Vec<&str> = Vec::new();
-
-            if msg.role == "assistant" {
-                // Assistant: single message with text-only content
-                for block in blocks {
-                    if let ContentBlock::Text { text, .. } = block {
-                        text_parts.push(text);
-                    }
-                }
-                let tool_calls: Vec<RhaiToolCall> = blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        ContentBlock::ToolUse {
-                            id, name, input, ..
-                        } => Some(RhaiToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments_json: serde_json::to_string(input).unwrap_or_default(),
-                        }),
-                        _ => None,
-                    })
-                    .collect();
-                result.push(RhaiMessage {
-                    role: "assistant".to_string(),
-                    content: text_parts.join("\n"),
-                    tool_call_id: None,
-                    tool_calls,
-                });
-            } else {
-                // User: tool_results → separate "tool" messages, text → "user" message
-                for block in blocks {
-                    match block {
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            ..
-                        } => {
-                            let text = tool_result_content_text(content);
-                            result.push(RhaiMessage {
-                                role: "tool".to_string(),
-                                content: text,
-                                tool_call_id: Some(tool_use_id.clone()),
-                                tool_calls: vec![],
-                            });
-                        }
-                        ContentBlock::Text { text, .. } => {
-                            text_parts.push(text);
-                        }
-                        _ => {} // Image, Document, Unknown — not in Rhai projection
-                    }
-                }
-                if !text_parts.is_empty() {
-                    result.push(RhaiMessage {
-                        role: "user".to_string(),
-                        content: text_parts.join("\n"),
-                        tool_call_id: None,
-                        tool_calls: vec![],
-                    });
-                }
-            }
-            result
-        }
-    }
-}
 
 /// Sets a tool result's text: its text blocks become one holding it, a
 /// non-text block (an image) kept.
@@ -1774,53 +1774,6 @@ fn set_tool_result_text(content: &mut Option<crate::api::messages::ToolResultCon
             } else {
                 Some(crate::api::messages::ToolResultContent::Text(new_text.to_string()))
             };
-        }
-    }
-}
-
-/// Update a specific ToolResult's text content within an Anthropic message.
-/// Preserves is_error, cache_control, and non-text ToolResultBlock content.
-fn update_tool_result_content(msg: &mut AnthropicMessage, tool_use_id: &str, new_text: &str) {
-    if let AnthropicContent::Blocks(blocks) = &mut msg.content {
-        for block in blocks {
-            if let ContentBlock::ToolResult {
-                tool_use_id: id,
-                content,
-                ..
-            } = block
-                && id == tool_use_id
-            {
-                set_tool_result_text(content, new_text);
-                return;
-            }
-        }
-    }
-}
-
-/// Update text blocks in an Anthropic message, preserving all non-text blocks
-/// (ToolResult, Thinking, ToolUse, Image, Document).
-fn update_anthropic_text(msg: &mut AnthropicMessage, new_text: &str) {
-    match &mut msg.content {
-        AnthropicContent::Blocks(blocks) => {
-            let mut replaced = false;
-            blocks.retain_mut(|b| match b {
-                ContentBlock::Text { text, .. } if !replaced => {
-                    *text = new_text.to_string();
-                    replaced = true;
-                    true
-                }
-                ContentBlock::Text { .. } => false,
-                _ => true,
-            });
-            if !replaced {
-                blocks.push(ContentBlock::Text {
-                    text: new_text.to_string(),
-                    cache_control: None,
-                });
-            }
-        }
-        _ => {
-            msg.content = AnthropicContent::Text(new_text.to_string());
         }
     }
 }
@@ -1874,20 +1827,8 @@ fn group_rhai_for_anthropic(rhai_msgs: &[RhaiMessage]) -> Vec<RhaiGroup<'_>> {
     groups
 }
 
-/// Extract tool_result IDs from an Anthropic message.
-fn extract_tool_result_ids(msg: &AnthropicMessage) -> std::collections::HashSet<String> {
-    let mut ids = std::collections::HashSet::new();
-    if let AnthropicContent::Blocks(blocks) = &msg.content {
-        for block in blocks {
-            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                ids.insert(tool_use_id.clone());
-            }
-        }
-    }
-    ids
-}
-
-/// Build a native Anthropic message from a Rhai group (no matching original).
+/// Build a native Anthropic message from a group of messages the script wrote
+/// (no original item holds them as they are), an assistant's calls included.
 fn build_anthropic_from_group(group: &RhaiGroup<'_>) -> AnthropicMessage {
     match group {
         RhaiGroup::ToolGroup {
@@ -1914,6 +1855,7 @@ fn build_anthropic_from_group(group: &RhaiGroup<'_>) -> AnthropicMessage {
                 blocks.push(ContentBlock::Text {
                     text: tm.content.clone(),
                     cache_control: None,
+                    extra: BTreeMap::new(),
                 });
             }
             AnthropicMessage {
@@ -1921,509 +1863,19 @@ fn build_anthropic_from_group(group: &RhaiGroup<'_>) -> AnthropicMessage {
                 content: AnthropicContent::Blocks(blocks),
             }
         }
-        RhaiGroup::Single(rm) => AnthropicMessage {
+        RhaiGroup::Single(rm) if rm.tool_calls.is_empty() => AnthropicMessage {
             role: rm.role.clone(),
             content: AnthropicContent::Text(rm.content.clone()),
         },
-    }
-}
-
-/// Rebuild a native Anthropic message from a matched original + Rhai group.
-///
-/// Keeps the original's ToolResult blocks whole — is_error, cache_control and
-/// every inner block (an image, a document, a breakpoint) — setting a
-/// result's text only where the script changed it, through the same
-/// [`set_tool_result_text`] a redaction uses. Removes ToolResult blocks not in
-/// the group (script removed them). Updates/adds text block from the group's
-/// text_msg.
-fn rebuild_native_from_group(original: &AnthropicMessage, group: &RhaiGroup<'_>) -> AnthropicMessage {
-    match group {
-        RhaiGroup::ToolGroup {
-            tool_msgs,
-            text_msg,
-        } => {
-            let group_ids: std::collections::HashSet<&str> = tool_msgs
-                .iter()
-                .filter_map(|m| m.tool_call_id.as_deref())
-                .collect();
-
-            let mut blocks = Vec::new();
-
-            // Preserve original ToolResult blocks that are still in the group,
-            // updating their text content from the Rhai messages.
-            if let AnthropicContent::Blocks(orig_blocks) = &original.content {
-                for block in orig_blocks {
-                    match block {
-                        ContentBlock::ToolResult { tool_use_id, .. }
-                            if group_ids.contains(tool_use_id.as_str()) =>
-                        {
-                            let mut b = block.clone();
-                            if let Some(rm) = tool_msgs
-                                .iter()
-                                .find(|m| m.tool_call_id.as_deref() == Some(tool_use_id.as_str()))
-                                && let ContentBlock::ToolResult { content, .. } = &mut b
-                                && tool_result_content_text(content) != rm.content
-                            {
-                                set_tool_result_text(content, &rm.content);
-                            }
-                            blocks.push(b);
-                        }
-                        ContentBlock::ToolResult { .. } => {
-                            // Script removed this tool_result — skip it
-                        }
-                        ContentBlock::Text { .. } => {
-                            // Will be replaced by text_msg below
-                        }
-                        other => {
-                            // Preserve Image, Document, Unknown blocks
-                            blocks.push(other.clone());
-                        }
-                    }
-                }
-            }
-
-            // Add text block from group
-            if let Some(tm) = text_msg {
-                blocks.push(ContentBlock::Text {
-                    text: tm.content.clone(),
-                    cache_control: None,
-                });
-            }
-
-            AnthropicMessage {
-                role: "user".to_string(),
-                content: AnthropicContent::Blocks(blocks),
-            }
-        }
         RhaiGroup::Single(rm) => {
-            // For matched single messages, update text preserving non-text blocks
-            let mut msg = original.clone();
-            if anthropic_msg_text(&msg) != rm.content {
-                update_anthropic_text(&mut msg, &rm.content);
+            let text = (!rm.content.is_empty())
+                .then(|| ContentBlock::Text { text: rm.content.clone(), cache_control: None, extra: BTreeMap::new() });
+            AnthropicMessage {
+                role: rm.role.clone(),
+                content: AnthropicContent::Blocks(
+                    text.into_iter().chain(rhai_tool_calls_to_anthropic_blocks(&rm.tool_calls)).collect(),
+                ),
             }
-            msg
-        }
-    }
-}
-
-/// Sync Anthropic native messages with Rhai-modified messages.
-///
-/// Unlike `sync_messages`, this handles the N:M mapping between Rhai messages
-/// (where tool_results are expanded into separate role="tool" messages) and
-/// native Anthropic messages (where tool_results are content blocks inside
-/// a role="user" message).
-fn sync_anthropic_messages(
-    native_msgs: &mut Vec<AnthropicMessage>,
-    modified_rhai: &[RhaiMessage],
-    changes: &mut Vec<String>,
-) {
-    // Step 1: Re-derive original Rhai projection from native to build index mapping.
-    let mut original_rhai: Vec<RhaiMessage> = Vec::new();
-    let mut rhai_to_native: Vec<usize> = Vec::new();
-    for (native_idx, native_msg) in native_msgs.iter().enumerate() {
-        for rm in anthropic_to_rhai_expansion(native_msg) {
-            rhai_to_native.push(native_idx);
-            original_rhai.push(rm);
-        }
-    }
-
-    if modified_rhai.len() == original_rhai.len() {
-        // Same-count path: in-place text update.
-        let mut changed_natives = std::collections::BTreeSet::new();
-
-        for (i, (orig, modified)) in original_rhai.iter().zip(modified_rhai).enumerate() {
-            if orig.content != modified.content {
-                let native_idx = rhai_to_native[i];
-
-                if modified.role == "tool" {
-                    if let Some(tool_id) = &modified.tool_call_id {
-                        update_tool_result_content(
-                            &mut native_msgs[native_idx],
-                            tool_id,
-                            &modified.content,
-                        );
-                    }
-                } else {
-                    update_anthropic_text(&mut native_msgs[native_idx], &modified.content);
-                }
-
-                changed_natives.insert(native_idx);
-            }
-        }
-
-        for idx in changed_natives {
-            changes.push(format!("message_{idx}"));
-        }
-    } else {
-        // Count-changed path: group and rebuild.
-        let groups = group_rhai_for_anthropic(modified_rhai);
-        let orig_native: Vec<_> = std::mem::take(native_msgs);
-        let mut used = vec![false; orig_native.len()];
-
-        *native_msgs = groups
-            .iter()
-            .map(|group| {
-                // Try to find matching original native message.
-                let matched = match group {
-                    RhaiGroup::ToolGroup { tool_msgs, .. } => {
-                        // Match by tool_use_ids.
-                        let ids: std::collections::HashSet<&str> = tool_msgs
-                            .iter()
-                            .filter_map(|m| m.tool_call_id.as_deref())
-                            .collect();
-                        orig_native.iter().enumerate().find_map(|(j, msg)| {
-                            if used[j] || msg.role != "user" {
-                                return None;
-                            }
-                            let msg_ids = extract_tool_result_ids(msg);
-                            if !ids.is_empty()
-                                && ids.iter().all(|id| msg_ids.contains(*id))
-                            {
-                                Some(j)
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                    RhaiGroup::Single(rm) => {
-                        orig_native.iter().enumerate().find_map(|(j, msg)| {
-                            if used[j] {
-                                return None;
-                            }
-                            if msg.role == rm.role
-                                && anthropic_msg_text(msg) == rm.content
-                            {
-                                Some(j)
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                };
-
-                if let Some(j) = matched {
-                    used[j] = true;
-                    rebuild_native_from_group(&orig_native[j], group)
-                } else {
-                    build_anthropic_from_group(group)
-                }
-            })
-            .collect();
-
-        changes.push("messages".to_string());
-    }
-}
-
-/// Extract text from a GeminiContent's Text parts.
-fn gemini_content_text(content: &GeminiContent) -> String {
-    content
-        .parts
-        .iter()
-        .filter_map(|p| match p {
-            GeminiPart::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Expand a GeminiContent into one or more RhaiMessages (mirrors from_gemini domain expansion).
-/// Returns Vec<(RhaiMessage, is_func_response)>. A call and a response are keyed
-/// as the client wrote them — a call's own id (empty where it has none), a
-/// response's id, else its function's name — the key edits are written back by;
-/// not the pairing the request's parse reads (`GeminiCallIds`).
-fn gemini_to_rhai_expansion(content: &GeminiContent) -> Vec<(RhaiMessage, bool)> {
-    let role_str = content.role.as_deref().unwrap_or("user");
-    let rhai_role = if role_str == "model" { "assistant" } else { "user" };
-
-    let mut result = Vec::new();
-
-    // Split: regular content parts vs FunctionResponse parts
-    let has_content_parts = content.parts.iter().any(|p| !matches!(p, GeminiPart::FunctionResponse { .. }));
-    let func_responses: Vec<_> = content
-        .parts
-        .iter()
-        .filter_map(|p| match p {
-            GeminiPart::FunctionResponse { function_response } => Some(function_response),
-            _ => None,
-        })
-        .collect();
-
-    // Main content message (text + non-func-response parts)
-    if has_content_parts {
-        let text = gemini_content_text(content);
-        let tool_calls: Vec<RhaiToolCall> = content
-            .parts
-            .iter()
-            .filter_map(|p| match p {
-                GeminiPart::FunctionCall { function_call, .. } => Some(RhaiToolCall {
-                    id: function_call.id.clone().unwrap_or_default(),
-                    name: function_call.name.clone(),
-                    arguments_json: serde_json::to_string(&function_call.args)
-                        .unwrap_or_default(),
-                }),
-                _ => None,
-            })
-            .collect();
-        result.push((
-            RhaiMessage {
-                role: rhai_role.to_string(),
-                content: text,
-                tool_call_id: None,
-                tool_calls,
-            },
-            false,
-        ));
-    }
-
-    // Each FunctionResponse as a separate tool message
-    for fr in func_responses {
-        let text = if fr.response.is_string() {
-            fr.response.as_str().unwrap_or("").to_string()
-        } else {
-            serde_json::to_string(&fr.response).unwrap_or_default()
-        };
-        let call_id = fr.id.clone().unwrap_or_else(|| fr.name.clone());
-        result.push((
-            RhaiMessage {
-                role: "tool".to_string(),
-                content: text,
-                tool_call_id: Some(call_id),
-                tool_calls: vec![],
-            },
-            true,
-        ));
-    }
-
-    result
-}
-
-/// The function a Gemini tool message keyed `id` answers: the name of the
-/// client's response under that key, else of the call the script's messages
-/// make under that id, else the key itself — a response is keyed by its name
-/// where the client sent no id.
-fn response_name(
-    originals: &[&crate::api::gemini::GeminiFunctionResponseData],
-    messages: &[RhaiMessage],
-    id: Option<&str>,
-) -> String {
-    let Some(id) = id else { return String::new() };
-    originals
-        .iter()
-        .find(|o| o.id.as_deref().unwrap_or(&o.name) == id)
-        .map(|o| o.name.clone())
-        .or_else(|| {
-            messages.iter().flat_map(|m| &m.tool_calls).find(|c| c.id == id).map(|c| c.name.clone())
-        })
-        .unwrap_or_else(|| id.to_string())
-}
-
-/// Sync Gemini native contents with Rhai-modified messages.
-///
-/// Handles the N:M mapping where a single GeminiContent with FunctionResponse parts
-/// expands into multiple Rhai messages (content message + tool messages).
-fn sync_gemini_messages(
-    contents: &mut Vec<GeminiContent>,
-    modified_rhai: &[RhaiMessage],
-    changes: &mut Vec<String>,
-) {
-    // Step 1: Re-derive original Rhai projection to build index mapping.
-    let mut original_rhai: Vec<RhaiMessage> = Vec::new();
-    let mut rhai_to_native: Vec<usize> = Vec::new(); // rhai index → contents index
-    let mut rhai_is_func_resp: Vec<bool> = Vec::new();
-    for (native_idx, content) in contents.iter().enumerate() {
-        for (rm, is_fr) in gemini_to_rhai_expansion(content) {
-            rhai_to_native.push(native_idx);
-            rhai_is_func_resp.push(is_fr);
-            original_rhai.push(rm);
-        }
-    }
-
-    if modified_rhai.len() == original_rhai.len() {
-        // Same-count path: in-place text update.
-        let mut changed_natives = std::collections::BTreeSet::new();
-
-        for (i, (orig, modified)) in original_rhai.iter().zip(modified_rhai).enumerate() {
-            if orig.content != modified.content {
-                let native_idx = rhai_to_native[i];
-
-                if rhai_is_func_resp[i] {
-                    // Update FunctionResponse content in the native content
-                    if let Some(tool_id) = &modified.tool_call_id {
-                        for part in &mut contents[native_idx].parts {
-                            if let GeminiPart::FunctionResponse { function_response } = part {
-                                let fr_id = function_response
-                                    .id
-                                    .as_deref()
-                                    .unwrap_or(&function_response.name);
-                                if fr_id == tool_id {
-                                    function_response.response =
-                                        gemini_response_as_written(&function_response.response, &modified.content);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Update Text parts in the native content
-                    // Replace text of the first Text part, clear additional ones
-                    let mut found = false;
-                    for part in &mut contents[native_idx].parts {
-                        if let GeminiPart::Text { text } = part {
-                            if !found {
-                                *text = modified.content.clone();
-                                found = true;
-                            } else {
-                                *text = String::new();
-                            }
-                        }
-                    }
-                    // Remove empty text parts
-                    contents[native_idx].parts.retain(|p| {
-                        !matches!(p, GeminiPart::Text { text } if text.is_empty())
-                    });
-                    // If no text part existed, add one
-                    if !found && !modified.content.is_empty() {
-                        contents[native_idx]
-                            .parts
-                            .insert(0, GeminiPart::Text { text: modified.content.clone() });
-                    }
-                }
-
-                changed_natives.insert(native_idx);
-            }
-        }
-
-        for idx in changed_natives {
-            changes.push(format!("message_{idx}"));
-        }
-    } else {
-        // Count-changed path: rebuild from Rhai messages, preserving non-text parts
-        // from originals where possible.
-        let orig_contents: Vec<_> = std::mem::take(contents);
-        let mut used = vec![false; orig_contents.len()];
-        // A response the script kept keeps its media and other members when
-        // its call key (an id, else the name) is the key of one original
-        // alone. Responses sharing a key (no id, one function) cannot be told
-        // apart once the script changed the conversation, so they keep none
-        // rather than risk another's.
-        let originals: Vec<&crate::api::gemini::GeminiFunctionResponseData> = orig_contents
-            .iter()
-            .flat_map(|c| &c.parts)
-            .filter_map(|p| match p {
-                GeminiPart::FunctionResponse { function_response } => Some(function_response),
-                _ => None,
-            })
-            .collect();
-        let response_text = |fr: &crate::api::gemini::GeminiFunctionResponseData| match &fr.response {
-            Value::String(s) => s.clone(),
-            other => serde_json::to_string(other).unwrap_or_default(),
-        };
-
-        // Group consecutive tool messages with their preceding content message
-        let mut i = 0;
-        while i < modified_rhai.len() {
-            let msg = &modified_rhai[i];
-
-            if msg.role == "tool" {
-                // Collect consecutive tool messages
-                let mut func_parts = Vec::new();
-                while i < modified_rhai.len() && modified_rhai[i].role == "tool" {
-                    let tm = &modified_rhai[i];
-                    let id = tm.tool_call_id.clone();
-                    let name = response_name(&originals, modified_rhai, id.as_deref());
-                    let mut same_key = originals
-                        .iter()
-                        .filter(|o| Some(o.id.as_deref().unwrap_or(&o.name)) == id.as_deref());
-                    let original = match (same_key.next(), same_key.next()) {
-                        (Some(only), None) => Some(*only),
-                        _ => None,
-                    };
-                    // A response the script left as it was goes as sent.
-                    let response = match original {
-                        Some(o) if response_text(o) == tm.content => o.response.clone(),
-                        Some(o) => gemini_response_as_written(&o.response, &tm.content),
-                        None => crate::api::domain_request::gemini_response(tm.content.clone(), None),
-                    };
-                    func_parts.push(GeminiPart::FunctionResponse {
-                        function_response: crate::api::gemini::GeminiFunctionResponseData {
-                            // The key is the name where the client sent no id.
-                            id: original.map_or(id, |o| o.id.clone()),
-                            name,
-                            response,
-                            parts: original.map(|o| o.parts.clone()).unwrap_or_default(),
-                            extra: original.map(|o| o.extra.clone()).unwrap_or_default(),
-                        },
-                    });
-                    i += 1;
-                }
-                contents.push(GeminiContent {
-                    role: Some("user".to_string()),
-                    parts: func_parts,
-                });
-            } else {
-                let gemini_role = if msg.role == "assistant" { "model" } else { &msg.role };
-
-                // Try to find a matching original to preserve non-text parts
-                let matched = orig_contents.iter().enumerate().find(|(j, c)| {
-                    !used[*j]
-                        && c.role.as_deref().unwrap_or("user") == gemini_role
-                        && gemini_content_text(c) == msg.content
-                });
-
-                if let Some((j, _)) = matched {
-                    used[j] = true;
-                    contents.push(orig_contents[j].clone());
-                } else {
-                    contents.push(GeminiContent {
-                        role: Some(gemini_role.to_string()),
-                        parts: vec![GeminiPart::Text { text: msg.content.clone() }],
-                    });
-                }
-                i += 1;
-            }
-        }
-
-        changes.push("messages".to_string());
-    }
-}
-
-/// Sync protocol messages with Rhai-modified messages, preserving structured content.
-///
-/// When count changed: rebuild from Rhai messages, preserving originals that match by (role, text).
-/// When count same: update text in-place for messages whose text was modified by Rhai.
-fn sync_messages<T: Clone>(
-    originals: &mut Vec<T>,
-    rhai_msgs: &[RhaiMessage],
-    text_of: &dyn Fn(&T) -> String,
-    role_of: &dyn Fn(&T) -> &str,
-    set_text: &dyn Fn(&mut T, &str),
-    from_rhai: &dyn Fn(&RhaiMessage) -> T,
-    changes: &mut Vec<String>,
-) {
-    if rhai_msgs.len() != originals.len() {
-        let orig: Vec<_> = std::mem::take(originals);
-        let mut used = vec![false; orig.len()];
-        *originals = rhai_msgs
-            .iter()
-            .map(|m| {
-                for (j, o) in orig.iter().enumerate() {
-                    if !used[j] && role_of(o) == m.role && text_of(o) == m.content {
-                        used[j] = true;
-                        return o.clone();
-                    }
-                }
-                from_rhai(m)
-            })
-            .collect();
-        changes.push("messages".to_string());
-    } else {
-        for (i, rhai_msg) in rhai_msgs.iter().enumerate() {
-            if let Some(msg) = originals.get_mut(i)
-                && text_of(msg) != rhai_msg.content {
-                    set_text(msg, &rhai_msg.content);
-                    changes.push(format!("message_{i}"));
-                }
         }
     }
 }
@@ -2480,29 +1932,6 @@ fn rhai_tool_calls_to_cc(
     if tcs.is_empty() { None } else { Some(tcs) }
 }
 
-/// For ChatCompletions: after message sync, reconcile assistant tool_calls from Rhai.
-/// Positional 1:1 mapping — CC has no expansion.
-fn apply_cc_tool_call_changes(
-    chat_msgs: &mut [Message],
-    rhai_msgs: &[RhaiMessage],
-    declared: &HashMap<String, bool>,
-    changes: &mut Vec<String>,
-) {
-    for (i, rm) in rhai_msgs.iter().enumerate() {
-        if rm.role != "assistant" {
-            continue;
-        }
-        let Some(nm) = chat_msgs.get_mut(i) else {
-            continue;
-        };
-        let new_tcs = rhai_tool_calls_to_cc(&rm.tool_calls, nm.tool_calls.as_deref().unwrap_or_default(), declared);
-        if nm.tool_calls != new_tcs {
-            nm.tool_calls = new_tcs;
-            changes.push(format!("message_{i}_tool_calls"));
-        }
-    }
-}
-
 /// Convert Rhai tool_calls to Anthropic `ToolUse` content blocks.
 /// `arguments_json` that fails to parse is logged as a warning and substituted
 /// with an empty object so the request is still well-formed.
@@ -2510,11 +1939,14 @@ fn rhai_tool_calls_to_anthropic_blocks(rhai_tcs: &[RhaiToolCall]) -> Vec<Content
     rhai_tcs
         .iter()
         .filter(|t| !t.name.is_empty())
-        .map(|t| ContentBlock::ToolUse {
-            id: t.id.clone(),
+        .enumerate()
+        .map(|(i, t)| ContentBlock::ToolUse {
+            // A call with no id is named by its place: Anthropic refuses an empty one.
+            id: if t.id.is_empty() { format!("call_{i}") } else { t.id.clone() },
             name: t.name.clone(),
             input: parse_rhai_args(&t.name, &t.arguments_json),
             cache_control: None,
+            extra: BTreeMap::new(),
         })
         .collect()
 }
@@ -2535,153 +1967,784 @@ fn parse_rhai_args(name: &str, raw: &str) -> Value {
     }
 }
 
-/// For Anthropic: after sync, reconcile ToolUse blocks on assistant messages.
-/// Positional mapping via anthropic_to_rhai_expansion — one rhai msg per assistant.
-fn apply_anthropic_tool_call_changes(
-    native_msgs: &mut [AnthropicMessage],
-    rhai_msgs: &[RhaiMessage],
-    changes: &mut Vec<String>,
-) {
-    // Build native_idx → rhai_idx mapping for assistant messages.
-    let mut rhai_to_native: Vec<Option<usize>> = Vec::new();
-    for (native_idx, native_msg) in native_msgs.iter().enumerate() {
-        for _ in anthropic_to_rhai_expansion(native_msg) {
-            rhai_to_native.push(Some(native_idx));
+// ── Writing a script's messages back ──
+//
+// A script reads the conversation as the domain view's messages
+// ([`from_api_request`]); one wire item may hold several of them (an Anthropic
+// user turn's tool results and text, a Gemini turn's function responses). Each
+// message is written back to the item and the part it was read from — the
+// pairing the inbound guardrail writes its edits by ([`set_item_text`]) — so
+// whatever the script does not see (images, a message's `name`, a call's
+// signature, items with no message) stays as the client sent it.
+
+/// One message the script read: as it read it, and the pieces it is read
+/// from — each `(item, part, that part as its item reads on its own)`. A
+/// message is one item's part, or several items in a row where the whole
+/// conversation joins them (a Responses call or reasoning item joins the
+/// assistant message before it).
+struct Place {
+    read: RhaiMessage,
+    pieces: Vec<(usize, usize, RhaiMessage)>,
+}
+
+/// Each message the script read, with the pieces it is read from, as the
+/// conversion records them. `None` when the items' own conversions do not
+/// add up to the whole conversation's, so no message can be placed.
+fn conversation_places(req: &ApiRequest) -> Option<Vec<Place>> {
+    let whole = DomainRequest::from_api_request(req).messages;
+    let own = |item: usize| -> Vec<RhaiMessage> {
+        DomainRequest::item_conversation(req, item).iter().map(domain_msg_to_rhai).collect()
+    };
+    let mut pieces: Vec<Vec<(usize, usize, RhaiMessage)>> = vec![Vec::new(); whole.len()];
+    if let ApiRequest::Responses(r) = req
+        && let crate::api::domain::ResponseInput::Raw(items) = &r.input
+    {
+        for (item, messages) in crate::api::domain_request::responses_item_messages(items).into_iter().enumerate() {
+            let parts = own(item);
+            if parts.len() != messages.len() {
+                return None;
+            }
+            for (part, (at, m)) in messages.into_iter().zip(parts).enumerate() {
+                pieces.get_mut(at)?.push((item, part, m));
+            }
+        }
+    } else {
+        let mut at = 0;
+        for item in conversation_start(req)..DomainRequest::conversation_len(req) {
+            for (part, m) in own(item).into_iter().enumerate() {
+                pieces.get_mut(at)?.push((item, part, m));
+                at += 1;
+            }
         }
     }
+    if pieces.iter().any(Vec::is_empty) {
+        return None;
+    }
+    let places: Vec<Place> =
+        whole.iter().zip(pieces).map(|(m, pieces)| Place { read: domain_msg_to_rhai(m), pieces }).collect();
+    // Each message reads as the role its first piece does, or the pairing
+    // went wrong somewhere and no message is placed.
+    places.iter().all(|p| p.read.role == p.pieces[0].2.role).then_some(places)
+}
 
-    for (rhai_idx, rm) in rhai_msgs.iter().enumerate() {
-        if rm.role != "assistant" {
-            continue;
-        }
-        let Some(Some(native_idx)) = rhai_to_native.get(rhai_idx) else {
-            continue;
-        };
-        let native_msg = &mut native_msgs[*native_idx];
-        // Extract current ToolUse blocks as RhaiToolCall equivalent.
-        let current: Vec<RhaiToolCall> = match &native_msg.content {
-            AnthropicContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::ToolUse {
-                        id, name, input, ..
-                    } => Some(RhaiToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        arguments_json: serde_json::to_string(input).unwrap_or_default(),
-                    }),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        if current == rm.tool_calls {
-            continue;
-        }
-        // Replace ToolUse blocks, preserve others.
-        let new_tool_blocks = rhai_tool_calls_to_anthropic_blocks(&rm.tool_calls);
-        match &mut native_msg.content {
-            AnthropicContent::Blocks(blocks) => {
-                blocks.retain(|b| !matches!(b, ContentBlock::ToolUse { .. }));
-                blocks.extend(new_tool_blocks);
-            }
-            AnthropicContent::Text(text) if !new_tool_blocks.is_empty() => {
-                let mut blocks = Vec::new();
-                if !text.is_empty() {
-                    blocks.push(ContentBlock::Text {
-                        text: text.clone(),
-                        cache_control: None,
-                    });
-                }
-                blocks.extend(new_tool_blocks);
-                native_msg.content = AnthropicContent::Blocks(blocks);
-            }
-            _ => {}
-        }
-        changes.push(format!("message_{native_idx}_tool_calls"));
+/// The first conversation item: on Chat Completions, the first after the
+/// system prompt's channel ([`chat_system_lead`]).
+fn conversation_start(req: &ApiRequest) -> usize {
+    match req {
+        ApiRequest::ChatCompletions(r) => chat_system_lead(&r.messages),
+        _ => 0,
     }
 }
 
-/// Convert Rhai tool_calls to Gemini `FunctionCall` parts.
-/// Invalid `arguments_json` is logged and substituted with an empty object.
-/// A call the script left as it was keeps the `thoughtSignature` its part
-/// carried (`signed` pairs each original call with its signature, each
-/// original taken once, in order); an edited or new call goes unsigned, since
-/// a signature covers the call as produced.
-fn rhai_tool_calls_to_gemini_parts(
-    rhai_tcs: &[RhaiToolCall],
-    signed: &[(RhaiToolCall, Option<String>)],
-) -> Vec<GeminiPart> {
-    let mut taken = vec![false; signed.len()];
-    rhai_tcs
+/// The calls `script` names, each one left as it was read (equal to an
+/// unclaimed `read[k]`) kept as the client's own `natives[k]` — its id,
+/// signature and breakpoint with it — and any other built from its place
+/// among the calls named. `natives` and `read` are one item's calls in order;
+/// when their counts differ, every call is built.
+fn keep_or_build_calls<T: Clone>(
+    script: &[RhaiToolCall],
+    read: &[RhaiToolCall],
+    natives: &[T],
+    build: impl Fn(usize, &RhaiToolCall) -> T,
+) -> Vec<T> {
+    let mut taken = vec![false; read.len()];
+    script
         .iter()
         .filter(|t| !t.name.is_empty())
-        .map(|t| {
-            let original = (0..signed.len()).find(|&i| !taken[i] && signed[i].0 == *t);
-            if let Some(i) = original {
-                taken[i] = true;
-            }
-            GeminiPart::FunctionCall {
-                function_call: crate::api::gemini::GeminiFunctionCallData {
-                    id: if t.id.is_empty() { None } else { Some(t.id.clone()) },
-                    name: t.name.clone(),
-                    args: parse_rhai_args(&t.name, &t.arguments_json),
-                },
-                thought_signature: original.and_then(|i| signed[i].1.clone()),
+        .enumerate()
+        .map(|(i, t)| {
+            let kept = (natives.len() == read.len())
+                .then(|| (0..read.len()).find(|&k| !taken[k] && read[k] == *t))
+                .flatten();
+            match kept {
+                Some(k) => {
+                    taken[k] = true;
+                    natives[k].clone()
+                }
+                None => build(i, t),
             }
         })
         .collect()
 }
 
-/// For Gemini: after sync, reconcile FunctionCall parts on model messages.
-fn apply_gemini_tool_call_changes(
-    contents: &mut [GeminiContent],
-    rhai_msgs: &[RhaiMessage],
+/// A Gemini function call the script wrote, unsigned (a signature covers the
+/// call as the model produced it). An id the gateway made up for a call the
+/// client sent without one (`made_up`) is not one the client knows, so it is
+/// not written.
+fn gemini_call_part(t: &RhaiToolCall, made_up: &HashMap<String, String>) -> GeminiPart {
+    GeminiPart::FunctionCall {
+        function_call: crate::api::gemini::GeminiFunctionCallData {
+            id: (!t.id.is_empty() && !made_up.contains_key(&t.id)).then(|| t.id.clone()),
+            name: t.name.clone(),
+            args: parse_rhai_args(&t.name, &t.arguments_json),
+        },
+        thought_signature: None,
+    }
+}
+
+/// The ids the gateway made up reading a Gemini request (calls the client
+/// sent without one, responses answering none), each with its function —
+/// never written back to the client. Empty on any other protocol.
+fn made_up_ids(req: &ApiRequest) -> HashMap<String, String> {
+    match req {
+        ApiRequest::GoogleGemini(r) => crate::api::domain_request::GeminiCallIds::of(&r.contents).generated(),
+        _ => HashMap::new(),
+    }
+}
+
+/// `parts` with the calls in it (`is_call`) replaced by `calls`, in place:
+/// each call slot takes the next call, a slot left over goes, and calls
+/// left over follow the last call slot (the end, where there was none) — so
+/// text, thinking and the calls' order stay where they were.
+fn replace_calls_in_place<T>(parts: &mut Vec<T>, calls: Vec<T>, is_call: impl Fn(&T) -> bool) {
+    let mut calls = calls.into_iter();
+    let mut out = Vec::with_capacity(parts.len());
+    let mut after_last_call = None;
+    for part in parts.drain(..) {
+        if is_call(&part) {
+            if let Some(call) = calls.next() {
+                out.push(call);
+            }
+            after_last_call = Some(out.len());
+        } else {
+            out.push(part);
+        }
+    }
+    let at = after_last_call.unwrap_or(out.len());
+    out.splice(at..at, calls);
+    *parts = out;
+}
+
+/// Write the calls a script gave the message of `item` it read as `read`.
+/// False where the item has no form for them (a Responses item but a lone
+/// function call).
+fn set_item_tool_calls(
+    req: &mut ApiRequest,
+    item: usize,
+    read: &[RhaiToolCall],
+    script: &[RhaiToolCall],
+    made_up: &HashMap<String, String>,
+) -> bool {
+    match req {
+        ApiRequest::ChatCompletions(r) => {
+            let declared = declared_tool_kinds(r.tools.as_ref());
+            let m = &mut r.messages[item];
+            let natives = m.tool_calls.clone().unwrap_or_default();
+            // A call the script could not see (neither a function nor a
+            // custom call) has no place in what it wrote: nothing is written.
+            if natives.len() != read.len() {
+                return false;
+            }
+            // Every call named, as a new one: an id the script left empty is
+            // its place among them, as a rebuilt message's.
+            let fresh = rhai_tool_calls_to_cc(script, &natives, &declared).unwrap_or_default();
+            let built = keep_or_build_calls(script, read, &natives, |i, t| {
+                fresh.get(i).cloned().unwrap_or_else(|| {
+                    crate::api::domain::ToolCall::function(t.id.clone(), t.name.clone(), t.arguments_json.clone())
+                })
+            });
+            m.tool_calls = (!built.is_empty()).then_some(built);
+            true
+        }
+        ApiRequest::AnthropicMessages(r) => {
+            let m = &mut r.messages[item];
+            let natives: Vec<ContentBlock> = match &m.content {
+                AnthropicContent::Blocks(blocks) => {
+                    blocks.iter().filter(|b| matches!(b, ContentBlock::ToolUse { .. })).cloned().collect()
+                }
+                AnthropicContent::Text(_) => Vec::new(),
+            };
+            // A call the script read that is no `tool_use` block has no slot
+            // here: nothing is written.
+            if natives.len() != read.len() {
+                return false;
+            }
+            // An edited call keeps the breakpoint of the call it edits, by id:
+            // where the prompt cache's prefix ends is the client's. Its other
+            // members (a `caller`, a `toolset_name`) say what made a call to
+            // THAT tool, so they stay only while the call names it.
+            let native = |id: &str, name: &str| {
+                natives.iter().find_map(|b| match b {
+                    ContentBlock::ToolUse { id: native, name: native_name, cache_control, extra, .. } if native == id => {
+                        Some((cache_control.clone(), if native_name == name { extra.clone() } else { BTreeMap::new() }))
+                    }
+                    _ => None,
+                })
+            };
+            let built = keep_or_build_calls(script, read, &natives, |i, t| {
+                let (cache_control, extra) = native(&t.id, &t.name).unwrap_or_default();
+                ContentBlock::ToolUse {
+                    id: if t.id.is_empty() { format!("call_{i}") } else { t.id.clone() },
+                    name: t.name.clone(),
+                    input: parse_rhai_args(&t.name, &t.arguments_json),
+                    cache_control,
+                    extra,
+                }
+            });
+            if let AnthropicContent::Text(text) = &mut m.content {
+                let text = std::mem::take(text);
+                m.content = AnthropicContent::Blocks(
+                    (!text.is_empty()).then_some(ContentBlock::Text { text, cache_control: None, extra: BTreeMap::new() }).into_iter().collect(),
+                );
+            }
+            if let AnthropicContent::Blocks(blocks) = &mut m.content {
+                replace_calls_in_place(blocks, built, |b| matches!(b, ContentBlock::ToolUse { .. }));
+            }
+            true
+        }
+        ApiRequest::GoogleGemini(r) => {
+            let content = &mut r.contents[item];
+            let natives: Vec<GeminiPart> =
+                content.parts.iter().filter(|p| matches!(p, GeminiPart::FunctionCall { .. })).cloned().collect();
+            let built = keep_or_build_calls(script, read, &natives, |_, t| gemini_call_part(t, made_up));
+            replace_calls_in_place(&mut content.parts, built, |p| matches!(p, GeminiPart::FunctionCall { .. }));
+            true
+        }
+        ApiRequest::Responses(r) => {
+            let crate::api::domain::ResponseInput::Raw(items) = &mut r.input else { return false };
+            let item = &mut items[item];
+            let ([_], [call]) = (read, script) else { return false };
+            let (key, value) = match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => ("arguments", call.arguments_json.clone()),
+                // A freeform call's input is its free text.
+                Some("custom_tool_call") => ("input", crate::api::domain_request::freeform_whole_text(&call.arguments_json)),
+                _ => return false,
+            };
+            if !call.id.is_empty() {
+                item["call_id"] = Value::String(call.id.clone());
+            }
+            item["name"] = Value::String(call.name.clone());
+            item[key] = Value::String(value);
+            true
+        }
+    }
+}
+
+/// Whether `item` can hold a message's text: on the Responses API, a
+/// message item or a call's output (a call or a reasoning item has no place
+/// for it).
+fn item_takes_text(req: &ApiRequest, item: usize) -> bool {
+    match req {
+        ApiRequest::Responses(r) => match &r.input {
+            crate::api::domain::ResponseInput::Raw(items) => items.get(item).is_some_and(|v| match v.get("type") {
+                Some(t) => t == "message" || t == "function_call_output" || t == "custom_tool_call_output",
+                None => v.get("role").is_some(),
+            }),
+            _ => true,
+        },
+        _ => true,
+    }
+}
+
+/// Write one script message over the message it read, in place: its text
+/// into the piece that holds text (else the first, where it can hold text),
+/// its calls into the pieces that hold them — split as read where several
+/// do, which needs as many calls as were read. What has no place is named
+/// `…_not_applied`.
+fn write_message_in_place(
+    req: &mut ApiRequest,
+    place: &Place,
+    script: &RhaiMessage,
+    i: usize,
+    made_up: &HashMap<String, String>,
     changes: &mut Vec<String>,
 ) {
-    // Build rhai_idx → native_idx map (only for "content" rhai messages, skip tool-response expansions).
-    let mut rhai_to_native: Vec<Option<usize>> = Vec::new();
-    for (native_idx, content) in contents.iter().enumerate() {
-        for (_, is_fr) in gemini_to_rhai_expansion(content) {
-            rhai_to_native.push(if is_fr { None } else { Some(native_idx) });
+    let read = &place.read;
+    if script.content != read.content {
+        let target = place
+            .pieces
+            .iter()
+            .find(|(.., m)| !m.content.is_empty())
+            .or_else(|| place.pieces.first().filter(|(item, ..)| item_takes_text(req, *item)));
+        match target {
+            Some((item, part, _)) => {
+                set_item_text(req, *item, *part, &script.content);
+                changes.push(format!("message_{i}"));
+            }
+            None => changes.push(format!("message_{i}_not_applied")),
+        }
+    }
+    if script.tool_calls != read.tool_calls {
+        // Only an assistant message makes calls: on any other there is no place for them.
+        let written = read.role == "assistant"
+            && match place.pieces.as_slice() {
+            [(item, ..)] => set_item_tool_calls(req, *item, &read.tool_calls, &script.tool_calls, made_up),
+            pieces if script.tool_calls.len() == read.tool_calls.len() => {
+                let mut from = 0;
+                let mut all = true;
+                for (item, _, m) in pieces {
+                    let calls = from..from + m.tool_calls.len();
+                    match (read.tool_calls.get(calls.clone()), script.tool_calls.get(calls.clone())) {
+                        (Some(read), Some(script)) if read != script => {
+                            all &= set_item_tool_calls(req, *item, read, script, made_up);
+                        }
+                        (Some(_), Some(_)) => {}
+                        // The pieces read more calls than the message: no place
+                        // to say which is which.
+                        _ => all = false,
+                    }
+                    from = calls.end;
+                }
+                all && from == read.tool_calls.len()
+            }
+                _ => false,
+            };
+        changes.push(if written { format!("message_{i}_tool_calls") } else { format!("message_{i}_tool_calls_not_applied") });
+    }
+}
+
+/// Each script message's place — the message it was read as — when it is
+/// that message: it keeps its `origin`, with the role and answered result
+/// read. A map left as read claims an origin before an edited copy does, so
+/// the copy is the new one. A map without an `origin` is a message the
+/// script made.
+fn claim_places(places: &[Place], script: &[RhaiMessage]) -> Vec<Option<usize>> {
+    let mut claimed = vec![false; places.len()];
+    let mut sources: Vec<Option<usize>> = vec![None; script.len()];
+    let identity = |o: usize, m: &RhaiMessage| {
+        places.get(o).is_some_and(|p| p.read.role == m.role && p.read.tool_call_id == m.tool_call_id)
+    };
+    for unchanged in [true, false] {
+        for (i, m) in script.iter().enumerate() {
+            let Some(o) = m.origin.filter(|&o| sources[i].is_none() && identity(o, m) && !claimed[o]) else {
+                continue;
+            };
+            let read = &places[o].read;
+            if unchanged == (read.content == m.content && read.tool_calls == m.tool_calls) {
+                claimed[o] = true;
+                sources[i] = Some(o);
+            }
+        }
+    }
+    sources
+}
+
+/// Whether `items` hold something a script cannot see, which a turn
+/// rebuilt from what the script reads would lose: a block that is neither
+/// text nor a call (an image, a document, thinking, a reasoning or shell
+/// item), a breakpoint, a call's signature, a result's error flag — or a
+/// member the domain does not model that carries something (on Chat
+/// Completions a message's `name` and other members, on the Responses API
+/// an item's or a part's).
+fn turn_holds_unseen(req: &ApiRequest, items: &[usize]) -> bool {
+    // A member that carries nothing (`refusal: null`, `annotations: []`) is
+    // not something lost.
+    let carries = |v: &Value| !(v.is_null() || v.as_array().is_some_and(Vec::is_empty) || v.as_str() == Some(""));
+    let members = |item: usize| match req {
+        ApiRequest::ChatCompletions(r) => {
+            r.messages.get(item).is_some_and(|m| m.name.is_some() || m.extra.values().any(carries))
+        }
+        // A Responses item rebuilt keeps its type, role, text, call id, name,
+        // arguments and output: any other member (`id`, `status`, `phase`, a
+        // part's `annotations`) it would lose.
+        ApiRequest::Responses(r) => match &r.input {
+            crate::api::domain::ResponseInput::Raw(items) => items.get(item).is_some_and(|v| {
+                const KEPT: &[&str] = &["type", "role", "content", "call_id", "name", "arguments", "input", "output"];
+                const PART: &[&str] = &["type", "text"];
+                let own = v.as_object().is_some_and(|o| o.iter().any(|(k, v)| !KEPT.contains(&k.as_str()) && carries(v)));
+                let parts = ["content", "output"].iter().filter_map(|k| v.get(*k)?.as_array()).flatten().any(|part| {
+                    part.as_object().is_some_and(|o| o.iter().any(|(k, v)| !PART.contains(&k.as_str()) && carries(v)))
+                });
+                own || parts
+            }),
+            crate::api::domain::ResponseInput::Messages(msgs) => {
+                msgs.get(item).is_some_and(|m| m.extra.values().any(carries))
+            }
+            crate::api::domain::ResponseInput::Text(_) => false,
+        },
+        // A block's members the typed block does not name (a text's
+        // `citations`, a call's `caller`, a tool result's `toolset_name`, an
+        // image's `transformations`, a file reference's context): what a
+        // translation names (`anthropic_history_parts`), a rebuild drops.
+        ApiRequest::AnthropicMessages(r) => {
+            r.messages.get(item).is_some_and(|m| !crate::api::domain_request::anthropic_history_parts(m).is_empty())
+        }
+        // A function response's other members, a text part's signature.
+        ApiRequest::GoogleGemini(r) => r.contents.get(item).is_some_and(|c| {
+            c.parts.iter().any(|p| match p {
+                GeminiPart::FunctionResponse { function_response } => function_response.extra.values().any(carries),
+                GeminiPart::ThoughtText { thought_signature, .. } => thought_signature.is_some(),
+                _ => false,
+            })
+        }),
+    };
+    items.iter().any(|&item| {
+        members(item)
+            || DomainRequest::item_conversation(req, item).iter().any(|m| {
+                matches!(&m.role, DomainRole::Tool { is_error: Some(_), .. } | DomainRole::Tool { cache_control: Some(_), .. })
+                    || m.content.iter().any(|b| match b {
+                        DomainContentBlock::Text { cache_control, .. } => cache_control.is_some(),
+                        DomainContentBlock::ToolUse { cache_control, thought_signature, .. } => {
+                            cache_control.is_some() || thought_signature.is_some()
+                        }
+                        _ => true,
+                    })
+            })
+    })
+}
+
+/// A Chat Completions message the script wrote, built new.
+fn chat_fresh_message(m: &RhaiMessage, declared: &HashMap<String, bool>) -> Message {
+    Message {
+        role: m.role.clone(),
+        content: Some(MessageContent::Text(m.content.clone())),
+        name: None,
+        tool_calls: rhai_tool_calls_to_cc(&m.tool_calls, &[], declared),
+        tool_call_id: m.tool_call_id.clone(),
+        extra: BTreeMap::new(),
+    }
+}
+
+/// Write a script's messages back onto `req`'s conversation (see above).
+///
+/// A script that kept every message where it was ([`claim_places`]: each
+/// map is the message read at its place, in order) has its edits written in
+/// place, each in its own item and part, so nothing the script cannot see
+/// changes. Any other script reshaped the conversation, and is written turn
+/// by turn: a turn whose every message the script kept, in a row and in
+/// order, is kept, its edits written in place; every other message (a turn
+/// the script split or partly dropped, a message it made) is built new where
+/// the script put it, and a turn rebuilt that way that held something the
+/// script cannot see (an image, a `name`, thinking, a signature) is named
+/// `…_not_applied`. Items a message spans are one turn (a Responses call
+/// item joins the assistant message before it, a reasoning item the item
+/// after it); an item the script could not see (no message read from it)
+/// goes before the turn after it, and one after every turn follows the last.
+fn write_messages(req: &mut ApiRequest, script: &[RhaiMessage], changes: &mut Vec<String>) {
+    let Some(places) = conversation_places(req) else {
+        tracing::warn!("a script's messages were not written back: the conversation's items could not be paired with them");
+        changes.push("messages_not_applied".to_string());
+        return;
+    };
+    let made_up = made_up_ids(req);
+    let sources = claim_places(&places, script);
+    if sources.iter().copied().eq((0..places.len()).map(Some)) {
+        for (i, (place, m)) in places.iter().zip(script).enumerate() {
+            write_message_in_place(req, place, m, i, &made_up, changes);
+        }
+        return;
+    }
+
+    let start = conversation_start(req);
+    let len = DomainRequest::conversation_len(req);
+    // The turns: items joined where one message spans them, each with its
+    // places in order. An item no message is read from is a turn of none.
+    let mut joined = vec![false; len];
+    for place in &places {
+        // Every item from the message's first to its last, an unseen one
+        // between included, is one turn.
+        let first = place.pieces[0].0;
+        let last = place.pieces.iter().map(|p| p.0).max().unwrap_or(first);
+        for item in joined.iter_mut().take(last + 1).skip(first + 1) {
+            *item = true;
+        }
+    }
+    // A Responses reasoning item belongs to the item after it, which must
+    // follow it: the two are one turn.
+    let leads_next = |item: usize| match &*req {
+        ApiRequest::Responses(r) => match &r.input {
+            crate::api::domain::ResponseInput::Raw(items) => {
+                items.get(item).and_then(|v| v.get("type")).is_some_and(|t| t == "reasoning")
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    let mut turns: Vec<Vec<usize>> = Vec::new();
+    let mut turn_of = vec![0usize; len];
+    for item in start..len {
+        let follows = item > start && leads_next(item - 1);
+        if !((joined[item] || follows) && !turns.is_empty()) {
+            turns.push(Vec::new());
+        }
+        if let Some(turn) = turns.last_mut() {
+            turn.push(item);
+        }
+        turn_of[item] = turns.len() - 1;
+    }
+    let mut reads: Vec<Vec<usize>> = vec![Vec::new(); turns.len()];
+    for (o, place) in places.iter().enumerate() {
+        reads[turn_of[place.pieces[0].0]].push(o);
+    }
+    // Where each place's message stands in the script.
+    let mut at_of: Vec<Option<usize>> = vec![None; places.len()];
+    for (i, source) in sources.iter().enumerate() {
+        if let Some(o) = source {
+            at_of[*o] = Some(i);
+        }
+    }
+    // A turn kept: all its messages, in a row, in order — their edits are
+    // written in place below, before the turns move.
+    let kept: Vec<bool> = reads
+        .iter()
+        .map(|r| {
+            let Some(first) = r.first().and_then(|&o| at_of[o]) else { return false };
+            r.iter().enumerate().all(|(k, &o)| at_of[o] == Some(first + k))
+        })
+        .collect();
+    for (t, r) in reads.iter().enumerate() {
+        if kept[t] {
+            for &o in r {
+                if let Some(i) = at_of[o] {
+                    write_message_in_place(req, &places[o], &script[i], i, &made_up, changes);
+                }
+            }
+        }
+    }
+    // A turn rebuilt that held something the script cannot see is named.
+    for (t, r) in reads.iter().enumerate() {
+        if !kept[t] && r.iter().any(|&o| at_of[o].is_some()) && turn_holds_unseen(req, &turns[t]) {
+            let i = r.iter().find_map(|&o| at_of[o]).unwrap_or_default();
+            changes.push(format!("message_{i}_not_applied"));
         }
     }
 
-    for (rhai_idx, rm) in rhai_msgs.iter().enumerate() {
-        if rm.role != "assistant" {
-            continue;
-        }
-        let Some(Some(native_idx)) = rhai_to_native.get(rhai_idx) else {
-            continue;
-        };
-        let native = &mut contents[*native_idx];
-        let current: Vec<(RhaiToolCall, Option<String>)> = native
-            .parts
-            .iter()
-            .filter_map(|p| match p {
-                GeminiPart::FunctionCall { function_call, thought_signature } => Some((
-                    RhaiToolCall {
-                        id: function_call.id.clone().unwrap_or_default(),
-                        name: function_call.name.clone(),
-                        arguments_json: serde_json::to_string(&function_call.args)
-                            .unwrap_or_default(),
-                    },
-                    thought_signature.clone(),
-                )),
-                _ => None,
-            })
-            .collect();
-        if current.iter().map(|(c, _)| c).eq(rm.tool_calls.iter()) {
-            continue;
-        }
-        native
-            .parts
-            .retain(|p| !matches!(p, GeminiPart::FunctionCall { .. }));
-        native
-            .parts
-            .extend(rhai_tool_calls_to_gemini_parts(&rm.tool_calls, &current));
-        changes.push(format!("message_{native_idx}_tool_calls"));
+    enum Out {
+        Item(usize),
+        New(std::ops::Range<usize>),
     }
+    let mut out: Vec<Out> = Vec::new();
+    // An unseen turn goes before the turn after it, wherever that turn's
+    // first message lands; those after every turn follow the last one read.
+    let last_read = (0..turns.len()).rev().find(|&t| !reads[t].is_empty());
+    let mut placed = vec![false; turns.len()];
+    let place_unseen = |t: usize, out: &mut Vec<Out>, placed: &mut Vec<bool>| {
+        for u in (0..t).rev().take_while(|&u| reads[u].is_empty()).collect::<Vec<_>>().into_iter().rev() {
+            if !placed[u] {
+                placed[u] = true;
+                out.extend(turns[u].iter().map(|&item| Out::Item(item)));
+            }
+        }
+    };
+    // The last script message of the last turn read: what follows every turn
+    // goes after it.
+    let last_of_last_read = (0..script.len())
+        .rev()
+        .find(|&i| sources[i].is_some_and(|o| Some(turn_of[places[o].pieces[0].0]) == last_read));
+    let mut i = 0;
+    while i < script.len() {
+        let turn = sources[i].map(|o| turn_of[places[o].pieces[0].0]);
+        if let Some(t) = turn {
+            place_unseen(t, &mut out, &mut placed);
+        }
+        if let Some(t) = turn.filter(|&t| kept[t] && reads[t].first() == sources[i].as_ref()) {
+            out.extend(turns[t].iter().map(|&item| Out::Item(item)));
+            i += reads[t].len();
+        } else {
+            match out.last_mut() {
+                Some(Out::New(run)) if run.end == i => run.end = i + 1,
+                _ => out.push(Out::New(i..i + 1)),
+            }
+            i += 1;
+        }
+        // `i` is past the messages just written.
+        if turn.is_some() && turn == last_read && last_of_last_read.is_some_and(|last| i > last) {
+            place_unseen(turns.len(), &mut out, &mut placed);
+        }
+    }
+    // Unseen turns left either went with the turn after them, which the
+    // script dropped, or close the conversation.
+    for t in 0..turns.len() {
+        if reads[t].is_empty() && !placed[t] && last_read.is_none_or(|l| t > l) {
+            out.extend(turns[t].iter().map(|&item| Out::Item(item)));
+        }
+    }
+
+    match req {
+        ApiRequest::ChatCompletions(chat) => {
+            let declared = declared_tool_kinds(chat.tools.as_ref());
+            let original = std::mem::take(&mut chat.messages);
+            chat.messages = original[..start].to_vec();
+            for piece in out {
+                match piece {
+                    Out::Item(item) => chat.messages.push(original[item].clone()),
+                    Out::New(run) => chat.messages.extend(script[run].iter().map(|m| chat_fresh_message(m, &declared))),
+                }
+            }
+        }
+        ApiRequest::AnthropicMessages(msg) => {
+            let original = std::mem::take(&mut msg.messages);
+            for piece in out {
+                match piece {
+                    Out::Item(item) => msg.messages.push(original[item].clone()),
+                    Out::New(run) => msg
+                        .messages
+                        .extend(group_rhai_for_anthropic(&script[run]).iter().map(build_anthropic_from_group)),
+                }
+            }
+        }
+        ApiRequest::GoogleGemini(gemini) => {
+            let original = std::mem::take(&mut gemini.contents);
+            // Each response the client sent, by the id the script read it
+            // under: what a rebuilt response is named.
+            let mut names: HashMap<String, String> = HashMap::new();
+            for place in &places {
+                let (item, part, _) = &place.pieces[0];
+                let (Some(id), Some(content)) = (&place.read.tool_call_id, original.get(*item)) else { continue };
+                let k = places
+                    .iter()
+                    .filter(|p| p.pieces[0].0 == *item && p.pieces[0].1 < *part && p.read.tool_call_id.is_some())
+                    .count();
+                if let Some(GeminiPart::FunctionResponse { function_response }) =
+                    content.parts.iter().filter(|p| matches!(p, GeminiPart::FunctionResponse { .. })).nth(k)
+                {
+                    names.insert(id.clone(), function_response.name.clone());
+                }
+            }
+            for piece in out {
+                match piece {
+                    Out::Item(item) => gemini.contents.push(original[item].clone()),
+                    Out::New(run) => gemini.contents.extend(gemini_fresh_contents(&script[run], script, &made_up, &names)),
+                }
+            }
+        }
+        ApiRequest::Responses(resp) => {
+            use crate::api::domain::{ResponseInput, ResponseInputMessage};
+            let declared = declared_tool_kinds(resp.tools.as_ref());
+            let plain = |m: &RhaiMessage| m.role != "tool" && m.tool_calls.is_empty();
+            let original = std::mem::replace(&mut resp.input, ResponseInput::Raw(Vec::new()));
+            let items: Vec<Value> = match original {
+                ResponseInput::Raw(items) => items,
+                // A string or a message list stays one while what the script
+                // wrote is plain messages.
+                ResponseInput::Text(_) | ResponseInput::Messages(_)
+                    if out.iter().all(|p| match p {
+                        Out::New(run) => script[run.clone()].iter().all(plain),
+                        Out::Item(_) => true,
+                    }) =>
+                {
+                    let original: Vec<ResponseInputMessage> = match original {
+                        ResponseInput::Messages(msgs) => msgs,
+                        ResponseInput::Text(text) => vec![ResponseInputMessage {
+                            role: "user".to_string(),
+                            content: MessageContent::Text(text),
+                            extra: BTreeMap::new(),
+                        }],
+                        ResponseInput::Raw(_) => Vec::new(),
+                    };
+                    resp.input = ResponseInput::Messages(
+                        out.into_iter()
+                            .flat_map(|piece| match piece {
+                                Out::Item(item) => original.get(item).cloned().into_iter().collect::<Vec<_>>(),
+                                Out::New(run) => script[run]
+                                    .iter()
+                                    .map(|m| ResponseInputMessage {
+                                        role: m.role.clone(),
+                                        content: MessageContent::Text(m.content.clone()),
+                                        extra: BTreeMap::new(),
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                    );
+                    changes.push("messages".to_string());
+                    return;
+                }
+                ResponseInput::Messages(msgs) => msgs.iter().map(|m| serde_json::to_value(m).unwrap_or_default()).collect(),
+                ResponseInput::Text(text) => vec![serde_json::json!({"role": "user", "content": text})],
+            };
+            resp.input = ResponseInput::Raw(
+                out.into_iter()
+                    .flat_map(|piece| match piece {
+                        Out::Item(item) => items.get(item).cloned().into_iter().collect::<Vec<_>>(),
+                        Out::New(run) => {
+                            run.clone().zip(&script[run]).flat_map(|(j, m)| responses_fresh_items(j, m, script, &declared)).collect()
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    changes.push("messages".to_string());
+}
+
+/// The Responses items a message the script wrote makes: a tool message is a
+/// call's output; any other is a message, and each of its calls a call item
+/// after it (no message when it carries only calls). A call to a custom
+/// (freeform) tool — by the request's tools (`declared`) — is a custom call
+/// with its free text, and the output answering it a custom call's output.
+fn responses_fresh_items(at: usize, m: &RhaiMessage, script: &[RhaiMessage], declared: &HashMap<String, bool>) -> Vec<Value> {
+    // A call with no id is named by its place: its message's, then its own.
+    let call_id = |i: usize, id: &str| if id.is_empty() { format!("call_{at}_{i}") } else { id.to_string() };
+    let custom = |name: &str| declared.get(name).copied().unwrap_or(false);
+    if m.role == "tool" {
+        let id = m.tool_call_id.clone().unwrap_or_default();
+        let answers_custom =
+            script.iter().flat_map(|s| &s.tool_calls).find(|c| c.id == id).is_some_and(|c| custom(&c.name));
+        let kind = if answers_custom { "custom_tool_call_output" } else { "function_call_output" };
+        return vec![serde_json::json!({"type": kind, "call_id": id, "output": m.content})];
+    }
+    let message = (!m.content.is_empty() || m.tool_calls.is_empty())
+        .then(|| serde_json::json!({"type": "message", "role": m.role, "content": m.content}));
+    message
+        .into_iter()
+        .chain(m.tool_calls.iter().filter(|t| !t.name.is_empty()).enumerate().map(|(i, t)| {
+            if custom(&t.name) {
+                serde_json::json!({
+                    "type": "custom_tool_call",
+                    "call_id": call_id(i, &t.id),
+                    "name": t.name,
+                    "input": crate::api::domain_request::freeform_whole_text(&t.arguments_json),
+                })
+            } else {
+                serde_json::json!({"type": "function_call", "call_id": call_id(i, &t.id), "name": t.name, "arguments": t.arguments_json})
+            }
+        }))
+        .collect()
+}
+
+/// The Gemini contents a run of messages the script wrote makes: consecutive
+/// tool messages are one user turn of function responses, any other message
+/// a turn of its text and calls. A response is named as the client's was
+/// (`names`, by the id the script read), else by its call; an id the
+/// gateway made up (`made_up`) is not written.
+fn gemini_fresh_contents(
+    run: &[RhaiMessage],
+    script: &[RhaiMessage],
+    made_up: &HashMap<String, String>,
+    names: &HashMap<String, String>,
+) -> Vec<GeminiContent> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < run.len() {
+        if run[i].role != "tool" {
+            let m = &run[i];
+            let role = if m.role == "assistant" { "model" } else { "user" };
+            let text = (!m.content.is_empty()).then(|| GeminiPart::Text { text: m.content.clone() });
+            out.push(GeminiContent {
+                role: Some(role.to_string()),
+                parts: text
+                    .into_iter()
+                    .chain(m.tool_calls.iter().filter(|t| !t.name.is_empty()).map(|t| gemini_call_part(t, made_up)))
+                    .collect(),
+            });
+            i += 1;
+            continue;
+        }
+        let mut parts = Vec::new();
+        while i < run.len() && run[i].role == "tool" {
+            let m = &run[i];
+            let id = m.tool_call_id.clone().unwrap_or_default();
+            let name = names
+                .get(&id)
+                .or_else(|| made_up.get(&id))
+                .cloned()
+                .or_else(|| script.iter().flat_map(|s| &s.tool_calls).find(|c| c.id == id).map(|c| c.name.clone()))
+                .unwrap_or_else(|| id.clone());
+            parts.push(GeminiPart::FunctionResponse {
+                function_response: crate::api::gemini::GeminiFunctionResponseData {
+                    id: (!id.is_empty() && !made_up.contains_key(&id)).then_some(id),
+                    name,
+                    response: crate::api::domain_request::gemini_response(m.content.clone(), None),
+                    parts: Vec::new(),
+                    extra: Default::default(),
+                },
+            });
+            i += 1;
+        }
+        out.push(GeminiContent { role: Some("user".to_string()), parts });
+    }
+    out
 }
 
 /// Whether a script left the tool list as it found it. `is_gateway_substituted`
@@ -3011,36 +3074,6 @@ pub fn apply_to_api_request(
                 chat.messages.extend(tail);
             }
 
-            if messages_changed {
-                // `ctx.messages` is the conversation after the system prompt's
-                // channel (`chat_system_lead`): it is synced against that tail
-                // alone, and its indices name the tail's messages.
-                let lead = chat_system_lead(&chat.messages);
-                let mut conversation = chat.messages.split_off(lead);
-                let declared = declared_tool_kinds(chat.tools.as_ref());
-
-                sync_messages(
-                    &mut conversation,
-                    &ctx.messages,
-                    &chat_msg_text,
-                    &|m| m.role.as_str(),
-                    &|m, text| match &mut m.content {
-                        Some(content) => set_message_content_text(content, text),
-                        None => m.content = Some(MessageContent::Text(text.to_string())),
-                    },
-                    &|rm| Message {
-                        role: rm.role.clone(),
-                        content: Some(MessageContent::Text(rm.content.clone())),
-                        name: None,
-                        tool_calls: rhai_tool_calls_to_cc(&rm.tool_calls, &[], &declared),
-                        tool_call_id: rm.tool_call_id.clone(),
-                        extra: BTreeMap::new(),
-                    },
-                    &mut changes,
-                );
-                apply_cc_tool_call_changes(&mut conversation, &ctx.messages, &declared, &mut changes);
-                chat.messages.append(&mut conversation);
-            }
 
             if changed.tools {
                 apply_openai_tool_changes(&ctx.tools, &mut chat.tools, FunctionSpelling::Nested, &mut changes);
@@ -3064,14 +3097,6 @@ pub fn apply_to_api_request(
                 changes.push("system_prompt_removed".to_string());
             }
 
-            if messages_changed {
-                sync_anthropic_messages(&mut msg.messages, &ctx.messages, &mut changes);
-                apply_anthropic_tool_call_changes(
-                    &mut msg.messages,
-                    &ctx.messages,
-                    &mut changes,
-                );
-            }
 
             if changed.tools {
                 // A tool edit forces a full rebuild of the list; index the prior
@@ -3129,27 +3154,6 @@ pub fn apply_to_api_request(
                 changes.push("system_prompt".to_string());
             }
 
-            // Messages — Responses uses simpler logic (no structured content to preserve)
-            if messages_changed {
-                let current_msg_count = match &resp.input {
-                    crate::api::domain::ResponseInput::Text(_) => 1,
-                    crate::api::domain::ResponseInput::Messages(msgs) => msgs.len(),
-                    crate::api::domain::ResponseInput::Raw(items) => items.len(),
-                };
-                if ctx.messages.len() != current_msg_count {
-                    resp.input = crate::api::domain::ResponseInput::Messages(
-                        ctx.messages
-                            .iter()
-                            .map(|m| crate::api::domain::ResponseInputMessage {
-                                role: m.role.clone(),
-                                content: MessageContent::Text(m.content.clone()),
-                                extra: BTreeMap::new(),
-                            })
-                            .collect(),
-                    );
-                    changes.push("messages".to_string());
-                }
-            }
 
             if changed.tools {
                 apply_openai_tool_changes(&ctx.tools, &mut resp.tools, FunctionSpelling::Flat, &mut changes);
@@ -3185,15 +3189,6 @@ pub fn apply_to_api_request(
                 }
             }
 
-            // Message sync
-            if messages_changed {
-                sync_gemini_messages(&mut gemini.contents, &ctx.messages, &mut changes);
-                apply_gemini_tool_call_changes(
-                    &mut gemini.contents,
-                    &ctx.messages,
-                    &mut changes,
-                );
-            }
 
             // Tool sync
             if changed.tools {
@@ -3206,6 +3201,12 @@ pub fn apply_to_api_request(
                 changes.push("model".to_string());
             }
         }
+    }
+
+    // The messages after the system prompt: a Chat Completions prompt edit
+    // above has settled which leading messages are its channel.
+    if messages_changed {
+        write_messages(req, &ctx.messages, &mut changes);
     }
 
     changes
@@ -3255,6 +3256,64 @@ mod tests {
 
     fn no_subs() -> std::collections::HashSet<String> {
         std::collections::HashSet::new()
+    }
+
+    /// A Chat Completions message's text, its text parts joined.
+    fn chat_msg_text(msg: &Message) -> String {
+        match &msg.content {
+            Some(MessageContent::Text(t)) => t.clone(),
+            Some(MessageContent::Parts(parts)) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    crate::api::domain::ContentPart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            None => String::new(),
+        }
+    }
+
+    /// The messages a script reads of a request.
+    fn script_view(req: &ApiRequest) -> Vec<RhaiMessage> {
+        from_api_request(req, &test_user(), None, None, None, false, &no_subs()).messages
+    }
+
+    fn anthropic_request(native: &[AnthropicMessage]) -> ApiRequest {
+        ApiRequest::AnthropicMessages(
+            serde_json::from_value(serde_json::json!({"model": "m", "max_tokens": 1, "messages": native})).unwrap(),
+        )
+    }
+
+    fn gemini_request(contents: &[GeminiContent]) -> ApiRequest {
+        ApiRequest::GoogleGemini(serde_json::from_value(serde_json::json!({"contents": contents})).unwrap())
+    }
+
+    /// The messages a script reads of an Anthropic conversation.
+    fn anthropic_view(native: &[AnthropicMessage]) -> Vec<RhaiMessage> {
+        script_view(&anthropic_request(native))
+    }
+
+    /// The messages a script reads of a Gemini conversation.
+    fn gemini_view(contents: &[GeminiContent]) -> Vec<RhaiMessage> {
+        script_view(&gemini_request(contents))
+    }
+
+    /// Write a script's messages back onto an Anthropic conversation, as a
+    /// script's result is written.
+    fn anthropic_write(native: &mut Vec<AnthropicMessage>, script: &[RhaiMessage], changes: &mut Vec<String>) {
+        let mut req = anthropic_request(native);
+        write_messages(&mut req, script, changes);
+        let ApiRequest::AnthropicMessages(r) = req else { unreachable!() };
+        *native = r.messages;
+    }
+
+    /// Write a script's messages back onto a Gemini conversation.
+    fn gemini_write(contents: &mut Vec<GeminiContent>, script: &[RhaiMessage], changes: &mut Vec<String>) {
+        let mut req = gemini_request(contents);
+        write_messages(&mut req, script, changes);
+        let ApiRequest::GoogleGemini(r) = req else { unreachable!() };
+        *contents = r.contents;
     }
 
     #[test]
@@ -3328,6 +3387,944 @@ mod tests {
         let ctx = from_api_request(&req, &test_user(), None, None, None, false, &no_subs());
         assert!(apply_to_api_request(&ctx, &mut req, messages).is_empty());
         assert_eq!(texts(&req), texts(&parse()));
+    }
+
+    /// Run a script's edit of the messages over `body` and return the body
+    /// the request then carries, with the changes it recorded.
+    fn messages_edit(
+        version: crate::api::sse::ApiVersion,
+        body: Value,
+        edit: impl FnOnce(&mut Vec<RhaiMessage>),
+    ) -> (Value, Vec<String>) {
+        let mut req = ApiRequest::parse(version, &Bytes::from(body.to_string())).unwrap();
+        let mut ctx = from_api_request(&req, &test_user(), None, None, None, false, &no_subs());
+        edit(&mut ctx.messages);
+        let changes = apply_to_api_request(&ctx, &mut req, ChangedFields { system_prompt: false, messages: true, tools: false });
+        let out = match &req {
+            ApiRequest::ChatCompletions(r) => serde_json::to_value(r).unwrap(),
+            ApiRequest::AnthropicMessages(r) => serde_json::to_value(r).unwrap(),
+            ApiRequest::Responses(r) => serde_json::to_value(r).unwrap(),
+            ApiRequest::GoogleGemini(r) => serde_json::to_value(r).unwrap(),
+        };
+        (out, changes)
+    }
+
+    /// A Chat Completions edit lands on the message it was read from, the
+    /// rest as sent: several leading system messages stay once each, a
+    /// message the script cannot see (no content) stays, and the edited
+    /// message keeps its image and its `name`; a script that adds a message
+    /// keeps every other as sent.
+    #[test]
+    fn a_chat_completions_edit_keeps_what_the_script_does_not_see() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "system", "content": "S1"},
+            {"role": "system", "content": "S2"},
+            {"role": "user", "name": "bob", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+            ]},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "more"},
+        ]});
+        let edited_user = serde_json::json!({"role": "user", "name": "bob", "content": [
+            {"type": "text", "text": "LOOK"},
+            {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+        ]});
+
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            let at = m.iter().position(|m| m.content == "look").unwrap();
+            m[at].content = "LOOK".to_string();
+        });
+        assert!(!changes.is_empty());
+        let mut want = body.clone();
+        want["messages"][2] = edited_user.clone();
+        assert_eq!(out["messages"], want["messages"]);
+
+        // A message added: every message the script kept is the client's own.
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m.push(RhaiMessage { role: "user".to_string(), content: "added".to_string(), ..Default::default() });
+        });
+        assert!(changes.contains(&"messages".to_string()), "{changes:?}");
+        let mut want = body["messages"].as_array().unwrap().clone();
+        want.push(serde_json::json!({"role": "user", "content": "added"}));
+        assert_eq!(out["messages"], Value::Array(want));
+
+        // Control: a script that changes nothing writes nothing.
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |_| {});
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(out["messages"], body["messages"]);
+    }
+
+    /// A Responses edit that keeps the count lands in its item; one that
+    /// drops a message keeps every other item as sent — calls, their
+    /// outputs and reasoning — and an added message is a message item.
+    #[test]
+    fn a_responses_edit_keeps_calls_outputs_and_reasoning() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "a.txt"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]},
+        ]});
+
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            let at = m.iter().position(|m| m.content == "next").unwrap();
+            m[at].content = "NEXT".to_string();
+        });
+        assert!(!changes.is_empty());
+        let mut want = body["input"].clone();
+        want[4]["content"][0]["text"] = Value::from("NEXT");
+        assert_eq!(out["input"], want);
+
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            m.remove(0);
+            for text in ["added", "more"] {
+                m.push(RhaiMessage { role: "user".to_string(), content: text.to_string(), ..Default::default() });
+            }
+        });
+        assert!(changes.contains(&"messages".to_string()), "{changes:?}");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(
+            out["input"],
+            serde_json::json!([
+                input[1], input[2], input[3], input[4],
+                {"type": "message", "role": "user", "content": "added"},
+                {"type": "message", "role": "user", "content": "more"},
+            ])
+        );
+    }
+
+    /// A Gemini call the client sent without an id is shown to the script
+    /// under one the gateway made up; that id never reaches the wire, whether
+    /// the script edits the call in place or also reshapes the conversation,
+    /// and a call left as it was keeps its signature.
+    #[test]
+    fn a_gemini_call_without_an_id_is_written_back_without_one() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "go"}]},
+            {"role": "model", "parts": [
+                {"functionCall": {"name": "ls", "args": {"p": "."}}, "thoughtSignature": "SIG"},
+                {"functionCall": {"name": "cat", "args": {"f": "a"}}},
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"name": "ls", "response": {"r": "a"}}},
+                {"functionResponse": {"name": "cat", "response": {"r": "x"}}},
+            ]},
+            {"role": "user", "parts": [{"text": "and?"}]},
+        ]});
+        let edit_cat = |m: &mut Vec<RhaiMessage>| {
+            let calls = &mut m.iter_mut().find(|m| !m.tool_calls.is_empty()).unwrap().tool_calls;
+            assert!(calls.iter().all(|c| !c.id.is_empty()), "the script sees an id on every call");
+            calls[1].arguments_json = r#"{"f":"b"}"#.to_string();
+        };
+        let want_model = serde_json::json!({"role": "model", "parts": [
+            {"functionCall": {"name": "ls", "args": {"p": "."}}, "thoughtSignature": "SIG"},
+            {"functionCall": {"name": "cat", "args": {"f": "b"}}},
+        ]});
+
+        let (out, changes) = messages_edit(ApiVersion::GoogleGemini, body.clone(), edit_cat);
+        assert!(!changes.is_empty());
+        assert_eq!(out["contents"][1], want_model);
+        assert_eq!(out["contents"][2], body["contents"][2]);
+
+        // Reshaped as well, the edited turn is kept whole and edited in place.
+        let (out, changes) = messages_edit(ApiVersion::GoogleGemini, body.clone(), |m| {
+            edit_cat(m);
+            m.pop();
+        });
+        assert!(changes.contains(&"messages".to_string()), "{changes:?}");
+        assert_eq!(out["contents"], serde_json::json!([body["contents"][0], want_model, body["contents"][2]]));
+    }
+
+    /// A Codex-shaped Responses input — reasoning and a shell call joined to
+    /// the assistant message before them — pairs with what the script read:
+    /// an edit lands, and a script that drops a message keeps the rest.
+    #[test]
+    fn a_responses_edit_lands_beside_reasoning_and_shell_items() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "run it"}]},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "local_shell_call", "id": "ls_1", "call_id": "s1", "status": "completed", "action": {"type": "exec", "command": ["ls"]}},
+            {"type": "local_shell_call_output", "id": "s1", "output": "a.txt"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "a@b.com"}]},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            let at = m.iter().position(|m| m.content == "a@b.com").unwrap();
+            m[at].content = "[email]".to_string();
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+        let mut want = body["input"].clone();
+        want[4]["content"][0]["text"] = Value::from("[email]");
+        assert_eq!(out["input"], want);
+
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            m.remove(0);
+        });
+        assert!(changes.contains(&"messages".to_string()), "{changes:?}");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(out["input"], serde_json::json!([input[1], input[2], input[3], input[4]]));
+    }
+
+    /// A script that keeps the count but moves messages (a sliding window: the
+    /// first dropped, one added) is rebuilt, never written over the messages
+    /// that stood there: a call stays on its assistant turn, a result on its.
+    #[test]
+    fn a_sliding_window_of_the_same_length_moves_no_text_onto_another_message() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": [{"type": "text", "text": "b"}, {"type": "tool_use", "id": "c1", "name": "ls", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "out"}]},
+            {"role": "assistant", "content": "done"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::AnthropicMessages, body.clone(), |m| {
+            m.remove(0);
+            m.push(RhaiMessage { role: "user".to_string(), content: "next".to_string(), ..Default::default() });
+        });
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            out["messages"],
+            serde_json::json!([msgs[1], msgs[2], msgs[3], {"role": "user", "content": "next"}])
+        );
+    }
+
+    /// Text a script gives a Responses assistant message read only from call
+    /// items has no item to go in: it is named not applied, and the items stay
+    /// as sent. Control: the call's own edit lands.
+    #[test]
+    fn text_for_a_responses_call_only_message_is_named_not_applied() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "a"},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            m[1].content = "Running ls".to_string();
+        });
+        assert_eq!(changes, ["message_1_not_applied"]);
+        assert_eq!(out["input"], body["input"]);
+
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            m[1].tool_calls[0].arguments_json = r#"{"p":"/"}"#.to_string();
+        });
+        assert_eq!(changes, ["message_1_tool_calls"]);
+        assert_eq!(out["input"][1]["arguments"], Value::from(r#"{"p":"/"}"#));
+    }
+
+    /// Calls a script adds without ids are numbered by their place, as a
+    /// rebuilt message's are — never two with one id.
+    #[test]
+    fn calls_a_script_adds_without_ids_get_distinct_ids() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "ok"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body, |m| {
+            let call = |name: &str| RhaiToolCall { id: String::new(), name: name.to_string(), arguments_json: "{}".to_string() };
+            m[1].tool_calls = vec![call("ls"), call("cat")];
+        });
+        let ids: Vec<&Value> = out["messages"][1]["tool_calls"].as_array().unwrap().iter().map(|c| &c["id"]).collect();
+        assert_eq!(ids, [&Value::from("call_0"), &Value::from("call_1")]);
+    }
+
+    /// Gemini ids on a rebuild: a call the client named keeps its id even
+    /// where the response answering it has none, and a call sent with an
+    /// empty id is not written back with a made-up one.
+    #[test]
+    fn a_gemini_rebuild_keeps_the_clients_call_ids_and_makes_up_none() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "go"}]},
+            {"role": "model", "parts": [
+                {"text": "calling"},
+                {"functionCall": {"id": "abc", "name": "ls", "args": {}}},
+                {"functionCall": {"id": "", "name": "cat", "args": {}}},
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"name": "ls", "response": {"r": "a"}}},
+                {"functionResponse": {"name": "cat", "response": {"r": "b"}}},
+            ]},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::GoogleGemini, body.clone(), |m| {
+            m.remove(0);
+            let at = m.iter().position(|m| m.content == "calling").unwrap();
+            m[at].content = "CALLING".to_string();
+            m[at].tool_calls[1].arguments_json = r#"{"f":"x"}"#.to_string();
+        });
+        assert!(changes.contains(&"messages".to_string()), "{changes:?}");
+        let parts = &out["contents"][0]["parts"];
+        assert_eq!(parts[0], serde_json::json!({"text": "CALLING"}));
+        assert_eq!(parts[1]["functionCall"]["id"], Value::from("abc"));
+        assert_eq!(parts[2]["functionCall"].get("id"), None, "{parts}");
+        assert_eq!(out["contents"][1], body["contents"][2]);
+    }
+
+    /// A Responses call a script writes to a custom (freeform) tool is a
+    /// custom call with its free text, and the output answering it a custom
+    /// call's output.
+    #[test]
+    fn a_rebuilt_responses_call_to_a_custom_tool_stays_custom() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m",
+            "tools": [{"type": "custom", "name": "apply_patch"}],
+            "input": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": "patch it"},
+            ]});
+        let (out, _) = messages_edit(ApiVersion::Responses, body, |m| {
+            m.remove(0);
+            m.push(RhaiMessage {
+                role: "assistant".to_string(),
+                tool_calls: vec![RhaiToolCall { id: "p1".to_string(), name: "apply_patch".to_string(), arguments_json: r#"{"input":"*** Begin"}"#.to_string() }],
+                ..Default::default()
+            });
+            m.push(RhaiMessage { role: "tool".to_string(), content: "done".to_string(), tool_call_id: Some("p1".to_string()), ..Default::default() });
+        });
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], Value::from("custom_tool_call"), "{input:?}");
+        assert_eq!(input[1]["input"], Value::from("*** Begin"));
+        assert_eq!(input[2]["type"], Value::from("custom_tool_call_output"));
+    }
+
+    /// Messages of the same roles shifted by a script (two dropped at the
+    /// front, two added at the end) keep their own items: no text lands on
+    /// another message's image or name.
+    #[test]
+    fn a_shift_of_same_role_messages_writes_no_text_over_another() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "name": "bob", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+            ]},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "d"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m.drain(0..2);
+            for (role, text) in [("user", "e"), ("assistant", "f")] {
+                m.push(RhaiMessage { role: role.to_string(), content: text.to_string(), ..Default::default() });
+            }
+        });
+        assert_eq!(out["messages"], serde_json::json!([
+            body["messages"][2], body["messages"][3],
+            {"role": "user", "content": "e"}, {"role": "assistant", "content": "f"},
+        ]));
+    }
+
+    /// An item the script could not see goes with the item after it: kept
+    /// when that item is kept, edited or not.
+    #[test]
+    fn an_unseen_item_goes_with_the_item_after_it() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "", "audio": {"id": "au_1"}},
+            {"role": "user", "content": "b"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m.remove(0);
+            m[0].content = "B".to_string();
+        });
+        assert_eq!(out["messages"], serde_json::json!([body["messages"][1], {"role": "user", "content": "B"}]));
+    }
+
+    /// A message is the message it was read as once: a copy the script makes
+    /// is a new message, and so is one whose role it changed.
+    #[test]
+    fn a_copy_or_a_changed_role_is_a_new_message() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "name": "bob", "content": "hi"},
+            {"role": "assistant", "content": "yo"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            let copy = m[0].clone();
+            m.push(copy);
+            m[1].role = "user".to_string();
+        });
+        assert_eq!(out["messages"], serde_json::json!([
+            body["messages"][0],
+            {"role": "user", "content": "yo"},
+            {"role": "user", "content": "hi"},
+        ]));
+    }
+
+    /// A call edited in place keeps its place among the turn's parts: text
+    /// and calls stay in the order sent, so results paired by position still
+    /// answer their own call; the id the gateway made up for it is not
+    /// written.
+    #[test]
+    fn an_edited_call_keeps_its_place_in_the_turn() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "first"},
+                {"type": "tool_use", "id": "A", "name": "ls", "input": {}},
+                {"type": "text", "text": "then"},
+                {"type": "tool_use", "id": "B", "name": "cat", "input": {}},
+            ]},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::AnthropicMessages, body.clone(), |m| {
+            m[1].tool_calls[0].arguments_json = r#"{"p":"/"}"#.to_string();
+        });
+        let mut want = body["messages"][1].clone();
+        want["content"][1]["input"] = serde_json::json!({"p": "/"});
+        assert_eq!(out["messages"][1], want);
+
+        let gemini = serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "go"}]},
+            {"role": "model", "parts": [
+                {"functionCall": {"name": "f", "args": {"n": 1}}},
+                {"functionCall": {"name": "f", "args": {"n": 2}}},
+            ]},
+            {"role": "user", "parts": [
+                {"functionResponse": {"name": "f", "response": {"r": 1}}},
+                {"functionResponse": {"name": "f", "response": {"r": 2}}},
+            ]},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::GoogleGemini, gemini.clone(), |m| {
+            m[1].tool_calls[0].arguments_json = r#"{"n":10}"#.to_string();
+        });
+        assert_eq!(out["contents"][1]["parts"], serde_json::json!([
+            {"functionCall": {"name": "f", "args": {"n": 10}}},
+            {"functionCall": {"name": "f", "args": {"n": 2}}},
+        ]));
+        assert_eq!(out["contents"][2], gemini["contents"][2]);
+    }
+
+    /// A Responses freeform call's edit lands in its `input`.
+    #[test]
+    fn a_responses_custom_calls_edit_lands_in_its_input() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "tools": [{"type": "custom", "name": "apply_patch"}], "input": [
+            {"type": "message", "role": "user", "content": "go"},
+            {"type": "custom_tool_call", "call_id": "p1", "name": "apply_patch", "input": "old"},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::Responses, body, |m| {
+            m[1].tool_calls[0].arguments_json = r#"{"input":"new"}"#.to_string();
+        });
+        assert_eq!(changes, ["message_1_tool_calls"]);
+        assert_eq!(out["input"][1]["input"], Value::from("new"));
+    }
+
+    /// An item the script could not see at the end stays right after the item
+    /// before it, ahead of a message the script appends.
+    #[test]
+    fn a_trailing_unseen_item_stays_ahead_of_an_appended_message() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "", "audio": {"id": "au_1"}},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m.push(RhaiMessage { role: "user".to_string(), content: "b".to_string(), ..Default::default() });
+        });
+        assert_eq!(out["messages"], serde_json::json!([body["messages"][0], body["messages"][1], {"role": "user", "content": "b"}]));
+    }
+
+    /// Emptying the first conversation message while adding one moves
+    /// nothing into the system prompt's lead: no message is sent twice.
+    #[test]
+    fn emptying_the_first_message_sends_no_message_twice() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": [{"type": "text", "text": "secret"}]},
+            {"role": "system", "content": "S2"},
+            {"role": "assistant", "content": "A"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m[0].content = String::new();
+            m.push(RhaiMessage { role: "user".to_string(), content: "note".to_string(), ..Default::default() });
+        });
+        assert_eq!(out["messages"], serde_json::json!([
+            body["messages"][0],
+            {"role": "user", "content": [{"type": "text", "text": ""}]},
+            body["messages"][2],
+            body["messages"][3],
+            {"role": "user", "content": "note"},
+        ]));
+    }
+
+    /// An unseen item at the end stays when the script drops the item before
+    /// it: it closes the conversation.
+    #[test]
+    fn a_trailing_unseen_item_stays_when_the_item_before_it_goes() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "user", "content": "b"},
+            {"role": "assistant", "content": "", "audio": {"id": "au_1"}},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m.pop();
+        });
+        assert_eq!(out["messages"], serde_json::json!([body["messages"][0], body["messages"][2]]));
+    }
+
+    /// A Chat call the script could not see (neither a function nor a custom
+    /// call) is never dropped by an edit of the calls beside it: the edit is
+    /// named not applied and the calls stay as sent.
+    #[test]
+    fn a_call_the_script_cannot_see_stays_and_the_edit_is_named() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "ok", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "ls", "arguments": "{}"}},
+                {"id": "x1", "type": "browser"},
+            ]},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m[1].tool_calls[0].arguments_json = r#"{"p":"/"}"#.to_string();
+        });
+        assert_eq!(changes, ["message_1_tool_calls_not_applied"]);
+        assert_eq!(out["messages"], body["messages"]);
+    }
+
+    /// A message the script copies to an earlier place keeps its own item
+    /// where it was; the copy is a new message.
+    #[test]
+    fn a_copy_placed_earlier_leaves_the_original_in_place() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "user", "name": "bob", "content": "rule"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            let mut copy = m[1].clone();
+            copy.content = "rule (repeated)".to_string();
+            m.insert(0, copy);
+        });
+        assert_eq!(out["messages"], serde_json::json!([
+            {"role": "user", "content": "rule (repeated)"}, body["messages"][0], body["messages"][1],
+        ]));
+    }
+
+    /// A message the script builds in place of one it removed is a new
+    /// message: the removed one's image and `name` do not come back with it.
+    #[test]
+    fn a_replacement_message_takes_nothing_from_the_one_removed() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "name": "bob", "content": [
+                {"type": "text", "text": "x"},
+                {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+            ]},
+            {"role": "assistant", "content": "y"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m.remove(0);
+            m.insert(0, RhaiMessage { role: "user".to_string(), content: "[image removed]".to_string(), ..Default::default() });
+        });
+        assert_eq!(out["messages"], serde_json::json!([{"role": "user", "content": "[image removed]"}, body["messages"][1]]));
+    }
+
+    /// A reshaped conversation keeps every turn whose messages the script
+    /// kept whole, edited in place: the result beside the edited text keeps
+    /// its image, error flag and breakpoint.
+    #[test]
+    fn a_whole_turn_in_a_reshaped_conversation_is_edited_in_place() {
+        use crate::api::sse::ApiVersion;
+        let result = serde_json::json!({"type": "tool_result", "tool_use_id": "c1", "is_error": true,
+            "cache_control": {"type": "ephemeral"}, "content": [
+                {"type": "text", "text": "shot"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}},
+            ]});
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "start"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "shot", "input": {}}]},
+            {"role": "user", "content": [result, {"type": "text", "text": "mail a@b.com"}]},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::AnthropicMessages, body.clone(), |m| {
+            m.remove(0);
+            let at = m.iter().position(|m| m.content == "mail a@b.com").unwrap();
+            m[at].content = "mail [email]".to_string();
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+        let mut want = body["messages"][2].clone();
+        want["content"][1]["text"] = Value::from("mail [email]");
+        assert_eq!(out["messages"], serde_json::json!([body["messages"][1], want]));
+    }
+
+    /// A turn the script reshapes that holds nothing it cannot see is
+    /// rebuilt as the script wrote it, unnamed: two results swapped go in
+    /// the new order.
+    #[test]
+    fn a_reorder_within_a_turn_of_plain_results_is_written() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "ls", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "ls", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "2"},
+            ]},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::AnthropicMessages, body.clone(), |m| {
+            m.swap(1, 2);
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+        assert_eq!(out["messages"], serde_json::json!([body["messages"][0], {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "b", "content": "2"},
+            {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+        ]}]));
+    }
+
+    /// A call dropped from a thinking turn, with its result: the turn keeps
+    /// its thinking and the other call, edited in place, and the results'
+    /// turn the script split is rebuilt from what it kept.
+    #[test]
+    fn dropping_a_call_keeps_the_turns_thinking() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "SIG"},
+                {"type": "tool_use", "id": "c1", "name": "ls", "input": {}},
+                {"type": "tool_use", "id": "c2", "name": "cat", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": "a"},
+                {"type": "tool_result", "tool_use_id": "c2", "content": "b"},
+            ]},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::AnthropicMessages, body.clone(), |m| {
+            let turn = m.iter().position(|m| m.tool_calls.len() == 2).unwrap();
+            m[turn].tool_calls.retain(|c| c.id == "c1");
+            m.retain(|m| m.tool_call_id.as_deref() != Some("c2"));
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+        assert_eq!(out["messages"], serde_json::json!([
+            body["messages"][0],
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "plan", "signature": "SIG"},
+                {"type": "tool_use", "id": "c1", "name": "ls", "input": {}},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "c1", "content": "a"}]},
+        ]));
+    }
+
+    /// A map the script built (no `origin`) is a new message, even in place
+    /// of the one it was made from: the script replaced the message, so the
+    /// conversation is sent as it wrote it, nothing named. Control: the same
+    /// edit made on the map itself lands in place, the image kept.
+    #[test]
+    fn a_map_without_an_origin_is_a_new_message() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "a@b.com"},
+                {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+            ]},
+            {"role": "assistant", "content": "ok"},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            *m = m
+                .iter()
+                .map(|m| RhaiMessage { role: m.role.clone(), content: m.content.replace("a@b.com", "[email]"), ..Default::default() })
+                .collect();
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+        assert_eq!(out["messages"], serde_json::json!([{"role": "user", "content": "[email]"}, {"role": "assistant", "content": "ok"}]));
+
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m[0].content = m[0].content.replace("a@b.com", "[email]");
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+        let mut want = body["messages"].clone();
+        want[0]["content"][0]["text"] = Value::from("[email]");
+        assert_eq!(out["messages"], want);
+    }
+
+    /// A Responses reasoning item goes with the item after it: a script that
+    /// drops the assistant message after it never leaves the reasoning item
+    /// without what must follow it — the turn is rebuilt from what the
+    /// script kept, and the reasoning it could not see is named.
+    #[test]
+    fn a_reasoning_item_goes_with_the_message_after_it() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "reasoning", "id": "rs_1", "summary": []},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "secret"}]},
+            {"type": "message", "role": "user", "content": "next"},
+        ]});
+        let (out, changes) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            m.retain(|m| !m.content.contains("secret"));
+        });
+        assert!(changes.iter().any(|c| c.ends_with("_not_applied")), "{changes:?}");
+        let input = out["input"].as_array().unwrap();
+        assert!(input.iter().all(|i| i["type"] != "reasoning"), "{input:?}");
+        assert_eq!(input.first(), Some(&body["input"][0]));
+        assert_eq!(input.last(), Some(&body["input"][3]));
+    }
+
+    /// A Gemini response rebuilt after the script dropped the call it answers
+    /// is still named by its function, as the client sent it.
+    #[test]
+    fn a_rebuilt_gemini_response_keeps_its_functions_name() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"contents": [
+            {"role": "user", "parts": [{"text": "go"}]},
+            {"role": "model", "parts": [{"functionCall": {"id": "fc_9", "name": "search", "args": {}}}]},
+            {"role": "user", "parts": [{"functionResponse": {"id": "fc_9", "name": "search", "response": {"r": "a@b.com"}}}]},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::GoogleGemini, body, |m| {
+            m.remove(1);
+            let at = m.iter().position(|m| m.role == "tool").unwrap();
+            m[at].content = r#"{"r":"[email]"}"#.to_string();
+        });
+        let response = &out["contents"][1]["parts"][0]["functionResponse"];
+        assert_eq!(response["name"], Value::from("search"), "{out}");
+        assert_eq!(response["id"], Value::from("fc_9"));
+    }
+
+    /// The seeded compression script keeps the last user message's own map,
+    /// so the compressed prompt goes with that message's image.
+    #[test]
+    fn the_compression_seed_keeps_the_last_user_messages_image() {
+        use crate::api::sse::ApiVersion;
+        use crate::scripting::{ScriptEngine, ScriptFailMode, TransformProgram};
+        let body = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "old ".repeat(200)},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "now"},
+                {"type": "image_url", "image_url": {"url": "https://x/i.png"}},
+            ]},
+        ]});
+        let mut req = ApiRequest::parse(ApiVersion::ChatCompletions, &Bytes::from(body.to_string())).unwrap();
+        let ctx = from_api_request(&req, &test_user(), None, Some(100), None, false, &no_subs());
+        let program = TransformProgram {
+            id: "compression".to_string(),
+            name: "compression".to_string(),
+            source: include_str!("../../../../seeds/scripts/compression.rhai").to_string(),
+            phase: "request".to_string(),
+            scope: "global".to_string(),
+            priority: 900,
+            enabled: true,
+            version_hash: "v1".to_string(),
+            model_filter: None,
+            app_filter: None,
+            trigger_regex: None,
+            match_mode: None,
+            profile_id: None,
+        };
+        let (result, ..) =
+            ScriptEngine::new().execute_chain(&[program], ctx, false, None, ScriptFailMode::Open).unwrap();
+        assert_eq!(result.metadata.get("compression").map(String::as_str), Some("applied"));
+        apply_to_api_request(&result, &mut req, ChangedFields { system_prompt: false, messages: true, tools: false });
+        let ApiRequest::ChatCompletions(chat) = &req else { unreachable!() };
+        let out = serde_json::to_value(&chat.messages).unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 1, "{out}");
+        let parts = &out[0]["content"];
+        assert!(parts.to_string().contains("https://x/i.png"), "{out}");
+        assert!(parts[0]["text"].as_str().is_some_and(|t| t.contains("old") && t.ends_with("now")), "{out}");
+    }
+
+    /// A Responses call joined to the assistant message before it across an
+    /// item that reads as nothing is one turn with it: dropping the message
+    /// drops the call too, never leaving it behind.
+    #[test]
+    fn a_call_joined_across_an_empty_item_goes_with_its_message() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "x"}]},
+            {"type": "message", "role": "user", "content": []},
+            {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "a"},
+            {"type": "message", "role": "user", "content": "next"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::Responses, body.clone(), |m| {
+            m.retain(|m| m.role != "assistant");
+        });
+        let input = out["input"].as_array().unwrap();
+        assert!(input.iter().all(|i| i["type"] != "function_call"), "{input:?}");
+        assert_eq!(input.first(), Some(&body["input"][0]));
+        assert_eq!(input.last(), Some(&body["input"][5]));
+    }
+
+    /// A Responses call the script writes without an id is named by its
+    /// place (its message's, then its own), never sent with an empty one.
+    #[test]
+    fn a_responses_call_without_an_id_gets_one() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "input": [{"type": "message", "role": "user", "content": "q"}]});
+        let (out, _) = messages_edit(ApiVersion::Responses, body, |m| {
+            m.push(RhaiMessage {
+                role: "assistant".to_string(),
+                tool_calls: vec![RhaiToolCall { id: String::new(), name: "ls".to_string(), arguments_json: "{}".to_string() }],
+                ..Default::default()
+            });
+        });
+        let call = out["input"].as_array().unwrap().iter().find(|i| i["type"] == "function_call").cloned();
+        assert_eq!(call.map(|c| c["call_id"].clone()), Some(Value::from("call_1_0")), "{out}");
+    }
+
+    /// A rebuilt Responses turn whose item carried a member the rebuild
+    /// drops (`phase`) is named not applied; a Chat member that carries
+    /// nothing (`refusal: null`) is no loss.
+    #[test]
+    fn a_rebuild_names_a_lost_member_and_not_an_empty_one() {
+        use crate::api::sse::ApiVersion;
+        let responses = serde_json::json!({"model": "m", "input": [
+            {"type": "message", "role": "user", "content": "q"},
+            {"type": "message", "role": "assistant", "phase": "final_answer", "content": [{"type": "output_text", "text": "a"}]},
+            {"type": "function_call", "call_id": "c1", "name": "ls", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "x"},
+        ]});
+        let parse = |v: Value| ApiRequest::parse(ApiVersion::Responses, &Bytes::from(v.to_string())).unwrap();
+        assert!(turn_holds_unseen(&parse(responses.clone()), &[1]));
+        let mut plain = responses;
+        plain["input"][1].as_object_mut().unwrap().remove("phase");
+        assert!(!turn_holds_unseen(&parse(plain), &[1]));
+
+        let chat = serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a", "refusal": null},
+            {"role": "user", "content": "b"},
+        ]});
+        let (_, changes) = messages_edit(ApiVersion::ChatCompletions, chat, |m| {
+            m.remove(0);
+            m[0].content = "A".to_string();
+            m.swap(0, 1);
+        });
+        assert!(changes.iter().all(|c| !c.ends_with("_not_applied")), "{changes:?}");
+    }
+
+    /// An edited Anthropic call keeps its breakpoint.
+    #[test]
+    fn an_edited_call_keeps_its_breakpoint() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "c1", "name": "ls", "input": {}, "cache_control": {"type": "ephemeral"}},
+            ]},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::AnthropicMessages, body, |m| {
+            m[1].tool_calls[0].arguments_json = r#"{"p":"/"}"#.to_string();
+        });
+        assert_eq!(out["messages"][1]["content"][0]["cache_control"], serde_json::json!({"type": "ephemeral"}), "{out}");
+        assert_eq!(out["messages"][1]["content"][0]["input"], serde_json::json!({"p": "/"}));
+    }
+
+    /// An item after every turn follows the last turn read whole, even when
+    /// that turn is rebuilt: never between its messages.
+    #[test]
+    fn a_trailing_unseen_item_follows_a_rebuilt_last_turn_whole() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "ls", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "ls", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "2"},
+                {"type": "text", "text": "more"},
+            ]},
+            {"role": "assistant", "content": []},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::AnthropicMessages, body.clone(), |m| {
+            m.retain(|m| m.tool_call_id.as_deref() != Some("a"));
+        });
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.last(), Some(&body["messages"][3]), "{out}");
+        assert_eq!(msgs.iter().filter(|m| m["content"] == serde_json::json!([])).count(), 1, "{out}");
+    }
+
+    /// Calls a script gives a message that is not an assistant's have no place
+    /// on the wire: named not applied, the message as sent.
+    #[test]
+    fn calls_on_a_user_message_are_named_not_applied() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "go"}]});
+        let (out, changes) = messages_edit(ApiVersion::ChatCompletions, body.clone(), |m| {
+            m[0].tool_calls = vec![RhaiToolCall { id: "c1".to_string(), name: "ls".to_string(), arguments_json: "{}".to_string() }];
+        });
+        assert_eq!(changes, ["message_0_tool_calls_not_applied"]);
+        assert_eq!(out["messages"], body["messages"]);
+    }
+
+    /// An Anthropic call the script adds without an id is named by its place,
+    /// never sent with an empty one.
+    #[test]
+    fn an_anthropic_call_without_an_id_gets_one() {
+        use crate::api::sse::ApiVersion;
+        let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "ok"},
+        ]});
+        let (out, _) = messages_edit(ApiVersion::AnthropicMessages, body, |m| {
+            m[1].tool_calls = vec![RhaiToolCall { id: String::new(), name: "ls".to_string(), arguments_json: "{}".to_string() }];
+        });
+        let call = out["messages"][1]["content"].as_array().unwrap().iter().find(|b| b["type"] == "tool_use").cloned();
+        assert_eq!(call.map(|c| c["id"].clone()), Some(Value::from("call_0")), "{out}");
+    }
+
+    /// A turn whose Anthropic result or Gemini response carries a member a
+    /// rebuild drops holds something the script cannot see; without it, not.
+    #[test]
+    fn anthropic_and_gemini_members_a_rebuild_drops_are_seen_as_lost() {
+        use crate::api::sse::ApiVersion;
+        let anthropic = |extra: bool| {
+            let mut result = serde_json::json!({"type": "tool_result", "tool_use_id": "c1", "content": "a"});
+            if extra {
+                result["toolset_name"] = Value::from("files");
+            }
+            let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "c1", "name": "ls", "input": {}}]},
+                {"role": "user", "content": [result]},
+            ]});
+            ApiRequest::parse(ApiVersion::AnthropicMessages, &Bytes::from(body.to_string())).unwrap()
+        };
+        assert!(turn_holds_unseen(&anthropic(true), &[1]));
+        assert!(!turn_holds_unseen(&anthropic(false), &[1]));
+        // A call's `caller` from inside code execution, and a text's
+        // citations, a rebuild drops too; a call's default caller loses nothing.
+        let assistant = |block: Value| {
+            let body = serde_json::json!({"model": "m", "max_tokens": 1, "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [block]},
+            ]});
+            ApiRequest::parse(ApiVersion::AnthropicMessages, &Bytes::from(body.to_string())).unwrap()
+        };
+        let call = |caller: Value| serde_json::json!({"type": "tool_use", "id": "c1", "name": "ls", "input": {}, "caller": caller});
+        assert!(turn_holds_unseen(&assistant(call(serde_json::json!({"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}))), &[1]));
+        assert!(!turn_holds_unseen(&assistant(call(serde_json::json!({"type": "direct"}))), &[1]));
+        let cited = serde_json::json!({"type": "text", "text": "a", "citations": [{"type": "char_location", "cited_text": "a",
+            "document_index": 0, "document_title": null, "start_char_index": 0, "end_char_index": 1}]});
+        assert!(turn_holds_unseen(&assistant(cited), &[1]));
+        assert!(!turn_holds_unseen(&assistant(serde_json::json!({"type": "text", "text": "a", "citations": null})), &[1]));
+        let gemini = |extra: bool| {
+            let mut response = serde_json::json!({"name": "ls", "response": {"r": "a"}});
+            if extra {
+                response["willContinue"] = Value::from(true);
+            }
+            let body = serde_json::json!({"contents": [
+                {"role": "model", "parts": [{"functionCall": {"name": "ls", "args": {}}}]},
+                {"role": "user", "parts": [{"functionResponse": response}]},
+            ]});
+            ApiRequest::parse(ApiVersion::GoogleGemini, &Bytes::from(body.to_string())).unwrap()
+        };
+        assert!(turn_holds_unseen(&gemini(true), &[1]));
+        assert!(!turn_holds_unseen(&gemini(false), &[1]));
     }
 
     #[test]
@@ -3574,6 +4571,7 @@ mod tests {
                 content: "hello".to_string(),
                 tool_call_id: None,
                 tool_calls: vec![],
+                origin: None,
             }],
             tools: vec![RhaiTool {
                 name: "search".to_string(),
@@ -3801,8 +4799,8 @@ mod tests {
 
     #[test]
     fn anthropic_tool_result_rebuilt_as_valid_when_messages_changed() {
-        // Regression: when the messages are marked changed, sync_anthropic_messages must
-        // never produce role="tool" (Anthropic rejects it with 400).
+        // When the messages are marked changed, the write-back must never
+        // produce role="tool" (Anthropic rejects it with 400).
         // Same-count path: tool_result blocks are updated in-place.
         let json = r#"{
             "model": "claude-3",
@@ -3846,12 +4844,12 @@ mod tests {
     #[test]
     fn group_rhai_for_anthropic_groups_correctly() {
         let msgs = vec![
-            RhaiMessage { role: "user".to_string(), content: "hello".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "assistant".to_string(), content: "I'll search".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "tool".to_string(), content: "r1".to_string(), tool_call_id: Some("c1".to_string()), tool_calls: vec![] },
-            RhaiMessage { role: "tool".to_string(), content: "r2".to_string(), tool_call_id: Some("c2".to_string()), tool_calls: vec![] },
-            RhaiMessage { role: "user".to_string(), content: "what next?".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "assistant".to_string(), content: "done".to_string(), tool_call_id: None, tool_calls: vec![] },
+            RhaiMessage { role: "user".to_string(), content: "hello".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
+            RhaiMessage { role: "assistant".to_string(), content: "I'll search".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
+            RhaiMessage { role: "tool".to_string(), content: "r1".to_string(), tool_call_id: Some("c1".to_string()), tool_calls: vec![], origin: None },
+            RhaiMessage { role: "tool".to_string(), content: "r2".to_string(), tool_call_id: Some("c2".to_string()), tool_calls: vec![], origin: None },
+            RhaiMessage { role: "user".to_string(), content: "what next?".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
+            RhaiMessage { role: "assistant".to_string(), content: "done".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
         ];
 
         let groups = group_rhai_for_anthropic(&msgs);
@@ -3875,7 +4873,7 @@ mod tests {
 
         // Edge case: tool messages at end (no trailing user)
         let msgs2 = vec![
-            RhaiMessage { role: "tool".to_string(), content: "r1".to_string(), tool_call_id: Some("c1".to_string()), tool_calls: vec![] },
+            RhaiMessage { role: "tool".to_string(), content: "r1".to_string(), tool_call_id: Some("c1".to_string()), tool_calls: vec![], origin: None },
         ];
         let groups2 = group_rhai_for_anthropic(&msgs2);
         assert_eq!(groups2.len(), 1);
@@ -3888,11 +4886,10 @@ mod tests {
         }
     }
 
-    /// The messages a script is given and the native expansion its result is
-    /// synced against read a tool result alike — several text blocks and an
-    /// image included — so a script that changes nothing changes nothing.
+    /// A script reads a tool result's text blocks joined — an image among
+    /// them included — and a script that changes nothing writes nothing.
     #[test]
-    fn a_tool_results_projection_is_the_same_from_the_domain_and_the_native_message() {
+    fn a_script_that_changes_nothing_in_a_tool_result_writes_nothing() {
         let msg: AnthropicMessage = serde_json::from_value(serde_json::json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "c1", "content": [
                 {"type": "text", "text": "a"},
@@ -3906,126 +4903,45 @@ mod tests {
             serde_json::from_value(serde_json::json!({"model": "m", "max_tokens": 1, "messages": [msg.clone()]})).unwrap();
         let domain = DomainRequest::from_anthropic(&req).messages;
         let from_domain: Vec<String> = domain.iter().map(|m| domain_msg_to_rhai(m).content).collect();
-        let native: Vec<String> = anthropic_to_rhai_expansion(&msg).into_iter().map(|m| m.content).collect();
-        assert_eq!(from_domain, native);
-        assert_eq!(native, ["ab", "next"]);
+        assert_eq!(from_domain, ["ab", "next"]);
 
         let mut contents = vec![msg];
-        let modified: Vec<RhaiMessage> = domain.iter().map(domain_msg_to_rhai).collect();
+        let modified = anthropic_view(&contents);
         let mut changes = Vec::new();
-        sync_anthropic_messages(&mut contents, &modified, &mut changes);
+        anthropic_write(&mut contents, &modified, &mut changes);
         assert!(changes.is_empty(), "{changes:?}");
     }
 
+    /// A script reads no citation, so a text it rewrites loses them — in a
+    /// message and in a tool result — and one it leaves keeps them.
     #[test]
-    fn anthropic_rhai_expansion_matches_domain() {
-        // Verify our expansion mirrors convert_anthropic_message + domain_msg_to_rhai
-        use crate::api::messages::*;
-
-        // Case 1: simple text
-        let msg = AnthropicMessage {
-            role: "user".to_string(),
-            content: AnthropicContent::Text("hello".to_string()),
+    fn a_script_rewritten_text_drops_the_citations_it_never_read() {
+        let cite = serde_json::json!([{"type": "char_location", "cited_text": "ssn 1", "document_index": 0, "document_title": null,
+            "start_char_index": 0, "end_char_index": 1}]);
+        let msg = |text: &str, result: &str| -> AnthropicMessage {
+            serde_json::from_value(serde_json::json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "c1", "content": [{"type": "text", "text": result, "citations": cite}]},
+                {"type": "text", "text": text, "citations": cite},
+            ]}))
+            .unwrap()
         };
-        let rhai = anthropic_to_rhai_expansion(&msg);
-        assert_eq!(rhai.len(), 1);
-        assert_eq!(rhai[0].role, "user");
-        assert_eq!(rhai[0].content, "hello");
-
-        // Case 2: user with tool_result + text
-        let msg = AnthropicMessage {
-            role: "user".to_string(),
-            content: AnthropicContent::Blocks(vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "c1".to_string(),
-                    content: Some(ToolResultContent::Text("result output".to_string())),
-                    is_error: None,
-                    cache_control: None,
-                    extra: Default::default(),
-                },
-                ContentBlock::Text {
-                    text: "What did you find?".to_string(),
-                    cache_control: None,
-                },
-            ]),
-        };
-        let rhai = anthropic_to_rhai_expansion(&msg);
-        assert_eq!(rhai.len(), 2, "tool_result + text = 2 Rhai messages");
-        assert_eq!(rhai[0].role, "tool");
-        assert_eq!(rhai[0].content, "result output");
-        assert_eq!(rhai[0].tool_call_id.as_deref(), Some("c1"));
-        assert_eq!(rhai[1].role, "user");
-        assert_eq!(rhai[1].content, "What did you find?");
-
-        // Case 3: assistant with thinking + text + tool_use
-        let msg = AnthropicMessage {
-            role: "assistant".to_string(),
-            content: AnthropicContent::Blocks(vec![
-                ContentBlock::Thinking {
-                    thinking: "reasoning...".to_string(),
-                    signature: Some("sig".to_string()),
-                },
-                ContentBlock::Text {
-                    text: "my answer".to_string(),
-                    cache_control: None,
-                },
-                ContentBlock::ToolUse {
-                    id: "tu_1".to_string(),
-                    name: "bash".to_string(),
-                    input: serde_json::json!({}),
-                    cache_control: None,
-                },
-            ]),
-        };
-        let rhai = anthropic_to_rhai_expansion(&msg);
-        assert_eq!(rhai.len(), 1, "assistant is always 1 Rhai message");
-        assert_eq!(rhai[0].role, "assistant");
-        assert_eq!(rhai[0].content, "my answer");
-
-        // Case 4: user with only tool_result (no text)
-        let msg = AnthropicMessage {
-            role: "user".to_string(),
-            content: AnthropicContent::Blocks(vec![ContentBlock::ToolResult {
-                tool_use_id: "c2".to_string(),
-                content: Some(ToolResultContent::Text("output".to_string())),
-                is_error: None,
-                cache_control: None,
-                extra: Default::default(),
-            }]),
-        };
-        let rhai = anthropic_to_rhai_expansion(&msg);
-        assert_eq!(rhai.len(), 1, "tool_result only = 1 Rhai message (no user text)");
-        assert_eq!(rhai[0].role, "tool");
-
-        // Case 5: user with multiple tool_results + text
-        let msg = AnthropicMessage {
-            role: "user".to_string(),
-            content: AnthropicContent::Blocks(vec![
-                ContentBlock::ToolResult {
-                    tool_use_id: "c1".to_string(),
-                    content: Some(ToolResultContent::Text("r1".to_string())),
-                    is_error: None,
-                    cache_control: None,
-                    extra: Default::default(),
-                },
-                ContentBlock::ToolResult {
-                    tool_use_id: "c2".to_string(),
-                    content: Some(ToolResultContent::Text("r2".to_string())),
-                    is_error: None,
-                    cache_control: None,
-                    extra: Default::default(),
-                },
-                ContentBlock::Text {
-                    text: "summarize".to_string(),
-                    cache_control: None,
-                },
-            ]),
-        };
-        let rhai = anthropic_to_rhai_expansion(&msg);
-        assert_eq!(rhai.len(), 3, "2 tool_results + text = 3 Rhai messages");
-        assert_eq!(rhai[0].role, "tool");
-        assert_eq!(rhai[1].role, "tool");
-        assert_eq!(rhai[2].role, "user");
+        let mut contents = vec![msg("ssn 1", "found")];
+        let mut script = anthropic_view(&contents);
+        let prose = script.iter().position(|m| m.content == "ssn 1").unwrap();
+        script[prose].content = "[X]".to_string();
+        let mut changes = Vec::new();
+        anthropic_write(&mut contents, &script, &mut changes);
+        let wire = serde_json::to_value(&contents[0]).unwrap();
+        assert_eq!(wire["content"][1], serde_json::json!({"type": "text", "text": "[X]"}));
+        assert_eq!(wire["content"][0]["content"][0]["citations"], cite, "the result the script left keeps its own");
+        let mut contents = vec![msg("next", "ssn 1")];
+        let mut script = anthropic_view(&contents);
+        let result = script.iter().position(|m| m.content == "ssn 1").unwrap();
+        script[result].content = "[X]".to_string();
+        anthropic_write(&mut contents, &script, &mut changes);
+        let wire = serde_json::to_value(&contents[0]).unwrap();
+        assert!(wire["content"][0]["content"].to_string().contains("[X]") && !wire["content"][0]["content"].to_string().contains("citations"), "{wire}");
+        assert_eq!(wire["content"][1]["citations"], cite);
     }
 
     #[test]
@@ -4038,12 +4954,14 @@ mod tests {
                     ContentBlock::Text {
                         text: "I'll search".to_string(),
                         cache_control: None,
+                        extra: BTreeMap::new(),
                     },
                     ContentBlock::ToolUse {
                         id: "c1".to_string(),
                         name: "bash".to_string(),
                         input: serde_json::json!({}),
                         cache_control: None,
+                        extra: BTreeMap::new(),
                     },
                 ]),
             },
@@ -4062,35 +4980,20 @@ mod tests {
                     ContentBlock::Text {
                         text: "Tell me about user@email.com".to_string(),
                         cache_control: None,
+                        extra: BTreeMap::new(),
                     },
                 ]),
             },
         ];
 
         // Simulate email anonymizer: modify text content
-        let modified_rhai = vec![
-            RhaiMessage {
-                role: "assistant".to_string(),
-                content: "I'll search".to_string(),
-                tool_call_id: None,
-                tool_calls: vec![],
-            },
-            RhaiMessage {
-                role: "tool".to_string(),
-                content: "[REDACTED] found".to_string(),
-                tool_call_id: Some("c1".to_string()),
-                tool_calls: vec![],
-            },
-            RhaiMessage {
-                role: "user".to_string(),
-                content: "Tell me about [REDACTED]".to_string(),
-                tool_call_id: None,
-                tool_calls: vec![],
-            },
-        ];
+        let mut modified_rhai = anthropic_view(&native);
+        assert_eq!(modified_rhai.len(), 3);
+        modified_rhai[1].content = "[REDACTED] found".to_string();
+        modified_rhai[2].content = "Tell me about [REDACTED]".to_string();
 
         let mut changes = Vec::new();
-        sync_anthropic_messages(&mut native, &modified_rhai, &mut changes);
+        anthropic_write(&mut native, &modified_rhai, &mut changes);
 
         assert!(!changes.is_empty(), "should report changes");
         assert_eq!(native.len(), 2, "native count unchanged");
@@ -4153,6 +5056,7 @@ mod tests {
                     name: "bash".to_string(),
                     input: serde_json::json!({}),
                     cache_control: None,
+                    extra: BTreeMap::new(),
                 }]),
             },
             AnthropicMessage {
@@ -4168,6 +5072,7 @@ mod tests {
                     ContentBlock::Text {
                         text: "ok what next?".to_string(),
                         cache_control: None,
+                        extra: BTreeMap::new(),
                     },
                 ]),
             },
@@ -4188,17 +5093,19 @@ mod tests {
                 content: "start".to_string(),
                 tool_call_id: None,
                 tool_calls: vec![],
+                origin: None,
             },
             RhaiMessage {
                 role: "user".to_string(),
                 content: "thanks".to_string(),
                 tool_call_id: None,
                 tool_calls: vec![],
+                origin: None,
             },
         ];
 
         let mut changes = Vec::new();
-        sync_anthropic_messages(&mut native, &modified_rhai, &mut changes);
+        anthropic_write(&mut native, &modified_rhai, &mut changes);
 
         assert_eq!(native.len(), 2, "should have 2 messages after compression");
         assert!(
@@ -4365,12 +5272,12 @@ mod tests {
         ];
 
         let modified = vec![
-            RhaiMessage { role: "user".to_string(), content: "Modified hello".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "assistant".to_string(), content: "World".to_string(), tool_call_id: None, tool_calls: vec![] },
+            RhaiMessage { role: "user".to_string(), content: "Modified hello".to_string(), tool_call_id: None, tool_calls: vec![], origin: Some(0) },
+            RhaiMessage { role: "assistant".to_string(), content: "World".to_string(), tool_call_id: None, tool_calls: vec![], origin: Some(1) },
         ];
 
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
 
         assert_eq!(changes, vec!["message_0"]);
         // Text updated
@@ -4411,14 +5318,11 @@ mod tests {
             },
         ];
 
-        // Rhai expansion: model text, tool response
-        let modified = vec![
-            RhaiMessage { role: "assistant".to_string(), content: "Checking".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "tool".to_string(), content: r#"{"result":"updated"}"#.to_string(), tool_call_id: Some("call_1".to_string()), tool_calls: vec![] },
-        ];
+        let mut modified = gemini_view(&contents);
+        modified[1].content = r#"{"result":"updated"}"#.to_string();
 
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
 
         assert!(changes.contains(&"message_1".to_string()));
         // FunctionResponse updated
@@ -4429,52 +5333,11 @@ mod tests {
         }
     }
 
-    /// A script that changes the conversation's length rebuilds the native
-    /// messages: a tool result it left alone goes as the client sent it (its
-    /// image, its breakpoints), and one whose text it changed keeps its image.
+    /// Responses with no call id that share their function's name are told
+    /// apart by the place each was read from: when a script prunes one, every
+    /// other keeps its own media, and none another's.
     #[test]
-    fn a_rebuild_keeps_a_tool_results_media_and_breakpoints() {
-        let image = serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBO"}, "cache_control": {"type": "ephemeral"}});
-        let results = serde_json::json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "c1", "cache_control": {"type": "ephemeral"}, "content": [
-                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}, image.clone(),
-            ]},
-            {"type": "tool_result", "tool_use_id": "c2", "content": [{"type": "text", "text": "b"}, image.clone()]},
-        ]});
-        let mut native: Vec<AnthropicMessage> = serde_json::from_value(serde_json::json!([
-            {"role": "user", "content": "start"},
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "c1", "name": "shot", "input": {}},
-                {"type": "tool_use", "id": "c2", "name": "shot", "input": {}},
-            ]},
-            results,
-            {"role": "assistant", "content": "done"},
-            {"role": "user", "content": "thanks"},
-        ]))
-        .unwrap();
-        let mut modified: Vec<RhaiMessage> = native.iter().flat_map(anthropic_to_rhai_expansion).collect();
-        modified.pop();
-        let c2 = modified.iter_mut().find(|m| m.tool_call_id.as_deref() == Some("c2")).unwrap();
-        c2.content = "B".to_string();
-
-        let mut changes = Vec::new();
-        sync_anthropic_messages(&mut native, &modified, &mut changes);
-
-        assert_eq!(changes, ["messages"]);
-        assert_eq!(native.len(), 4);
-        assert_eq!(serde_json::to_value(&native[2]).unwrap(), serde_json::json!({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": "c1", "cache_control": {"type": "ephemeral"}, "content": [
-                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}}, image.clone(),
-            ]},
-            {"type": "tool_result", "tool_use_id": "c2", "content": [{"type": "text", "text": "B"}, image]},
-        ]}));
-    }
-
-    /// Responses with no call id that share their function's name cannot be
-    /// told apart once a script changed the conversation: none is given
-    /// another's media; a response whose key is its own keeps its own.
-    #[test]
-    fn a_gemini_rebuild_gives_no_response_another_ones_media() {
+    fn a_gemini_rebuild_gives_each_response_its_own_media() {
         let response = |name: &str, n: u8| serde_json::json!({"functionResponse": {
             "name": name, "response": {"n": n}, "parts": [{"inlineData": {"mimeType": "image/png", "data": format!("IMG{n}")}}],
         }});
@@ -4488,11 +5351,11 @@ mod tests {
         ]))
         .unwrap();
         // The script prunes the first call and its response.
-        let mut modified: Vec<RhaiMessage> = contents.iter().flat_map(gemini_to_rhai_expansion).map(|(m, _)| m).collect();
+        let mut modified: Vec<RhaiMessage> = gemini_view(&contents);
         modified.drain(0..2);
 
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
 
         let parts: Vec<Value> = contents
             .iter()
@@ -4502,7 +5365,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(parts, [serde_json::json!([]), response("read", 3)["functionResponse"]["parts"].clone()]);
+        assert_eq!(
+            parts,
+            [response("shot", 2)["functionResponse"]["parts"].clone(), response("read", 3)["functionResponse"]["parts"].clone()]
+        );
     }
 
     /// A script's text written into a function response in place is the
@@ -4514,10 +5380,10 @@ mod tests {
             {"role": "user", "parts": [{"functionResponse": {"id": "c1", "name": "f", "response": {"email": "a@b"}}}]},
         ]))
         .unwrap();
-        let mut modified: Vec<RhaiMessage> = contents.iter().flat_map(gemini_to_rhai_expansion).map(|(m, _)| m).collect();
+        let mut modified: Vec<RhaiMessage> = gemini_view(&contents);
         modified[1].content = "[REDACTED]".to_string();
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
         assert_matches!(&contents[1].parts[0], GeminiPart::FunctionResponse { function_response }
             if function_response.response == serde_json::json!({"output": "[REDACTED]"}));
     }
@@ -4555,10 +5421,10 @@ mod tests {
             {"role": "model", "parts": [{"text": "done"}]},
         ]))
         .unwrap();
-        let mut modified: Vec<RhaiMessage> = contents.iter().flat_map(gemini_to_rhai_expansion).map(|(m, _)| m).collect();
+        let mut modified: Vec<RhaiMessage> = gemini_view(&contents);
         modified.pop();
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
         assert_matches!(&contents[1].parts[0], GeminiPart::FunctionResponse { function_response }
             if function_response.response == serde_json::json!("ok"));
     }
@@ -4609,11 +5475,11 @@ mod tests {
             {"role": "model", "parts": [{"text": "done"}]},
         ]))
         .unwrap();
-        let mut modified: Vec<RhaiMessage> = contents.iter().flat_map(gemini_to_rhai_expansion).map(|(m, _)| m).collect();
+        let mut modified: Vec<RhaiMessage> = gemini_view(&contents);
         modified.pop();
 
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
 
         assert_eq!(changes, ["messages"]);
         let rebuilt = contents.iter().flat_map(|c| &c.parts).find(|p| matches!(p, GeminiPart::FunctionResponse { .. })).unwrap();
@@ -4635,13 +5501,13 @@ mod tests {
 
         // Add a new message
         let modified = vec![
-            RhaiMessage { role: "user".to_string(), content: "Hello".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "assistant".to_string(), content: "World".to_string(), tool_call_id: None, tool_calls: vec![] },
-            RhaiMessage { role: "user".to_string(), content: "New message".to_string(), tool_call_id: None, tool_calls: vec![] },
+            RhaiMessage { role: "user".to_string(), content: "Hello".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
+            RhaiMessage { role: "assistant".to_string(), content: "World".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
+            RhaiMessage { role: "user".to_string(), content: "New message".to_string(), tool_call_id: None, tool_calls: vec![], origin: None },
         ];
 
         let mut changes = Vec::new();
-        sync_gemini_messages(&mut contents, &modified, &mut changes);
+        gemini_write(&mut contents, &modified, &mut changes);
 
         assert_eq!(changes, vec!["messages"]);
         assert_eq!(contents.len(), 3);
@@ -4680,9 +5546,10 @@ mod tests {
             content: String::new(),
             tool_call_id: None,
             tool_calls: vec![rhai("c1", "a"), rhai("c3", "edited")],
+            origin: Some(0),
         }];
         let mut changes = Vec::new();
-        apply_gemini_tool_call_changes(&mut contents, &msgs, &mut changes);
+        gemini_write(&mut contents, &msgs, &mut changes);
         assert_eq!(changes, ["message_0_tool_calls"]);
         let signed: Vec<(Option<&str>, Option<&str>)> = contents[0]
             .parts
@@ -4773,6 +5640,7 @@ mod tests {
                 DomainContentBlock::Text {
                     text: "Looking it up".to_string(),
                     cache_control: None,
+                    citations: Vec::new(),
                 },
                 DomainContentBlock::ToolUse {
                     id: "call_1".to_string(),
@@ -4811,12 +5679,14 @@ mod tests {
                 ContentBlock::Text {
                     text: "Let me search.".to_string(),
                     cache_control: None,
+                    extra: BTreeMap::new(),
                 },
                 ContentBlock::ToolUse {
                     id: "tu_1".to_string(),
                     name: "search".to_string(),
                     input: serde_json::json!({"q": "secret"}),
                     cache_control: None,
+                    extra: BTreeMap::new(),
                 },
             ]),
         }];
@@ -4831,10 +5701,11 @@ mod tests {
                 name: "search".to_string(),
                 arguments_json: r#"{"q":"[redacted]"}"#.to_string(),
             }],
+            origin: Some(0),
         }];
 
         let mut changes = Vec::new();
-        super::apply_anthropic_tool_call_changes(&mut msgs, &rhai_msgs, &mut changes);
+        anthropic_write(&mut msgs, &rhai_msgs, &mut changes);
 
         assert_eq!(changes, vec!["message_0_tool_calls"]);
         let blocks = match &msgs[0].content {
@@ -4858,7 +5729,7 @@ mod tests {
     fn cc_tool_call_drop_updates_native() {
         use crate::api::domain::{Message, MessageContent, ToolCall};
 
-        let mut chat_msgs = vec![Message {
+        let chat_msgs = vec![Message {
             role: "assistant".to_string(),
             content: Some(MessageContent::Text("ok".to_string())),
             name: None,
@@ -4877,13 +5748,18 @@ mod tests {
             content: "ok".to_string(),
             tool_call_id: None,
             tool_calls: vec![],
+            origin: Some(0),
         }];
 
+        let mut req = ApiRequest::ChatCompletions(
+            serde_json::from_value(serde_json::json!({"model": "m", "messages": chat_msgs})).unwrap(),
+        );
         let mut changes = Vec::new();
-        super::apply_cc_tool_call_changes(&mut chat_msgs, &rhai_msgs, &HashMap::new(), &mut changes);
+        write_messages(&mut req, &rhai_msgs, &mut changes);
 
         assert_eq!(changes, vec!["message_0_tool_calls"]);
-        assert!(chat_msgs[0].tool_calls.is_none());
+        let ApiRequest::ChatCompletions(chat) = req else { unreachable!() };
+        assert!(chat.messages[0].tool_calls.is_none());
     }
 
     #[test]
@@ -5600,6 +6476,30 @@ mod scan_messages_tests {
         }
     }
 
+    /// A write over a Responses message's text keeps the prompt-cache
+    /// breakpoint of a text part it merges away on the part it writes, raw
+    /// items and the typed message list alike.
+    #[test]
+    fn a_responses_text_write_keeps_the_merged_parts_breakpoint() {
+        let bp = json!({"mode": "explicit"});
+        let content = json!([
+            {"type": "input_text", "text": "intro"},
+            {"type": "input_image", "image_url": "https://x/a.png"},
+            {"type": "input_text", "text": "doc", "prompt_cache_breakpoint": bp},
+        ]);
+        let raw = vec![json!({"type": "function_call", "call_id": "c0", "name": "f", "arguments": "{}"}),
+                       json!({"type": "message", "role": "user", "content": content.clone()})];
+        let typed = vec![json!({"role": "user", "content": content})];
+        for (items, item) in [(raw, 1), (typed, 0)] {
+            let mut req = parse(ApiVersion::Responses, &body(ApiVersion::Responses, items));
+            set_item_text(&mut req, item, 0, "[removed]");
+            let sent: Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+            let parts = &sent["input"][item]["content"];
+            assert_eq!(parts[0], json!({"type": "input_text", "text": "[removed]", "prompt_cache_breakpoint": bp}), "{sent}");
+            assert_eq!(parts.as_array().unwrap().len(), 2, "{sent}");
+        }
+    }
+
     /// One text the model reads, in each shape a provider's spec gives it, with
     /// where the edit must land.
     fn model_read_cases() -> Vec<(&'static str, ApiVersion, Value, &'static str)> {
@@ -5615,6 +6515,10 @@ mod scan_messages_tests {
             ("anthropic document, content source as a string", ApiVersion::AnthropicMessages,
              json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": SECRET}}]}]),
              "/messages/0/content/0/source/content/0/text"),
+            ("anthropic document, content source's text with a citation", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": SECRET, "citations": [
+                 {"type": "content_block_location", "cited_text": SECRET, "document_index": 0, "document_title": null, "start_block_index": 0, "end_block_index": 1}]}]}}]}]),
+             "/messages/0/content/0/source/content/0/text"),
             ("anthropic document, content source as blocks", ApiVersion::AnthropicMessages,
              json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [{"type": "text", "text": SECRET}]}}]}]),
              "/messages/0/content/0/source/content/0/text"),
@@ -5626,6 +6530,14 @@ mod scan_messages_tests {
              "/messages/0/content/0/source/data"),
             ("anthropic tool result's document", ApiVersion::AnthropicMessages,
              json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [text_doc.clone()]}]}]),
+             "/messages/0/content/0/content/0/source/data"),
+            ("anthropic tool result's document's title", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                 {"type": "document", "title": SECRET, "source": {"type": "base64", "media_type": "application/pdf", "data": "AAAA"}}]}]}]),
+             "/messages/0/content/0/content/0/context"),
+            ("anthropic tool result's document's context", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                 {"type": "document", "context": SECRET, "source": {"type": "text", "media_type": "text/plain", "data": "x"}}]}]}]),
              "/messages/0/content/0/content/0/source/data"),
             ("anthropic mcp_tool_result", ApiVersion::AnthropicMessages,
              Value::Array(result(json!({"role": "assistant", "content": [{"type": "mcp_tool_result", "tool_use_id": "m1", "content": [{"type": "text", "text": SECRET}]}]}))),
@@ -5654,6 +6566,10 @@ mod scan_messages_tests {
             ("anthropic file reference's context", ApiVersion::AnthropicMessages,
              json!([{"role": "user", "content": [{"type": "document", "context": SECRET, "source": {"type": "file", "file_id": "f1"}}]}]),
              "/messages/0/content/0/context"),
+            ("anthropic tool result's file reference's context", ApiVersion::AnthropicMessages,
+             json!([{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                 {"type": "text", "text": "see"}, {"type": "document", "title": SECRET, "source": {"type": "file", "file_id": "f1"}}]}]}]),
+             "/messages/0/content/0/content/1/context"),
             ("anthropic text body spelled as base64", ApiVersion::AnthropicMessages,
              json!([{"role": "user", "content": [{"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": SECRET}}]}]),
              "/messages/0/content/0/source/data"),
@@ -5697,6 +6613,19 @@ mod scan_messages_tests {
              json!([{"role": "user", "parts": [{"inlineData": {"mimeType": "text/plain", "data": b64}}]}]), ""),
             ("gemini function response's text blob", ApiVersion::GoogleGemini,
              json!([{"role": "user", "parts": [{"functionResponse": {"name": "f", "response": {"ok": true}, "parts": [{"inlineData": {"mimeType": "text/plain", "data": b64}}]}}]}]), ""),
+            ("gemini code execution result", ApiVersion::GoogleGemini,
+             json!([{"role": "model", "parts": [{"executableCode": {"language": "PYTHON", "code": "print(1)", "id": "e1"}},
+                     {"codeExecutionResult": {"outcome": "OUTCOME_OK", "id": "e1", "output": SECRET}}]},
+                    {"role": "user", "parts": [{"text": "go on"}]}]),
+             "/contents/0/parts/1/codeExecutionResult/output"),
+            ("gemini code execution result, snake_case", ApiVersion::GoogleGemini,
+             json!([{"role": "model", "parts": [{"code_execution_result": {"outcome": "OUTCOME_FAILED", "output": SECRET}}]},
+                    {"role": "user", "parts": [{"text": "go on"}]}]),
+             "/contents/0/parts/0/code_execution_result/output"),
+            ("gemini tool response", ApiVersion::GoogleGemini,
+             json!([{"role": "model", "parts": [{"toolCall": {"toolType": "URL_CONTEXT", "id": "u1", "args": {"url": "https://x.example"}}}]},
+                    {"role": "user", "parts": [{"toolResponse": {"toolType": "URL_CONTEXT", "id": "u1", "response": {"pages": [{"text": SECRET}]}}}]}]),
+             "/contents/1/parts/0/toolResponse/response/pages/0/text"),
         ]
     }
 
@@ -5744,6 +6673,19 @@ mod scan_messages_tests {
         }
     }
 
+    /// A Gemini result names no call when its optional `id` is absent: its
+    /// piece still names one, empty, so a finding on it lands on a stub of its
+    /// own — never on the prose of the user turn it sits in.
+    #[test]
+    fn an_id_less_gemini_result_is_held_apart_from_its_turns_prose() {
+        let items = vec![json!({"role": "user", "parts": [{"text": "go on"}, {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": SECRET}}]})];
+        let read = scan_messages(&parse(ApiVersion::GoogleGemini, &body(ApiVersion::GoogleGemini, items)), 0).unwrap();
+        let result = read.iter().find(|m| m.message.content == SECRET).unwrap();
+        assert_eq!(result.held_call.as_deref(), Some(""));
+        let prose = read.iter().find(|m| m.message.content == "go on").unwrap();
+        assert_eq!(prose.held_call, None);
+    }
+
     /// What the guardrail does not read, and why: bytes no detector reads, the
     /// ids that pair a result with its call, a file's name, what the call says
     /// (the model's own). The positive control is the case above.
@@ -5752,6 +6694,14 @@ mod scan_messages_tests {
         let cases = vec![
             (ApiVersion::AnthropicMessages, json!([{"role": "user", "content": [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": SECRET}}]}])),
             (ApiVersion::AnthropicMessages, json!([{"role": "user", "content": [{"type": "document", "source": {"type": "content", "content": [{"type": "x", "text": SECRET}]}}]}])),
+            // A cited source's quote and title: the guardrail reads none — a
+            // user's or a tool result's travel as sent (rare, client-sent), as an
+            // assistant's do, unread as its text is.
+            (ApiVersion::AnthropicMessages, json!([{"role": "user", "content": [{"type": "text", "text": "see", "citations": [
+                {"type": "char_location", "cited_text": SECRET, "document_index": 0, "document_title": SECRET, "start_char_index": 0, "end_char_index": 4}]}]}])),
+            (ApiVersion::AnthropicMessages, json!([{"role": "assistant", "content": [{"type": "text", "text": "see", "citations": [
+                {"type": "char_location", "cited_text": SECRET, "document_index": 0, "document_title": SECRET, "start_char_index": 0, "end_char_index": 4}]}]},
+                {"role": "user", "content": "go"}])),
             (ApiVersion::AnthropicMessages, json!([{"role": "assistant", "content": [{"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": [{"type": "web_search_result", "encrypted_content": SECRET, "title": "t", "url": "https://x.example"}]}]}, {"role": "user", "content": "go"}])),
             (ApiVersion::AnthropicMessages, json!([{"role": "assistant", "content": [{"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "content": {"type": "web_fetch_result", "url": "https://x.example", "content": {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": SECRET}}}}]}, {"role": "user", "content": "go"}])),
             (ApiVersion::Responses, json!([{"type": "message", "role": "user", "content": [{"type": "input_file", "filename": SECRET, "file_data": "data:text/plain;base64,aGVsbG8="}]}])),
@@ -5759,6 +6709,12 @@ mod scan_messages_tests {
             (ApiVersion::Responses, json!([{"type": "code_interpreter_call", "id": "c", "container_id": "c", "code": SECRET, "status": "completed", "outputs": [{"type": "image", "url": SECRET}]}])),
             (ApiVersion::Responses, json!([{"type": "computer_call_output", "call_id": SECRET, "output": {"type": "computer_screenshot", "image_url": SECRET}}])),
             (ApiVersion::Responses, json!([{"type": "web_search_call", "id": SECRET, "status": "completed", "action": {"type": "search", "query": SECRET}}])),
+            (ApiVersion::Responses, json!([{"type": "mcp_list_tools", "id": SECRET, "server_label": SECRET, "tools": [{"name": SECRET, "input_schema":
+                {"type": "object", "properties": {"mode": {"type": "string", "enum": [SECRET], "default": SECRET}}}}]}])),
+            (ApiVersion::GoogleGemini, json!([{"role": "model", "parts": [{"executableCode": {"language": "PYTHON", "code": SECRET, "id": SECRET}},
+                {"codeExecutionResult": {"outcome": "OUTCOME_OK", "id": SECRET}}]}, {"role": "user", "parts": [{"text": "go"}]}])),
+            (ApiVersion::GoogleGemini, json!([{"role": "model", "parts": [{"toolCall": {"toolType": "URL_CONTEXT", "id": SECRET, "toolName": SECRET, "args": {"q": SECRET}}}]},
+                {"role": "user", "parts": [{"toolResponse": {"toolType": "URL_CONTEXT", "id": SECRET, "response": {}}}]}])),
         ];
         for (version, items) in cases {
             let Value::Array(items) = items.clone() else { panic!() };

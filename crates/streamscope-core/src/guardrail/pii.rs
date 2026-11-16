@@ -573,6 +573,20 @@ mod tests {
         assert!(red.contains("<system-reminder>contact a@b.com</system-reminder>"));
     }
 
+    /// A user who writes about a framework tag is still screened after it: a
+    /// tag the message mentions, never closed, is the user's own prose.
+    #[test]
+    fn inbound_screens_prose_after_a_tag_the_user_mentions() {
+        let inputs = vec![GuardrailInput {
+            id: "0".to_string(),
+            classifiable: "Why does `<system-reminder>` show up? My ssn is 123-45-6789".to_string(),
+            target: String::new(),
+        }];
+        let out = run_pii_enforce(&settings(), &inputs, GuardrailSurface::Inbound)
+            .expect("the ssn after the mention is the user's");
+        assert!(out.redactions.get("0").is_some_and(|r| r.contains("[REDACTED:US_SSN]")));
+    }
+
     #[test]
     fn disabled_is_noop() {
         let s = PiiSettings {

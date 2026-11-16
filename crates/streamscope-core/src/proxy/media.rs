@@ -770,6 +770,7 @@ pub fn build_media_call(ctx: MediaCaptureCtx<'_>) -> DomainMediaCall {
     let text_block = |text: String| DomainContentBlock::Text {
         text,
         cache_control: None,
+        citations: Vec::new(),
     };
     // When the blob is `stored=true`, emit a BlobRef that resolves to the
     // stored bytes. When dropped for size, emit a `Stripped` placeholder so
@@ -893,7 +894,7 @@ fn extract_domain_params(
     if content_type.starts_with("multipart/form-data") {
         let get = |name: &str| extract_text_field_from_multipart(body, content_type, name);
         p.language = get("language");
-        p.temperature = get("temperature").and_then(|s| s.parse::<f32>().ok());
+        p.temperature = get("temperature").and_then(|s| s.parse::<f64>().ok());
         p.size = get("size");
         p.n = get("n").and_then(|s| s.parse::<u32>().ok());
         p.format = get("response_format").or_else(|| get("format"));
@@ -908,7 +909,7 @@ fn extract_domain_params(
     };
     let get_str = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(String::from);
     let get_u = |k: &str| obj.get(k).and_then(|v| v.as_u64()).map(|u| u as u32);
-    let get_f = |k: &str| obj.get(k).and_then(|v| v.as_f64()).map(|f| f as f32);
+    let get_f = |k: &str| obj.get(k).and_then(|v| v.as_f64());
 
     p.voice = get_str("voice");
     p.format = obj

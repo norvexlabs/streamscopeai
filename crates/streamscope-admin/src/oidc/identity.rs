@@ -769,34 +769,81 @@ pub async fn provision_portal_user(
 
     // Add the user to every workspace whose OIDC rule matches: the workspace
     // names a claim (`oidc_claim_name`) and a POSIX regex (`oidc_claim_pattern`)
-    // matched against each of that claim's values. The claim is read by the
-    // name the workspace stores — AD FS sends `group`, others `groups` or
-    // `roles` — and a claim this login did not carry matches nothing.
-    // Additive only — memberships are never removed here, so an operator's
-    // manual grant survives a login that no longer carries the value.
-    let synced = sqlx::query(
-        r#"INSERT INTO workspace_members (workspace_id, user_id, tenant_id, role)
-           SELECT w.id, $1, $2, 'member'
-           FROM workspaces w
-           WHERE w.oidc_claim_name IS NOT NULL
-             AND w.oidc_claim_pattern IS NOT NULL
-             AND EXISTS (
-                 SELECT 1
-                 FROM jsonb_array_elements_text(COALESCE($3::jsonb -> w.oidc_claim_name, '[]'::jsonb)) AS g
-                 WHERE g ~ w.oidc_claim_pattern
-             )
-           ON CONFLICT (tenant_id, workspace_id, user_id) DO NOTHING"#,
-    )
-    .bind(user_id)
-    .bind(tenant_id)
-    .bind(sqlx::types::Json(claims))
-    .execute(db.conn())
-    .await;
+    // that must match one of that claim's values WHOLE (`oidc_whole_value_sql!`).
+    // The claim is read by the name the workspace stores — AD FS sends `group`,
+    // others `groups` or `roles` — and a claim this login did not carry matches
+    // nothing. Additive only — memberships are never removed here, so an
+    // operator's manual grant survives a login that no longer carries the value.
+    //
+    // One statement per rule, each its own autocommit: a stored pattern
+    // Postgres refuses once anchored (a leading `(?i)`, say) fails that
+    // workspace alone, never the others. Each statement binds only the values
+    // of the claim its rule reads, NUL-scrubbed and trimmed — edge whitespace
+    // never decides a match, as the pattern is trimmed at save and the header
+    // path's groups are; another claim this login carries never reaches it —
+    // and re-reads the rule from the row, so a workspace edited or deleted
+    // since the list was read joins by its current rule or not at all. Only
+    // rules on a claim this login carries are read: any other matches nothing.
+    //
     // A failed sync must not fail the login: the user is authenticated
     // either way, and a missing membership is visible and recoverable
     // where a refused login is neither.
-    if let Err(e) = synced {
-        tracing::warn!(email = %user_email, "OIDC workspace membership sync failed: {e}");
+    let carried: Vec<String> = claims
+        .iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(name, _)| streamscope_core::pg_text::storable_str(name).into_owned())
+        .collect();
+    let rules: Result<Vec<(Uuid, String)>, sqlx::Error> = sqlx::query_as(
+        "SELECT id, oidc_claim_name FROM workspaces \
+         WHERE tenant_id = $1 AND oidc_claim_name = ANY($2) AND oidc_claim_pattern IS NOT NULL",
+    )
+    .bind(tenant_id)
+    .bind(&carried)
+    .fetch_all(db.conn())
+    .await;
+    match rules {
+        Err(e) => {
+            tracing::warn!(email = %user_email, "OIDC workspace membership sync failed: {e}");
+        }
+        Ok(rules) => {
+            for (workspace_id, claim_name) in rules {
+                let Some(values) = claims.get(&claim_name).filter(|v| !v.is_empty()) else {
+                    continue;
+                };
+                let values: Vec<String> = values
+                    .iter()
+                    .map(|v| streamscope_core::pg_text::storable_str(v.trim()).into_owned())
+                    .collect();
+                let joined = sqlx::query(concat!(
+                    "INSERT INTO workspace_members (workspace_id, user_id, tenant_id, role) \
+                     SELECT w.id, $1, $2, 'member' \
+                     FROM workspaces w \
+                     WHERE w.tenant_id = $2 AND w.id = $3 \
+                       AND w.oidc_claim_name = $4 \
+                       AND w.oidc_claim_pattern IS NOT NULL \
+                       AND EXISTS ( \
+                           SELECT 1 FROM unnest($5::text[]) AS g \
+                           WHERE g ~ ",
+                    oidc_whole_value_sql!("w.oidc_claim_pattern"),
+                    ") \
+                     ON CONFLICT (tenant_id, workspace_id, user_id) DO NOTHING"
+                ))
+                .bind(user_id)
+                .bind(tenant_id)
+                .bind(workspace_id)
+                .bind(&claim_name)
+                .bind(&values)
+                .execute(db.conn())
+                .await;
+                if let Err(e) = joined {
+                    tracing::warn!(
+                        email = %user_email,
+                        %workspace_id,
+                        "OIDC workspace membership sync failed for this workspace: {e}"
+                    );
+                }
+            }
+        }
     }
 
     Ok(ProvisionedPortalUser {

@@ -179,7 +179,7 @@ pub const OPENCODE_ENGINE: EngineSpec = EngineSpec {
     basic_user: "opencode",
     env: &[("OPENCODE_DISABLE_MODELS_FETCH", "1"), ("OPENCODE_DISABLE_AUTOUPDATE", "1")],
     min_major: 2,
-    upgrade_hint: "npm install -g @opencode/cli",
+    upgrade_hint: "npm install -g --allow-scripts=@opencode/cli @opencode/cli",
 };
 
 /// Built-in per-agent profiles. Derived from the clients Streamscope provisions
@@ -243,7 +243,8 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@qwen-code/qwen-code"),
-        windows_config: &[],
+        // Qwen Code takes the variable for its `.qwen` folder itself.
+        windows_config: &[WindowsConfig { var: "QWEN_HOME", value: "~/.qwen", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
     },
@@ -262,7 +263,12 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: Some(&OPENCODE_ENGINE),
         config_dir_env: Some("OPENCODE_CONFIG_DIR"),
         npm_package: Some("@opencode/cli"),
-        windows_config: &[],
+        // OpenCode's own variable for its configuration folder, the one
+        // provision writes (`~/.config/opencode`): it reaches no program the
+        // agent starts, as `XDG_CONFIG_HOME` would. In a project the run sets
+        // it to the project's folder instead (`config_dir_env`). Its data,
+        // state and cache stay the account's own.
+        windows_config: &[WindowsConfig { var: "OPENCODE_CONFIG_DIR", value: "~/.config/opencode", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
     },
@@ -288,13 +294,32 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_seed: &[],
     },
     AgentProfile {
+        // Open Code Review keeps its config, sessions and rules under one
+        // directory of the home. Its npm launcher checks the registry for a
+        // newer release in the background unless told not to.
+        names: &["ocr", "open-code-review"],
+        state_dirs: &["~/.opencodereview"],
+        env: &[("OCR_NO_UPDATE", "1")],
+        engine: None,
+        config_dir_env: None,
+        npm_package: Some("@alibaba-group/open-code-review"),
+        // Open Code Review reads only the home Windows names in `USERPROFILE`:
+        // pointed at the developer's profile, `.opencodereview` granted.
+        windows_config: &[WindowsConfig { var: "USERPROFILE", value: "~", granted: ".opencodereview" }],
+        windows_args: &[],
+        windows_seed: &[],
+    },
+    AgentProfile {
         names: &["aider"],
         state_dirs: &["~/.aider", "~/.aider.conf.yml", "~/.aider.model.metadata.json", "~/.aider.model.settings.yml", "~/.config/aider", "~/.cache/aider"],
         env: &[],
         engine: None,
         config_dir_env: None,
         npm_package: None,
-        windows_config: &[],
+        // Aider reads `.aider.conf.yml` in the home Windows names in
+        // `USERPROFILE` (the file is granted as a provisioned file) and keeps its
+        // caches in `.aider` there.
+        windows_config: &[WindowsConfig { var: "USERPROFILE", value: "~", granted: ".aider" }],
         windows_args: &[],
         windows_seed: &[],
     },
@@ -309,7 +334,7 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@continuedev/cli"),
-        windows_config: &[],
+        windows_config: &[WindowsConfig { var: "CONTINUE_GLOBAL_DIR", value: "~/.continue", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
     },
@@ -320,7 +345,8 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: Some("@charmland/crush"),
-        windows_config: &[],
+        // Crush's data stays in the account's own `%LOCALAPPDATA%\crush`.
+        windows_config: &[WindowsConfig { var: "CRUSH_GLOBAL_CONFIG", value: "~/.config/crush", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
     },
@@ -331,7 +357,7 @@ pub const AGENTS: &[AgentProfile] = &[
         engine: None,
         config_dir_env: None,
         npm_package: None,
-        windows_config: &[],
+        windows_config: &[WindowsConfig { var: "VIBE_HOME", value: "~/.vibe", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
     },
@@ -401,6 +427,7 @@ pub const TOOLCHAINS: &[ToolchainProfile] = &[
             "~/.local/share/uv",
             "~/.local/state/uv",
             "~/.local/pipx",
+            "~/.local/share/pipx",
             "~/.pyenv",
             "~/.virtualenvs",
             "~/.cache/pre-commit",
@@ -552,6 +579,20 @@ pub fn agent_for(name: &str) -> Option<&'static AgentProfile> {
     AGENTS.iter().find(|p| p.names.contains(&name))
 }
 
+
+/// The directory `ssai run` hands a client as its user config dir
+/// ([`AgentProfile::config_dir_env`]) for a project whose main config is
+/// `config`: the directory holding it, when that is a directory of its own
+/// inside the project (`<root>/.opencode`). Never the project root itself: a
+/// client that read the root as its user-config directory would load the
+/// repository's `plugins/`, `agents/`, … as its own (a project on a root-level
+/// config gets no override). `project_root` is canonical; `config` is resolved
+/// the same way, so a project reached through a symlink still compares equal.
+pub fn project_config_dir(config: &std::path::Path, project_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = dunce::canonicalize(config.parent()?).ok()?;
+    (dir != project_root && dir.starts_with(project_root)).then_some(dir)
+}
+
 /// Toolchain profile for a runtime command name.
 #[cfg(target_os = "linux")]
 pub fn toolchain_for(name: &str) -> Option<&'static ToolchainProfile> {
@@ -584,6 +625,15 @@ mod tests {
                 assert!(!arg.contains(['"', '%', '\r', '\n']), "{arg}");
             }
         }
+    }
+
+    /// Under the Windows sandbox the client runs as another account, whose
+    /// own profile holds none of the developer's configuration: every client
+    /// is pointed at the folder `provision` writes it into.
+    #[test]
+    fn every_client_finds_its_configuration_under_the_windows_sandbox() {
+        let unpointed: Vec<_> = AGENTS.iter().filter(|a| a.windows_config.is_empty()).map(|a| a.names[0]).collect();
+        assert!(unpointed.is_empty(), "{unpointed:?}");
     }
 
     /// Every AgentProfile has the `engine` field set explicitly; this lists the

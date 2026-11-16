@@ -44,7 +44,13 @@ pub struct GeminiContent {
     /// `"user"` or `"model"`. Absent on `systemInstruction`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(deserialize_with = "read_parts")]
     pub parts: Vec<GeminiPart>,
+}
+
+/// A content's parts, each read by [`GeminiPart::from_value_split`].
+fn read_parts<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<GeminiPart>, D::Error> {
+    Ok(Vec::<Value>::deserialize(deserializer)?.into_iter().flat_map(GeminiPart::from_value_split).collect())
 }
 
 /// A single content part — text, inline media, function call/response. Proto3
@@ -111,9 +117,11 @@ pub enum GeminiPart {
 /// The members a media part may carry beside its blob and send on: the spec's
 /// non-data `Part` members that steer how the model reads the media, by their
 /// camelCase name. Closed, because what a part carries beyond them — a second
-/// data member (`text`, `fileData`), a transcription's `text`, `partMetadata`, a
-/// blob's `displayName` — is content no capability gate or screen reads, and
-/// must never ride a forward unread. (Their values are sent as written.)
+/// data member (a `text` is read as a part of its own,
+/// [`GeminiPart::from_value_split`]), a transcription's `text`,
+/// `partMetadata`, a blob's `displayName` — is content no capability gate or
+/// screen reads, and must never ride a forward unread. (Their values are sent
+/// as written.)
 pub const PART_MEMBERS: &[&str] = &["thought", "thoughtSignature", "mediaResolution", "mediaProcessing", "videoMetadata"];
 
 /// Each member's proto3 snake_case spelling, read as its camelCase one.
@@ -142,6 +150,27 @@ pub(crate) fn is_part_member(name: &str) -> bool {
         &["partMetadata", "part_metadata", "audioTranscription", "audio_transcription", "speechMetadata", "speech_metadata"];
     part_member_name(name).is_some() || FREE_TEXT.contains(&name)
 }
+
+/// The spec's `data` union members other than `text`, under both proto3
+/// spellings: a part holds one of them, or its text.
+const DATA_MEMBERS: &[&str] = &[
+    "inlineData",
+    "inline_data",
+    "functionCall",
+    "function_call",
+    "functionResponse",
+    "function_response",
+    "fileData",
+    "file_data",
+    "executableCode",
+    "executable_code",
+    "codeExecutionResult",
+    "code_execution_result",
+    "toolCall",
+    "tool_call",
+    "toolResponse",
+    "tool_response",
+];
 
 /// A part's [`PART_MEMBERS`]; `part` is already under the camelCase spelling
 /// ([`camel_case_part_members`]).
@@ -234,13 +263,45 @@ impl GeminiPart {
         Self::FileData { file_data: GeminiFileData { mime_type, file_uri }, members: Default::default() }
     }
 
+    /// Read a part as the parts it holds: the spec's `data` union holds one
+    /// member, and a non-empty `text` beside another (an image's prompt written
+    /// into its part) is the client's text all the same — read as a text part
+    /// of its own, with the part's `thought`, so every reader carries and
+    /// screens it as any text: before the rest, as the client wrote it, but
+    /// after a function or tool response, which must follow its call. The
+    /// rest is read by [`Self::from_value`]. An empty text goes with the part,
+    /// as no text.
+    pub fn from_value_split(value: Value) -> Vec<Self> {
+        match value {
+            Value::Object(mut rest)
+                if rest.get("text").and_then(Value::as_str).is_some_and(|t| !t.is_empty())
+                    && DATA_MEMBERS.iter().any(|m| rest.get(*m).is_some_and(|v| !v.is_null())) =>
+            {
+                let mut text = serde_json::Map::new();
+                for member in ["text", "thought"] {
+                    if let Some(v) = rest.remove(member) {
+                        text.insert(member.to_string(), v);
+                    }
+                }
+                let responds = ["functionResponse", "function_response", "toolResponse", "tool_response"]
+                    .iter()
+                    .any(|m| rest.get(*m).is_some_and(|v| !v.is_null()));
+                let (text, rest) = (Self::from_value(Value::Object(text)), Self::from_value(Value::Object(rest)));
+                if responds { vec![rest, text] } else { vec![text, rest] }
+            }
+            value => vec![Self::from_value(value)],
+        }
+    }
+
     /// Read a part: each variant is tried, in declaration order, only when the
     /// member its shape requires is present — a shape without it can never
     /// match — and the first that reads wins; a part none reads, or that is not
     /// an object, is kept whole as `Unknown`. Every variant reads a member under
     /// either proto3 spelling (`thought_signature` on a call too); a media part
     /// keeps its [`PART_MEMBERS`], and every other member beside a variant's
-    /// data is dropped.
+    /// data is dropped — a content's parts are read by
+    /// [`Self::from_value_split`], which reads a `text` beside other data
+    /// apart first.
     pub fn from_value(value: Value) -> Self {
         fn read<'a, T: Deserialize<'a>>(value: &'a Value) -> Option<T> {
             T::deserialize(value).ok()
@@ -394,9 +455,9 @@ pub struct GeminiFunctionCallingConfig {
 #[serde(rename_all = "camelCase")]
 pub struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -404,9 +465,9 @@ pub struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub presence_penalty: Option<f32>,
+    pub presence_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_penalty: Option<f32>,
+    pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -702,8 +763,8 @@ mod tests {
             "inline_data": {"mime_type": "video/mp4", "data": "AAAA", "displayName": "unread"},
             "videoMetadata": {"fps": 2.0},
             "thoughtSignature": "sig",
-            // Content no screen reads never rides along: a second data member,
-            // free text (a transcription's, custom metadata), an unknown key.
+            // Content no screen reads never rides along: free text (a
+            // transcription's, custom metadata), an unknown key.
             "audioTranscription": {"text": "unread"},
             "partMetadata": {"note": "unread"},
             "futureMember": "unread",
@@ -719,7 +780,6 @@ mod tests {
         assert!(!serde_json::to_string(&part).unwrap().contains("unread"));
         let file: GeminiPart = serde_json::from_value(serde_json::json!({
             "file_data": {"file_uri": "gs://b/o", "displayName": "unread"}, "media_processing": "STATIC",
-            "text": "unread",
             // One member in both spellings travels once, camelCase, whatever the order.
             "thought_signature": "b", "thoughtSignature": "a", "video_metadata": {"fps": 1.0},
         }))
@@ -733,6 +793,43 @@ mod tests {
                 "videoMetadata": {"fps": 1.0},
             })
         );
+    }
+
+    #[test]
+    fn a_text_beside_other_data_is_read_as_a_text_part_of_its_own() {
+        let content: GeminiContent = serde_json::from_value(serde_json::json!({"role": "user", "parts": [
+            {"text": "what is this?", "inlineData": {"mimeType": "image/png", "data": "AAAA"}, "videoMetadata": {"fps": 1.0}},
+            {"thought": true, "text": "plan", "functionCall": {"name": "f"}, "thoughtSignature": "s"},
+            {"text": "both ways", "file_data": {"fileUri": "gs://b/o"}},
+            {"text": "result", "functionResponse": {"name": "f", "response": {}}},
+            {"text": "alone"},
+        ]}))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&content.parts).unwrap(),
+            serde_json::json!([
+                {"text": "what is this?"},
+                {"inlineData": {"mimeType": "image/png", "data": "AAAA"}, "videoMetadata": {"fps": 1.0}},
+                {"thought": true, "text": "plan"},
+                {"functionCall": {"name": "f", "args": null}, "thoughtSignature": "s"},
+                {"text": "both ways"},
+                {"fileData": {"fileUri": "gs://b/o"}},
+                {"functionResponse": {"name": "f", "response": {}}},
+                {"text": "result"},
+                {"text": "alone"},
+            ])
+        );
+        // Control: a part of text alone, of other data alone, or beside a
+        // data member that is null (unset), is one part.
+        let null: GeminiContent = serde_json::from_value(serde_json::json!({"parts": [{"text": "hi", "inlineData": null}]})).unwrap();
+        assert_matches!(&null.parts[..], [GeminiPart::Text { text }] if text == "hi");
+        let empty: GeminiContent =
+            serde_json::from_value(serde_json::json!({"parts": [{"text": "", "inlineData": {"mimeType": "image/png", "data": "AAAA"}}]})).unwrap();
+        assert_matches!(&empty.parts[..], [GeminiPart::InlineData { .. }]);
+        let one: GeminiContent = serde_json::from_value(serde_json::json!({"parts": [
+            {"inlineData": {"mimeType": "image/png", "data": "AAAA"}}]}))
+        .unwrap();
+        assert_eq!(one.parts.len(), 1);
     }
 
     #[test]
@@ -778,6 +875,30 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// Whatever data member a non-empty `text` sits beside, the text is
+        /// read as a text part of its own — after a response, else before —
+        /// holding exactly that text, and the rest as one part carrying no
+        /// `text`. Not claimed: that the rest reads as a typed variant (an
+        /// off-spec one stays the client's).
+        #[test]
+        fn a_text_beside_any_data_member_is_a_part_of_its_own(
+            text in "\\PC{1,24}",
+            member in proptest::sample::select(DATA_MEMBERS.to_vec()),
+            thought in proptest::option::of(proptest::prelude::any::<bool>()),
+        ) {
+            let mut part = serde_json::json!({"text": text, member: {"mimeType": "image/png", "data": "AAAA", "name": "f"}});
+            if let Some(t) = thought {
+                part["thought"] = t.into();
+            }
+            let parts = GeminiPart::from_value_split(part);
+            proptest::prop_assert_eq!(parts.len(), 2);
+            let (at, other) = if member.contains("esponse") { (1, 0) } else { (0, 1) };
+            let split = serde_json::to_value(&parts[at]).unwrap();
+            proptest::prop_assert_eq!(split["text"].as_str(), Some(text.as_str()));
+            let rest = serde_json::to_value(&parts[other]).unwrap();
+            proptest::prop_assert!(rest.get("text").is_none(), "{rest}");
+        }
+
         /// Whatever members a media part carries, only a `PART_MEMBERS` name
         /// rides beside its blob, under its camelCase spelling, each once.
         #[test]

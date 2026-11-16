@@ -395,6 +395,16 @@
   }
 
   // OIDC auto-membership (lives under Members).
+  // A pattern must match a WHOLE claim value — the server anchors it.
+  const OIDC_PATTERN_EXAMPLES: { want: string; pattern: string; joins: string; not: string }[] = [
+    { want: 'One group', pattern: 'RD', joins: 'RD', not: 'RD-ext, CARD' },
+    { want: 'Any of several', pattern: 'RD|IT|Sales', joins: 'RD, IT, Sales', not: 'IT-Admins' },
+    { want: 'Starts with', pattern: 'eng-.*', joins: 'eng-web', not: 'old-eng-web' },
+    { want: 'Ends with', pattern: '.*-admins', joins: 'it-admins', not: 'admins-ro' },
+    { want: 'Contains', pattern: '.*IT.*', joins: 'IT-Admins, SECURITY', not: 'It-support' },
+    { want: 'Special characters', pattern: 'R&D \\(Paris\\)', joins: 'R&D (Paris)', not: 'R&D Paris' },
+    { want: 'Anyone with the claim', pattern: '.*', joins: 'any value', not: 'no claim' },
+  ];
   let editClaimName = $state('');
   let editClaimPattern = $state('');
   let savingOidc = $state(false);
@@ -402,13 +412,16 @@
     savingOidc = true;
     const { error } = await adminApi.PATCH('/api/v1/admin/workspaces/{id}', {
       params: { path: { id } },
-      body: {
-        oidc_claim_name: editClaimName.trim() || null,
-        oidc_claim_pattern: editClaimPattern.trim() || null,
-      },
+      // A blank pattern turns the rule off: both fields are cleared together.
+      body: editClaimPattern.trim()
+        ? { oidc_claim_name: editClaimName.trim() || null, oidc_claim_pattern: editClaimPattern.trim() }
+        : { oidc_claim_name: null, oidc_claim_pattern: null },
     });
     if (error) toast.error('Failed to save', { body: extractError(error) });
-    else { toast.success('OIDC mapping saved'); await loadDetail(); }
+    else {
+      toast.success(editClaimPattern.trim() ? 'OIDC mapping saved' : 'OIDC auto-membership turned off');
+      await loadDetail();
+    }
     savingOidc = false;
   }
 
@@ -837,12 +850,35 @@
               <h3 class="text-sm font-semibold text-(--text-primary)">OIDC auto-membership</h3>
               <p class="text-xs text-(--text-secondary)">Auto-add users to this workspace when their IdP claim matches the pattern at login.</p>
             </div>
-            <FormField label="OIDC claim name" help="The ID-token claim to match — one value or a list: groups on most providers, group on AD FS; under proxy (header) sign-in always groups. Name a claim your directory sets, never one users can edit.">
+            <FormField label="OIDC claim name" help="The ID-token claim to match — one value or a list: groups on most providers, group on AD FS unless a claim rule renames it; under proxy (header) sign-in always groups. Required with a pattern. Name a claim your directory sets, never one users can edit.">
               <TextInput bind:value={editClaimName} placeholder="groups" mono />
             </FormField>
-            <FormField label="OIDC claim pattern" help="POSIX regular expression matched against the claim value.">
-              <TextInput bind:value={editClaimPattern} placeholder="^eng-.*$" mono />
+            <FormField label="OIDC claim pattern" help="A POSIX regular expression that must match a whole value, case-sensitively. A user joins at their next sign-in when any one of their values matches. Checked when you save.">
+              <TextInput bind:value={editClaimPattern} placeholder="eng-.*" mono />
             </FormField>
+            <div data-testid="oidc-pattern-examples">
+              <table class="w-full text-[11px]">
+                <thead>
+                  <tr class="border-b border-(--border)">
+                    <th class="py-1 pr-3 text-left font-normal text-(--text-secondary)">To join</th>
+                    <th class="py-1 pr-3 text-left font-normal text-(--text-secondary)">Pattern</th>
+                    <th class="py-1 pr-3 text-left font-normal text-(--text-secondary)">Joins</th>
+                    <th class="py-1 text-left font-normal text-(--text-secondary)">Does not join</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {#each OIDC_PATTERN_EXAMPLES as ex (ex.want)}
+                    <tr>
+                      <td class="py-0.5 pr-3 text-(--text-secondary)">{ex.want}</td>
+                      <td class="py-0.5 pr-3 font-mono text-(--text-primary)">{ex.pattern}</td>
+                      <td class="py-0.5 pr-3 font-mono text-(--text-secondary)">{ex.joins}</td>
+                      <td class="py-0.5 font-mono text-(--text-tertiary)">{ex.not}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+              <p class="text-[10px] text-(--text-secondary) mt-1">Put a backslash before <code class="font-mono">. ( ) [ ] {'{'} {'}'} + * ? | ^ $ \</code> to match it literally. Leave the pattern blank to turn the rule off. A pattern cannot exclude a group: any other group the user has would still match.</p>
+            </div>
             <button onclick={saveOidc} disabled={savingOidc} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingOidc ? 'Saving…' : 'Save OIDC mapping'}</button>
           </div>
         </div>

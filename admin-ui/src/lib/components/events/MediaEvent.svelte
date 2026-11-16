@@ -2,11 +2,12 @@
   /**
    * The body of a `media` conversation event — the one renderer for it, shared
    * by the session view and the audit detail (each draws its own frame and
-   * header around it). In order: inline data of a type safe to play, the
-   * stored blob the event names (`StoredMedia`, which addresses it for this
-   * plane), the client's external URL, the client's provider file id, and
-   * otherwise why nothing can be shown. A stored blob is never described as
-   * "not stored".
+   * header around it). A document's context and a file's detail first, then,
+   * in order: inline
+   * data of a type safe to play, the stored blob the event names
+   * (`StoredMedia`, which addresses it for this plane), the client's external
+   * URL, the client's provider file id, and otherwise why nothing can be
+   * shown. A stored blob is never described as "not stored".
    */
   import type { ConversationEvent } from '#lib/api-types.js';
   import { m } from '#lib/paraglide/messages.js';
@@ -35,6 +36,14 @@
   const media = $derived(compact ? 'block max-w-full h-auto rounded-sm border border-(--border) mt-1' : 'block max-w-full h-auto rounded-sm');
 </script>
 
+{#if event.context}
+  <!-- What the client set beside a document for the model to read. -->
+  <p class="text-xs text-(--text-secondary) mb-1 whitespace-pre-wrap"><span class="font-medium">{m.conv_document_context()}:</span> {event.context}</p>
+{/if}
+{#if event.detail}
+  <!-- The detail the client asked the model to read the file at. -->
+  <p class="text-xs text-(--text-secondary) mb-1"><span class="font-medium">{m.conv_file_detail()}:</span> {event.detail}</p>
+{/if}
 {#if event.content_type === 'image' && event.data && SAFE_IMAGE_TYPES.has(event.media_type)}
   <img src="data:{event.media_type};base64,{event.data}" alt={event.title ?? m.conv_image_attachment()} class={media} />
 {:else if event.content_type === 'audio' && event.data && SAFE_AUDIO_TYPES.has(event.media_type)}

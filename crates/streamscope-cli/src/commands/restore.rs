@@ -101,12 +101,47 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         bail!("aborted");
     }
 
+    // A file is put back as it was, a gateway key included — and one the
+    // repository has started tracking since would carry that key into its next
+    // commit. Checked before any file is written or backed up.
+    // The keys the CLI recorded: this scope's manifest now and then, the
+    // other scope's (a project run writes a global-only client's file), and
+    // the device's key store.
+    let live = Manifest::load(&paths)?;
+    let other = match &scope {
+        ManifestScope::Project(_) => Some(ManifestScope::Global),
+        // `--global` inside a provisioned project: that project's.
+        ManifestScope::Global => Some(resolve_scope(None, false, false)?).filter(|s| matches!(s, ManifestScope::Project(_))),
+    };
+    let other = match other.map(|s| Paths::for_scope(&s).and_then(|p| Manifest::load(&p))) {
+        Some(Ok(m)) => Some(m),
+        Some(Err(e)) => {
+            crate::ui::warn("  ", format_args!("the other scope's manifest could not be read ({e:#}) — its keys are not looked for"));
+            None
+        }
+        None => None,
+    };
+    let mut keys: std::collections::BTreeSet<String> = [Some(&live), before.as_ref(), other.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|m| m.hosts.values())
+        .flat_map(|ws| ws.keys.values().map(|k| k.plaintext.clone()))
+        .collect();
+    match state::ToolKeys::load() {
+        Ok(device) => keys.extend(device.hosts.into_values().flatten().map(|k| k.key.plaintext)),
+        Err(e) => crate::ui::warn(
+            "  ",
+            format_args!("the device's key store could not be read ({e:#}) — only the manifests' keys are looked for"),
+        ),
+    }
+    keep_restored_keys_out_of_git(&snapshot, &keys.into_iter().collect::<Vec<_>>())?;
+
     // Snapshot the current state first so this restore can itself be undone.
     let undo_stamp = state::new_run_stamp("-pre-restore");
     for (path, _) in &snapshot {
         state::backup_file(paths.base(), &undo_stamp, path)?;
     }
-    state::backup_manifest_into_run(&paths, &undo_stamp, &Manifest::load(&paths)?)?;
+    state::backup_manifest_into_run(&paths, &undo_stamp, &live)?;
 
     for (path, contents) in &snapshot {
         match contents {
@@ -142,6 +177,41 @@ pub async fn run(args: RestoreArgs) -> Result<()> {
         "Restored {} file(s). The pre-restore state was saved as backup {undo_stamp}.",
         snapshot.len()
     );
+    Ok(())
+}
+
+/// Keep each file of `snapshot` whose restored bytes hold one of `keys` out
+/// of every commit: refuse one git tracks or cannot answer for, exclude an
+/// exposed one locally. Every file is judged before any is excluded, so such
+/// a refusal changes nothing; an exclusion that fails (a `.gitignore` rule
+/// re-including the file) refuses after the files before it were excluded.
+fn keep_restored_keys_out_of_git(snapshot: &[(std::path::PathBuf, Option<Vec<u8>>)], keys: &[String]) -> Result<()> {
+    let holds_a_key = |bytes: &[u8]| {
+        keys.iter().filter(|k| !k.is_empty()).any(|k| bytes.windows(k.len()).any(|w| w == k.as_bytes()))
+    };
+    let holding: Vec<&std::path::PathBuf> =
+        snapshot.iter().filter(|(_, c)| c.as_deref().is_some_and(holds_a_key)).map(|(p, _)| p).collect();
+    let check = |path: &std::path::PathBuf| {
+        state::keep_out_of_git(
+            state::GitTarget::File(path),
+            "the gateway key it held then",
+            "take it out of git first (`git rm --cached`), or restore another run",
+            false,
+            false,
+        )
+    };
+    let mut exposed = Vec::new();
+    for path in holding {
+        match state::git_exposure(state::GitTarget::File(path)) {
+            state::GitExposure::Outside | state::GitExposure::Ignored => {}
+            state::GitExposure::Exposed => exposed.push(path),
+            // Refused, naming why.
+            _ => check(path)?,
+        }
+    }
+    for path in exposed {
+        check(path)?;
+    }
     Ok(())
 }
 
@@ -357,5 +427,44 @@ mod tests {
         assert_eq!(claude.files[0].file_hash, "old");
         assert!(ws.clients.iter().any(|c| c.client_id == "codex"), "a later run's client survives");
         assert!(ws.keys.contains_key(&K2.parse().unwrap()), "and so does its key");
+    }
+
+    /// A restored file that holds a key is kept out of git like a provisioned
+    /// one: refused while tracked, excluded while exposed; a file without a
+    /// key, or one being removed, is never asked about.
+    #[test]
+    fn a_restored_file_holding_a_key_is_kept_out_of_git() {
+        let dir = std::env::temp_dir().join(format!("ss-restore-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dunce::canonicalize(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            for var in crate::state::GIT_REPOSITORY_VARS {
+                cmd.env_remove(var);
+            }
+            assert!(cmd.args(args).current_dir(&dir).status().unwrap().success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("tracked.json"), "{}").unwrap();
+        git(&["add", "tracked.json"]);
+        let keys = vec![String::new(), "sk-then".to_string()];
+        let with_key = Some(b"{\"key\": \"sk-then\"}".to_vec());
+        let tracked = (dir.join("tracked.json"), with_key.clone());
+        let e = keep_restored_keys_out_of_git(std::slice::from_ref(&tracked), &keys).unwrap_err();
+        assert!(format!("{e:#}").contains("tracked by git"), "{e:#}");
+        // The positive controls: the same tracked file restored without a key,
+        // or removed, and an untracked one holding it (excluded locally).
+        keep_restored_keys_out_of_git(&[(dir.join("tracked.json"), Some(b"{}".to_vec()))], &keys).unwrap();
+        keep_restored_keys_out_of_git(&[(dir.join("tracked.json"), None)], &keys).unwrap();
+        // A run whose tracked file is refused excludes none of its other files.
+        let both = [(dir.join("new.json"), with_key.clone()), tracked.clone()];
+        assert!(keep_restored_keys_out_of_git(&both, &keys).is_err());
+        let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap_or_default();
+        assert!(!exclude.contains("/new.json"), "{exclude}");
+        keep_restored_keys_out_of_git(&[(dir.join("new.json"), with_key)], &keys).unwrap();
+        let exclude = std::fs::read_to_string(dir.join(".git/info/exclude")).unwrap();
+        assert!(exclude.lines().any(|l| l == "/new.json"), "{exclude}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

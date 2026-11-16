@@ -47,6 +47,8 @@ pub async fn run(
         );
     };
 
+    // Before signing in: no commit may pick up the tokens it records.
+    crate::state::keep_global_state_out_of_git()?;
     let metadata = api::fetch_metadata(&origin, &slug).await?;
     let device_name = device_name.unwrap_or_else(default_device_name);
 

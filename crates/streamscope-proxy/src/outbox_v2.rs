@@ -8,8 +8,18 @@
 //!
 //! Invariants to preserve:
 //! - **Content never leaves before its last referencing record has
-//!   committed**: a share carries its records' content with them, and content
-//!   is deleted only when no remaining `refs` row names it.
+//!   committed, and leaves with it**: a share carries its records' content
+//!   with them, content is deleted only when no remaining `refs` row names it,
+//!   and deleting records deletes, in the same transaction, the content only
+//!   they named ([`delete_records`]) — no body is left that no share would
+//!   name again.
+//! - **Every write goes through the one writer, every read through a
+//!   read-only connection** (WAL): no write waits on another connection's
+//!   lock — where SQLite's busy timeout would lose it — and none waits for a
+//!   read. A write waits its turn in-process; a write transaction takes
+//!   records up to a budget ([`TX_MAX_BYTES`]), so none spans a whole batch
+//!   or backlog, and a
+//!   share reads the bodies of the records it takes, never the backlog's.
 //! - **A record's `refs` are every body it needs, whether or not a content
 //!   row holds it**: for an LLM turn, exactly what its stored body names
 //!   ([`Record::content_keys`] — so a turn stripped to fit names, and needs,
@@ -28,7 +38,7 @@
 //!   takes the next value.
 
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use streamscope_core::audit::BlobType;
@@ -116,10 +126,22 @@ async fn count_records(path: &str) -> Result<i64, anyhow::Error> {
     Ok(n)
 }
 
-/// SQLite's bound-parameter limit is 999; id lists are chunked under it.
-const ID_CHUNK: usize = 500;
-/// Records evicted per pass while over the size cap.
+/// The most records one eviction transaction takes while over the size cap
+/// (fewer once they weigh [`TX_MAX_BYTES`]).
 const EVICT_CHUNK: i64 = 64;
+/// The budget of one write transaction: an enqueue's records and the bodies
+/// they bring that the call has not written yet, or the bodies of the records
+/// an eviction takes — at least one record, whatever it weighs, and a body an
+/// earlier transaction wrote and lost since is written again beyond it. Writes
+/// take their turn on one connection ([`OutboxV2::writer`]): a transaction
+/// never spans a whole batch or backlog.
+const TX_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// The write-ahead log is cut back to this once checkpointed: a large
+/// transaction does not leave its size on disk.
+const WAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// How long a write may wait for the writer: past any wait the store makes —
+/// a write is never given up while the ones before it run.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 /// An ack no share named for this long is forgotten: a body named again
 /// after it is carried once more. It bounds the acks to the bodies of
 /// sessions active within it.
@@ -135,16 +157,41 @@ const ACK_RENEW_MS: i64 = 3600 * 1000;
 /// leaves its own parts out for that request rather than lowering it.
 const LONE_SHARE_MAX_BYTES: usize = streamscope_edge_api::ingest::INGEST_REQUEST_MAX_BYTES - 2 * 1024 * 1024;
 
-/// A pool on the outbox file, created if missing.
-async fn connect(path: &str) -> Result<sqlx::SqlitePool, anyhow::Error> {
-    let options = sqlx::sqlite::SqliteConnectOptions::new()
+/// The outbox file's options, shared by its writer and its readers.
+fn connect_options(path: &str) -> sqlx::sqlite::SqliteConnectOptions {
+    sqlx::sqlite::SqliteConnectOptions::new()
         .filename(path)
-        .create_if_missing(true)
         // `refs` rows cascade from their record.
-        .foreign_keys(true);
+        .foreign_keys(true)
+}
+
+/// The one connection every write goes through, on the outbox file, created
+/// if missing: a pool of one, so a connection that dies is replaced, whose
+/// acquire is fair and never gives up — a write waits its turn however long
+/// the one before it takes. WAL: a reader neither waits for the writer nor
+/// holds it back. `FULL`: a committed write is the record's only copy, so it
+/// is on disk before the commit returns.
+async fn connect_writer(path: &str) -> Result<sqlx::SqlitePool, anyhow::Error> {
+    let options = connect_options(path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Full)
+        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES.to_string());
+    Ok(sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(WRITER_WAIT)
+        // Waiting for the writer is how writes take their turn, not a symptom.
+        .acquire_slow_threshold(WRITER_WAIT)
+        .connect_with(options)
+        .await?)
+}
+
+/// The read-only connections every read goes through: none can write, so
+/// none can contend with the writer.
+async fn connect_readers(path: &str) -> Result<sqlx::SqlitePool, anyhow::Error> {
     Ok(sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(crate::settings::proxy_settings().sqlite_pool_size)
-        .connect_with(options)
+        .connect_with(connect_options(path).read_only(true))
         .await?)
 }
 
@@ -319,6 +366,29 @@ impl Uploads {
     }
 }
 
+/// An [`OutboxV2::enqueue`] some of whose transactions failed.
+#[derive(Debug)]
+pub struct EnqueueError {
+    /// The indexes of the records the other transactions buffered.
+    pub held: Vec<usize>,
+    /// How many records the failed transactions held — lost.
+    pub lost: usize,
+    /// The first failure.
+    pub error: anyhow::Error,
+}
+
+impl std::fmt::Display for EnqueueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for EnqueueError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
 /// What [`OutboxV2::apply`] did with a share, for the caller's log.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Applied {
@@ -335,7 +405,15 @@ pub enum Applied {
 }
 
 pub struct OutboxV2 {
-    pool: sqlx::SqlitePool,
+    /// Every write, on one connection ([`connect_writer`]). SQLite lets one
+    /// writer in at a time: writers on several connections would contend
+    /// through its busy timeout, and a write that outwaits it is lost. Here a
+    /// write waits its turn in-process instead; the audit writer behind it
+    /// stops draining its channel, and a producer meets that channel's own
+    /// rule for a full channel.
+    writer: sqlx::SqlitePool,
+    /// Every read, on read-only connections.
+    reads: sqlx::SqlitePool,
     page_size: u64,
     /// Held for the life of the store: one process per data directory.
     _lock: std::fs::File,
@@ -359,7 +437,8 @@ impl OutboxV2 {
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
         note_other_stores(data_dir).await;
-        let pool = connect(&format!("{data_dir}/{}", store_file())).await?;
+        let path = format!("{data_dir}/{}", store_file());
+        let writer = connect_writer(&path).await?;
         for ddl in [
             // AUTOINCREMENT: an id is never reused, so a share in flight that
             // deletes its rows by id on commit cannot take a later row with it.
@@ -391,19 +470,65 @@ impl OutboxV2 {
             // one store.
             "CREATE TABLE IF NOT EXISTS identity (one INTEGER PRIMARY KEY CHECK (one = 1), instance TEXT NOT NULL)",
         ] {
-            sqlx::query(ddl).execute(&pool).await?;
+            sqlx::query(ddl).execute(&writer).await?;
         }
-        let (page_size,): (i64,) = sqlx::query_as("PRAGMA page_size").fetch_one(&pool).await?;
-        Ok(Self { pool, page_size: page_size.max(0) as u64, _lock: lock })
+        // A body no record names is never named again, so no share would take
+        // it away. Every deletion takes such a body with its record
+        // ([`delete_records`]); a store is swept for any it holds once, in
+        // chunks, and marked (`meta.orphans_swept`).
+        let swept: Option<(i64,)> =
+            sqlx::query_as("SELECT value FROM meta WHERE key = 'orphans_swept'").fetch_optional(&writer).await?;
+        if swept.is_none() {
+            // One pass in rowid order, a chunk of rows at a time.
+            let mut orphans = 0;
+            let mut after = 0i64;
+            loop {
+                let last: Option<i64> =
+                    sqlx::query_scalar("SELECT MAX(rowid) FROM (SELECT rowid FROM content WHERE rowid > ? ORDER BY rowid LIMIT ?)")
+                        .bind(after)
+                        .bind(ACK_SWEEP_CHUNK)
+                        .fetch_one(&writer)
+                        .await?;
+                let Some(last) = last else { break };
+                orphans += sqlx::query(
+                    "DELETE FROM content WHERE rowid > ?1 AND rowid <= ?2 AND NOT EXISTS (SELECT 1 FROM refs r \
+                       WHERE r.tenant_id = content.tenant_id AND r.kind = content.kind AND r.hash = content.hash)",
+                )
+                .bind(after)
+                .bind(last)
+                .execute(&writer)
+                .await?
+                .rows_affected();
+                after = last;
+            }
+            sqlx::query("INSERT INTO meta (key, value) VALUES ('orphans_swept', 1) ON CONFLICT DO NOTHING").execute(&writer).await?;
+            if orphans > 0 {
+                tracing::info!(orphans, "edge outbox: content no record named was removed");
+            }
+        }
+        let (page_size,): (i64,) = sqlx::query_as("PRAGMA page_size").fetch_one(&writer).await?;
+        // After the writer: it creates the file and puts it in WAL mode.
+        let reads = connect_readers(&path).await?;
+        Ok(Self { writer, reads, page_size: page_size.max(0) as u64, _lock: lock })
+    }
+
+    /// Close the readers, then the writer: the last connection to close
+    /// checkpoints the write-ahead log into the file, which a read-only one
+    /// cannot do.
+    #[cfg(test)]
+    async fn close(self) {
+        self.reads.close().await;
+        self.writer.close().await;
     }
 
     /// The instance id this store belongs to, created on first use.
     pub async fn instance(&self) -> Result<uuid::Uuid, anyhow::Error> {
+        let mut w = self.writer.acquire().await?;
         sqlx::query("INSERT INTO identity (one, instance) VALUES (1, ?) ON CONFLICT DO NOTHING")
             .bind(uuid::Uuid::new_v4().to_string())
-            .execute(&self.pool)
+            .execute(&mut *w)
             .await?;
-        let (id,): (String,) = sqlx::query_as("SELECT instance FROM identity WHERE one = 1").fetch_one(&self.pool).await?;
+        let (id,): (String,) = sqlx::query_as("SELECT instance FROM identity WHERE one = 1").fetch_one(&mut *w).await?;
         Ok(uuid::Uuid::parse_str(&id)?)
     }
 
@@ -425,23 +550,26 @@ impl OutboxV2 {
              ON CONFLICT (key) DO UPDATE SET value = MAX(value + 1, ?1) RETURNING value",
         )
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&self.writer)
         .await?;
         Ok(epoch as Epoch)
     }
 
-    /// Buffer one tenant's records and the content they reference, in one
-    /// transaction. A record already buffered under its natural key is kept
-    /// as it is — except a credential rotation, replaced by one with a later
-    /// `expires_at`. Content already buffered is kept. Returns the indexes in
-    /// `records` of those the outbox holds: one dropped here (logged) is not
-    /// among them.
-    pub async fn enqueue(&self, tenant: uuid::Uuid, records: &[Enqueued], content: &Content) -> Result<Vec<usize>, anyhow::Error> {
+    /// Buffer one tenant's records and the content they reference: records in
+    /// order, in transactions of at most [`TX_MAX_BYTES`] (at least one
+    /// record), each writing its records with the bodies they bring — a body is
+    /// never committed without a record that names it. A record already
+    /// buffered under its natural key is kept as it is — except a credential
+    /// rotation, replaced by one with a later `expires_at`. Content already
+    /// buffered is kept. Returns the indexes in `records` of those the outbox
+    /// holds: one dropped here (logged) is not among them. A transaction that
+    /// fails loses its records only: the error carries the ones the others hold.
+    pub async fn enqueue(&self, tenant: uuid::Uuid, records: &[Enqueued], content: &Content) -> Result<Vec<usize>, EnqueueError> {
         let tenant = tenant.to_string();
         let now = chrono::Utc::now().timestamp_millis();
-        // Everything is fitted before the transaction: the write lock it takes
-        // at its first INSERT is held for the inserts alone, not for the
-        // serializing and shrinking every other writer would wait on.
+        // Everything is fitted before any transaction: the writer is held for
+        // the inserts alone, not for the serializing and shrinking every other
+        // write would wait behind.
         let mut bodies: Vec<(String, String, Vec<u8>)> = Vec::new();
         for (r, body) in content_rows(content) {
             let (kind, hash) = r.key();
@@ -497,77 +625,181 @@ impl OutboxV2 {
             // not kept.
             return Ok(Vec::new());
         }
-        let mut tx = self.pool.begin().await?;
-        // The content rows this call adds, and the keys its records need.
-        let mut added: BTreeSet<(String, String)> = BTreeSet::new();
-        let mut needed: BTreeSet<(String, String)> = BTreeSet::new();
-        for (kind, hash, body) in bodies {
-            let inserted = sqlx::query("INSERT INTO content (tenant_id, kind, hash, body) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING")
-                .bind(&tenant)
-                .bind(&kind)
-                .bind(&hash)
-                .bind(body)
-                .execute(&mut *tx)
-                .await?;
-            if inserted.rows_affected() > 0 {
-                added.insert((kind, hash));
-            }
-        }
-        let held: Vec<usize> = fitted_records.iter().map(|r| r.index).collect();
-        for ToStore { record, natural_key, body, refs, .. } in fitted_records {
-            let inserted: Option<(i64,)> = sqlx::query_as(
-                "INSERT INTO records (tenant_id, kind, natural_key, body, created_at) VALUES (?, ?, ?, ?, ?) \
-                 ON CONFLICT DO NOTHING RETURNING id",
-            )
-            .bind(&tenant)
-            .bind(record.kind().as_str())
-            .bind(&natural_key)
-            .bind(&body)
-            .bind(now)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some((id,)) = inserted else {
-                if let Record::CredentialRotation(newer) = record {
-                    replace_if_newer(&mut tx, &tenant, &natural_key, newer.expires_at, &body).await?;
+        let mut bodies: BTreeMap<(String, String), Vec<u8>> = bodies.into_iter().map(|(kind, hash, body)| ((kind, hash), body)).collect();
+        // A body none of these records needs (its turn stripped to fit) is
+        // kept only for an earlier record that names it.
+        let unneeded: Vec<((String, String), Vec<u8>)> = {
+            let needed: BTreeSet<&(String, String)> = fitted_records.iter().flat_map(|r| r.refs.iter()).collect();
+            let keys: Vec<(String, String)> = bodies.keys().filter(|k| !needed.contains(k)).cloned().collect();
+            keys.into_iter().filter_map(|k| bodies.remove(&k).map(|b| (k, b))).collect()
+        };
+        // Bodies a committed transaction of this call wrote or found held: a
+        // later one checks such a body is still there (an eviction or an
+        // answered share may have taken it since) rather than write it again,
+        // and counts it in no transaction's weight.
+        let mut written_bodies: BTreeSet<(String, String)> = BTreeSet::new();
+        let mut held: Vec<usize> = Vec::new();
+        let mut failed: Option<EnqueueError> = None;
+        let mut rest = fitted_records.into_iter().peekable();
+        while rest.peek().is_some() {
+            let mut chunk: Vec<ToStore<'_>> = Vec::new();
+            // The bodies the chunk's records name that this call holds.
+            let mut names: BTreeSet<&(String, String)> = BTreeSet::new();
+            let mut weight = 0usize;
+            while let Some(next) = rest.peek() {
+                // Keys borrowed from `bodies`, which outlives the chunk.
+                let brings: Vec<(&(String, String), usize)> = next
+                    .refs
+                    .iter()
+                    .filter_map(|k| bodies.get_key_value(k))
+                    .filter(|(k, _)| !names.contains(k))
+                    .map(|(k, body)| (k, if written_bodies.contains(k) { 0 } else { body.len() }))
+                    .collect();
+                let w = next.body.len() + brings.iter().map(|(_, len)| len).sum::<usize>();
+                if !chunk.is_empty() && weight + w > TX_MAX_BYTES {
+                    break;
                 }
-                continue;
-            };
-            // Kept whether or not a content row holds the body: one refused
-            // above is still needed, and named unavailable when the record goes.
-            for (rkind, hash) in refs {
-                sqlx::query("INSERT INTO refs (record_id, tenant_id, kind, hash) VALUES (?, ?, ?, ?)")
-                    .bind(id)
+                weight += w;
+                names.extend(brings.into_iter().map(|(k, _)| k));
+                chunk.extend(rest.next());
+            }
+            let indexes: Vec<usize> = chunk.iter().map(|r| r.index).collect();
+            // The chunk's records with the bodies they bring, in one transaction.
+            let written: Result<(), anyhow::Error> = async {
+                let mut w = self.writer.acquire().await?;
+                let mut tx = sqlx::Connection::begin(&mut *w).await?;
+                // The content rows this transaction adds.
+                let mut added: Vec<&(String, String)> = Vec::new();
+                for &key in &names {
+                    let Some(body) = bodies.get(key) else { continue };
+                    if written_bodies.contains(key) {
+                        let (held,): (bool,) =
+                            sqlx::query_as("SELECT EXISTS (SELECT 1 FROM content WHERE tenant_id = ? AND kind = ? AND hash = ?)")
+                                .bind(&tenant)
+                                .bind(&key.0)
+                                .bind(&key.1)
+                                .fetch_one(&mut *tx)
+                                .await?;
+                        if held {
+                            continue;
+                        }
+                    }
+                    let inserted = sqlx::query("INSERT INTO content (tenant_id, kind, hash, body) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING")
+                        .bind(&tenant)
+                        .bind(&key.0)
+                        .bind(&key.1)
+                        .bind(body)
+                        .execute(&mut *tx)
+                        .await?;
+                    if inserted.rows_affected() > 0 {
+                        added.push(key);
+                    }
+                }
+                for ToStore { record, natural_key, body, refs, .. } in &chunk {
+                    let inserted: Option<(i64,)> = sqlx::query_as(
+                        "INSERT INTO records (tenant_id, kind, natural_key, body, created_at) VALUES (?, ?, ?, ?, ?) \
+                         ON CONFLICT DO NOTHING RETURNING id",
+                    )
                     .bind(&tenant)
-                    .bind(&rkind)
-                    .bind(&hash)
+                    .bind(record.kind().as_str())
+                    .bind(natural_key)
+                    .bind(body)
+                    .bind(now)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let Some((id,)) = inserted else {
+                        if let Record::CredentialRotation(newer) = record {
+                            replace_if_newer(&mut tx, &tenant, natural_key, newer.expires_at, body).await?;
+                        }
+                        continue;
+                    };
+                    // Kept whether or not a content row holds the body: one
+                    // refused above is still needed, and named unavailable
+                    // when the record goes.
+                    for (rkind, hash) in refs {
+                        sqlx::query("INSERT INTO refs (record_id, tenant_id, kind, hash) VALUES (?, ?, ?, ?)")
+                            .bind(id)
+                            .bind(&tenant)
+                            .bind(rkind)
+                            .bind(hash)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+                // A body added for a record that was already buffered (kept as
+                // it was) is named by no ref: not kept.
+                for (kind, hash) in added {
+                    sqlx::query(
+                        "DELETE FROM content WHERE tenant_id = ?1 AND kind = ?2 AND hash = ?3 \
+                           AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = ?1 AND r.kind = ?2 AND r.hash = ?3)",
+                    )
+                    .bind(&tenant)
+                    .bind(kind)
+                    .bind(hash)
                     .execute(&mut *tx)
                     .await?;
-                needed.insert((rkind, hash));
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+            match written {
+                Ok(()) => {
+                    held.extend(indexes);
+                    written_bodies.extend(names.into_iter().cloned());
+                }
+                Err(error) => match &mut failed {
+                    Some(f) => f.lost += indexes.len(),
+                    None => failed = Some(EnqueueError { held: Vec::new(), lost: indexes.len(), error }),
+                },
             }
         }
-        // A body this call added that none of its records needs (its turn
-        // stripped to fit) is not kept — unless an earlier record needs it.
-        for (kind, hash) in added.difference(&needed) {
-            sqlx::query(
-                "DELETE FROM content WHERE tenant_id = ? AND kind = ? AND hash = ? \
-                   AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = ? AND r.kind = ? AND r.hash = ?)",
-            )
-            .bind(&tenant)
-            .bind(kind)
-            .bind(hash)
-            .bind(&tenant)
-            .bind(kind)
-            .bind(hash)
-            .execute(&mut *tx)
-            .await?;
+        let mut rest = unneeded.iter().peekable();
+        while rest.peek().is_some() {
+            let mut part = Vec::new();
+            let mut weight = 0usize;
+            while let Some(((_, _), body)) = rest.peek() {
+                if !part.is_empty() && weight + body.len() > TX_MAX_BYTES {
+                    break;
+                }
+                weight += body.len();
+                part.extend(rest.next());
+            }
+            let written: Result<(), anyhow::Error> = async {
+                let mut w = self.writer.acquire().await?;
+                let mut tx = sqlx::Connection::begin(&mut *w).await?;
+                for ((kind, hash), body) in &part {
+                    sqlx::query(
+                        "INSERT INTO content (tenant_id, kind, hash, body) SELECT ?1, ?2, ?3, ?4 \
+                         WHERE EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = ?1 AND r.kind = ?2 AND r.hash = ?3) \
+                         ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&tenant)
+                    .bind(kind)
+                    .bind(hash)
+                    .bind(body)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                tx.commit().await?;
+                Ok(())
+            }
+            .await;
+            // No record of this call is lost: the earlier one that names the
+            // body still names it unavailable when it goes.
+            if let Err(e) = written {
+                tracing::warn!(%tenant, bodies = part.len(), "bodies an earlier record lacks could not be buffered — it ships without them: {e}");
+            }
         }
-        tx.commit().await?;
-        Ok(held)
+        match failed {
+            None => Ok(held),
+            Some(f) => Err(EnqueueError { held, ..f }),
+        }
     }
 
     /// Records still buffered.
     pub async fn pending(&self) -> Result<u64, anyhow::Error> {
-        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM records").fetch_one(&self.pool).await?;
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM records").fetch_one(&self.reads).await?;
         Ok(n.max(0) as u64)
     }
 
@@ -596,7 +828,7 @@ impl OutboxV2 {
         uploads: &Uploads,
     ) -> Result<Vec<PendingShare>, anyhow::Error> {
         let tenants: Vec<(String,)> =
-            sqlx::query_as("SELECT tenant_id FROM records GROUP BY tenant_id ORDER BY MIN(id)").fetch_all(&self.pool).await?;
+            sqlx::query_as("SELECT tenant_id FROM records GROUP BY tenant_id ORDER BY MIN(id)").fetch_all(&self.reads).await?;
         let mut shares = Vec::new();
         let mut total = 0usize;
         // One blob starts going up per request at most: another read now
@@ -651,7 +883,7 @@ impl OutboxV2 {
         // A blob going up is no part of the request: any tenant may start
         // one, not only the request's first.
         let starts_here = may_start;
-        let mut sql = String::from("SELECT r.id, r.body FROM records r WHERE r.tenant_id = ?");
+        let mut sql = String::from("SELECT r.id, length(r.body) FROM records r WHERE r.tenant_id = ?");
         if !held_here.is_empty() || !starts_here {
             sql.push_str(
                 " AND NOT EXISTS (SELECT 1 FROM refs f JOIN content c \
@@ -688,7 +920,10 @@ impl OutboxV2 {
                 query = query.bind(i64::try_from(lone_max).unwrap_or(i64::MAX));
             }
         }
-        let rows: Vec<(i64, Vec<u8>)> = query.fetch_all(&self.pool).await?;
+        // Each record's size, not its body: a body is read only once its
+        // record goes into the share, so a read costs what ships, never the
+        // backlog.
+        let rows: Vec<(i64, i64)> = query.fetch_all(&self.reads).await?;
         let mut share = TenantShare { tenant: tenant_id, ..Default::default() };
         let mut record_ids = Vec::new();
         let mut content_keys: BTreeSet<(String, String)> = BTreeSet::new();
@@ -697,27 +932,28 @@ impl OutboxV2 {
         let mut size = 0usize;
         let mut unreadable = Vec::new();
         let mut content_bytes = 0usize;
-        for (id, body) in rows {
-            let record: Record = match read_stored(&body) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!(id, "outbox record cannot be read — dropped: {e}");
-                    unreadable.push(id);
-                    continue;
-                }
-            };
-            // The content this record needs that the share does not carry yet.
-            let refs: Vec<(String, String)> = sqlx::query_as("SELECT kind, hash FROM refs WHERE record_id = ?")
-                .bind(id)
-                .fetch_all(&self.pool)
-                .await?;
+        for (id, body_len) in rows {
+            let body_len = body_len.max(0) as usize;
+            // Every body the record names — whether a row holds it, its size,
+            // whether admin-api acked it — in one read, however long the
+            // history.
+            let refs: Vec<(String, String, Option<i64>, bool)> = sqlx::query_as(
+                "SELECT f.kind, f.hash, \
+                        (SELECT length(c.body) FROM content c \
+                          WHERE c.tenant_id = f.tenant_id AND c.kind = f.kind AND c.hash = f.hash), \
+                        EXISTS (SELECT 1 FROM acked a WHERE a.tenant_id = f.tenant_id AND a.kind = f.kind AND a.hash = f.hash) \
+                 FROM refs f WHERE f.record_id = ?",
+            )
+            .bind(id)
+            .fetch_all(&self.reads)
+            .await?;
             // `(kind, hash, size, acked)`; a body is read only once it goes,
             // and one admin-api acked is left out.
             let mut needed: Vec<(String, String, usize, bool)> = Vec::new();
             // Needed, neither acked nor held in a content row.
             let mut lost: Vec<(String, String)> = Vec::new();
             let mut waits = false;
-            for (kind, hash) in refs {
+            for (kind, hash, len, acked) in refs {
                 if content_keys.contains(&(kind.clone(), hash.clone())) || unavailable.contains(&(kind.clone(), hash.clone())) {
                     continue;
                 }
@@ -725,15 +961,6 @@ impl OutboxV2 {
                     waits = true; // its blob is on its way up, or waits to be sent again
                     break;
                 }
-                let (len, acked): (Option<i64>, bool) = sqlx::query_as(
-                    "SELECT (SELECT length(body) FROM content WHERE tenant_id = ?1 AND kind = ?2 AND hash = ?3), \
-                            EXISTS (SELECT 1 FROM acked WHERE tenant_id = ?1 AND kind = ?2 AND hash = ?3)",
-                )
-                .bind(tenant)
-                .bind(&kind)
-                .bind(&hash)
-                .fetch_one(&self.pool)
-                .await?;
                 match (len, acked) {
                     (_, true) => needed.push((kind, hash, 0, true)),
                     (Some(len), false) => needed.push((kind, hash, len.max(0) as usize, false)),
@@ -750,7 +977,7 @@ impl OutboxV2 {
             // carries, and the keys it names `unavailable`.
             let cost_of = |needed: &[(String, String, usize, bool)], lost: &[(String, String)]| {
                 let carried: usize = needed.iter().filter(|n| !n.3).map(|n| n.2).sum();
-                body.len() + carried + lost.iter().map(|(k, h)| key_bytes(k, h)).sum::<usize>()
+                body_len + carried + lost.iter().map(|(k, h)| key_bytes(k, h)).sum::<usize>()
             };
             let mut cost = cost_of(&needed, &lost);
             // A blob that cannot travel with records goes up first, by itself:
@@ -763,6 +990,18 @@ impl OutboxV2 {
             if let Some((kind, hash, _, _)) = goes_alone {
                 if !record_ids.is_empty() || !may_start {
                     continue; // its blob goes up first, in a later request; the rest go now
+                }
+                // Its blob goes up for it only if the record itself reads.
+                let body: Option<Vec<u8>> =
+                    sqlx::query_scalar("SELECT body FROM records WHERE id = ?").bind(id).fetch_optional(&self.reads).await?;
+                match body.map(|b| read_stored::<Record>(&b)) {
+                    None => continue,
+                    Some(Err(e)) => {
+                        tracing::error!(id, "outbox record cannot be read — dropped: {e}");
+                        unreadable.push(id);
+                        continue;
+                    }
+                    Some(Ok(_)) => {}
                 }
                 self.delete_ids(&unreadable).await?;
                 let blob: Result<BlobContent, String> = match self.content_body(tenant, kind, hash).await? {
@@ -794,6 +1033,21 @@ impl OutboxV2 {
             if (!record_ids.is_empty() || !alone) && size + cost > budget {
                 break;
             }
+            // The record goes: its body is read now. One that does not read
+            // is dropped, and the records after it are still reached.
+            let body: Option<Vec<u8>> =
+                sqlx::query_scalar("SELECT body FROM records WHERE id = ?").bind(id).fetch_optional(&self.reads).await?;
+            let Some(body) = body else {
+                continue; // replaced meanwhile (a newer credential rotation): its successor comes later
+            };
+            let record: Record = match read_stored(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(id, "outbox record cannot be read — dropped: {e}");
+                    unreadable.push(id);
+                    continue;
+                }
+            };
             // Alone and still past what a request carries once its blobs are
             // up: its largest content can never travel with it, and would hold
             // back every record behind it. It is dropped; the record ships
@@ -861,9 +1115,6 @@ impl OutboxV2 {
         if record_ids.is_empty() {
             return Ok(None);
         }
-        // A row for an unavailable key may arrive while the share is out;
-        // it is collected with the rest once the share is answered.
-        content_keys.extend(unavailable.iter().cloned());
         share.unavailable = unavailable
             .into_iter()
             .filter_map(|(kind, hash)| ContentRef::from_key(&kind, hash).map(ContentRef::content_key))
@@ -913,7 +1164,8 @@ impl OutboxV2 {
                     }
                     tracing::warn!(%tenant, "recording what admin-api holds failed — those bodies are carried again: {e}");
                 }
-                self.collect_content(&tenant, &pending.content_keys).await?;
+                // Their content went with them (`delete_ids`); a blob that went
+                // up by itself stays while a record still names it.
                 Ok(if pending.ships.is_some() { Applied::Shipped } else { Applied::Deleted })
             }
             ShareOutcome::TenantDeleted => {
@@ -928,7 +1180,8 @@ impl OutboxV2 {
                 if missing.is_empty() {
                     return Ok(Applied::Kept);
                 }
-                let mut tx = self.pool.begin().await?;
+                let mut w = self.writer.acquire().await?;
+                let mut tx = sqlx::Connection::begin(&mut *w).await?;
                 let mut forgotten = 0;
                 for key in missing {
                     let (kind, hash) = row_key(key);
@@ -959,51 +1212,79 @@ impl OutboxV2 {
             return Ok(0);
         }
         let low_water = cap_bytes / 10 * 9;
-        // In chunks: one statement over every ack would hold the write lock
-        // an `enqueue` waits on.
+        // In chunks, the writer taken for each: one statement over every ack
+        // would hold up every other write.
         let mut forgotten = 0;
-        loop {
-            let gone = sqlx::query("DELETE FROM acked WHERE rowid IN (SELECT rowid FROM acked LIMIT ?)")
-                .bind(ACK_SWEEP_CHUNK)
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
-            forgotten += gone;
-            if gone < ACK_SWEEP_CHUNK as u64 {
-                break;
+        let swept: Result<(), anyhow::Error> = async {
+            loop {
+                let gone = sqlx::query("DELETE FROM acked WHERE rowid IN (SELECT rowid FROM acked LIMIT ?)")
+                    .bind(ACK_SWEEP_CHUNK)
+                    .execute(&self.writer)
+                    .await?
+                    .rows_affected();
+                forgotten += gone;
+                if gone < ACK_SWEEP_CHUNK as u64 {
+                    return Ok(());
+                }
             }
         }
+        .await;
         if forgotten > 0 {
             tracing::warn!(forgotten, cap_bytes, "edge outbox over its size cap — every ack forgotten; the bodies they named are carried again once");
         }
+        swept?;
+        // Counted as each eviction commits, and named whatever ends the loop:
+        // no evicted record goes unsaid.
         let mut evicted = 0u64;
-        while self.logical_size().await? > low_water {
-            let ids: Vec<(i64,)> = sqlx::query_as("SELECT id FROM records ORDER BY id LIMIT ?")
-                .bind(EVICT_CHUNK)
-                .fetch_all(&self.pool)
-                .await?;
-            if ids.is_empty() {
-                break;
+        let result: Result<(), anyhow::Error> = async {
+            while self.logical_size().await? > low_water {
+                let gone = self.evict_oldest().await?;
+                if gone == 0 {
+                    break;
+                }
+                evicted += gone;
             }
-            let ids: Vec<i64> = ids.into_iter().map(|(id,)| id).collect();
-            self.delete_ids(&ids).await?;
-            evicted += ids.len() as u64;
-            sqlx::query(
-                "DELETE FROM content WHERE NOT EXISTS (SELECT 1 FROM refs r \
-                   WHERE r.tenant_id = content.tenant_id AND r.kind = content.kind AND r.hash = content.hash)",
-            )
-            .execute(&self.pool)
-            .await?;
+            Ok(())
         }
+        .await;
         if evicted > 0 {
             tracing::error!(evicted, cap_bytes, "edge outbox over its size cap — the oldest records were evicted and will not reach admin-api");
         }
-        Ok(evicted)
+        result.map(|()| evicted)
+    }
+
+    /// Evict the oldest records — up to [`EVICT_CHUNK`], fewer once their
+    /// bodies weigh [`TX_MAX_BYTES`], at least one — with the content only
+    /// they named (not counted in that weight), in one transaction. Returns
+    /// how many.
+    async fn evict_oldest(&self) -> Result<u64, anyhow::Error> {
+        let mut w = self.writer.acquire().await?;
+        let mut tx = sqlx::Connection::begin(&mut *w).await?;
+        let oldest: Vec<(i64, i64)> = sqlx::query_as("SELECT id, length(body) FROM records ORDER BY id LIMIT ?")
+            .bind(EVICT_CHUNK)
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut ids: Vec<i64> = Vec::new();
+        let mut weight = 0usize;
+        for (id, len) in oldest {
+            let len = len.max(0) as usize;
+            if !ids.is_empty() && weight + len > TX_MAX_BYTES {
+                break;
+            }
+            weight += len;
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        delete_records(&mut tx, &ids).await?;
+        tx.commit().await?;
+        Ok(ids.len() as u64)
     }
 
     /// Forget the acks no share named for [`ACK_TTL_MS`].
-    /// Deleted in chunks, so no one statement holds the write lock an
-    /// `enqueue` waits on for long.
+    /// Deleted in chunks, the writer taken for each, so no one statement
+    /// holds up every other write for long.
     pub async fn forget_stale_acks(&self) -> Result<u64, anyhow::Error> {
         let cutoff = chrono::Utc::now().timestamp_millis() - ACK_TTL_MS;
         let mut forgotten = 0;
@@ -1011,7 +1292,7 @@ impl OutboxV2 {
             let gone = sqlx::query("DELETE FROM acked WHERE rowid IN (SELECT rowid FROM acked WHERE acked_at < ? LIMIT ?)")
                 .bind(cutoff)
                 .bind(ACK_SWEEP_CHUNK)
-                .execute(&self.pool)
+                .execute(&self.writer)
                 .await?
                 .rows_affected();
             forgotten += gone;
@@ -1023,21 +1304,21 @@ impl OutboxV2 {
     }
 
     async fn logical_size(&self) -> Result<u64, anyhow::Error> {
-        let (pages,): (i64,) = sqlx::query_as("PRAGMA page_count").fetch_one(&self.pool).await?;
-        let (free,): (i64,) = sqlx::query_as("PRAGMA freelist_count").fetch_one(&self.pool).await?;
+        let (pages,): (i64,) = sqlx::query_as("PRAGMA page_count").fetch_one(&self.reads).await?;
+        let (free,): (i64,) = sqlx::query_as("PRAGMA freelist_count").fetch_one(&self.reads).await?;
         Ok((pages - free).max(0) as u64 * self.page_size)
     }
 
+    /// Delete records by id with the content only they named, in one
+    /// transaction ([`delete_records`]).
     async fn delete_ids(&self, ids: &[i64]) -> Result<(), anyhow::Error> {
-        for chunk in ids.chunks(ID_CHUNK) {
-            let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!("DELETE FROM records WHERE id IN ({placeholders})");
-            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-            for id in chunk {
-                q = q.bind(id);
-            }
-            q.execute(&self.pool).await?;
+        if ids.is_empty() {
+            return Ok(());
         }
+        let mut w = self.writer.acquire().await?;
+        let mut tx = sqlx::Connection::begin(&mut *w).await?;
+        delete_records(&mut tx, ids).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1060,26 +1341,7 @@ impl OutboxV2 {
         .bind(now)
         .bind(serde_json::to_string(keys)?)
         .bind(ACK_RENEW_MS)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Delete the given content rows that no remaining record references.
-    /// One statement, however many keys: a write per key would take the
-    /// write lock an `enqueue` waits on once per body of the session.
-    async fn collect_content(&self, tenant: &str, keys: &[(String, String)]) -> Result<(), anyhow::Error> {
-        if keys.is_empty() {
-            return Ok(());
-        }
-        sqlx::query(
-            "DELETE FROM content WHERE tenant_id = ?1 \
-               AND (kind, hash) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?2)) \
-               AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = content.tenant_id AND r.kind = content.kind AND r.hash = content.hash)",
-        )
-        .bind(tenant)
-        .bind(serde_json::to_string(keys)?)
-        .execute(&self.pool)
+        .execute(&self.writer)
         .await?;
         Ok(())
     }
@@ -1089,7 +1351,7 @@ impl OutboxV2 {
             .bind(tenant)
             .bind(kind)
             .bind(hash)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.reads)
             .await?)
     }
 
@@ -1100,19 +1362,44 @@ impl OutboxV2 {
             .bind(tenant)
             .bind(kind)
             .bind(hash)
-            .execute(&self.pool)
+            .execute(&self.writer)
             .await?;
         Ok(())
     }
 
+    /// Drop everything a tenant holds, in one transaction: only a deleted
+    /// tenant (or one whose id does not read) is dropped, so no enqueue of its
+    /// races it, and its rows go together.
     async fn drop_tenant(&self, tenant: &str) -> Result<(), anyhow::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut w = self.writer.acquire().await?;
+        let mut tx = sqlx::Connection::begin(&mut *w).await?;
         sqlx::query("DELETE FROM records WHERE tenant_id = ?").bind(tenant).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM content WHERE tenant_id = ?").bind(tenant).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM acked WHERE tenant_id = ?").bind(tenant).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
+}
+
+/// Delete the records `ids` and the content only they named: their `refs`
+/// cascade, and a body no remaining ref names goes in the same transaction
+/// (`tx`) — content leaves with its last record, never before it and never
+/// after (an orphan no share would name again).
+async fn delete_records(tx: &mut sqlx::SqliteConnection, ids: &[i64]) -> Result<(), anyhow::Error> {
+    let ids = serde_json::to_string(ids)?;
+    // The bodies these records name that no other record names, before their
+    // refs cascade away.
+    sqlx::query(
+        "DELETE FROM content WHERE (tenant_id, kind, hash) IN \
+           (SELECT f.tenant_id, f.kind, f.hash FROM refs f WHERE f.record_id IN (SELECT value FROM json_each(?1))) \
+         AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = content.tenant_id AND r.kind = content.kind \
+           AND r.hash = content.hash AND r.record_id NOT IN (SELECT value FROM json_each(?1)))",
+    )
+    .bind(&ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM records WHERE id IN (SELECT value FROM json_each(?))").bind(&ids).execute(&mut *tx).await?;
+    Ok(())
 }
 
 /// Replace a buffered credential rotation with `body` when `expires_at` is
@@ -1656,7 +1943,7 @@ mod tests {
     }
 
     async fn content_count(o: &OutboxV2) -> i64 {
-        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM content").fetch_one(&o.pool).await.unwrap().0
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM content").fetch_one(&o.reads).await.unwrap().0
     }
 
     #[tokio::test]
@@ -1677,7 +1964,7 @@ mod tests {
         // A store restored from an older backup: its counter is far behind.
         // The next start is the clock again — past every epoch a process of
         // this store started at before the restore (one per second, at most).
-        sqlx::query("UPDATE meta SET value = 5 WHERE key = 'process_epoch'").execute(&reopened.pool).await.unwrap();
+        sqlx::query("UPDATE meta SET value = 5 WHERE key = 'process_epoch'").execute(&mut *reopened.writer.acquire().await.unwrap()).await.unwrap();
         let restored = reopened.start_process().await.unwrap();
         assert!(restored >= now && restored > 5, "a restored counter restarts at the clock, not at its own value");
     }
@@ -2224,13 +2511,11 @@ mod tests {
         let t = uuid::Uuid::new_v4();
         o.enqueue(t, &[with(event(t, 1))], &Content::default()).await.unwrap();
         let first = o.instance().await.unwrap();
-        o.pool.close().await;
-        drop(o);
+        o.close().await;
         // Positive control: this build's store reopens with what it held.
         let o = OutboxV2::open(path).await.unwrap();
         assert_eq!((o.pending().await.unwrap(), o.instance().await.unwrap()), (1, first));
-        o.pool.close().await;
-        drop(o);
+        o.close().await;
         // The same store under other builds' names (an older one's, a later
         // one's) and a copy beside it: none is read, none is touched.
         let others = ["outbox_v2.s1.db", "outbox_v2.s99.db", "outbox_v2.s1.bak.db"];
@@ -2245,8 +2530,7 @@ mod tests {
         for other in others {
             assert!(dir.join(other).exists(), "{other} is left");
         }
-        o.pool.close().await;
-        drop(o);
+        o.close().await;
         // Beside them, this build's store is kept whole; another build's
         // store that holds nothing is removed, having nothing to deliver.
         std::fs::copy(dir.join(store_file()), dir.join("outbox_v2.s97.db")).unwrap();
@@ -2620,7 +2904,7 @@ mod tests {
         let o = outbox().await;
         let t = uuid::Uuid::new_v4();
         let token_of = |o: &OutboxV2| {
-            let pool = o.pool.clone();
+            let pool = o.reads.clone();
             async move {
                 let (b,): (Vec<u8>,) = sqlx::query_as("SELECT body FROM records").fetch_one(&pool).await.unwrap();
                 match serde_json::from_slice::<Record>(&b).unwrap() {
@@ -2657,12 +2941,12 @@ mod tests {
         assert_eq!(left + evicted, 200);
         // Every remaining record still has its content, and no orphan is kept.
         assert_eq!(content_count(&o).await, left as i64);
-        let oldest: (i64,) = sqlx::query_as("SELECT MIN(id) FROM records").fetch_one(&o.pool).await.unwrap();
+        let oldest: (i64,) = sqlx::query_as("SELECT MIN(id) FROM records").fetch_one(&o.reads).await.unwrap();
         assert_eq!(oldest.0, evicted as i64 + 1, "the oldest went first");
     }
 
     async fn ack_count(o: &OutboxV2) -> i64 {
-        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM acked").fetch_one(&o.pool).await.unwrap().0
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM acked").fetch_one(&o.reads).await.unwrap().0
     }
 
     /// One turn of a session whose history is `1..=n`, with the bodies it
@@ -2766,7 +3050,7 @@ mod tests {
         enqueue_history(&o, a, 2).await;
         let share = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap().remove(0);
         o.apply(&share, &ShareOutcome::TenantDeleted).await.unwrap();
-        let left: Vec<(String,)> = sqlx::query_as("SELECT tenant_id FROM acked").fetch_all(&o.pool).await.unwrap();
+        let left: Vec<(String,)> = sqlx::query_as("SELECT tenant_id FROM acked").fetch_all(&o.reads).await.unwrap();
         assert_eq!(left, vec![(b.to_string(),)]);
     }
 
@@ -2797,17 +3081,219 @@ mod tests {
         let keys = [("message".to_string(), "old".to_string()), ("message".to_string(), "named".to_string())];
         o.ack(&t.to_string(), &keys).await.unwrap();
         let stale = chrono::Utc::now().timestamp_millis() - ACK_TTL_MS - 1;
-        sqlx::query("UPDATE acked SET acked_at = ?").bind(stale).execute(&o.pool).await.unwrap();
+        sqlx::query("UPDATE acked SET acked_at = ?").bind(stale).execute(&mut *o.writer.acquire().await.unwrap()).await.unwrap();
         // Named again by a committed share: renewed, past the renewal interval.
         o.ack(&t.to_string(), &keys[1..]).await.unwrap();
         assert_eq!(o.forget_stale_acks().await.unwrap(), 1);
-        let left: Vec<(String,)> = sqlx::query_as("SELECT hash FROM acked").fetch_all(&o.pool).await.unwrap();
+        let left: Vec<(String,)> = sqlx::query_as("SELECT hash FROM acked").fetch_all(&o.reads).await.unwrap();
         assert_eq!(left, vec![("named".to_string(),)]);
         // Renewed at most once per interval: a fresh ack is not rewritten.
-        let before: (i64,) = sqlx::query_as("SELECT acked_at FROM acked").fetch_one(&o.pool).await.unwrap();
-        sqlx::query("UPDATE acked SET acked_at = acked_at - 1").execute(&o.pool).await.unwrap();
+        let before: (i64,) = sqlx::query_as("SELECT acked_at FROM acked").fetch_one(&o.reads).await.unwrap();
+        sqlx::query("UPDATE acked SET acked_at = acked_at - 1").execute(&mut *o.writer.acquire().await.unwrap()).await.unwrap();
         o.ack(&t.to_string(), &keys[1..]).await.unwrap();
-        let after: (i64,) = sqlx::query_as("SELECT acked_at FROM acked").fetch_one(&o.pool).await.unwrap();
+        let after: (i64,) = sqlx::query_as("SELECT acked_at FROM acked").fetch_one(&o.reads).await.unwrap();
         assert_eq!(after.0, before.0 - 1);
+    }
+
+    /// WAL: a read in progress (a share being assembled) does not hold back a
+    /// write, and a write in progress does not hold back a read.
+    #[tokio::test]
+    async fn a_long_read_neither_holds_back_a_write_nor_waits_for_one() {
+        use sqlx::Connection;
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        o.enqueue(t, &[with(event(t, 1))], &Content::default()).await.unwrap();
+        let quick = std::time::Duration::from_secs(2);
+        // A read transaction left open on a reader.
+        let mut reader = o.reads.acquire().await.unwrap();
+        let mut read = reader.begin().await.unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM records").fetch_one(&mut *read).await.unwrap();
+        assert_eq!(n, 1);
+        tokio::time::timeout(quick, o.enqueue(t, &[with(event(t, 2))], &Content::default()))
+            .await
+            .expect("a write is not held back by an open read")
+            .unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM records").fetch_one(&mut *read).await.unwrap();
+        assert_eq!(n, 1, "the open read keeps the snapshot it started with");
+        drop(read);
+        drop(reader);
+        // A write transaction left open on the writer.
+        let mut w = o.writer.acquire().await.unwrap();
+        let mut write = w.begin().await.unwrap();
+        sqlx::query("DELETE FROM records").execute(&mut *write).await.unwrap();
+        let pending = tokio::time::timeout(quick, o.pending()).await.expect("a read is not held back by an open write").unwrap();
+        assert_eq!(pending, 2, "a read sees what is committed, and only that");
+        write.rollback().await.unwrap();
+    }
+
+    /// Every write goes through the one writer: a write that comes while a
+    /// long write transaction holds it waits its turn, past SQLite's busy
+    /// timeout (5 s), which a write on a connection of its own would hit.
+    #[tokio::test]
+    async fn a_write_waits_its_turn_behind_a_long_one_and_is_not_lost() {
+        use sqlx::Connection;
+        let o = std::sync::Arc::new(outbox().await);
+        let t = uuid::Uuid::new_v4();
+        o.enqueue(t, &[with(event(t, 1))], &Content::default()).await.unwrap();
+        let share = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap().remove(0);
+        let (holding, held) = tokio::sync::oneshot::channel();
+        let long = {
+            let o = o.clone();
+            tokio::spawn(async move {
+                let mut w = o.writer.acquire().await.unwrap();
+                let mut tx = w.begin().await.unwrap();
+                sqlx::query("INSERT INTO meta (key, value) VALUES ('long', 1)").execute(&mut *tx).await.unwrap();
+                holding.send(()).unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                tx.commit().await.unwrap();
+            })
+        };
+        held.await.unwrap();
+        let (next, none) = ([with(event(t, 2))], Content::default());
+        let (enqueued, applied, swept, epoch) = tokio::join!(
+            o.enqueue(t, &next, &none),
+            o.apply(&share, &ShareOutcome::Committed),
+            o.forget_stale_acks(),
+            o.start_process(),
+        );
+        enqueued.expect("the enqueue waited its turn");
+        assert_eq!(applied.expect("the outcome waited its turn"), Applied::Deleted);
+        swept.expect("the sweep waited its turn");
+        epoch.expect("the epoch waited its turn");
+        long.await.unwrap();
+        assert_eq!(o.pending().await.unwrap(), 1, "the shipped record went, the new one is held");
+    }
+
+    /// A share decides on each record's size and reads a body only once its
+    /// record goes in: a record left behind by the budget is not read — here
+    /// one that would not read back, which a read would have dropped.
+    #[tokio::test]
+    async fn a_share_reads_no_body_of_a_record_it_leaves_behind() {
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        for seq in 1..=5 {
+            o.enqueue(t, &[with(event(t, seq))], &Content::default()).await.unwrap();
+        }
+        let (len,): (i64,) = sqlx::query_as("SELECT length(body) FROM records WHERE id = 1").fetch_one(&o.reads).await.unwrap();
+        sqlx::query("UPDATE records SET body = zeroblob(length(body)) WHERE id > 2")
+            .execute(&mut *o.writer.acquire().await.unwrap())
+            .await
+            .unwrap();
+        let shares = o.assemble_with(usize::MAX, 2 * len as usize, &Uploads::idle()).await.unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share.records.len(), 2, "the budget holds two records");
+        assert_eq!(o.pending().await.unwrap(), 5, "the three left behind were never read, so none was found unreadable");
+        // Positive control: once reached, an unreadable record is dropped.
+        let shares = o.assemble_with(usize::MAX, usize::MAX, &Uploads::idle()).await.unwrap();
+        assert_eq!(shares[0].share.records.len(), 2);
+        assert_eq!(o.pending().await.unwrap(), 2);
+    }
+
+    /// A record deleted for any reason takes with it the content only it
+    /// named, in the same transaction: a record dropped unread leaves no body
+    /// behind that no share would ever name again, and a body another record
+    /// names stays.
+    #[tokio::test]
+    async fn a_record_dropped_unread_takes_the_content_only_it_named() {
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        let content = Content { messages: vec![message("only"), message("shared")], ..Default::default() };
+        let records = [
+            turn_naming(t, 1, vec![ContentRef::Message("only".into()), ContentRef::Message("shared".into())]),
+            turn_naming(t, 2, vec![ContentRef::Message("shared".into())]),
+        ];
+        o.enqueue(t, &records, &content).await.unwrap();
+        sqlx::query("UPDATE records SET body = zeroblob(length(body)) WHERE id = 1")
+            .execute(&mut *o.writer.acquire().await.unwrap())
+            .await
+            .unwrap();
+        let shares = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap();
+        assert_eq!(shares[0].share.records.len(), 1, "the readable turn ships");
+        assert_eq!(o.pending().await.unwrap(), 1, "the unreadable one is dropped");
+        let left: Vec<(String,)> = sqlx::query_as("SELECT hash FROM content ORDER BY hash").fetch_all(&o.reads).await.unwrap();
+        assert_eq!(left, vec![("shared".to_string(),)], "its own body went with it; the shared one stays");
+    }
+
+    /// A batch past one transaction is written in several, each its records
+    /// with the bodies they bring: one that fails loses its own records only,
+    /// and the error names the ones the others hold.
+    #[tokio::test]
+    async fn a_batch_past_one_transaction_loses_only_the_records_of_the_one_that_fails() {
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        // Each record between half a transaction and a whole one: one each.
+        let sized = |seq: i64, data: usize| {
+            let mut r = event(t, seq);
+            if let Record::McpSseEvent(e) = &mut r {
+                e.event_data = vec![b'x'; data];
+            }
+            r
+        };
+        let size = |data: usize| serde_json::to_vec(&sized(1, data)).unwrap().len();
+        let per_byte = (size(1000) - size(0)) as f64 / 1000.0;
+        let data = ((TX_MAX_BYTES as f64 * 0.75 - size(0) as f64) / per_byte) as usize;
+        assert!(size(data) > TX_MAX_BYTES / 2 && size(data) < TX_MAX_BYTES);
+        let records: Vec<Enqueued> = (1..=4).map(|seq| with(sized(seq, data))).collect();
+        let refused = records[1].record.natural_key().replace('\'', "''");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER refuse BEFORE INSERT ON records WHEN NEW.natural_key = '{refused}' \
+             BEGIN SELECT RAISE(ABORT, 'refused'); END"
+        )))
+        .execute(&mut *o.writer.acquire().await.unwrap())
+        .await
+        .unwrap();
+        let e = o.enqueue(t, &records, &Content::default()).await.expect_err("one transaction is refused");
+        assert_eq!((e.held, e.lost), (vec![0, 2, 3], 1), "the refused record alone is lost");
+        assert_eq!(o.pending().await.unwrap(), 3);
+    }
+
+    /// A store not yet swept has every body no record names removed when it
+    /// opens; a body a record names stays.
+    #[tokio::test]
+    async fn a_body_no_record_names_is_swept_when_the_store_opens() {
+        let dir = std::env::temp_dir().join(format!("streamscope_outbox_v2_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        let o = OutboxV2::open(path).await.unwrap();
+        let t = uuid::Uuid::new_v4();
+        let content = Content { messages: vec![message("named"), message("orphan")], ..Default::default() };
+        let records = [
+            turn_naming(t, 1, vec![ContentRef::Message("named".into())]),
+            turn_naming(t, 2, vec![ContentRef::Message("orphan".into())]),
+        ];
+        o.enqueue(t, &records, &content).await.unwrap();
+        // The record alone deleted: its body is left with no record naming it.
+        sqlx::query("DELETE FROM records WHERE id = 2").execute(&o.writer).await.unwrap();
+        // A store not yet swept.
+        sqlx::query("DELETE FROM meta WHERE key = 'orphans_swept'").execute(&o.writer).await.unwrap();
+        o.close().await;
+        let o = OutboxV2::open(path).await.unwrap();
+        let left: Vec<(String,)> = sqlx::query_as("SELECT hash FROM content").fetch_all(&o.reads).await.unwrap();
+        assert_eq!(left, vec![("named".to_string(),)]);
+        o.close().await;
+    }
+
+    /// A body one transaction of an enqueue wrote and took back (the record
+    /// that brought it was already buffered, naming none) is written again by
+    /// the later transaction whose record names it.
+    #[tokio::test]
+    async fn a_body_an_earlier_transaction_took_back_is_written_for_the_record_that_names_it() {
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        o.enqueue(t, &[turn_naming(t, 1, vec![])], &Content::default()).await.unwrap();
+        // Two records past one transaction together: each its own.
+        let big = |seq: i64| {
+            let mut e = turn_naming(t, seq, vec![ContentRef::Message("x".into())]);
+            if let Record::LlmAudit(r) = &mut e.record {
+                r.user_agent = Some("u".repeat(TX_MAX_BYTES * 2 / 3));
+            }
+            e
+        };
+        let content = Content { messages: vec![message("x")], ..Default::default() };
+        o.enqueue(t, &[big(1), big(2)], &content).await.unwrap();
+        let left: Vec<(String,)> = sqlx::query_as("SELECT hash FROM content").fetch_all(&o.reads).await.unwrap();
+        assert_eq!(left, vec![("x".to_string(),)], "the second record's body is held");
+        let shares = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap();
+        assert!(shares.iter().all(|s| s.share.unavailable.is_empty()), "no body is named unavailable");
     }
 }

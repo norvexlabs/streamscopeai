@@ -1103,13 +1103,15 @@ fn parse_test_context(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|m| {
-                    Some(RhaiMessage {
-                        role: m.get("role")?.as_str()?.to_string(),
-                        content: m.get("content")?.as_str()?.to_string(),
-                        tool_call_id: m.get("tool_call_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        tool_calls: vec![],
-                    })
+                .filter_map(|m| Some((m.get("role")?.as_str()?, m.get("content")?.as_str()?, m)))
+                .enumerate()
+                .map(|(i, (role, content, m))| RhaiMessage {
+                    role: role.to_string(),
+                    content: content.to_string(),
+                    tool_call_id: m.get("tool_call_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    tool_calls: vec![],
+                    // Read as a request's messages are, each its place.
+                    origin: Some(i),
                 })
                 .collect()
         })

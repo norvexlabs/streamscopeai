@@ -141,8 +141,10 @@ impl ContentPart {
     /// text part carried beside its text (a later part's winning), so a merge
     /// drops no `cache_control`; a removed untyped part's members (a Responses
     /// `output_text`'s `annotations`, offsets into its own text) describe text
-    /// that is gone and go with it. A kept untyped part keeps its own, which
-    /// its protocol may require. Returns whether a text part was there to keep.
+    /// that is gone and go with it — but its `prompt_cache_breakpoint` (the
+    /// latest) moves onto the kept part, untyped or typed, so the merge drops
+    /// no breakpoint. A kept untyped part keeps its own members, which its
+    /// protocol may require. Returns whether a text part was there to keep.
     pub fn merge_text_parts(parts: &mut Vec<ContentPart>, text: &str, is_text: impl Fn(&ContentPart) -> bool) -> bool {
         let members = |part: &ContentPart| -> Vec<(String, Value)> {
             match part {
@@ -154,6 +156,15 @@ impl ContentPart {
             return false;
         };
         let merged: Vec<(String, Value)> = parts[first + 1..].iter().filter(|p| is_text(p)).flat_map(members).collect();
+        // A merged Responses part's prompt-cache breakpoint, the latest.
+        let breakpoint = parts[first + 1..]
+            .iter()
+            .filter(|p| is_text(p))
+            .filter_map(|p| match p {
+                Self::Unknown(v) => v.get("prompt_cache_breakpoint").filter(|b| !b.is_null()).cloned(),
+                _ => None,
+            })
+            .next_back();
         let mut at = 0;
         parts.retain(|p| {
             let keep = at <= first || !is_text(p);
@@ -164,11 +175,17 @@ impl ContentPart {
             Self::Text { text: t, extra } => {
                 *t = text.to_string();
                 extra.extend(merged);
+                if let Some(b) = breakpoint {
+                    extra.insert("prompt_cache_breakpoint".into(), b);
+                }
             }
             // An untyped part's protocol defines its own members: it takes
             // none of a typed text part's.
             Self::Unknown(Value::Object(m)) => {
                 m.insert("text".into(), Value::String(text.to_string()));
+                if let Some(b) = breakpoint {
+                    m.insert("prompt_cache_breakpoint".into(), b);
+                }
             }
             _ => {}
         }

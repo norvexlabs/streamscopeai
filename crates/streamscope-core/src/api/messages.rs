@@ -25,9 +25,9 @@ pub struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,6 +69,17 @@ pub struct SystemBlock {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
+    /// The block's other members (`citations`), sent on as the client wrote
+    /// them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl SystemBlock {
+    /// A plain text block the gateway writes.
+    pub fn text(text: String) -> Self {
+        Self { r#type: "text".to_string(), text, cache_control: None, extra: BTreeMap::new() }
+    }
 }
 
 /// Anthropic's cache breakpoint as the client sent it: `{"type": "ephemeral",
@@ -119,6 +130,42 @@ pub enum AnthropicContent {
     Blocks(Vec<ContentBlock>),
 }
 
+/// The citations a text block's other members carry (`citations`, a list in
+/// the spec; any other shape, or `null`, is none).
+pub fn block_citations(extra: &BTreeMap<String, Value>) -> Vec<Value> {
+    extra.get("citations").and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
+/// A text block's other members holding `citations` — none when there are
+/// none. Only a citation of a kind the Messages API defines is written
+/// ([`crate::audit::is_anthropic_citation`]): a domain text also carries an
+/// OpenAI client's annotations, which have no Anthropic shape and are named
+/// where the translation parsed them.
+pub fn citations_extra(citations: &[Value]) -> BTreeMap<String, Value> {
+    let anthropic: Vec<Value> = citations.iter().filter(|c| crate::audit::is_anthropic_citation(c)).cloned().collect();
+    if anthropic.is_empty() {
+        return BTreeMap::new();
+    }
+    BTreeMap::from([("citations".to_string(), Value::Array(anthropic))])
+}
+
+impl ContentBlock {
+    /// Write `new` over a text block's text. Its `citations` go with the text
+    /// they annotated: a citation quotes its source, so one kept beside an
+    /// edited text would still carry what the edit took out. `false` when the
+    /// block is no text.
+    pub fn write_text(&mut self, new: &str) -> bool {
+        match self {
+            Self::Text { text, extra, .. } => {
+                *text = new.to_string();
+                extra.remove("citations");
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Anthropic content block — tagged by `type`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -128,6 +175,11 @@ pub enum ContentBlock {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// The block's other members (`citations`), sent on as the client
+        /// wrote them on a same-protocol forward. Held untyped, so no shape of
+        /// theirs can turn the block into an unread one.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
     },
     #[serde(rename = "image")]
     Image {
@@ -146,6 +198,10 @@ pub enum ContentBlock {
         input: Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// The block's other members (`caller`, `toolset_name`), sent on as
+        /// the client wrote them on a same-protocol forward.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -164,9 +220,9 @@ pub enum ContentBlock {
     #[serde(rename = "document")]
     Document {
         source: ImageSource,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "lenient_text", skip_serializing_if = "Option::is_none")]
         title: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, deserialize_with = "lenient_text", skip_serializing_if = "Option::is_none")]
         context: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         citations: Option<Value>,
@@ -188,7 +244,7 @@ pub enum ContentBlock {
 impl ToolResultBlock {
     /// A plain text block the gateway writes.
     pub fn text(text: String) -> Self {
-        Self::Text { text, cache_control: None }
+        Self::Text { text, cache_control: None, extra: BTreeMap::new() }
     }
 
     /// Make `new` a tool result's whole text, its other blocks (an image, a
@@ -209,8 +265,11 @@ impl ToolResultBlock {
             blocks.insert(0, Self::text(new.to_string()));
             return;
         };
-        if let Self::Text { text, .. } = &mut blocks[keep] {
+        // The texts' citations go with what the edit wrote over: a quote kept
+        // would still carry what it took out.
+        if let Self::Text { text, extra, .. } = &mut blocks[keep] {
             *text = new.to_string();
+            extra.remove("citations");
         }
         let mut i = 0;
         blocks.retain(|b| {
@@ -267,6 +326,9 @@ pub enum ToolResultBlock {
         text: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// The block's other members (`citations`), as [`ContentBlock::Text`]'s.
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
     },
     #[serde(rename = "image")]
     Image {
@@ -278,9 +340,16 @@ pub enum ToolResultBlock {
         #[serde(flatten)]
         extra: BTreeMap<String, Value>,
     },
+    /// The spec's one document block, as [`ContentBlock::Document`].
     #[serde(rename = "document")]
     Document {
         source: ImageSource,
+        #[serde(default, deserialize_with = "lenient_text", skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, deserialize_with = "lenient_text", skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        citations: Option<Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
     },
@@ -307,6 +376,17 @@ pub struct ImageSource {
     pub content: Option<Vec<ContentBlock>>,
 }
 
+/// A document's `title` or `context`: a string, else none. A value of
+/// another shape, which the spec does not allow, must not turn the document
+/// into an unread `Unknown` block (its body would escape every screen); it is
+/// left out, as the API would refuse it.
+fn lenient_text<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<String>, D::Error> {
+    Ok(match Value::deserialize(de)? {
+        Value::String(text) => Some(text),
+        _ => None,
+    })
+}
+
 fn source_content<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Vec<ContentBlock>>, D::Error> {
     #[derive(Deserialize)]
     #[serde(untagged)]
@@ -315,7 +395,7 @@ fn source_content<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Vec<
         Blocks(Vec<ContentBlock>),
     }
     Ok(Option::<Content>::deserialize(de)?.map(|content| match content {
-        Content::Text(text) => vec![ContentBlock::Text { text, cache_control: None }],
+        Content::Text(text) => vec![ContentBlock::Text { text, cache_control: None, extra: BTreeMap::new() }],
         Content::Blocks(blocks) => blocks,
     }))
 }
@@ -674,7 +754,7 @@ impl MessagesRequest {
                             object.insert("cache_control".into(), breakpoint);
                         }
                         if !list.removed.is_empty() && list.kept == 0 {
-                            follow_with = Some(ContentBlock::Text { text: notice(&list.removed), cache_control: None });
+                            follow_with = Some(ContentBlock::Text { text: notice(&list.removed), cache_control: None, extra: BTreeMap::new() });
                         }
                     }
                     _ => {}
@@ -1024,11 +1104,13 @@ mod tests {
                 r#type: "text".to_string(),
                 text: "First".to_string(),
                 cache_control: None,
+                extra: BTreeMap::new(),
             },
             SystemBlock {
                 r#type: "text".to_string(),
                 text: "Second".to_string(),
                 cache_control: None,
+                extra: BTreeMap::new(),
             },
         ]);
         assert_eq!(blocks.to_text(), "First\n\nSecond");
@@ -1215,6 +1297,84 @@ mod tests {
         let serialized = serde_json::to_string(&tools[0]).unwrap();
         assert!(serialized.contains("web_search_20250305"));
         assert!(!serialized.contains("input_schema"));
+    }
+
+    /// Every member the spec gives a block this type names travels on a
+    /// same-protocol forward as the client wrote it: each citation kind on a
+    /// text block (in a message, a tool result and the system prompt), a call's
+    /// `caller` and `toolset_name`, and a tool result's document's `title`,
+    /// `context` and `citations` — the spec's one `DocumentBlockParam`. Shapes
+    /// from the Messages API reference (`TextBlockParam`, `TextCitationParam`,
+    /// `ToolUseBlockParam`, `ToolResultBlockParam`, `DocumentBlockParam`).
+    #[test]
+    fn every_spec_member_of_a_block_survives_a_same_protocol_forward() {
+        let citations = serde_json::json!([
+            {"type": "char_location", "cited_text": "a", "document_index": 0, "document_title": "Doc", "start_char_index": 0, "end_char_index": 1},
+            {"type": "page_location", "cited_text": "b", "document_index": 0, "document_title": null, "start_page_number": 1, "end_page_number": 2},
+            {"type": "content_block_location", "cited_text": "c", "document_index": 1, "document_title": "Doc", "start_block_index": 0, "end_block_index": 1},
+            {"type": "web_search_result_location", "cited_text": "d", "encrypted_index": "EiQ", "title": "Page", "url": "https://example.com/"},
+            {"type": "search_result_location", "cited_text": "e", "search_result_index": 0, "source": "https://example.com/kb", "title": "KB", "start_block_index": 0, "end_block_index": 1}
+        ]);
+        let body = serde_json::json!({
+            "model": "claude-x", "max_tokens": 64,
+            "system": [{"type": "text", "text": "be brief", "citations": citations}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "q", "citations": citations}]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "per the source", "citations": citations},
+                    {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"},
+                     "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}},
+                    {"type": "tool_use", "id": "toolu_2", "name": "click", "input": {}, "caller": {"type": "direct"}, "toolset_name": "browser"}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "found", "citations": citations},
+                        {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "body"},
+                         "title": "Notes", "context": "from the wiki", "citations": {"enabled": true}}
+                    ]},
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "ok"}
+                ]}
+            ]
+        });
+        let req: MessagesRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&req).unwrap(), body);
+    }
+
+    /// A tool result's text an edit writes takes every text's citations with
+    /// it — a quote would still carry what the edit took out.
+    #[test]
+    fn an_edited_text_keeps_no_citations() {
+        let cite = serde_json::json!({"type": "char_location", "cited_text": "card 4111", "document_index": 0, "document_title": null,
+            "start_char_index": 0, "end_char_index": 9});
+        let mut blocks: Vec<ToolResultBlock> = serde_json::from_value(serde_json::json!([
+            {"type": "text", "text": "a", "citations": [cite]},
+            {"type": "text", "text": "card 4111", "cache_control": {"type": "ephemeral"}, "citations": [cite]},
+        ]))
+        .unwrap();
+        ToolResultBlock::set_text(&mut blocks, "[withheld]");
+        assert_eq!(
+            serde_json::to_value(&blocks).unwrap(),
+            serde_json::json!([{"type": "text", "text": "[withheld]", "cache_control": {"type": "ephemeral"}}])
+        );
+    }
+
+    /// A document whose name or context has a shape the spec does not allow is
+    /// still a document — its body read, the bad member left out — at the top
+    /// and in a tool result.
+    #[test]
+    fn an_off_spec_document_member_never_turns_the_document_unread() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({"model": "m", "max_tokens": 8, "messages": [
+            {"role": "user", "content": [
+                {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "body"}, "title": 5, "context": {"x": 1}},
+                {"type": "tool_result", "tool_use_id": "c1", "content": [
+                    {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "body"}, "title": ["t"]}]},
+            ]},
+        ]}))
+        .unwrap();
+        let AnthropicContent::Blocks(blocks) = &req.messages[0].content else { panic!() };
+        assert_matches!(&blocks[0], ContentBlock::Document { title: None, context: None, .. });
+        assert_matches!(&blocks[1], ContentBlock::ToolResult { content: Some(ToolResultContent::Blocks(inner)), .. }
+            if matches!(&inner[0], ToolResultBlock::Document { title: None, .. }));
     }
 
     #[test]

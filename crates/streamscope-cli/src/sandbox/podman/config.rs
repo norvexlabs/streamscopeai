@@ -19,9 +19,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use streamscope_client_templates::sandbox_image;
 
 /// Where `sandbox.json` lives, under the project root.
-pub const SANDBOX_FILE: &str = ".streamscopeai/sandbox.json";
+pub const SANDBOX_FILE: &str = crate::sandbox::DOCKER_SANDBOX_FILE;
 
 /// The sandbox a run starts: the one field of `Sandboxes`.
 pub const DEFAULT_SANDBOX: &str = "default";
@@ -80,6 +81,7 @@ struct SandboxFile {
     devcontainer: Option<String>,
     #[serde(default)]
     docker: bool,
+    network: Option<crate::sandbox::NetworkChoice>,
     memory: Option<String>,
     cpus: Option<f64>,
     pids: Option<u32>,
@@ -114,8 +116,10 @@ pub struct DockerConfig {
     pub source: ImageSource,
     /// The `devcontainer.json` file, when the image comes from one.
     pub devcontainer: Option<PathBuf>,
-    /// `features` are present: the image needs the devcontainer CLI to build.
-    pub has_features: bool,
+    /// With `features` (the image needs the devcontainer CLI to build), what
+    /// that build reads beside the image and the users: `features`,
+    /// `overrideFeatureInstallOrder` and `build.cacheFrom` (as `cacheFrom`).
+    pub features: Option<serde_json::Map<String, Value>>,
     /// `remoteUser` and `containerUser`: who the agent runs as, with the
     /// image's own metadata (see `prepare`). Both `None`: the image decides.
     pub remote_user: Option<String>,
@@ -124,6 +128,8 @@ pub struct DockerConfig {
     pub workspace_folder: Option<String>,
     /// Run an engine (dockerd) inside.
     pub docker: bool,
+    /// `network`: `gateway` narrows the run to the gateway alone.
+    pub network: Option<crate::sandbox::NetworkChoice>,
     pub limits: Limits,
     /// The lifecycle commands and the environment it sets.
     pub lifecycle: Lifecycle,
@@ -277,22 +283,43 @@ pub fn resolve(root: &Path, text: &str, read: &dyn Fn(&Path) -> Result<String>) 
     resolve_one(root, file, read)
 }
 
+/// The configuration of a project without a `sandbox.json`, from its
+/// workspace's profile default: the image, the engine and the limits; the
+/// rest as a `sandbox.json` naming only that image has it.
+pub fn from_profile_default(default: &sandbox_image::DefaultImage) -> Result<DockerConfig> {
+    default.validate().map_err(|e| anyhow::anyhow!("your organisation's default sandbox image: {e}"))?;
+    Ok(DockerConfig {
+        source: ImageSource::Image(registry_reference(default.image.trim())),
+        devcontainer: None,
+        features: None,
+        remote_user: None,
+        container_user: None,
+        workspace_folder: None,
+        docker: default.docker,
+        network: None,
+        limits: Limits { memory: default.memory.clone(), cpus: default.cpus, pids: DEFAULT_PIDS },
+        lifecycle: Lifecycle::default(),
+        notes: Vec::new(),
+    })
+}
+
 fn resolve_one(root: &Path, file: SandboxFile, read: &dyn Fn(&Path) -> Result<String>) -> Result<DockerConfig> {
     let limits = limits(&file)?;
     match (file.image, file.devcontainer) {
         (Some(image), None) => {
             let image = image.trim();
-            if !image_reference(image) {
+            if !sandbox_image::image_reference(image) {
                 bail!("{SANDBOX_FILE}: `image` must be an image reference, got {image:?}");
             }
             Ok(DockerConfig {
                 source: ImageSource::Image(registry_reference(image)),
                 devcontainer: None,
-                has_features: false,
+                features: None,
                 remote_user: None,
                 container_user: None,
                 workspace_folder: None,
                 docker: file.docker,
+                network: file.network,
                 limits,
                 lifecycle: Lifecycle::default(),
                 notes: Vec::new(),
@@ -302,7 +329,7 @@ fn resolve_one(root: &Path, file: SandboxFile, read: &dyn Fn(&Path) -> Result<St
             let path = inside(root, &rel).with_context(|| format!("{SANDBOX_FILE}: `devcontainer`"))?;
             let text = read(&path).with_context(|| format!("read {}", path.display()))?;
             let value = crate::writer::json::parse_jsonc(&text).with_context(|| format!("parse {}", path.display()))?;
-            devcontainer(root, &path, &value, file.docker, limits)
+            devcontainer(root, &path, &value, file.docker, limits).map(|c| DockerConfig { network: file.network, ..c })
         }
         (Some(_), Some(_)) => bail!("{SANDBOX_FILE}: set `image` or `devcontainer`, not both"),
         (None, None) => bail!("{SANDBOX_FILE}: set `image` (an image reference) or `devcontainer` (a devcontainer.json path)"),
@@ -310,14 +337,13 @@ fn resolve_one(root: &Path, file: SandboxFile, read: &dyn Fn(&Path) -> Result<St
 }
 
 fn limits(file: &SandboxFile) -> Result<Limits> {
-    if let Some(m) = &file.memory {
-        let digits = m.strip_suffix(['b', 'k', 'm', 'g', 'B', 'K', 'M', 'G']).unwrap_or(m);
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            bail!("{SANDBOX_FILE}: `memory` must be a size such as \"6g\", got {m:?}");
-        }
+    if let Some(m) = &file.memory
+        && !sandbox_image::memory(m)
+    {
+        bail!("{SANDBOX_FILE}: `memory` must be a size such as \"6g\", got {m:?}");
     }
     if let Some(c) = file.cpus
-        && !(c > 0.0 && c <= 1024.0)
+        && !sandbox_image::cpus(c)
     {
         bail!("{SANDBOX_FILE}: `cpus` must be above 0 and at most 1024, got {c}");
     }
@@ -394,7 +420,7 @@ fn devcontainer(root: &Path, path: &Path, value: &Value, docker: bool, limits: L
         expand(text, root, Some(&container_workspace)).with_context(|| format!("{shown}: `{key}`"))
     };
     let source = match (string("image")?, obj.get("build")) {
-        (Some(image), None) if !image_reference(&image) => bail!("{shown}: `image` must be an image reference, got {image:?}"),
+        (Some(image), None) if !sandbox_image::image_reference(&image) => bail!("{shown}: `image` must be an image reference, got {image:?}"),
         (Some(image), None) => ImageSource::Image(registry_reference(&image)),
         (None, Some(build)) => build_source(root, dir, build, &expand_here).with_context(|| format!("{shown}: `build`"))?,
         (Some(_), Some(_)) => bail!("{shown}: set `image` or `build`, not both"),
@@ -421,15 +447,24 @@ fn devcontainer(root: &Path, path: &Path, value: &Value, docker: bool, limits: L
     }) {
         bail!("{shown}: the local feature {local:?} is refused by the docker sandbox — publish it, or install it in a Dockerfile");
     }
-    // With `features` the whole file goes to the Dev Container CLI, which may
-    // run it on the host while it builds.
-    // The same CLI expands `${env:…}` from this machine's environment, the
-    // shell's `${env:-x}` included.
-    if has_features && text.contains("${env:") {
-        bail!("{shown}: `${{env:…}}` is refused beside `features` — the Dev Container CLI that builds them would read it from your environment");
-    }
-    if has_features && obj.contains_key("initializeCommand") {
-        bail!("{shown}: `initializeCommand` is refused beside `features` — the Dev Container CLI that builds them could run it on the host");
+    // With `features` the Dev Container CLI builds the image from a copy
+    // holding what its build reads (`prepare`): these keys, the image, the
+    // users and the workspace path. That CLI expands `${env:…}` from this
+    // machine's environment, the shell's `${env:-x}` included.
+    let features = has_features.then(|| {
+        let mut keys = serde_json::Map::new();
+        for key in ["features", "overrideFeatureInstallOrder"] {
+            if let Some(v) = obj.get(key) {
+                keys.insert(key.into(), v.clone());
+            }
+        }
+        if let Some(v) = obj.get("build").and_then(|b| b.get("cacheFrom")) {
+            keys.insert("cacheFrom".into(), v.clone());
+        }
+        keys
+    });
+    if features.as_ref().is_some_and(|f| Value::Object(f.clone()).to_string().contains("${env:")) {
+        bail!("{shown}: `${{env:…}}` is refused in `features` — the Dev Container CLI that builds them would read it from your environment");
     }
     let lifecycle = lifecycle_of(obj, &|key, text| {
         expand_lenient(text, root, &container_workspace).with_context(|| format!("{shown}: `{key}`"))
@@ -437,11 +472,12 @@ fn devcontainer(root: &Path, path: &Path, value: &Value, docker: bool, limits: L
     Ok(DockerConfig {
         source,
         devcontainer: Some(path.to_path_buf()),
-        has_features,
+        features,
         remote_user: string("remoteUser")?.map(|u| expand_here(&u, "remoteUser")).transpose()?,
         container_user: string("containerUser")?.map(|u| expand_here(&u, "containerUser")).transpose()?,
         workspace_folder,
         docker,
+        network: None,
         limits,
         lifecycle,
         notes,
@@ -490,27 +526,12 @@ fn in_project(root: &Path, dir: &Path, rel: &str, key: &str) -> Result<PathBuf> 
     Ok(out)
 }
 
-/// Podman transports that read the image from a path, not a registry: one
-/// would import a host file from outside the project.
-const PATH_TRANSPORTS: &[&str] =
-    &["dir", "oci", "oci-archive", "docker-archive", "containers-storage", "docker-daemon", "sif", "tarball", "ostree"];
 
 /// `image` as podman stores it: a `docker://` transport is the registry's own.
 fn registry_reference(image: &str) -> String {
     image.strip_prefix("docker://").unwrap_or(image).to_string()
 }
 
-/// A positional image reference from a registry: not empty, not an option,
-/// one word, no path transport.
-fn image_reference(image: &str) -> bool {
-    // Checked as podman will read it: a path transport behind `docker://`
-    // is still one.
-    let image = image.strip_prefix("docker://").unwrap_or(image);
-    !image.is_empty()
-        && !image.starts_with('-')
-        && !image.chars().any(|c| c.is_whitespace() || c.is_control())
-        && !image.split_once(':').is_some_and(|(scheme, _)| PATH_TRANSPORTS.contains(&scheme))
-}
 
 /// `text` with the Dev Container variables it names expanded:
 /// `${localWorkspaceFolder}` and `${localWorkspaceFolderBasename}` (the
@@ -637,6 +658,17 @@ mod tests {
         assert_eq!(c.source, ImageSource::Image("ghcr.io/team/dev:1".into()));
         assert!(!c.docker && c.remote_user.is_none() && c.container_user.is_none() && c.workspace_folder.is_none() && c.notes.is_empty());
         assert_eq!(c.limits, Limits { memory: None, cpus: None, pids: DEFAULT_PIDS });
+    }
+
+    #[test]
+    fn network_narrows_to_the_gateway_or_keeps_the_policy_and_nothing_else() {
+        use crate::sandbox::NetworkChoice;
+        let read = |net: &str| resolve(Path::new("/p"), &format!(r#"{{"sandboxes": {{"default": {{"image": "a", "network": {net}}}}}}}"#), &no_file);
+        assert_eq!(read(r#""gateway""#).unwrap().network, Some(NetworkChoice::Gateway));
+        assert_eq!(read(r#""policy""#).unwrap().network, Some(NetworkChoice::Policy));
+        assert_eq!(resolve(Path::new("/p"), r#"{"sandboxes": {"default": {"image": "a"}}}"#, &no_file).unwrap().network, None);
+        // It can only narrow: `open` is not a choice.
+        assert!(read(r#""open""#).is_err());
     }
 
     #[test]
@@ -769,7 +801,7 @@ mod tests {
         assert_eq!(c.source, ImageSource::Image("mcr.microsoft.com/devcontainers/base:ubuntu-24.04".into()));
         assert_eq!(c.remote_user.as_deref(), Some("vscode"));
         assert_eq!(c.workspace_folder.as_deref(), Some("/workspaces/app"));
-        assert!(c.has_features);
+        assert!(c.features.is_some());
         assert_eq!(c.devcontainer.as_deref(), Some(Path::new("/p/.devcontainer/devcontainer.json")));
         // Each kept as it is: which wins is decided with the image's metadata.
         let c = resolve_entry(Path::new("/p"), DC, &with(r#"{"image": "a", "containerUser": "dev"}"#)).unwrap();
@@ -897,7 +929,7 @@ mod tests {
             &with(r#"{"build": {"dockerfile": "D", "cacheFrom": "x"}, "features": {"ghcr.io/devcontainers/features/node:1": {}}}"#),
         )
         .unwrap();
-        assert!(c.has_features && !c.notes.iter().any(|n| n.contains("not used")), "{:?}", c.notes);
+        assert!(c.features.is_some() && !c.notes.iter().any(|n| n.contains("not used")), "{:?}", c.notes);
         assert!(c.notes.iter().any(|n| n.contains("`build.cacheFrom` is pulled by the Dev Container CLI")), "{:?}", c.notes);
     }
 
@@ -923,21 +955,24 @@ mod tests {
             assert!(format!("{:#}", resolve_entry(Path::new("/p"), DC, &read).unwrap_err()).contains("local feature"), "{local}");
         }
         let c = resolve_entry(Path::new("/p"), DC, &with(r#"{"image": "a", "features": {"ghcr.io/devcontainers/features/node:1": {}}}"#)).unwrap();
-        assert!(c.has_features);
+        assert!(c.features.is_some());
     }
 
     #[test]
-    fn initialize_command_beside_features_is_refused() {
-        let both = r#"{"image": "a", "features": {"f:1": {}}, "initializeCommand": "x"}"#;
-        assert!(format!("{:#}", resolve_entry(Path::new("/p"), DC, &with(both)).unwrap_err()).contains("initializeCommand"));
-        // Without features it is noted, never run.
-        let c = resolve_entry(Path::new("/p"), DC, &with(r#"{"image": "a", "initializeCommand": "x"}"#)).unwrap();
+    fn only_what_the_features_build_reads_is_held_for_it() {
+        let dc = r#"{"image": "a", "features": {"f:1": {"v": "2"}}, "overrideFeatureInstallOrder": ["f"],
+            "initializeCommand": "x", "postCreateCommand": "echo ${env:-dev}", "remoteEnv": {"A": "1"}}"#;
+        let c = resolve_entry(Path::new("/p"), DC, &with(dc)).unwrap();
+        let keys: Vec<&String> = c.features.as_ref().unwrap().keys().collect();
+        assert_eq!(keys, ["features", "overrideFeatureInstallOrder"]);
+        // `initializeCommand` is noted, never run, features or not.
         assert!(c.notes.iter().any(|n| n.contains("`initializeCommand`")));
+        let cached = r#"{"build": {"dockerfile": "Dockerfile", "cacheFrom": "x/y"}, "features": {"f:1": {}}}"#;
+        let c = resolve_entry(Path::new("/p"), DC, &with(cached)).unwrap();
+        assert_eq!(c.features.unwrap().get("cacheFrom"), Some(&Value::String("x/y".into())));
         // The CLI building features reads `${env:…}` from this machine, the shell's `${env:-x}` too.
-        let env = r#"{"image": "a", "features": {"f:1": {}}, "postCreateCommand": "echo ${env:-dev}"}"#;
-        assert!(format!("{:#}", resolve_entry(Path::new("/p"), DC, &with(env)).unwrap_err()).contains("beside `features`"));
-        // Without features the shell's form is the shell's (the positive control).
-        assert!(resolve_entry(Path::new("/p"), DC, &with(r#"{"image": "a", "postCreateCommand": "echo ${env:-dev}"}"#)).is_ok());
+        let env = r#"{"image": "a", "features": {"f:1": {"v": "${env:-dev}"}}}"#;
+        assert!(format!("{:#}", resolve_entry(Path::new("/p"), DC, &with(env)).unwrap_err()).contains("in `features`"));
     }
 
 

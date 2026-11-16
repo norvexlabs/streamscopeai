@@ -173,7 +173,7 @@
   open={confirmReset}
   title="Reset to seed"
   message={info.standaloneOnly
-    ? 'Offer every client again, detach every sandbox destination list and put the sandbox settings back to their defaults?'
+    ? 'Offer every client again, and put the sandbox back to a new profile\'s: its network on Internet with only the Internal networks list attached, blocked (on Allowed lists only, with nothing attached, if that list was deleted), and its other settings at their defaults?'
     : isDefault
     ? 'Restore this Default profile to the built-in defaults? Your changes to it will be lost.'
     : 'Restore this profile to a fresh copy of the built-in defaults? Its current content will be replaced.'}

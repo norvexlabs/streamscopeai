@@ -5,8 +5,10 @@
 //! In order: take every signal it handles (blocked, then read in one loop —
 //! PID 1 has no default action for a signal it does not handle); start the
 //! relay (`127.0.0.1:<port>` → the guard's socket — the container's only
-//! way out); with an engine inside, give it its own cgroup and start
-//! `dockerd`; run the project's lifecycle commands as the image's user (the
+//! way out); with an engine inside, route every connection to the guard
+//! (`routing.rs`) and listen on the routing stub's address too (the proxy
+//! the variables name, which the engine's containers reach), give the engine
+//! its own cgroup and start `dockerd`; run the project's lifecycle commands as the image's user (the
 //! create ones only when this home has not run them on this image); start
 //! the agent as that user; then reap every child
 //! until the agent exits, and exit with its status, written to the exit file
@@ -63,6 +65,18 @@ pub struct Start {
     pub exit_file: String,
     /// A terminal is attached.
     pub tty: bool,
+    /// An OpenCode agent's gateway, for init to judge what OpenCode loads here.
+    pub opencode: Option<OpencodeCheck>,
+}
+
+/// What an OpenCode agent was provisioned with: the gateway's provider key and
+/// the main config's place in the container.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OpencodeCheck {
+    pub provider: String,
+    pub config: String,
+    /// A global provisioning: the config's own pins are judged too.
+    pub global: bool,
 }
 
 /// How long the engine may take to answer on its socket.
@@ -82,7 +96,13 @@ pub fn main(path: &Path) -> Result<()> {
     let start: Start = serde_json::from_str(&std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?)
         .context("read the start file")?;
     let signals = SignalSet::take(start.tty)?;
-    relay(start.relay_port, start.guard_socket.clone())?;
+    relay(std::net::Ipv4Addr::LOCALHOST, start.relay_port, start.guard_socket.clone())?;
+    if start.engine {
+        super::routing::start(&start.guard_socket)?;
+        // The proxy the variables name with an engine inside: the engine's
+        // containers reach this address, never the container's loopback.
+        relay(super::routing::STUB, start.relay_port, start.guard_socket.clone())?;
+    }
     let mut engine = if start.engine { Some(start_engine(&start)?) } else { None };
     // An engine that started is stopped on every way out: its cache is a
     // volume the next run starts from.
@@ -91,6 +111,7 @@ pub fn main(path: &Path) -> Result<()> {
             if Path::new(&start.cwd).is_dir() { Ok(()) } else { bail!("the working directory {} is not in the sandbox", start.cwd) }
         })
         .and_then(|()| lifecycle(&start, &signals, &mut engine))
+        .map(|()| report_opencode(&start, &signals, &mut engine))
         .and_then(|()| {
             if signals.stop_pending(&mut engine) { bail!("the run was stopped before the agent started") } else { Ok(()) }
         })
@@ -111,6 +132,34 @@ pub fn main(path: &Path) -> Result<()> {
     // The exit file is what tells the agent's status from podman's own.
     write_exit(&start.exit_file, code);
     std::process::exit(code);
+}
+
+/// Print what OpenCode's configs in the container do to the provisioned one —
+/// read after the lifecycle commands that may write a config, by
+/// `__opencode-check` started as the agent (its user, groups, environment and
+/// working directory): init is root, and never reads a file the agent placed.
+/// A stop while it runs is passed to it, as to a lifecycle command.
+fn report_opencode(start: &Start, signals: &SignalSet, engine: &mut Option<libc::pid_t>) {
+    let Some(check) = &start.opencode else { return };
+    let mut argv = vec![
+        super::plan::INIT_BINARY.to_string(),
+        "__opencode-check".into(),
+        format!("--provider={}", check.provider),
+        format!("--config={}", check.config),
+    ];
+    if check.global {
+        argv.push("--global".into());
+    }
+    let child = agent_command(start, &argv, &start.cwd).and_then(|mut cmd| {
+        cmd.stdin(std::process::Stdio::null());
+        cmd.spawn().context("start the check")
+    });
+    match child {
+        Ok(child) => {
+            signals.wait_for(child.id() as libc::pid_t, engine);
+        }
+        Err(e) => eprintln!("ssai: OpenCode's configs in the sandbox were not checked: {e:#}"),
+    }
 }
 
 /// Write the exit code to `path`, a file in a directory the agent can write:
@@ -235,11 +284,11 @@ fn reap(agent: libc::pid_t, engine: &mut Option<libc::pid_t>) -> Option<i32> {
     }
 }
 
-/// Listen on `127.0.0.1:<port>` and pass every connection to the guard's
+/// Listen on `<addr>:<port>` and pass every connection to the guard's
 /// socket, one thread pair per connection. It lives in init, so it lives as
 /// long as the container.
-fn relay(port: u16, socket: String) -> Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("listen on 127.0.0.1:{port}"))?;
+fn relay(addr: std::net::Ipv4Addr, port: u16, socket: String) -> Result<()> {
+    let listener = TcpListener::bind((addr, port)).with_context(|| format!("listen on {addr}:{port}"))?;
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             // A failed accept (out of fds, say) backs off instead of
@@ -264,7 +313,7 @@ fn relay(port: u16, socket: String) -> Result<()> {
 /// Copy both ways. The client closing its side passes on to the guard; the
 /// guard closing ends the connection both ways, so an idle client that never
 /// closes does not hold the upload thread.
-fn pipe(tcp: TcpStream, unix: UnixStream) {
+pub(super) fn pipe(tcp: TcpStream, unix: UnixStream) {
     let (Ok(mut tcp_r), Ok(mut unix_r)) = (tcp.try_clone(), unix.try_clone()) else { return };
     let (mut tcp_w, mut unix_w) = (tcp, unix);
     let Ok(up) = std::thread::Builder::new().spawn(move || {
@@ -291,23 +340,25 @@ fn copy(from: &mut impl Read, to: &mut impl Write) -> std::io::Result<()> {
 
 /// Start `dockerd` in its own cgroup and its own process group (a Ctrl-C at
 /// the agent's terminal, sent to the foreground group, must not stop it),
-/// reaching registries through the relay, its socket the agent group's; wait
-/// until it answers.
+/// reaching registries through the routing like everything else, its socket
+/// the agent group's; wait until it answers. No ip6tables: the sandbox has no
+/// IPv6 route, and an image's legacy ip6tables may lack the filter table a
+/// dual-stack network (kind's) would be refused for.
 fn start_engine(start: &Start) -> Result<libc::pid_t> {
     delegate_cgroups();
-    let proxy = format!("http://127.0.0.1:{}", start.relay_port);
     let log = std::fs::File::create(ENGINE_LOG).context("create the engine log")?;
     let child = std::process::Command::new("dockerd")
         .process_group(0)
         .arg(format!("--group={}", start.gid))
-        .env("HTTP_PROXY", &proxy)
-        .env("HTTPS_PROXY", &proxy)
-        .env("NO_PROXY", "localhost,127.0.0.1,::1")
+        .arg("--ip6tables=false")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
-        .context("start dockerd — `\"docker\": true` needs an image with Docker Engine installed")?;
+        .context(
+            "start dockerd — the sandbox's image has no Docker Engine: run `ssai sandbox prepare <client>` to add \
+             one, or install it in the image",
+        )?;
     let pid = child.id() as libc::pid_t;
     let deadline = std::time::Instant::now() + ENGINE_READY;
     while UnixStream::connect(ENGINE_SOCKET).is_err() {
@@ -620,6 +671,7 @@ mod tests {
             engine: false,
             exit_file: "/run/ssai-sock/exit".into(),
             tty: true,
+            opencode: None,
         };
         let back: Start = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
@@ -645,7 +697,7 @@ mod tests {
             }
         });
         let port = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        relay(port, sock.to_string_lossy().into_owned()).unwrap();
+        relay(std::net::Ipv4Addr::LOCALHOST, port, sock.to_string_lossy().into_owned()).unwrap();
         let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
         c.write_all(b"hello").unwrap();
         let mut back = [0u8; 5];
@@ -720,6 +772,7 @@ mod tests {
             engine: false,
             exit_file: String::new(),
             tty: false,
+            opencode: None,
         };
         let (dir, marker) = create_marker(&h, "k");
         // `~/.ssai` a symlink the agent left: refused, its target untouched.

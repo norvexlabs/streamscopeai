@@ -127,6 +127,9 @@ pub struct ProvisionArgs {
 }
 
 pub async fn run(mut args: ProvisionArgs) -> Result<()> {
+    // Before the gateway is asked for anything: no commit may pick up the
+    // tokens and keys the run records.
+    crate::state::keep_global_state_out_of_git()?;
     let session = session::open(args.host.as_deref()).await?;
     let api = &session.api;
     // First, so a provision this build can no longer make still names the fix.
@@ -632,6 +635,11 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
         println!("{line}");
     }
 
+    // A project's own state records the keys this run mints, in every mode.
+    for job in scope_jobs.iter().filter(|j| j.is_project) {
+        crate::state::keep_project_state_out_of_git(&job.paths)?;
+    }
+
     // ----- Key strategy -----
     // Precedence per group (one client each): out-of-band key
     // (`STREAMSCOPE_GATEWAY_KEY`, render-only) > CI per-run short-TTL mint > the
@@ -703,7 +711,8 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
     let single_key_run = all_groups.len() == 1;
 
     for job in &mut scope_jobs {
-        // Create the state dir (+ project `.gitignore`) before any write/backup.
+        // The global state dir before any write/backup (a project's was
+        // created, with its `.gitignore`, by the git check above, in every mode).
         if !args.dry_run && !args.print {
             job.paths.ensure()?;
         }
@@ -958,7 +967,7 @@ pub async fn run(mut args: ProvisionArgs) -> Result<()> {
         // now, not when it silently runs on another provider.
         if !args.dry_run && !args.print {
             for m in group_results.iter().flat_map(|gr| &gr.managed) {
-                for warning in crate::opencode_global::for_managed(m) {
+                for warning in crate::opencode_global::for_managed(m, job.paths.project_root()) {
                     crate::ui::warn_out("  ", &warning.text);
                 }
             }
@@ -1162,21 +1171,28 @@ pub(crate) fn provision_one(
             bail!("{} writes {} twice — fix the client profile's companion paths", cb.label, p.filename);
         }
     }
-    // A file git tracks would commit the key with it — in a project, or in a
-    // home directory that is a git repository: a `.gitignore` line cannot
-    // untrack it, so the client is refused before any of its files is written.
-    if let Some(key) = plaintext.filter(|k| !k.is_empty())
-        && let Some(p) = pending
-            .iter()
-            .find(|p| p.outcome.contents.contains(key) && crate::state::git_tracks(&p.path))
-    {
-        bail!(
-            "{} is tracked by git, so your gateway key \
-             would reach its next commit — keep the file out of git, or provision {} in the other \
-             scope (`--global` or `--dir`)",
-            p.filename,
+    // No commit may pick up a file the key is written into — in a project, or
+    // in a home directory that is a git repository — so before any of the
+    // client's files is written, one git tracks (a `.gitignore` line cannot
+    // untrack it) or cannot answer for refuses the client, and an exposed one
+    // the project's `.gitignore` does not reach is excluded in its repository.
+    if let Some(key) = plaintext.filter(|k| !k.is_empty()) {
+        let remedy = format!(
+            "keep the file out of git, or provision {} in the other scope (`--global` or `--dir`)",
             cb.label
         );
+        for p in pending.iter().filter(|p| p.outcome.contents.contains(key)) {
+            let left_to_gitignore = paths
+                .project_root()
+                .is_some_and(|root| crate::state::covered_by_project_gitignore(root, &p.path));
+            crate::state::keep_out_of_git(
+                crate::state::GitTarget::File(&p.path),
+                "your gateway key",
+                &remedy,
+                left_to_gitignore,
+                mode.dry_run,
+            )?;
+        }
     }
     if mode.dry_run {
         for p in &pending {
@@ -3213,6 +3229,7 @@ fn detect_in(dirs: &crate::state::UserDirs, os: Platform, which: impl Fn(&str) -
         ("opencode", "opencode", "", &[], "~/.config/opencode"),
         ("crush", "crush", "", &[], "~/.config/crush"),
         ("aider", "aider", "", &[], "~/.aider.conf.yml"),
+        ("open-code-review", "ocr", "", &[], "~/.opencodereview"),
         // The Continue CLI (`cn`) and its extension, in any editor, read `~/.continue`.
         ("continue", "cn", "continue.continue-", ANY_EDITOR, "~/.continue"),
         // Cline is configured in VS Code's own settings file, which no fork reads.

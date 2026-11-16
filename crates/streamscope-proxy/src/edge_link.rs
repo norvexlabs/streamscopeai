@@ -128,11 +128,12 @@ impl OutboxSink {
         self.durable_tools_call.load(Ordering::Relaxed)
     }
 
-    /// Buffer each tenant's records with their content, in a transaction per
-    /// tenant: one tenant's failure takes no other's records with it. Calls
-    /// `held` for each record the outbox holds; returns how many it does not
-    /// — a failed tenant's (logged here) and any it dropped itself (logged by
-    /// the outbox).
+    /// Buffer each tenant's records with their content, tenant by tenant
+    /// (each in transactions of its own, [`OutboxV2::enqueue`]): one tenant's
+    /// failure takes no other's records with it. Calls `held` for each record
+    /// the outbox holds; returns how many it does not — those of a failed
+    /// transaction (logged here) and any it dropped itself (logged by the
+    /// outbox).
     async fn enqueue_groups(
         &self,
         groups: impl IntoIterator<Item = (uuid::Uuid, Vec<Enqueued>, Content)>,
@@ -146,8 +147,9 @@ impl OutboxSink {
                     indexes.into_iter().for_each(|i| held(&records[i].record));
                 }
                 Err(e) => {
-                    lost += records.len();
-                    tracing::error!(%tenant, count = records.len(), "records could not be buffered for admin-api — lost: {e}");
+                    lost += records.len() - e.held.len();
+                    e.held.iter().for_each(|&i| held(&records[i].record));
+                    tracing::error!(%tenant, count = e.lost, "records could not be buffered for admin-api — lost: {e}");
                 }
             }
         }

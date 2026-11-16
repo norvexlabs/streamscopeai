@@ -1341,6 +1341,10 @@ mod tests {
                     assert_eq!(doc["update"], "disable", "{}", t.title);
                 }
                 assert!(t.keyed_arrays.contains_key("/experimental/policies"), "{}", t.title);
+                // OpenCode 2.3 reads the top-level list after the experimental
+                // one; an earlier OpenCode 2 reads only the experimental one.
+                assert_eq!(doc["policies"], doc["experimental"]["policies"], "{}", t.title);
+                assert!(t.keyed_arrays.contains_key("/policies"), "{}", t.title);
             }
             checked += 1;
         }
@@ -1872,10 +1876,10 @@ mod tests {
                 checked.push(format!("{}/{}", profile.id, t.title));
             }
         }
-        // Every MCP-capable profile has a template here: 12 profiles, 23 templates.
+        // Every MCP-capable profile has a template here: 13 profiles, 27 templates.
         let profiles: std::collections::BTreeSet<&str> =
             checked.iter().map(|c| c.split('/').next().unwrap_or_default()).collect();
-        assert_eq!((profiles.len(), checked.len()), (12, 23), "{checked:#?}");
+        assert_eq!((profiles.len(), checked.len()), (13, 27), "{checked:#?}");
     }
 
     /// Claude Code reads MCP servers only from `~/.claude.json` (user scope)
@@ -2042,6 +2046,89 @@ mod tests {
                 assert_eq!(doc, expected, "{ctx}");
             }
         }
+    }
+
+    /// Open Code Review reads `~/.opencodereview/config.json`: `provider` names
+    /// an entry of `custom_providers` (any name that is not one of its presets),
+    /// which carries `protocol` (`anthropic` | `openai` | `openai-responses`),
+    /// `url`, `api_key`, `model` and the `models` a `--model` override may pick;
+    /// `mcp_servers.<name>` is `type: "remote"` + `url` + `headers` for an HTTP
+    /// server, each also sending `X-App-Id` (its MCP client's User-Agent is
+    /// Go's generic one). The protocol each LLM variant writes is the one its template
+    /// declares, and `url` is the address the gateway composed for that
+    /// protocol (its client appends `/v1/messages`, `/chat/completions` or
+    /// `/responses` itself). Shapes from the client's own config loader.
+    #[test]
+    fn open_code_review_names_the_gateway_provider_its_models_and_its_mcp_servers() {
+        let profile = seed("open-code-review");
+        let phs = validation_placeholders();
+        let aliases: Vec<serde_json::Value> = match phs.get("routes") {
+            Some(Value::List(routes)) => routes
+                .iter()
+                .map(|r| match r.get("model_alias") {
+                    Some(Value::String(a)) => serde_json::json!(a),
+                    other => panic!("route alias: {other:?}"),
+                })
+                .collect(),
+            other => panic!("routes: {other:?}"),
+        };
+        let mut protocols = Vec::new();
+        for t in &profile.templates {
+            for forward_auth in [false, true] {
+                let mut phs = validation_placeholders();
+                phs.insert("forward_auth".into(), Value::Bool(forward_auth));
+                // The provider's own model id differs from every alias, so a
+                // template naming it instead of the gateway's alias fails.
+                phs.insert("upstream_model".into(), Value::String("provider-side-model-id".into()));
+                let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+                let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
+                let ctx = format!("{} forward_auth={forward_auth}", t.title);
+                for slug in ["fs", "web"] {
+                    let server = &doc["mcp_servers"][slug];
+                    assert_eq!(server["type"], "remote", "{ctx}");
+                    assert_eq!(server["url"], format!("https://gw.example.com/mcp/{slug}").as_str(), "{ctx}");
+                    assert_eq!(
+                        server["headers"]["Authorization"],
+                        format!("Bearer <paste-your-{slug}-mcp-key-here>").as_str(),
+                        "{ctx}"
+                    );
+                    // Its MCP client sends Go's generic User-Agent: the header
+                    // is what names the app on the gateway's MCP rows.
+                    assert_eq!(server["headers"]["X-App-Id"], "open-code-review", "{ctx}");
+                }
+                if !t.kind.needs_llm() {
+                    assert!(doc.get("provider").is_none() && doc.get("custom_providers").is_none(), "{ctx}");
+                    continue;
+                }
+                assert_eq!(doc["provider"], "streamscope", "{ctx}");
+                let entry = &doc["custom_providers"]["streamscope"];
+                let protocol = entry["protocol"].as_str().expect("protocol").to_string();
+                let want = match t.protocol.as_deref() {
+                    Some("anthropic_messages") => "anthropic",
+                    Some("chat_completions") => "openai",
+                    Some("responses") => "openai-responses",
+                    other => panic!("{ctx}: no Open Code Review protocol for {other:?}"),
+                };
+                assert_eq!(protocol, want, "{ctx}");
+                assert_eq!(entry["url"], str_of(&phs, "base_url").as_str(), "{ctx}");
+                assert_eq!(entry["api_key"], str_of(&phs, "api_key").as_str(), "{ctx}");
+                assert_eq!(entry["model"], str_of(&phs, "model_slot_default").as_str(), "{ctx}");
+                assert_eq!(entry["models"], serde_json::Value::Array(aliases.clone()), "{ctx}");
+                if !forward_auth {
+                    protocols.push(protocol);
+                }
+            }
+            // With no server, the config carries no `mcp_servers` block.
+            if t.kind.needs_llm() {
+                let mut phs = validation_placeholders();
+                phs.insert("forward_auth".into(), Value::Bool(false));
+                phs.remove("mcp_servers");
+                let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+                let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
+                assert!(doc.get("mcp_servers").is_none(), "{}: {body}", t.title);
+            }
+        }
+        assert_eq!(protocols, ["anthropic", "openai", "openai-responses"]);
     }
 
     /// Replaces the constant at the former `companions.rs` vibe arm.

@@ -184,6 +184,8 @@ pub(crate) struct TimelineTurn {
     pub(crate) is_baseline: bool,
     pub(crate) response_content: Option<String>,
     pub(crate) response_tool_calls: Option<serde_json::Value>,
+    /// The sources the answer's text cites, each a `Citation`.
+    pub(crate) response_citations: Option<serde_json::Value>,
     /// The system prompt's hash; NULL except where the conversation renders
     /// the prompt — on a turn that [`Self::opens_view`] — unless [`turns`] was
     /// asked for every prompt (the raw format). The caller reads the bodies
@@ -291,7 +293,7 @@ pub(crate) async fn turns(
 ) -> sqlx::Result<Vec<TimelineTurn>> {
     sqlx::query_as(
         "SELECT t.request_id, t.timestamp, t.turn_number, \
-         t.is_baseline, t.response_content, t.response_tool_calls, \
+         t.is_baseline, t.response_content, t.response_tool_calls, t.response_citations, \
          CASE WHEN $2 OR v.opens_view THEN t.system_prompt_hash END AS system_prompt_hash, \
          t.transform_diff, v.opens_view, v.reads_whole, \
          CASE WHEN v.reads_whole THEN t.message_hashes ELSE t.added_hashes END AS message_hashes, \

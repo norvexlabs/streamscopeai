@@ -27,7 +27,9 @@
   import { scopeHref } from '#lib/tenant.js';
   import GuardrailBanner from '#lib/components/events/GuardrailBanner.svelte';
   import GuardrailPill from '#lib/components/events/GuardrailPill.svelte';
+  import FrameworkReminderEvent from '#lib/components/events/FrameworkReminderEvent.svelte';
   import MediaEvent from '#lib/components/events/MediaEvent.svelte';
+  import CitationList from '#lib/components/events/CitationList.svelte';
   import StoredMedia from '#lib/components/events/StoredMedia.svelte';
   import { guardrailsTone, dedupeBadgesByCode } from '#lib/badges.js';
   import { m } from '#lib/paraglide/messages.js';
@@ -588,6 +590,8 @@
                     {/if}
                   {/if}
                 </div>
+              {:else if ev.type === 'framework_reminder'}
+                <FrameworkReminderEvent event={ev} />
               {:else if ev.type === 'message'}
                 {@const gs = ev.guardrails ?? []}
                 <div
@@ -605,6 +609,7 @@
                       <pre class="text-xs font-mono text-(--text-secondary) whitespace-pre-wrap mt-1 italic">{m.audit_detail_thinking()} {ev.thinking}</pre>
                     {/if}
                     <pre class="text-xs font-mono text-(--text-primary) whitespace-pre-wrap mt-1">{ev.content}</pre>
+                    <CitationList citations={ev.citations ?? []} />
                   </div>
                   {#each gs as g}
                     <GuardrailBanner guardrail={g} />

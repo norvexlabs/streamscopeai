@@ -1,0 +1,50 @@
+{
+  "id": "open-code-review",
+  "label": "Open Code Review",
+  "targeted_client_version": "1.13.9",
+  "homepage": "https://github.com/alibaba/open-code-review",
+  "supports_llm": true,
+  "supports_mcp": true,
+  "launch_command": "ocr",
+  "templates": [
+    {
+      "kind": "combined",
+      "protocol": "anthropic_messages",
+      "route_tag": "open-code-review",
+      "filename": "~/.opencodereview/config.json",
+      "format": "json",
+      "title": "Open Code Review (Native Anthropic)",
+      "instructions": "Place at ~/.opencodereview/config.json. Pick this variant for Claude models: it speaks the Messages API end to end. `provider` selects the gateway entry under `custom_providers`; `model` is the gateway's default model and `models` lists every model this key reaches, so `ocr review --model <name>` can pick another. Gateway MCP servers go under `mcp_servers`, which Open Code Review offers to its review agent as tools; each sends `X-App-Id: open-code-review`, since its MCP client sends only Go's generic User-Agent. Open Code Review sends no telemetry unless `OCR_ENABLE_TELEMETRY=1` is set; its npm launcher checks the npm registry for a newer release unless `OCR_NO_UPDATE=1` is set.",
+      "body": "{\n  \"provider\": \"streamscope\",\n  \"custom_providers\": {\n    \"streamscope\": {\n      \"protocol\": \"anthropic\",\n      \"url\": \"{{base_url}}\",\n      \"api_key\": \"{{api_key}}\",\n      \"model\": \"{{model_alias}}\",\n      \"models\": [{{#each routes}}\"{{model_alias}}\"{{#unless @last}}, {{/unless}}{{/each}}]\n    }\n  }{{#if mcp_servers}},\n  \"mcp_servers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"remote\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"X-App-Id\": \"open-code-review\"{{#each headers}}, \"{{name}}\": \"{{value}}\"{{/each}} }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }{{/if}}\n}\n"
+    },
+    {
+      "kind": "combined",
+      "protocol": "chat_completions",
+      "route_tag": "open-code-review",
+      "filename": "~/.opencodereview/config.json",
+      "format": "json",
+      "title": "Open Code Review (OpenAI-compatible)",
+      "instructions": "Place at ~/.opencodereview/config.json. Works with every model the gateway serves, through the Chat Completions API. `provider` selects the gateway entry under `custom_providers`; `model` is the gateway's default model and `models` lists every model this key reaches, so `ocr review --model <name>` can pick another. Gateway MCP servers go under `mcp_servers`, which Open Code Review offers to its review agent as tools; each sends `X-App-Id: open-code-review`, since its MCP client sends only Go's generic User-Agent. Open Code Review sends no telemetry unless `OCR_ENABLE_TELEMETRY=1` is set; its npm launcher checks the npm registry for a newer release unless `OCR_NO_UPDATE=1` is set.",
+      "body": "{\n  \"provider\": \"streamscope\",\n  \"custom_providers\": {\n    \"streamscope\": {\n      \"protocol\": \"openai\",\n      \"url\": \"{{base_url}}\",\n      \"api_key\": \"{{api_key}}\",\n      \"model\": \"{{model_alias}}\",\n      \"models\": [{{#each routes}}\"{{model_alias}}\"{{#unless @last}}, {{/unless}}{{/each}}]\n    }\n  }{{#if mcp_servers}},\n  \"mcp_servers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"remote\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"X-App-Id\": \"open-code-review\"{{#each headers}}, \"{{name}}\": \"{{value}}\"{{/each}} }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }{{/if}}\n}\n"
+    },
+    {
+      "kind": "combined",
+      "protocol": "responses",
+      "route_tag": "open-code-review",
+      "filename": "~/.opencodereview/config.json",
+      "format": "json",
+      "title": "Open Code Review (OpenAI Responses)",
+      "instructions": "Place at ~/.opencodereview/config.json. Pick this variant for GPT-5 and o-series models: Open Code Review then calls the Responses API. `provider` selects the gateway entry under `custom_providers`; `model` is the gateway's default model and `models` lists every model this key reaches, so `ocr review --model <name>` can pick another. Gateway MCP servers go under `mcp_servers`, which Open Code Review offers to its review agent as tools; each sends `X-App-Id: open-code-review`, since its MCP client sends only Go's generic User-Agent. Open Code Review sends no telemetry unless `OCR_ENABLE_TELEMETRY=1` is set; its npm launcher checks the npm registry for a newer release unless `OCR_NO_UPDATE=1` is set.",
+      "body": "{\n  \"provider\": \"streamscope\",\n  \"custom_providers\": {\n    \"streamscope\": {\n      \"protocol\": \"openai-responses\",\n      \"url\": \"{{base_url}}\",\n      \"api_key\": \"{{api_key}}\",\n      \"model\": \"{{model_alias}}\",\n      \"models\": [{{#each routes}}\"{{model_alias}}\"{{#unless @last}}, {{/unless}}{{/each}}]\n    }\n  }{{#if mcp_servers}},\n  \"mcp_servers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"remote\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"X-App-Id\": \"open-code-review\"{{#each headers}}, \"{{name}}\": \"{{value}}\"{{/each}} }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }{{/if}}\n}\n"
+    },
+    {
+      "kind": "mcp",
+      "protocol": null,
+      "filename": "~/.opencodereview/config.json",
+      "format": "json",
+      "title": "Open Code Review · MCP only (static key)",
+      "instructions": "Merge into ~/.opencodereview/config.json beside your existing provider settings. No LLM key is minted in this flow. Open Code Review offers each server's tools to its review agent; each server sends `X-App-Id: open-code-review`, since its MCP client sends only Go's generic User-Agent.",
+      "body": "{\n  \"mcp_servers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {\n      \"type\": \"remote\",\n      \"url\": \"{{url}}\",\n      \"headers\": { \"X-App-Id\": \"open-code-review\"{{#each headers}}, \"{{name}}\": \"{{value}}\"{{/each}} }\n    }{{#unless @last}},{{/unless}}\n{{/each}}  }\n}\n"
+    }
+  ]
+}

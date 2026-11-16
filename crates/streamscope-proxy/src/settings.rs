@@ -128,7 +128,8 @@ pub struct ProxySettings {
     pub upstream_circuit_breaker_cooldown_secs: u64,
 
     // -- Outbox --
-    /// Outbox connection pool size. Env: `SQLITE_POOL_SIZE`. Default: 2.
+    /// Outbox read connections; every write goes through one connection of
+    /// its own. Env: `SQLITE_POOL_SIZE`. Default: 2.
     pub sqlite_pool_size: u32,
     /// Hard cap on the edge's outbox (audit waiting for admin-api), in MiB.
     /// Past the cap the oldest records are evicted. `0` disables the cap.

@@ -31,6 +31,12 @@ pub async fn open(selector: Option<&str>) -> Result<ActiveSession> {
     let mut hosts = HostsFile::load()?;
     let (key, mut entry) = hosts.select(selector)?;
 
+    // A refresh rewrites the tokens: keep them out of every commit first. A
+    // warning only — refusing would lose a token the gateway has rotated.
+    if let Err(e) = crate::state::keep_global_state_out_of_git() {
+        crate::ui::warn("", format_args!("{e:#}"));
+    }
+
     if entry.access_expires_at - chrono::Utc::now() < chrono::Duration::seconds(60) {
         refresh_entry(&mut hosts, &key, &mut entry).await?;
     }

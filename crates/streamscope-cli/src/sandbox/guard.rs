@@ -577,6 +577,7 @@ mod tests {
             destinations: Policy {
                 allow: DestinationSet::parse(allow).unwrap(),
                 block: DestinationSet::parse(block).unwrap(),
+                ..Policy::default()
             },
         }
     }
@@ -747,6 +748,7 @@ mod tests {
                 destinations: Policy {
                     allow: DestinationSet::parse(&[format!("127.0.0.1:{up_port}")]).unwrap(),
                     block: DestinationSet::default(),
+                    ..Policy::default()
                 },
             },
             false,
@@ -786,6 +788,7 @@ mod tests {
             destinations: Policy {
                 allow: DestinationSet::parse(&[format!("127.0.0.1:{up_port}")]).unwrap(),
                 block: DestinationSet::default(),
+                ..Policy::default()
             },
         };
         let guard = start_guard(policy).await;
@@ -862,6 +865,7 @@ mod tests {
             destinations: Policy {
                 allow: DestinationSet::parse(&[format!("127.0.0.1:{up_port}")]).unwrap(),
                 block: DestinationSet::default(),
+                ..Policy::default()
             },
         };
         let dir = std::env::temp_dir().join(format!("ssai-guard-test-{}-{up_port}", std::process::id()));

@@ -672,6 +672,7 @@ impl ChatTurns {
                 "transform_diff": v.get("transform_diff"),
                 "response_content": v.get("response_content"),
                 "response_tool_calls": v.get("response_tool_calls"),
+                "response_citations": v.get("response_citations"),
                 "api_version": v.get("api_version"),
             });
             // An absent field must reach the insert as SQL NULL: kept as a JSON
@@ -1897,7 +1898,7 @@ async fn bulk_insert_chat_turns(
              parent_request_id, is_baseline, history_head, link_head, message_count, message_bytes, added_from, \
              tools_available_hash, tools_effective_hash, \
              request_params, system_prompt_hash, transform_diff, \
-             response_content, response_tool_calls, \
+             response_content, response_tool_calls, response_citations, \
              request_size_bytes, response_size_bytes, api_version \
          ) \
          SELECT \
@@ -1922,6 +1923,7 @@ async fn bulk_insert_chat_turns(
              j->'transform_diff', \
              j->>'response_content', \
              j->'response_tool_calls', \
+             j->'response_citations', \
              NULL::int, \
              octet_length(j->>'response_content')::int, \
              j->>'api_version' \
