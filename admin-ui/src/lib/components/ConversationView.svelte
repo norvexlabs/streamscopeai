@@ -290,7 +290,11 @@
             <div class="flex-1 border-t border-dashed border-(--warning)"></div>
             <span class="text-xs text-(--warning) font-medium flex items-center gap-1.5 px-3 py-1 rounded-full bg-(--warning)/10 border border-(--warning)">
               <span>&#9986;</span>
-              {m.conv_context_compacted()}
+              {#if event.requested}
+                {m.conv_compaction_requested()}
+              {:else}
+                {m.conv_context_compacted()}
+              {/if}
               {#if event.messages_before && event.messages_after}
                 : {m.conv_compacted_messages({ before: event.messages_before, after: event.messages_after })}
               {/if}

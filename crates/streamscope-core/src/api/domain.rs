@@ -693,6 +693,12 @@ impl CallArguments {
 pub enum DomainEvent {
     /// Incremental text content.
     TextDelta(String),
+    /// Incremental refusal: the model declining to answer (a Chat delta's
+    /// `refusal`, a Responses `refusal.delta`). A channel of its own beside
+    /// the text: response scripts do not rewrite it, the record keeps it
+    /// apart, and each client is sent it where its protocol has a place for a
+    /// refusal (Chat's `refusal`, a Responses `refusal` part), else as text.
+    RefusalDelta(String),
     /// Incremental reasoning/thinking content (from thinking models).
     ReasoningDelta(String),
     /// Incremental tool call. `index` is the stream's own number for the call

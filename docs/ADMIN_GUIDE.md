@@ -2649,10 +2649,10 @@ admin-console only (read-only accounts see them too).
   citations, an OpenAI answer's web-page and file annotations, or such an answer sent back in a
   conversation's history) carries a collapsed **Sources** list: each source's title or link, the file it
   names, where in it the quote is, and the quote. A document shows the context the client set beside it,
-  and a file the detail it was sent with. An answer that is the model's refusal shows the refusal as its
-  text and carries the **Refusal** badge. A program the model ran (OpenAI programmatic tool calling)
-  shows as a tool call with its code, its output as the call's result, and a client's request to compact
-  the conversation as a compaction. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
+  and a file or an image the detail it was sent with. An answer that is the model's refusal shows the refusal after
+  any text it wrote and carries the **Refusal** badge. A program the model ran (OpenAI programmatic tool calling) shows as a tool
+  call with its code, its output as the call's result, and a client's request to compact the
+  conversation as **Compaction requested by the client**, apart from a compaction that happened. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
   **badges** flag sessions the experts found noteworthy.
 - **Tool Calls** (`/tool-calls`) — every tool invocation (LLM and MCP) with the policy rule that
   classified, blocked, or rewrote it shown inline — the fastest way to audit what agents are doing.

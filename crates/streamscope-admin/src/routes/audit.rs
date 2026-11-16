@@ -2698,6 +2698,7 @@ pub async fn get_session_conversation_impl(
                     messages_before,
                     messages_after,
                     summary: prev_summary,
+                    requested: false,
                 });
                 compaction_emitted = true;
             } else {
@@ -2930,6 +2931,7 @@ pub async fn get_session_conversation_impl(
                             messages_before: None,
                             messages_after: None,
                             summary: Some(summary),
+                            requested: false,
                         });
                     }
         }

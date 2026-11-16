@@ -388,6 +388,11 @@ struct ChatDelta {
     /// text only, so no shape of it can fail the chunk.
     #[serde(default)]
     refusal: Option<Value>,
+    /// The sources the text cites, where a server streams them on the delta
+    /// (the chunk spec has none; the message's `annotations` is the whole
+    /// answer's place). Held raw: only its objects are read.
+    #[serde(default)]
+    annotations: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -556,12 +561,9 @@ struct FrameFacts {
     /// upstream wrote it (a `citations_delta`'s `citation`, or a text block
     /// opened with its `citations`).
     citations: Vec<serde_json::Value>,
-    /// The frame carries the model's refusal (a Chat delta's `refusal`, a
-    /// Responses `refusal.delta`).
-    refused: bool,
-    /// A Chat delta's refusal text, which no domain event carries: a Chat
-    /// client reads it from the frame, and the record reads it here.
-    refusal: Option<String>,
+    /// The frame names sources the record does not keep (a Chat delta's
+    /// `annotations`).
+    cites_unrecorded: bool,
 }
 
 /// The output item a Responses event names, by its place in the response's
@@ -711,10 +713,9 @@ pub struct StreamParser {
     /// The sources the answer's text cites, read since the last
     /// [`Self::take_citations`].
     citations: Vec<serde_json::Value>,
-    /// The stream carried the model's refusal — see [`Self::refused`].
-    refused: bool,
-    /// A Chat refusal's text, read since the last [`Self::take_refusal`].
-    refusal: String,
+    /// The stream named sources the record does not keep — see
+    /// [`Self::cites_unrecorded`].
+    cites_unrecorded: bool,
     /// The request whose answer this is, where the parser gives a Gemini call
     /// that opens with no id the gateway's ([`Self::identifying_calls`]).
     request_id: Option<uuid::Uuid>,
@@ -736,8 +737,7 @@ impl StreamParser {
             unaddressed: false,
             unread_parts: std::collections::BTreeSet::new(),
             citations: Vec::new(),
-            refused: false,
-            refusal: String::new(),
+            cites_unrecorded: false,
             request_id: None,
             settled: Vec::new(),
         }
@@ -765,24 +765,18 @@ impl StreamParser {
         &self.unread_parts
     }
 
+    /// Whether the stream named sources the record does not keep (a Chat
+    /// delta's `annotations`, which the chunk spec does not define): the
+    /// answer cites, though [`Self::take_citations`] gives none of them.
+    pub fn cites_unrecorded(&self) -> bool {
+        self.cites_unrecorded
+    }
+
     /// The sources the answer's text cites that the frames read since the
     /// last call carried — taken frame by frame, so a client gone mid-stream
     /// leaves the audit every one read.
     pub fn take_citations(&mut self) -> Vec<serde_json::Value> {
         std::mem::take(&mut self.citations)
-    }
-
-    /// Whether the stream carried the model's refusal (a Chat delta's
-    /// `refusal`, a Responses `refusal.delta`) — the answer is one.
-    pub fn refused(&self) -> bool {
-        self.refused
-    }
-
-    /// A Chat refusal's text the frames read since the last call carried —
-    /// text no domain event carries (a Responses refusal is a `TextDelta`),
-    /// so the record adds it to the answer's.
-    pub fn take_refusal(&mut self) -> String {
-        std::mem::take(&mut self.refusal)
     }
 
     /// The domain events `event` carries, with each freeform call's arguments
@@ -792,11 +786,8 @@ impl StreamParser {
         let mut facts = FrameFacts::default();
         let mut parsed = parse_frame(event, self.version, &mut facts);
         self.unread_parts.extend(std::mem::take(&mut facts.unread_parts));
+        self.cites_unrecorded |= facts.cites_unrecorded;
         self.citations.append(&mut facts.citations);
-        self.refused |= facts.refused;
-        if let Some(refusal) = facts.refusal.take() {
-            self.refusal.push_str(&refusal);
-        }
         // A Responses call event is placed at the item it names.
         let at = facts.item.as_ref().map(|item| self.items.place(item));
         if let Some(at) = at {
@@ -1074,12 +1065,16 @@ fn parse_chat_completions_event(event: &SseEvent, facts: &mut FrameFacts) -> Vec
         {
             events.push(DomainEvent::ReasoningDelta(reasoning.to_string()));
         }
-        if let Some(refusal) = delta.refusal.as_ref().and_then(Value::as_str).filter(|r| !r.is_empty()) {
-            facts.refused = true;
-            facts.refusal = Some(refusal.to_string());
-            // A translated client is sent no refusal: the Chat parser makes it
-            // no event.
-            facts.unread_parts.push("refusal".to_string());
+        // Sources a server streams on the delta, though the chunk spec has
+        // none: their meaning per chunk (each one's own, or all so far) is not
+        // defined, so they are not recorded — the answer is marked as citing
+        // (the response cache keeps none such), and a translated client,
+        // which has no channel for them, is told.
+        if let Some(Value::Array(annotations)) = &delta.annotations
+            && annotations.iter().any(Value::is_object)
+        {
+            facts.cites_unrecorded = true;
+            facts.unread_parts.push("citation".to_string());
         }
         match &delta.content {
             Some(Value::String(content)) if !content.is_empty() => {
@@ -1100,6 +1095,11 @@ fn parse_chat_completions_event(event: &SseEvent, facts: &mut FrameFacts) -> Vec
                 }
             }
             _ => {}
+        }
+        // The refusal after the content: a frame left whole rides its first
+        // event, which a script rewriting the text must be the one to own.
+        if let Some(refusal) = crate::api::chat::refusal_member(delta.refusal.as_ref()) {
+            events.push(DomainEvent::RefusalDelta(refusal.to_string()));
         }
         // An empty id or name names nothing: some servers send `"id": ""` on
         // every delta after the first, and reading it as an id would start a
@@ -1236,10 +1236,10 @@ fn parse_responses_event(event: &SseEvent, facts: &mut FrameFacts) -> Vec<Domain
                     return vec![];
                 }
             };
-            facts.refused |= delta.delta.as_deref().is_some_and(|d| !d.is_empty());
             delta
                 .delta
-                .map(|d| vec![DomainEvent::TextDelta(d)])
+                .filter(|d| !d.is_empty())
+                .map(|d| vec![DomainEvent::RefusalDelta(d)])
                 .unwrap_or_default()
         }
         "response.output_item.added" => {
@@ -2291,9 +2291,10 @@ mod tests {
     }
 
     /// A Responses answer's annotations are read beside its text from each
-    /// `output_text.annotation.added`, and a refusal — Responses' a text, a
-    /// Chat delta's `refusal` read as the record's text — flags the stream;
-    /// a Chat refusal is named for a translated client, which is sent none.
+    /// `output_text.annotation.added`, and a Chat answer's from a delta's
+    /// `annotations`, where a server streams them. A refusal — a Responses
+    /// `refusal.delta`, a Chat delta's `refusal` — is its own event, never the
+    /// answer's text.
     #[test]
     fn an_openai_answers_annotations_and_refusal_are_read_from_its_stream() {
         let frame = |kind: Option<&str>, data: serde_json::Value| SseEvent { event_type: kind.map(str::to_string), data: data.to_string(), id: None };
@@ -2303,25 +2304,33 @@ mod tests {
             "type": "response.output_text.annotation.added", "item_id": "m", "output_index": 0, "content_index": 0,
             "annotation_index": 0, "annotation": annotation.clone()})));
         assert!(added.is_empty(), "a source is no text: {added:?}");
-        assert_eq!(responses.take_citations(), [annotation]);
-        assert!(!responses.refused());
+        assert_eq!(responses.take_citations(), std::slice::from_ref(&annotation));
         let refusal = responses.parse(&frame(Some("response.refusal.delta"), serde_json::json!({
             "type": "response.refusal.delta", "item_id": "m", "output_index": 0, "content_index": 0, "delta": "no"})));
-        assert_matches!(refusal.as_slice(), [DomainEvent::TextDelta(t)] if t == "no");
-        assert!(responses.refused());
-        assert!(responses.take_refusal().is_empty(), "a Responses refusal is its text event");
+        assert_matches!(refusal.as_slice(), [DomainEvent::RefusalDelta(t)] if t == "no");
+        let empty = responses.parse(&frame(Some("response.refusal.delta"), serde_json::json!({
+            "type": "response.refusal.delta", "item_id": "m", "output_index": 0, "content_index": 0, "delta": ""})));
+        assert!(empty.is_empty(), "an empty piece is no refusal: {empty:?}");
 
         let mut chat = StreamParser::new(ApiVersion::ChatCompletions);
         let events = chat.parse(&frame(None, serde_json::json!({"choices": [{"index": 0, "delta": {"refusal": "I can"}}]})));
-        assert!(events.is_empty(), "a Chat refusal is no content event: {events:?}");
-        chat.parse(&frame(None, serde_json::json!({"choices": [{"index": 0, "delta": {"refusal": "not."}}]})));
-        assert!(chat.refused());
-        assert_eq!(chat.take_refusal(), "I cannot.");
-        assert!(chat.unread_parts().contains("refusal"));
-        // Positive control: plain text flags nothing.
+        assert_matches!(events.as_slice(), [DomainEvent::RefusalDelta(t)] if t == "I can");
+        // After the content: a frame left whole rides the text, which a
+        // script rewriting it owns.
+        let both = chat.parse(&frame(None, serde_json::json!({"choices": [{"index": 0, "delta": {"content": "partly", "refusal": "no"}}]})));
+        assert_matches!(both.as_slice(), [DomainEvent::TextDelta(t), DomainEvent::RefusalDelta(r)] if t == "partly" && r == "no");
+        assert!(chat.unread_parts().is_empty(), "a refusal reaches every client");
+        let cited = chat.parse(&frame(None, serde_json::json!({"choices": [{"index": 0, "delta": {"content": "per x", "annotations": [annotation]}}]})));
+        assert_matches!(cited.as_slice(), [DomainEvent::TextDelta(t)] if t == "per x");
+        // Marked as citing, never recorded: the chunk spec defines no such member.
+        assert!(chat.cites_unrecorded());
+        assert!(chat.take_citations().is_empty());
+        assert!(chat.unread_parts().contains("citation"));
+        // Positive control: plain text carries neither.
         let mut plain = StreamParser::new(ApiVersion::ChatCompletions);
-        plain.parse(&frame(None, serde_json::json!({"choices": [{"index": 0, "delta": {"content": "hi", "refusal": null}}]})));
-        assert!(!plain.refused() && plain.take_refusal().is_empty() && plain.unread_parts().is_empty());
+        let events = plain.parse(&frame(None, serde_json::json!({"choices": [{"index": 0, "delta": {"content": "hi", "refusal": null, "annotations": []}}]})));
+        assert_matches!(events.as_slice(), [DomainEvent::TextDelta(t)] if t == "hi");
+        assert!(plain.take_citations().is_empty() && plain.unread_parts().is_empty() && !plain.cites_unrecorded());
     }
 
     /// An Anthropic answer's sources are read beside its text, never into it:
@@ -3096,8 +3105,8 @@ mod tests {
         let result = parse_domain_event(&event, ApiVersion::Responses);
         assert_eq!(result.len(), 1);
         match &result[0] {
-            DomainEvent::TextDelta(text) => assert_eq!(text, "I cannot help with that request."),
-            other => panic!("expected TextDelta, got {other:?}"),
+            DomainEvent::RefusalDelta(text) => assert_eq!(text, "I cannot help with that request."),
+            other => panic!("expected RefusalDelta, got {other:?}"),
         }
     }
 

@@ -1986,19 +1986,22 @@ pub fn whole_answer_text(response_json: &serde_json::Value, version: ApiVersion)
                         reasoning.extend(texts(item.get("summary"), "text"));
                         reasoning.extend(texts(item.get("content"), "text"));
                     }
-                    // Each part in order: an `output_text`'s text, a `refusal`
-                    // part's refusal.
+                    // Each part's text in order; a `refusal` part is the
+                    // answer's refusal ([`answer_refusal`]).
+                    // A message holding only a refusal adds no text.
                     Some("message") => message.push(
                         item.get("content")
                             .and_then(serde_json::Value::as_array)
                             .into_iter()
                             .flatten()
+                            .filter(|part| part.get("type").and_then(serde_json::Value::as_str) != Some("refusal"))
                             .filter_map(crate::api::responses::part_text)
                             .collect(),
                     ),
                     _ => {}
                 }
             }
+            message.retain(|m| !m.is_empty());
             framed_answer(Some(&reasoning.join("\n")), Some(&message.join("\n")))
         }
         ApiVersion::AnthropicMessages => {
@@ -2046,46 +2049,60 @@ pub fn answer_citations(response_json: &serde_json::Value, version: ApiVersion) 
     cited.into_iter().filter(|c| c.is_object()).cloned().collect()
 }
 
-/// Whether a whole answer is the model's refusal: a Chat answer's message
-/// `refusal` (the first choice, the answer the record keeps), a Responses
-/// answer's `refusal` part — what a stream's frames say
-/// ([`crate::api::sse::StreamParser::refused`]). Its text is the answer's
-/// ([`whole_answer_text`]).
-pub fn answer_refused(response_json: &serde_json::Value, version: ApiVersion) -> bool {
-    match version {
-        ApiVersion::ChatCompletions => response_json
-            .pointer("/choices/0/message/refusal")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|r| !r.is_empty()),
-        ApiVersion::Responses => response_json
-            .get("output")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
-            .flat_map(|item| item.get("content").and_then(serde_json::Value::as_array).into_iter().flatten())
-            .any(|part| {
-                part.get("type").and_then(serde_json::Value::as_str) == Some("refusal")
-                    && crate::api::responses::part_text(part).is_some_and(|r| !r.is_empty())
-            }),
-        ApiVersion::AnthropicMessages | ApiVersion::GoogleGemini => false,
+/// A whole answer as its row records it: its text ([`whole_answer_text`]),
+/// then its refusal ([`answer_refusal`]), as [`with_refusal`] renders them
+/// for a streamed answer too.
+pub fn recorded_answer_text(response_json: &serde_json::Value, version: ApiVersion) -> Option<String> {
+    let content = whole_answer_text(response_json, version).unwrap_or_default();
+    let refusal = answer_refusal(response_json, version).unwrap_or_default();
+    Some(with_refusal(content, &refusal)).filter(|t| !t.is_empty())
+}
+
+/// An answer's text followed by its refusal, the one rendering of the two on
+/// the row: the refusal alone where there is no text.
+pub fn with_refusal(content: String, refusal: &str) -> String {
+    match (content.is_empty(), refusal.is_empty()) {
+        (_, true) => content,
+        (true, false) => refusal.to_string(),
+        (false, false) => format!("{content}\n\n{refusal}"),
     }
 }
 
+/// A whole answer's refusal — a Chat message's `refusal` member
+/// ([`crate::api::chat::message_refusal`]), each Responses `refusal` part's in
+/// order — kept apart from its text, as a stream's
+/// `RefusalDelta`s are; `None` where the model did not refuse.
+pub fn answer_refusal(response_json: &serde_json::Value, version: ApiVersion) -> Option<String> {
+    let refusal = match version {
+        ApiVersion::ChatCompletions => {
+            response_json.pointer("/choices/0/message").and_then(crate::api::chat::message_refusal).map(str::to_string)
+        }
+        ApiVersion::Responses => {
+            let parts: Vec<&str> = response_json
+                .get("output")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+                .flat_map(|item| item.get("content").and_then(serde_json::Value::as_array).into_iter().flatten())
+                .filter_map(crate::api::responses::refusal_part_text)
+                .collect();
+            // Concatenated, as a stream's `refusal.delta`s are.
+            (!parts.is_empty()).then(|| parts.concat())
+        }
+        ApiVersion::AnthropicMessages | ApiVersion::GoogleGemini => None,
+    };
+    refusal.filter(|r| !r.is_empty())
+}
+
 /// A Chat choice's answer, as [`whole_answer_text`] reads the first: its
-/// `refusal` where the model refused, then its content (the spec's message
-/// carries one or the other).
+/// reasoning and its content. Its `refusal` is the answer's refusal
+/// ([`answer_refusal`]).
 fn chat_choice_text(choice: &serde_json::Value) -> Option<String> {
     let message = choice.get("message");
     let reasoning = message.and_then(crate::api::chat::message_reasoning);
     let content = message.and_then(|m| crate::api::chat::content_text(m.get("content")));
-    let refusal = message.and_then(|m| m.get("refusal")).and_then(serde_json::Value::as_str).filter(|r| !r.is_empty());
-    let text = match (content, refusal) {
-        (Some(content), Some(refusal)) => Some(format!("{refusal}{content}")),
-        (Some(content), None) => Some(content.into_owned()),
-        (None, refusal) => refusal.map(str::to_string),
-    };
-    framed_answer(reasoning.as_deref(), text.as_deref())
+    framed_answer(reasoning.as_deref(), content.as_deref())
 }
 
 /// A Gemini candidate's answer, as [`whole_answer_text`] reads the first: its
@@ -2126,7 +2143,14 @@ pub fn other_answers_text(response_json: &serde_json::Value, version: ApiVersion
         .flatten()
         .enumerate()
         .skip(1)
-        .filter_map(|(at, answer)| read(answer).map(|text| (format!("{key}[{at}]"), text)))
+        .flat_map(|(at, answer)| {
+            // A Chat choice's refusal is its own input, as the first's is.
+            let refusal = (version == ApiVersion::ChatCompletions)
+                .then(|| answer.get("message").and_then(crate::api::chat::message_refusal))
+                .flatten()
+                .map(|r| (format!("{key}[{at}].refusal"), r.to_string()));
+            read(answer).map(|text| (format!("{key}[{at}]"), text)).into_iter().chain(refusal)
+        })
         .collect()
 }
 
@@ -2181,7 +2205,7 @@ pub fn extract_response_content(
             // reader the audit's "after" side uses: a reasoning spelling one
             // reads and the other does not would render the model's own
             // reasoning as text a transform inserted.
-            let content = whole_answer_text(response_json, version);
+            let content = recorded_answer_text(response_json, version);
 
             let tool_calls = message
                 .and_then(|msg| msg.get("tool_calls"))
@@ -2195,7 +2219,7 @@ pub fn extract_response_content(
                 .get("output")
                 .and_then(|o| o.as_array());
 
-            let content = whole_answer_text(response_json, version);
+            let content = recorded_answer_text(response_json, version);
 
             // Collect every output item calling a tool — function calls and
             // custom (freeform) tool calls — as tool calls, and a tool on a
@@ -2226,7 +2250,7 @@ pub fn extract_response_content(
                 .get("content")
                 .and_then(|c| c.as_array());
 
-            let content = whole_answer_text(response_json, version);
+            let content = recorded_answer_text(response_json, version);
 
             // The client's calls (`tool_use`), and the server tools the
             // upstream ran itself (`server_tool_use`, `mcp_tool_use`), marked
@@ -2259,7 +2283,7 @@ pub fn extract_response_content(
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array());
 
-            let content = whole_answer_text(response_json, version);
+            let content = recorded_answer_text(response_json, version);
 
             let tool_calls = parts.and_then(|items| {
                 let calls: Vec<&serde_json::Value> = items
@@ -3157,7 +3181,8 @@ mod tests {
 
     /// An OpenAI answer's annotations are its citations, in order — a
     /// Responses answer's `output_text` parts', a Chat answer's message's —
-    /// and its refusal is its text, flagged; an answer of neither reads none.
+    /// and its refusal is read apart from its text; an answer of neither
+    /// reads none.
     #[test]
     fn an_openai_answers_annotations_and_refusal_are_read() {
         let url = serde_json::json!({"type": "url_citation", "url": "https://x.example", "title": "t", "start_index": 0, "end_index": 1});
@@ -3167,25 +3192,26 @@ mod tests {
             {"type": "message", "content": [{"type": "output_text", "text": "x", "annotations": [url]},
                                             {"type": "output_text", "text": "y", "annotations": [file, 7]}]}]});
         assert_eq!(answer_citations(&responses, ApiVersion::Responses), [url.clone(), file]);
-        assert!(!answer_refused(&responses, ApiVersion::Responses));
+        assert_eq!(answer_refusal(&responses, ApiVersion::Responses), None);
         let chat_url = serde_json::json!({"type": "url_citation", "url_citation": {"url": "https://x.example", "title": "t"}});
         let chat = serde_json::json!({"choices": [{"message": {"content": "x", "annotations": [chat_url]}}]});
         assert_eq!(answer_citations(&chat, ApiVersion::ChatCompletions), [chat_url]);
-        assert!(!answer_refused(&chat, ApiVersion::ChatCompletions));
+        assert_eq!(answer_refusal(&chat, ApiVersion::ChatCompletions), None);
 
-        let chat_refused = serde_json::json!({"choices": [{"message": {"content": null, "refusal": "no"}}]});
-        assert!(answer_refused(&chat_refused, ApiVersion::ChatCompletions));
-        assert_eq!(whole_answer_text(&chat_refused, ApiVersion::ChatCompletions).as_deref(), Some("no"));
-        let responses_refused = serde_json::json!({"output": [{"type": "message", "content": [{"type": "refusal", "refusal": "no"}]}]});
-        assert!(answer_refused(&responses_refused, ApiVersion::Responses));
-        assert_eq!(whole_answer_text(&responses_refused, ApiVersion::Responses).as_deref(), Some("no"));
+        let chat_refused = serde_json::json!({"choices": [{"message": {"content": "partly", "refusal": "no"}}]});
+        assert_eq!(answer_refusal(&chat_refused, ApiVersion::ChatCompletions).as_deref(), Some("no"));
+        assert_eq!(whole_answer_text(&chat_refused, ApiVersion::ChatCompletions).as_deref(), Some("partly"));
+        let responses_refused = serde_json::json!({"output": [{"type": "message", "content": [
+            {"type": "output_text", "text": "partly"}, {"type": "refusal", "refusal": "no"}]}]});
+        assert_eq!(answer_refusal(&responses_refused, ApiVersion::Responses).as_deref(), Some("no"));
+        assert_eq!(whole_answer_text(&responses_refused, ApiVersion::Responses).as_deref(), Some("partly"));
         // An empty refusal (`refusal: null` / `""` beside content, an empty
         // refusal part beside a text) is none.
         let empty_part = serde_json::json!({"output": [{"type": "message", "content": [
             {"type": "output_text", "text": "x"}, {"type": "refusal", "refusal": ""}]}]});
-        assert!(!answer_refused(&empty_part, ApiVersion::Responses));
+        assert_eq!(answer_refusal(&empty_part, ApiVersion::Responses), None);
         let not_refused = serde_json::json!({"choices": [{"message": {"content": "x", "refusal": ""}}]});
-        assert!(!answer_refused(&not_refused, ApiVersion::ChatCompletions));
+        assert_eq!(answer_refusal(&not_refused, ApiVersion::ChatCompletions), None);
     }
 
     /// A whole answer's other choices and candidates are read as the first

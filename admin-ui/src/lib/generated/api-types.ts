@@ -9449,6 +9449,11 @@ export interface components {
         } | {
             messages_after?: number | null;
             messages_before?: number | null;
+            /**
+             * @description The client asked for a compaction here (a Responses
+             *     `compaction_trigger` item) rather than one having happened.
+             */
+            requested?: boolean;
             summary?: string | null;
             /** Format: int32 */
             turn: number;
@@ -10889,6 +10894,12 @@ export interface components {
         } | {
             cache_control?: components["schemas"]["CacheControl"] | null;
             data: string;
+            /**
+             * @description The detail the model is to see the image at, as the client set it
+             *     (Chat `image_url.detail`, Responses `input_image.detail`). Chat and
+             *     Responses have a place for it: their walks send it, any other names it.
+             */
+            detail?: string | null;
             media_type: string;
             /** @enum {string} */
             type: "image";

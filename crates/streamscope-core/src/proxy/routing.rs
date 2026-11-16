@@ -242,16 +242,30 @@ impl UpstreamTarget {
     /// What a translation to this target needs to know about it — see
     /// [`crate::api::domain_request::UpstreamFacts`].
     pub fn translation_facts(&self) -> crate::api::domain_request::UpstreamFacts {
-        use crate::api::domain_request::{is_openai_platform, openai_model_takes_effort_none};
+        use crate::api::domain_request::{
+            anthropic_model_deep_efforts, is_openai_platform, openai_model_deep_efforts, openai_model_takes_effort_none,
+            openai_model_takes_prompt_cache_options,
+        };
+        let openai_platform = is_openai_platform(&self.provider, self.transport, &self.url);
+        let openai_own_api = crate::api::domain_request::is_openai_own_api(&self.provider, self.transport, &self.url);
         crate::api::domain_request::UpstreamFacts {
             output_limit: self.max_output_tokens.and_then(|limit| u32::try_from(limit).ok()).filter(|&l| l > 0),
             // Mistral takes `none` only on a model that reasons (live: a model
             // that does not refuses it), so only where reasoning is declared.
-            takes_effort_none: (is_openai_platform(&self.provider, self.transport, &self.url)
-                && openai_model_takes_effort_none(&self.model))
+            takes_effort_none: (openai_platform && openai_model_takes_effort_none(&self.model))
                 || (self.chat_dialect() == crate::api::mistral::ChatDialect::Mistral && self.capabilities.reasoning),
             chat_dialect: self.chat_dialect(),
             rerenders_client_request: false,
+            // A Claude model's levels are its own wherever it is served; an
+            // OpenAI model's are known on OpenAI's own API.
+            deep_efforts: if self.upstream_api_version == crate::api::sse::ApiVersion::AnthropicMessages {
+                anthropic_model_deep_efforts(&self.model)
+            } else if openai_own_api {
+                openai_model_deep_efforts(&self.model)
+            } else {
+                Default::default()
+            },
+            takes_prompt_cache_options: openai_own_api && openai_model_takes_prompt_cache_options(&self.model),
         }
     }
 
@@ -1039,6 +1053,33 @@ pub fn conform_for(
 mod tests {
     use super::*;
     use std::assert_matches;
+
+    /// The deep efforts and `prompt_cache_options` a model's page states hold
+    /// on OpenAI's own API — never on an Azure deployment, which its operator
+    /// names, nor on another host serving a model of that name; a Claude
+    /// model's levels hold on an Anthropic target.
+    #[test]
+    fn the_model_page_facts_hold_on_openais_own_api_only() {
+        use crate::api::domain_request::DeepEfforts;
+        use crate::api::sse::ApiVersion;
+        use crate::config::upstream_transport::UpstreamTransport;
+        let target = |provider: &str, url: &str, transport: UpstreamTransport, model: &str, api: ApiVersion| {
+            let mut t = test_replica_target(uuid::Uuid::nil(), uuid::Uuid::nil(), url);
+            t.provider = provider.to_string();
+            t.transport = transport;
+            t.model = model.to_string();
+            t.upstream_api_version = api;
+            t.translation_facts()
+        };
+        let own = target("openai", "https://api.openai.com", UpstreamTransport::default(), "gpt-5.6", ApiVersion::Responses);
+        assert_eq!((own.deep_efforts, own.takes_prompt_cache_options), (DeepEfforts::ALL, true));
+        let azure = target("openai", "https://x.openai.azure.com", UpstreamTransport::AzureOpenAi, "gpt-5.6", ApiVersion::Responses);
+        assert_eq!((azure.deep_efforts, azure.takes_prompt_cache_options), (DeepEfforts::default(), false));
+        let elsewhere = target("openai", "https://llm.example", UpstreamTransport::default(), "gpt-5.6", ApiVersion::ChatCompletions);
+        assert_eq!((elsewhere.deep_efforts, elsewhere.takes_prompt_cache_options), (DeepEfforts::default(), false));
+        let claude = target("anthropic", "https://api.anthropic.com", UpstreamTransport::default(), "claude-opus-4-6", ApiVersion::AnthropicMessages);
+        assert_eq!(claude.deep_efforts, DeepEfforts { xhigh: false, max: true });
+    }
 
     /// Thinking and the answer share Anthropic's `max_tokens`. With no cap from
     /// the client, a request that thinks gets the model's own output limit —

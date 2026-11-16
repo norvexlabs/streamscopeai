@@ -310,6 +310,10 @@ pub enum ConversationEvent {
         messages_after: Option<usize>,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
+        /// The client asked for a compaction here (a Responses
+        /// `compaction_trigger` item) rather than one having happened.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        requested: bool,
     },
 
     /// Emitted when the client rebuilt the message array without reducing its size

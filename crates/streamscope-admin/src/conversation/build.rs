@@ -794,7 +794,7 @@ fn append_message_events(
                 });
             }
             DomainContentBlock::Image {
-                data, media_type, ..
+                data, media_type, detail, ..
             } => {
                 let is_url = media_type == "image/url";
                 let img_data = if is_url { None } else { Some(data.clone()) };
@@ -807,7 +807,7 @@ fn append_message_events(
                     url: if is_url { Some(data.clone()) } else { None },
                     title: None,
                     context: None,
-                    detail: None,
+                    detail: detail.clone(),
                     size_bytes,
                     turn: turn.turn_number,
                     is_new,
@@ -983,6 +983,7 @@ fn append_message_events(
                         messages_before: None,
                         messages_after: None,
                         summary: None,
+                        requested: true,
                     }),
                 }
             }
@@ -1297,6 +1298,34 @@ pub(crate) mod tests {
         );
         assert!(read(json!("text")).is_none());
         assert_eq!(read(json!({"cited_text": "no kind"})).map(|c| (c.kind, c.cited_text)), Some((String::new(), "no kind".to_string())));
+    }
+
+    /// An image shows the detail the client sent it with, as a file does.
+    #[test]
+    fn an_image_shows_the_detail_it_was_sent_with() {
+        let turn = turn_for_messages(json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": "original"}}]}]));
+        let result = build_events(&turn).unwrap();
+        assert!(
+            result.events.iter().any(|e| matches!(e, ConversationEvent::Media { detail: Some(d), .. } if d == "original")),
+            "{:?}", result.events
+        );
+    }
+
+    /// A client's `compaction_trigger` reads as a compaction it asked for —
+    /// apart from one the conversation shows happened.
+    #[test]
+    fn a_compaction_trigger_is_a_requested_compaction() {
+        let mut turn = turn_for_messages(json!([
+            {"type": "message", "role": "user", "content": "go on"},
+            {"type": "compaction_trigger"},
+        ]));
+        turn.protocol = ApiVersion::Responses;
+        let result = build_events(&turn).unwrap();
+        assert!(
+            result.events.iter().any(|e| matches!(e, ConversationEvent::Compaction { requested: true, .. })),
+            "{:?}", result.events
+        );
     }
 
     #[test]

@@ -100,6 +100,7 @@
   "conv_client_history": "historique client",
   "conv_client_history_tooltip": "Envoyé par le client dans l'historique de la requête — aucune réponse en amont capturée n'a produit ce contenu.",
   "conv_compacted_messages": "{before} → {after} messages",
+  "conv_compaction_requested": "Compactage demandé par le client",
   "conv_compaction_summary": "Résumé de compactage",
   "conv_context_compacted": "Contexte compacté",
   "conv_context_reset": "Contexte réinitialisé",

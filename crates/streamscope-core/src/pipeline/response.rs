@@ -19,6 +19,17 @@ const MAX_ACCUMULATED_TEXT_BYTES: usize = 256 * 1024;
 /// [`crate::proxy::truncate_with_marker`] at other display-text cap sites.
 const ACCUMULATOR_TRUNCATED_MARKER: &str = "\n…[truncated: exceeded 256 KB accumulator cap]";
 
+/// Append `piece` to `record` while it holds less than
+/// [`MAX_ACCUMULATED_TEXT_BYTES`], marking where it was cut.
+fn push_capped(record: &mut String, piece: &str) {
+    if record.len() < MAX_ACCUMULATED_TEXT_BYTES {
+        record.push_str(piece);
+        if record.len() >= MAX_ACCUMULATED_TEXT_BYTES {
+            record.push_str(ACCUMULATOR_TRUNCATED_MARKER);
+        }
+    }
+}
+
 /// A tool call reassembled from streaming ToolCallDelta events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccumulatedToolCall {
@@ -199,12 +210,14 @@ pub struct TransformState {
     /// The answer cited a source, whether or not the client was sent it: what
     /// a stored answer, text and reasoning alone, could not replay.
     pub answer_cited: bool,
-    /// The answer is the model's refusal (a Chat message's `refusal`, a
-    /// Responses `refusal` part), its text the answer's: streamed,
-    /// [`crate::api::sse::StreamParser::refused`]; whole,
-    /// [`crate::proxy::content::answer_refused`]. Recorded on the turn; a
-    /// stored answer would replay it as ordinary text.
-    pub answer_refused: bool,
+    /// The model's refusal (a Chat message's `refusal`, a Responses `refusal`
+    /// part), kept apart from the answer's text: streamed, each
+    /// `RefusalDelta`; whole, [`crate::proxy::content::answer_refusal`]. The
+    /// record shows it after the text ([`Self::full_response_content`]), the
+    /// response PII scan reads it on its own, as the mask masks it
+    /// ([`Self::response_pii_inputs`]); a stored answer would replay it as
+    /// ordinary text.
+    pub answer_refusal: String,
     /// Accumulated reasoning/thinking content from streaming ReasoningDelta events.
     pub accumulated_reasoning: String,
     /// Accumulated tool calls reassembled from streaming ToolCallDelta events.
@@ -292,7 +305,7 @@ impl TransformState {
             other_answers: Vec::new(),
             answer_citations: Vec::new(),
             answer_cited: false,
-            answer_refused: false,
+            answer_refusal: String::new(),
             original_response_content: None,
             original_response_tool_calls: None,
             image_generation_count: 0,
@@ -462,6 +475,7 @@ impl TransformState {
         match event.as_ref() {
             DomainEvent::FreeformCallEnd { .. } => {}
             DomainEvent::TextDelta(text) => self.accumulate_text(text),
+            DomainEvent::RefusalDelta(text) => self.accumulate_refusal(text),
             DomainEvent::ReasoningDelta(text) => {
                 if self.first_token_at.is_none() {
                     self.first_token_at = Some(std::time::Instant::now());
@@ -594,19 +608,37 @@ impl TransformState {
 
     /// Add a piece of the answer's text to the record: the first marks the
     /// first token, and the record keeps at most `MAX_ACCUMULATED_TEXT_BYTES`,
-    /// marked where it was cut. Every piece of text goes through here — a
-    /// `TextDelta`, and a Chat refusal, which no event carries
-    /// ([`crate::api::sse::StreamParser::take_refusal`]).
+    /// marked where it was cut.
     pub fn accumulate_text(&mut self, text: &str) {
         if self.first_token_at.is_none() {
             self.first_token_at = Some(std::time::Instant::now());
         }
-        if self.accumulated_text.len() < MAX_ACCUMULATED_TEXT_BYTES {
-            self.accumulated_text.push_str(text);
-            if self.accumulated_text.len() >= MAX_ACCUMULATED_TEXT_BYTES {
-                self.accumulated_text.push_str(ACCUMULATOR_TRUNCATED_MARKER);
+        push_capped(&mut self.accumulated_text, text);
+    }
+
+    /// Add a piece of the model's refusal to the record, as
+    /// [`Self::accumulate_text`] adds the text's.
+    pub fn accumulate_refusal(&mut self, text: &str) {
+        if self.first_token_at.is_none() {
+            self.first_token_at = Some(std::time::Instant::now());
+        }
+        push_capped(&mut self.answer_refusal, text);
+    }
+
+    /// Take out of the record each source a script's rewrite withdrew from
+    /// the client ([`crate::pipeline::response_blocks::BlockAccumulator::withdrawn_citations`]),
+    /// once per withdrawal.
+    pub fn withdraw_citations(&mut self, withdrawn: &[serde_json::Value]) {
+        for source in withdrawn {
+            if let Some(at) = self.answer_citations.iter().position(|c| c == source) {
+                self.answer_citations.remove(at);
             }
         }
+    }
+
+    /// Whether the answer is the model's refusal.
+    pub fn answer_refused(&self) -> bool {
+        !self.answer_refusal.is_empty()
     }
 
     /// What the response PII scan reads: the answer, then a whole answer's
@@ -626,7 +658,8 @@ impl TransformState {
                 })
                 .chain(source.get("cited_text").and_then(serde_json::Value::as_str).map(|q| (format!("citations[{n}]"), q.to_string())))
         });
-        std::iter::once((String::new(), self.full_response_content()))
+        std::iter::once((String::new(), self.answer_content()))
+            .chain(std::iter::once(("refusal".to_string(), self.answer_refusal.clone())))
             .chain(self.other_answers.iter().cloned())
             .chain(quotes)
             .filter(|(_, text)| !text.trim().is_empty())
@@ -649,7 +682,15 @@ impl TransformState {
     /// in `accumulated_text`. In that case we extract them here so that the stored
     /// `response_content` always uses the canonical `<thinking>` format and the
     /// content portion is clean.
+    ///
+    /// The model's refusal follows, apart from the text it is not part of.
     pub fn full_response_content(&self) -> String {
+        crate::proxy::content::with_refusal(self.answer_content(), &self.answer_refusal)
+    }
+
+    /// The answer's reasoning and text, as [`Self::full_response_content`]
+    /// renders them, without its refusal.
+    fn answer_content(&self) -> String {
         let has_reasoning = !self.accumulated_reasoning.is_empty();
         let has_text = !self.accumulated_text.is_empty();
         match (has_reasoning, has_text) {
@@ -878,6 +919,41 @@ mod tests {
         let input = "just a plain answer";
         let result = TransformState::normalize_inline_think_tags(input);
         assert_eq!(result, "just a plain answer");
+    }
+
+    /// A refusal is the record's own channel: shown after the text, alone
+    /// where the model said nothing else, and read by the response PII scan
+    /// as an input of its own — the slot the whole-answer mask masks alone.
+    #[test]
+    fn a_refusal_is_shown_after_the_text_and_scanned_on_its_own() {
+        let mut state = TransformState::new(ApiVersion::ChatCompletions);
+        state.process_event(&DomainEvent::RefusalDelta("I can".into()));
+        state.process_event(&DomainEvent::RefusalDelta("not.".into()));
+        assert!(state.answer_refused());
+        assert_eq!(state.full_response_content(), "I cannot.");
+        state.process_event(&DomainEvent::TextDelta("partly".into()));
+        assert_eq!(state.full_response_content(), "partly\n\nI cannot.");
+        let inputs: Vec<(String, String)> =
+            state.response_pii_inputs().into_iter().map(|i| (i.target, i.classifiable)).collect();
+        assert_eq!(inputs, [(String::new(), "partly".to_string()), ("refusal".to_string(), "I cannot.".to_string())]);
+        // Positive control: an answer that did not refuse has no such input.
+        let mut plain = TransformState::new(ApiVersion::ChatCompletions);
+        plain.process_event(&DomainEvent::TextDelta("ok".into()));
+        assert!(!plain.answer_refused());
+        assert_eq!(plain.response_pii_inputs().len(), 1);
+    }
+
+    /// Each withdrawn source leaves the record once; one cited twice and
+    /// withdrawn once stays once, and one never withdrawn stays.
+    #[test]
+    fn a_withdrawn_source_leaves_the_record_once() {
+        let (a, b) = (serde_json::json!({"url": "a"}), serde_json::json!({"url": "b"}));
+        let mut state = TransformState::new(ApiVersion::Responses);
+        state.answer_citations = vec![a.clone(), b.clone(), a.clone()];
+        state.withdraw_citations(std::slice::from_ref(&a));
+        assert_eq!(state.answer_citations, [b.clone(), a.clone()]);
+        state.withdraw_citations(&[serde_json::json!({"url": "never"})]);
+        assert_eq!(state.answer_citations, [b, a]);
     }
 
     #[test]

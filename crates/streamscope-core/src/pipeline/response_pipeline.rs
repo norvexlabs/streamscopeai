@@ -65,6 +65,10 @@ fn client_labels_for_pending(
 /// entry records the dropped count.
 const DROPPED_PENDING_INJECTION_CAP: usize = 32;
 
+/// What sets a round's refusal apart from its text, as the record does
+/// ([`crate::proxy::content::with_refusal`]).
+const REFUSAL_SEPARATOR: &str = "\n\n";
+
 /// Cap on the bytes of intermediate-round preamble text the agent loop
 /// captures from the model's `TextDelta`s before a substituted `tool_use`.
 /// A misbehaving upstream that emits megabytes of text before its tool_use
@@ -90,13 +94,27 @@ fn capture_preamble(
 ) -> PreambleCapture {
     let mut text = String::new();
     let mut hit_tool = false;
+    let mut in_refusal = false;
     let mut dropped_post_tool_text_bytes = 0usize;
     for buf in round_events {
         match &buf.domain_event {
             Some(e @ DomainEvent::ToolCallDelta { .. }) if !e.not_a_client_call() => {
                 hit_tool = true;
             }
+            // The model's refusal is part of the round's turn, set apart from
+            // the text before it as the record sets it ([`REFUSAL_SEPARATOR`]).
+            Some(DomainEvent::RefusalDelta(s)) if !hit_tool => {
+                if !in_refusal && !text.is_empty() {
+                    text.push_str(REFUSAL_SEPARATOR);
+                }
+                in_refusal = true;
+                text.push_str(s);
+            }
             Some(DomainEvent::TextDelta(s)) => {
+                if in_refusal && !hit_tool && !text.is_empty() {
+                    text.push_str(REFUSAL_SEPARATOR);
+                }
+                in_refusal = false;
                 if hit_tool {
                     dropped_post_tool_text_bytes += s.len();
                 } else {
@@ -136,6 +154,8 @@ fn capture_preamble(
 #[derive(Default)]
 struct RoundCapture {
     parts: Vec<crate::api::domain_request::RoundPart>,
+    /// The text run's last piece was the model's refusal.
+    in_refusal: bool,
     thinking: String,
     calls: std::collections::HashSet<usize>,
 }
@@ -162,10 +182,21 @@ impl RoundCapture {
                     self.thinking.push_str(t);
                     continue;
                 }
-                DomainEvent::TextDelta(t) => match self.parts.last_mut() {
-                    Some(RoundPart::Text(run)) => run.push_str(t),
-                    _ => self.parts.push(RoundPart::Text(t.clone())),
-                },
+                // A refusal joins the round's text, set apart as
+                // `capture_preamble` sets it, so the two read the same.
+                DomainEvent::TextDelta(t) | DomainEvent::RefusalDelta(t) => {
+                    let refusal = matches!(event, DomainEvent::RefusalDelta(_));
+                    let switched = refusal != std::mem::replace(&mut self.in_refusal, refusal);
+                    match self.parts.last_mut() {
+                        Some(RoundPart::Text(run)) => {
+                            if switched && !run.is_empty() {
+                                run.push_str(REFUSAL_SEPARATOR);
+                            }
+                            run.push_str(t)
+                        }
+                        _ => self.parts.push(RoundPart::Text(t.clone())),
+                    }
+                }
                 DomainEvent::ToolCallDelta { index, id, .. }
                     if !event.not_a_client_call() && self.calls.insert(*index) =>
                 {
@@ -180,6 +211,7 @@ impl RoundCapture {
     /// The round's parts, leaving the capture empty for the next one.
     fn take(&mut self) -> Vec<crate::api::domain_request::RoundPart> {
         self.thinking.clear();
+        self.in_refusal = false;
         self.calls.clear();
         std::mem::take(&mut self.parts)
     }
@@ -1412,17 +1444,9 @@ impl ResponsePipeline {
                                 // them; a translated one is told they were not
                                 // carried (`unread_parts`, below).
                                 let cited = stream_parser.take_citations();
-                                local_state.answer_cited |= !cited.is_empty();
+                                local_state.answer_cited |= !cited.is_empty() || stream_parser.cites_unrecorded();
                                 if client_api_version == upstream_api_version {
                                     local_state.answer_citations.extend(cited);
-                                }
-                                // A Chat refusal's text, which no event
-                                // carries, is the answer's; a translated
-                                // client is told it was not carried.
-                                local_state.answer_refused |= stream_parser.refused();
-                                let refusal = stream_parser.take_refusal();
-                                if !refusal.is_empty() {
-                                    local_state.accumulate_text(&refusal);
                                 }
                                 // A pass-through client reads the frame: it is
                                 // given the ids the parser gave its Gemini
@@ -1970,7 +1994,7 @@ impl ResponsePipeline {
                     // sees; a translated one builds its own and forwards none.
                     if is_message_opener(buf_event, upstream_api_version) {
                         if let Some(run) = visible_run.take() {
-                            for chunk in emitter.process_streaming_event(&run.into_event(), None) {
+                            for chunk in emitter.process_streaming_event(&run.into_event_for(&emitter), None) {
                                 yield Ok::<Bytes, std::io::Error>(chunk);
                             }
                         }
@@ -2017,7 +2041,7 @@ impl ResponsePipeline {
                             Some(VisibleRun::Reasoning(t)) => t,
                             other => {
                                 if let Some(run) = other {
-                                    for chunk in emitter.process_streaming_event(&run.into_event(), None) {
+                                    for chunk in emitter.process_streaming_event(&run.into_event_for(&emitter), None) {
                                         yield Ok::<Bytes, std::io::Error>(chunk);
                                     }
                                 }
@@ -2033,7 +2057,7 @@ impl ResponsePipeline {
                     // client keeps it whole, as the upstream opened it.
                     if let Some(block) = buf_event.raw_sse.as_ref().and_then(whole_block_opened) {
                         if let Some(run) = visible_run.take() {
-                            for chunk in emitter.process_streaming_event(&run.into_event(), None) {
+                            for chunk in emitter.process_streaming_event(&run.into_event_for(&emitter), None) {
                                 yield Ok::<Bytes, std::io::Error>(chunk);
                             }
                         }
@@ -2054,16 +2078,23 @@ impl ResponsePipeline {
                             acc.push_str(t);
                             continue;
                         }
+                        (DomainEvent::RefusalDelta(t), Some(VisibleRun::Refusal(acc))) => {
+                            acc.push_str(t);
+                            continue;
+                        }
                         _ => {}
                     }
                     if let Some(run) = visible_run.take() {
-                        for chunk in emitter.process_streaming_event(&run.into_event(), None) {
+                        for chunk in emitter.process_streaming_event(&run.into_event_for(&emitter), None) {
                             yield Ok::<Bytes, std::io::Error>(chunk);
                         }
                     }
                     match domain_event {
                         DomainEvent::TextDelta(t) => {
                             visible_run = Some(VisibleRun::Text(t.clone()));
+                        }
+                        DomainEvent::RefusalDelta(t) => {
+                            visible_run = Some(VisibleRun::Refusal(t.clone()));
                         }
                         DomainEvent::ReasoningDelta(t) => {
                             visible_run = Some(VisibleRun::Reasoning(t.clone()));
@@ -2076,7 +2107,7 @@ impl ResponsePipeline {
                     }
                 }
                 if let Some(run) = visible_run.take() {
-                    for chunk in emitter.process_streaming_event(&run.into_event(), None) {
+                    for chunk in emitter.process_streaming_event(&run.into_event_for(&emitter), None) {
                         yield Ok::<Bytes, std::io::Error>(chunk);
                     }
                 }
@@ -4342,11 +4373,6 @@ impl ResponsePipeline {
             if transform_state.answer_cited {
                 transform_state.badges.add_not_carried(crate::api::chat::answer_parts_not_carried(["citation"]));
             }
-            // A Chat refusal is no content the translation reads, as on a
-            // stream (the Chat parser makes it no event).
-            if transform_state.answer_refused && self.upstream_api_version == ApiVersion::ChatCompletions {
-                transform_state.badges.add_not_carried(crate::api::chat::answer_parts_not_carried(["refusal"]));
-            }
             translate_non_streaming(
                 &response_json,
                 self.client_api_version,
@@ -5166,6 +5192,9 @@ fn fold_accumulator(state: &mut TransformState, accumulator: Option<&BlockAccumu
     for block in &acc.injection_blocks {
         state.record_injection_block(block.clone());
     }
+    // A source the client was not sent with the text a script rewrote is not
+    // the record's either.
+    state.withdraw_citations(&acc.withdrawn_citations);
     // Capture original response content if any blocks were modified
     if !acc.original_text_blocks.is_empty() {
         state.original_response_content = Some(acc.original_text_blocks.join("\n"));
@@ -6045,7 +6074,7 @@ pub fn cache_store_payload(
     if ts.answer_cited {
         return Err("citations");
     }
-    if ts.answer_refused {
+    if ts.answer_refused() {
         return Err("refusal");
     }
     if ts.image_generation_count > 0 {
@@ -6519,7 +6548,7 @@ fn extract_response_content_for_audit(
     if transform_state.api_version == upstream_version {
         transform_state.answer_citations = cited;
     }
-    transform_state.answer_refused = crate::proxy::content::answer_refused(response_json, upstream_version);
+    transform_state.answer_refusal = crate::proxy::content::answer_refusal(response_json, upstream_version).unwrap_or_default();
     // A Chat answer's calls as the record keeps them; the other protocols'
     // are captured by `extract_upstream_response`.
     if upstream_version == ApiVersion::ChatCompletions
@@ -6640,6 +6669,10 @@ fn translate_non_streaming(
 enum VisibleRun {
     Text(String),
     Reasoning(String),
+    /// The model's refusal: a translated client is sent it as its protocol
+    /// writes one; a pass-through, which writes no refusal of its own, as
+    /// text set apart ([`VisibleRun::into_event_for`]).
+    Refusal(String),
 }
 
 impl VisibleRun {
@@ -6647,6 +6680,17 @@ impl VisibleRun {
         match self {
             Self::Text(t) => DomainEvent::TextDelta(t),
             Self::Reasoning(t) => DomainEvent::ReasoningDelta(t),
+            Self::Refusal(t) => DomainEvent::RefusalDelta(t),
+        }
+    }
+
+    /// The run as `emitter` is handed it — see [`Self::Refusal`].
+    fn into_event_for(self, emitter: &EventEmitter) -> DomainEvent {
+        match self {
+            Self::Refusal(t) if matches!(emitter, EventEmitter::Passthrough { .. }) => {
+                DomainEvent::TextDelta(format!("{REFUSAL_SEPARATOR}{t}"))
+            }
+            run => run.into_event(),
         }
     }
 }
@@ -6757,6 +6801,7 @@ fn is_content_event(event: &DomainEvent) -> bool {
     matches!(
         event,
         DomainEvent::TextDelta(_)
+            | DomainEvent::RefusalDelta(_)
             | DomainEvent::ReasoningDelta(_)
             | DomainEvent::ToolCallDelta { .. }
     )
@@ -6791,8 +6836,11 @@ fn split_chat_chunk(
     {
         return None;
     }
+    // A `refusal` is a piece only where the parser read one from it; any
+    // other (`null`, a shape it does not read) stays in the remainder.
+    let refusal_read = events.iter().any(|e| matches!(e, DomainEvent::RefusalDelta(_)));
     let is_piece_field = |key: &str| {
-        key == "content" || key == "tool_calls" || reasoning_keys.contains(&key)
+        key == "content" || key == "tool_calls" || reasoning_keys.contains(&key) || (key == "refusal" && refusal_read)
     };
     let mut remainder: serde_json::Map<String, serde_json::Value> =
         delta.iter().filter(|(k, _)| !is_piece_field(k)).map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -6852,6 +6900,10 @@ fn split_chat_chunk(
             DomainEvent::TextDelta(_) => {
                 serde_json::Map::from_iter([("content".to_string(), delta.get("content")?.clone())])
             }
+            // The parser reads the delta's `refusal` as one event.
+            DomainEvent::RefusalDelta(_) => {
+                serde_json::Map::from_iter([("refusal".to_string(), delta.get("refusal")?.clone())])
+            }
             DomainEvent::ReasoningDelta(_) if !key_reasoning => next_chunk()?,
             DomainEvent::ReasoningDelta(_) => {
                 key_reasoning = false;
@@ -6896,7 +6948,8 @@ fn split_chat_chunk(
             piece.insert("role".to_string(), role.clone());
         }
         if first_piece {
-            // With no event to keep it, the rest of the remainder (`refusal`)
+            // With no event to keep it, the rest of the remainder (`annotations`,
+            // a `refusal` no event read)
             // rides the first piece too.
             if end.is_none() {
                 for (key, value) in std::mem::take(&mut remainder) {
@@ -9025,7 +9078,7 @@ pub fn assemble_audit_record(
     if healing_applied {
         all_badges.add_json_healed();
     }
-    if state.answer_refused {
+    if state.answer_refused() {
         all_badges.add_refusal();
     }
     // Mirror the request-side rule: any response-side injection_block (script
@@ -9274,6 +9327,7 @@ pub fn assemble_audit_record(
         },
         response_content: if !state.accumulated_text.is_empty()
             || !state.accumulated_reasoning.is_empty()
+            || state.answer_refused()
         {
             Some(state.full_response_content())
         } else if let Some(err_msg) = &state.error_message {
@@ -9760,6 +9814,19 @@ mod tests {
                 "{version:?}"
             );
         }
+        // A refusal follows the text, streamed or whole, on the row and on the
+        // diff's "before" side alike.
+        let refused = serde_json::json!({"choices": [{"message": {"content": "ok", "refusal": "no"}}]});
+        let mut streamed = TransformState::new(ApiVersion::ChatCompletions);
+        streamed.process_event(&DomainEvent::TextDelta("ok".into()));
+        streamed.process_event(&DomainEvent::RefusalDelta("no".into()));
+        let mut whole = TransformState::new(ApiVersion::ChatCompletions);
+        super::read_whole_answer(&refused, ApiVersion::ChatCompletions, &mut whole);
+        assert_eq!(whole.full_response_content(), streamed.full_response_content());
+        assert_eq!(
+            crate::proxy::content::extract_response_content(&refused, ApiVersion::ChatCompletions).0,
+            Some(streamed.full_response_content())
+        );
     }
 
     /// Every round of a substitution loop re-sends the request, its audio
@@ -11581,6 +11648,80 @@ mod tests {
         assert!(emitter.emit_whole_block(&redacted).is_empty());
     }
 
+    /// A chunk's `refusal` is cut into its own piece where the parser read
+    /// one; any other `refusal` (a `null`, a shape the parser does not read)
+    /// stays with the remainder, never dropped.
+    #[test]
+    fn a_chunks_refusal_is_its_own_piece_only_where_it_was_read() {
+        let cut = |delta: serde_json::Value| {
+            let event = crate::api::sse::SseEvent {
+                event_type: None,
+                data: serde_json::json!({"choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}]}).to_string(),
+                id: None,
+            };
+            let events = crate::api::sse::parse_domain_event(&event, super::ApiVersion::ChatCompletions);
+            let pieces: Vec<serde_json::Value> = super::split_frame(&event, super::ApiVersion::ChatCompletions, &events, true)
+                .into_iter()
+                .flatten()
+                .map(|f| serde_json::from_str(&f.data).unwrap())
+                .collect();
+            (events, pieces)
+        };
+        let (events, pieces) = cut(serde_json::json!({"content": "Hi", "refusal": "no"}));
+        assert!(events.iter().any(|e| matches!(e, super::DomainEvent::RefusalDelta(r) if r == "no")));
+        let refusals: Vec<&serde_json::Value> = pieces.iter().filter_map(|p| p.pointer("/choices/0/delta/refusal")).collect();
+        assert_eq!(refusals, [&serde_json::json!("no")], "{pieces:?}");
+        for unread in [serde_json::json!({"text": "x"}), serde_json::Value::Null] {
+            let (_, pieces) = cut(serde_json::json!({"content": "Hi", "refusal": unread.clone()}));
+            let kept: Vec<&serde_json::Value> = pieces.iter().filter_map(|p| p.pointer("/choices/0/delta/refusal")).collect();
+            assert_eq!(kept, [&unread], "{pieces:?}");
+        }
+    }
+
+    /// A refusal with no frame of its own is written by no pass-through
+    /// synthesizer: its bytes ride the upstream frame that carries them (a
+    /// chunk left whole), so writing it again would send it twice.
+    #[test]
+    fn a_pass_through_writes_no_refusal_of_its_own() {
+        let refusal = super::DomainEvent::RefusalDelta("I cannot.".into());
+        let mut pos = super::PassthroughPosition::default();
+        assert!(super::synthesize_responses_frames(&refusal, &mut pos).is_empty());
+        assert!(super::synthesize_chat_frames(&refusal, &pos).is_empty());
+        // Positive control: a frameless text is written.
+        assert!(!super::synthesize_responses_frames(&super::DomainEvent::TextDelta("hi".into()), &mut pos).is_empty());
+    }
+
+    /// A round's refusal is part of the turn the next round is told, after its
+    /// text and set apart as the record sets it — streamed (the preamble and
+    /// the round's parts read the same) and whole (Chat and Responses).
+    #[test]
+    fn a_rounds_refusal_follows_its_text_on_every_capture() {
+        use super::DomainEvent;
+        use crate::api::domain_request::RoundPart;
+        use crate::pipeline::response_blocks::BufferedEvent;
+        let events = vec![DomainEvent::TextDelta("partly".into()), DomainEvent::RefusalDelta("I cannot.".into())];
+        let buffered: Vec<BufferedEvent> =
+            events.iter().map(|e| BufferedEvent { domain_event: Some(e.clone()), raw_sse: None }).collect();
+        assert_eq!(super::capture_preamble(&buffered).text, "partly\n\nI cannot.");
+        let mut capture = super::RoundCapture::default();
+        let frame = crate::api::sse::SseEvent { event_type: None, data: "{}".into(), id: None };
+        capture.observe(&frame, &events);
+        assert_matches!(capture.take().as_slice(), [RoundPart::Text(t)] if t == "partly\n\nI cannot.");
+        let chat = serde_json::json!({"choices": [{"message": {"content": "partly", "refusal": "I cannot."}}]});
+        assert_eq!(
+            crate::pipeline::response_blocks::extract_preamble_from_response_json(&chat, super::ApiVersion::ChatCompletions),
+            "partly\n\nI cannot."
+        );
+        let responses = serde_json::json!({"output": [{"type": "message", "content": [
+            {"type": "output_text", "text": "partly"}, {"type": "refusal", "refusal": "I cannot."}]}]});
+        assert_eq!(
+            crate::pipeline::response_blocks::extract_preamble_from_response_json(&responses, super::ApiVersion::Responses),
+            "partly\n\nI cannot."
+        );
+        // Positive control: a round with no refusal reads its text alone.
+        assert_eq!(super::capture_preamble(&buffered[..1]).text, "partly");
+    }
+
     #[test]
     fn a_translated_leg_never_parses_a_chunk_twice() {
         let event = crate::api::sse::SseEvent {
@@ -12105,7 +12246,7 @@ mod tests {
         assert_eq!(store(&cited, &whole, Some(&body)), Err("citations"));
         // A refusal replayed would reach the client as ordinary text.
         let mut refused = answer(true, FinishReason::Stop);
-        refused.answer_refused = true;
+        refused.answer_refusal = "no".to_string();
         assert_eq!(store(&refused, &streamed, None), Err("refusal"));
         assert_eq!(store(&refused, &whole, Some(&body)), Err("refusal"));
     }

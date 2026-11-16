@@ -813,8 +813,8 @@ pub struct BlockAccumulator {
     /// Each server tool's call, by number: the wire address of the frame that
     /// opened it (see [`WireAddress`]).
     server_tools: std::collections::HashMap<usize, WireAddress>,
-    /// Usage reports that arrived while a block was held, released right
-    /// behind it.
+    /// Usage reports, and pieces of the model's refusal, that arrived while a
+    /// block was held, released right behind it.
     held_usage: Vec<BufferedEvent>,
     /// Which block types to buffer.
     interests: BlockInterests,
@@ -854,6 +854,12 @@ pub struct BlockAccumulator {
     pub tool_arg_modifications: Vec<crate::proxy::content::ToolArgModification>,
     /// Structured injection blocks for response-side transforms.
     pub injection_blocks: Vec<crate::proxy::content::InjectionBlock>,
+    /// The sources a text a script rewrote cited, whose frames the client is
+    /// not sent ([`is_citation_frame`]): the record keeps none of them, as a
+    /// whole answer's rewritten text keeps none.
+    pub withdrawn_citations: Vec<serde_json::Value>,
+    /// The upstream's protocol, whose parser reads a withdrawn frame.
+    upstream: crate::api::sse::ApiVersion,
     /// Tool-name → intercept handler map produced by request-phase
     /// `Substitute` / `InterceptOnly` rules. When the upstream emits a
     /// `ToolCallDelta` with a `function_name` that matches an entry, the
@@ -900,6 +906,7 @@ impl BlockAccumulator {
         upstream: crate::api::sse::ApiVersion,
     ) -> Self {
         Self {
+            upstream,
             active: None,
             calls_arrive_whole: upstream == crate::api::sse::ApiVersion::GoogleGemini,
             checked_calls: Vec::new(),
@@ -921,6 +928,7 @@ impl BlockAccumulator {
             blocked_tool_infos: Vec::new(),
             tool_arg_modifications: Vec::new(),
             injection_blocks: Vec::new(),
+            withdrawn_citations: Vec::new(),
             intercept_bindings,
             withheld_tools: Vec::new(),
             pending_intercepted: Vec::new(),
@@ -1149,6 +1157,28 @@ impl BlockAccumulator {
             }
             // Taken before this match (see the top of `process`).
             DomainEvent::FreeformCallEnd { .. } => vec![BufferedEvent { domain_event: Some(event), raw_sse }],
+            // ── A refusal — no text a response script rewrites, on any path
+            //    (a whole answer's scripts read its text alone). Like a usage
+            //    report it is no content boundary: a text held when it comes
+            //    stays one block (a Chat chunk can carry both), and the refusal
+            //    goes out right behind it ──
+            DomainEvent::RefusalDelta(_) => {
+                let refusal = BufferedEvent { domain_event: Some(event), raw_sse };
+                // Held within the cap a held block has; past it the block is
+                // released before it, as at any boundary.
+                if self.held_usage.len() >= MAX_BUFFERED_EVENTS {
+                    let mut out = self.flush_active();
+                    out.append(&mut self.held_usage);
+                    out.push(refusal);
+                    return out;
+                }
+                if self.active.is_some() || !self.held_usage.is_empty() {
+                    self.held_usage.push(refusal);
+                    Vec::new()
+                } else {
+                    vec![refusal]
+                }
+            }
             // ── Image generation — pass through (no buffering needed, tool policy
             //    is enforced at request time by blocking the tool from the tools array) ──
             DomainEvent::ImageGeneration { .. } => {
@@ -1610,7 +1640,10 @@ impl BlockAccumulator {
         // before the text's `done`), which would still quote or place what it
         // took out.
         if text_block && out.iter().any(|e| e.raw_sse.is_none() && matches!(e.domain_event, Some(DomainEvent::TextDelta(_)))) {
-            trailing.retain(|frame| !is_citation_frame(frame));
+            let (cited, kept): (Vec<SseEvent>, Vec<SseEvent>) = trailing.into_iter().partition(is_citation_frame);
+            let upstream = self.upstream;
+            self.withdrawn_citations.extend(cited.iter().flat_map(|f| frame_citations(upstream, f)));
+            trailing = kept;
         }
         // Withheld whole: no client is given any part of it — the audit, which
         // reads the stream's own events, still records the call — and it is
@@ -3407,9 +3440,15 @@ pub fn extract_preamble_from_response_json(
                 .and_then(|c| c.as_array())
                 .and_then(|a| a.first())
                 .and_then(|c| c.get("message"))
-                .and_then(|m| crate::api::chat::content_text(m.get("content")))
+                .map(|m| {
+                    // The model's refusal follows its text, set apart as the
+                    // record and a streamed round set it.
+                    crate::proxy::content::with_refusal(
+                        crate::api::chat::content_text(m.get("content")).unwrap_or_default().into_owned(),
+                        crate::api::chat::message_refusal(m).unwrap_or_default(),
+                    )
+                })
                 .unwrap_or_default()
-                .into_owned()
         }
         ApiVersion::AnthropicMessages => {
             let mut preamble = String::new();
@@ -3430,6 +3469,7 @@ pub fn extract_preamble_from_response_json(
         }
         ApiVersion::Responses => {
             let mut preamble = String::new();
+            let mut in_refusal = false;
             if let Some(output) = response_json.get("output").and_then(|o| o.as_array()) {
                 for item in output.iter() {
                     let it = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -3439,12 +3479,24 @@ pub fn extract_preamble_from_response_json(
                     if it == "message"
                         && let Some(parts) = item.get("content").and_then(|c| c.as_array())
                     {
+                        // Its text and the model's refusal, each switch between
+                        // the two set apart as a streamed round sets it.
                         for part in parts.iter() {
-                            if part.get("type").and_then(|t| t.as_str()) == Some("output_text")
-                                && let Some(t) = part.get("text").and_then(|t| t.as_str())
-                            {
-                                preamble.push_str(t);
+                            let (piece, refusal) = match crate::api::responses::refusal_part_text(part) {
+                                Some(r) => (r, true),
+                                None if part.get("type").and_then(|t| t.as_str()) == Some("output_text") => {
+                                    match part.get("text").and_then(|t| t.as_str()) {
+                                        Some(t) => (t, false),
+                                        None => continue,
+                                    }
+                                }
+                                None => continue,
+                            };
+                            if refusal != in_refusal && !preamble.is_empty() {
+                                preamble.push_str("\n\n");
                             }
+                            in_refusal = refusal;
+                            preamble.push_str(piece);
                         }
                     }
                 }
@@ -3540,6 +3592,14 @@ fn is_citation_frame(frame: &SseEvent) -> bool {
             .is_ok_and(|v| v.get("type").and_then(serde_json::Value::as_str) == Some(RESPONSES_ANNOTATION)),
         _ => false,
     }
+}
+
+/// The sources a citation frame ([`is_citation_frame`]) names, read by the
+/// stream parser that recorded them — the one reader of the frame.
+fn frame_citations(upstream: crate::api::sse::ApiVersion, frame: &SseEvent) -> Vec<serde_json::Value> {
+    let mut parser = crate::api::sse::StreamParser::new(upstream);
+    parser.parse(frame);
+    parser.take_citations()
 }
 
 /// Source for a `url_citation` annotation: a single URL+title pair pulled
@@ -4105,9 +4165,14 @@ pub fn redact_pii_in_response_json(
         (!findings.is_empty()).then(|| crate::guardrail::redact(text, &findings, &pii.redaction_placeholder))
     }
 
-    fn redact_in(value: &mut serde_json::Value, pii: &crate::guardrail::PiiSettings) {
-        if let Some(m) = value.as_str().and_then(|text| masked(text, pii)) {
-            *value = serde_json::Value::String(m);
+    /// Mask `value`'s text in place; whether it changed.
+    fn redact_in(value: &mut serde_json::Value, pii: &crate::guardrail::PiiSettings) -> bool {
+        match value.as_str().and_then(|text| masked(text, pii)) {
+            Some(m) => {
+                *value = serde_json::Value::String(m);
+                true
+            }
+            None => false,
         }
     }
 
@@ -4151,17 +4216,18 @@ pub fn redact_pii_in_response_json(
                         // The joined pass runs only where there are several
                         // slots: one slot alone is its whole channel.
                         let carries = |v: &serde_json::Value| v.as_str().is_some_and(|t| !t.is_empty());
-                        let text_before = crate::api::chat::content_text(message.get("content")).map(std::borrow::Cow::into_owned);
+                        let mut text_masked = false;
                         let mut text_slots = 0;
                         for slot in crate::api::chat::text_slots_mut(message) {
                             text_slots += usize::from(carries(slot));
-                            redact_in(slot, pii);
+                            text_masked |= redact_in(slot, pii);
                         }
                         if text_slots > 1
                             && let Some(m) = crate::api::chat::content_text(message.get("content"))
                                 .and_then(|t| masked(&t, pii))
                         {
                             crate::api::chat::set_content_text(message, m);
+                            text_masked = true;
                         }
                         // Reasoning joins across `thinking` chunk prose only
                         // where no key carries text: each key is a whole slot
@@ -4181,14 +4247,14 @@ pub fn redact_pii_in_response_json(
                         {
                             crate::api::chat::set_message_reasoning(message, &m);
                         }
-                        // The refusal the audit reads as the answer's text
-                        // (`content::whole_answer_text`), and each annotation's
+                        // The refusal, which the audit scans on its own
+                        // (`content::answer_refusal`), and each annotation's
                         // title — or none, where the mask changed the text
                         // their offsets point into.
                         if let Some(refusal) = message.get_mut("refusal") {
                             redact_in(refusal, pii);
                         }
-                        if crate::api::chat::content_text(message.get("content")).map(std::borrow::Cow::into_owned) != text_before
+                        if text_masked
                             && let Some(fields) = message.as_object_mut()
                         {
                             fields.remove("annotations");
@@ -4237,19 +4303,16 @@ pub fn redact_pii_in_response_json(
                                             // Its annotations place sources by
                                             // offsets into the text: a masked
                                             // text keeps none.
-                                            let before = part.get("text").cloned();
-                                            if let Some(text) = part.get_mut("text") {
-                                                redact_in(text, pii);
-                                            }
-                                            if part.get("text") != before.as_ref()
+                                            let text_masked = part.get_mut("text").is_some_and(|text| redact_in(text, pii));
+                                            if text_masked
                                                 && let Some(fields) = part.as_object_mut()
                                             {
                                                 fields.remove("annotations");
                                             }
                                             redact_citations(part.get_mut("annotations"), pii);
                                         }
-                                        // The refusal the audit reads as the
-                                        // answer's text.
+                                        // The refusal, which the audit scans
+                                        // on its own.
                                         Some("refusal") => {
                                             if let Some(text) = part.get_mut("refusal") {
                                                 redact_in(text, pii);
@@ -6081,6 +6144,38 @@ mod tests {
         assert_eq!(run(r#"fn transform(ctx) { ctx }"#), cited());
     }
 
+    /// A refusal is no text a response script rewrites: it passes a held text
+    /// block with its own frame, as sent, while the text beside it is
+    /// rewritten.
+    #[test]
+    fn a_refusal_passes_a_rewriting_script_as_sent() {
+        let programs = vec![make_response_program_with_source("p", "text", r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#)];
+        let interests = BlockInterests { buffer_tool_blocks: false, buffer_text_blocks: true, buffer_thinking_blocks: false };
+        let mut acc = BlockAccumulator::new(interests, vec![], Default::default(), programs, Some(Arc::new(ScriptEngine::new())),
+            Some(make_block_meta()), false, ScriptFailMode::Open, vec![], false, false, crate::api::sse::ApiVersion::Responses);
+        let refusal_frame = SseEvent {
+            event_type: Some("response.refusal.delta".into()),
+            data: r#"{"type":"response.refusal.delta","item_id":"m","output_index":1,"content_index":0,"delta":"I cannot."}"#.into(),
+            id: None,
+        };
+        let mut out = acc.process(DomainEvent::TextDelta("secret ".into()), None);
+        out.extend(acc.process(DomainEvent::RefusalDelta("I cannot.".into()), Some(refusal_frame.clone())));
+        // A text held across the refusal stays one block for the script.
+        out.extend(acc.process(DomainEvent::TextDelta("data".into()), None));
+        out.extend(acc.process(DomainEvent::Done { finish_reason: None, native_finish_reason: None }, None));
+        let texts: Vec<&String> = out.iter().filter_map(|e| match &e.domain_event {
+            Some(DomainEvent::TextDelta(t)) => Some(t),
+            _ => None,
+        }).collect();
+        assert_eq!(texts, ["[FILTERED]"], "one block, rewritten whole");
+        let refusal = out.iter().find(|e| matches!(&e.domain_event, Some(DomainEvent::RefusalDelta(_)))).expect("the refusal passes");
+        assert_matches!(&refusal.domain_event, Some(DomainEvent::RefusalDelta(t)) if t == "I cannot.");
+        assert_eq!(refusal.raw_sse.as_ref().map(|f| f.data.clone()), Some(refusal_frame.data));
+        // Positive control: the text beside it was rewritten.
+        assert!(out.iter().any(|e| matches!(&e.domain_event, Some(DomainEvent::TextDelta(t)) if t == "[FILTERED]")), "{:?}",
+            out.iter().map(|e| &e.domain_event).collect::<Vec<_>>());
+    }
+
     /// A streamed text a script rewrites loses the sources sent after it (the
     /// spec's order: `text_delta`, then `citations_delta`), held with the block;
     /// a text no script changes keeps them, in place behind it.
@@ -6108,13 +6203,19 @@ mod tests {
             out.extend(acc.process_raw(cite.clone(), false));
             out.extend(acc.process_raw(stop.clone(), false));
             out.extend(acc.process(DomainEvent::Done { finish_reason: None, native_finish_reason: None }, None));
-            out.iter().filter_map(|e| e.raw_sse.as_ref()).map(|f| f.data.clone()).collect::<Vec<_>>()
+            let frames = out.iter().filter_map(|e| e.raw_sse.as_ref()).map(|f| f.data.clone()).collect::<Vec<_>>();
+            (frames, acc.withdrawn_citations.clone())
         };
-        let rewritten = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
+        let (rewritten, withdrawn) = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
         assert!(rewritten.iter().all(|f| !f.contains("citations_delta")), "{rewritten:?}");
         assert!(rewritten.iter().any(|f| f.contains("content_block_stop")), "{rewritten:?}");
-        let kept = run(r#"fn transform(ctx) { ctx }"#);
+        let (kept, kept_withdrawn) = run(r#"fn transform(ctx) { ctx }"#);
         assert!(kept.iter().any(|f| f.contains("citations_delta")), "{kept:?}");
+        // The record keeps what the client was sent: the rewritten text's
+        // source is withdrawn, the unchanged one's is not.
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert!(withdrawn[0].is_object());
+        assert!(kept_withdrawn.is_empty(), "{kept_withdrawn:?}");
     }
 
     /// A Responses text a script rewrites loses the annotations the stream
@@ -6148,13 +6249,19 @@ mod tests {
             out.extend(acc.process_raw(added.clone(), false));
             out.extend(acc.process_raw(done.clone(), false));
             out.extend(acc.process(DomainEvent::Done { finish_reason: None, native_finish_reason: None }, None));
-            out.iter().filter_map(|e| e.raw_sse.as_ref()).map(|f| f.data.clone()).collect::<Vec<_>>()
+            let frames = out.iter().filter_map(|e| e.raw_sse.as_ref()).map(|f| f.data.clone()).collect::<Vec<_>>();
+            (frames, acc.withdrawn_citations.clone())
         };
-        let rewritten = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
+        let (rewritten, withdrawn) = run(r#"fn transform(ctx) { ctx.content = "[FILTERED]"; ctx }"#);
         assert!(rewritten.iter().all(|f| !f.contains("annotation.added")), "{rewritten:?}");
         assert!(rewritten.iter().any(|f| f.contains("output_text.done")), "{rewritten:?}");
-        let kept = run(r#"fn transform(ctx) { ctx }"#);
+        let (kept, kept_withdrawn) = run(r#"fn transform(ctx) { ctx }"#);
         assert!(kept.iter().any(|f| f.contains("annotation.added")), "{kept:?}");
+        // The record keeps what the client was sent: the rewritten text's
+        // source is withdrawn, the unchanged one's is not.
+        assert_eq!(withdrawn.len(), 1, "{withdrawn:?}");
+        assert!(withdrawn[0].is_object());
+        assert!(kept_withdrawn.is_empty(), "{kept_withdrawn:?}");
     }
 
     /// A whole OpenAI answer's refusal and its annotations' titles — Chat

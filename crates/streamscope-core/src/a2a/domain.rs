@@ -67,7 +67,7 @@ pub fn part_to_block(part: &A2aPart) -> DomainContentBlock {
                 };
             }
             if media_type.starts_with("image/") {
-                return DomainContentBlock::Image {
+                return DomainContentBlock::Image { detail: None,
                     data: base64.clone(),
                     media_type: media_type.to_string(),
                     cache_control: None,

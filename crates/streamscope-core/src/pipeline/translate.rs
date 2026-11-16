@@ -178,6 +178,9 @@ pub struct AnthropicResponseBuilder {
     content_index: usize,
     has_thinking_block: bool,
     has_text_block: bool,
+    /// The open text block holds the model's refusal, which is a block of its
+    /// own, as the whole-answer translation writes it.
+    text_is_refusal: bool,
     has_tool_block: bool,
     /// The call the open `tool_use` block carries.
     tool_block_call: Option<ToolBlock>,
@@ -252,6 +255,7 @@ impl AnthropicResponseBuilder {
             content_index: 0,
             has_thinking_block: false,
             has_text_block: false,
+            text_is_refusal: false,
             has_tool_block: false,
             tool_block_call: None,
             closed_tool_calls: std::collections::HashSet::new(),
@@ -324,7 +328,27 @@ impl AnthropicResponseBuilder {
                 }
             }
             DomainEvent::TextDelta(text) => {
+                if self.has_text_block && self.text_is_refusal {
+                    self.close_current_block(&mut sse_events);
+                }
+                self.text_is_refusal = false;
                 self.process_text_delta(text, &mut sse_events);
+            }
+            // Anthropic has no refusal block: the model's refusal is a text
+            // block of its own, as the whole-answer translation writes it.
+            DomainEvent::RefusalDelta(text) => {
+                if self.has_text_block && !self.text_is_refusal {
+                    self.close_current_block(&mut sse_events);
+                }
+                self.text_is_refusal = true;
+                // The answer has begun: a `<think>` the content opens later is
+                // its text, and one left open is closed by the refusal's block.
+                self.think_tag_state = match self.think_tag_state {
+                    ThinkTagState::Init => ThinkTagState::NoThinkTags,
+                    ThinkTagState::InsideThink => ThinkTagState::AfterThink,
+                    ref settled => settled.clone(),
+                };
+                self.emit_text_delta(text, &mut sse_events);
             }
             DomainEvent::ReasoningDelta(text) => {
                 // Dedicated reasoning field from upstream (e.g. OpenAI reasoning models).
@@ -1123,6 +1147,11 @@ pub fn openai_response_to_anthropic(
                 }
             }
 
+        // The model's refusal: Anthropic has no refusal block, so it is text.
+        if let Some(refusal) = message.and_then(crate::api::chat::message_refusal) {
+            content_blocks.push(serde_json::json!({"type": "text", "text": refusal}));
+        }
+
         // Extract tool calls
         if let Some(tool_calls) = message
             .and_then(|m| m.get("tool_calls"))
@@ -1350,6 +1379,8 @@ struct ResponsesItem {
 enum ResponsesItemKind {
     Reasoning,
     Message,
+    /// A message whose one part is the model's refusal (a `refusal` part).
+    Refusal,
     /// `call_id` is the upstream's own id (empty until it names one) and
     /// `index` its call index — what a continuing delta is compared with.
     /// `wire_call_id` is the id the client is given, fixed when the call is
@@ -1359,6 +1390,14 @@ enum ResponsesItemKind {
     /// call by it.
     FunctionCall { call_id: String, name: String, index: usize, wire_call_id: String },
     WebSearchCall,
+}
+
+/// The kind of text item [`ResponsesResponseBuilder::text_item`] opens.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextItem {
+    Reasoning,
+    Message,
+    Refusal,
 }
 
 /// In-flight `web_search_call` output_item state, kept between
@@ -1447,7 +1486,7 @@ impl ResponsesResponseBuilder {
     /// ends (a message opened sooner would close calls still streaming).
     fn write_withheld_notices(&mut self, out: &mut Vec<String>) {
         for text in self.withheld.untold() {
-            let i = self.text_item(true, out);
+            let i = self.text_item(TextItem::Message, out);
             self.items[i].text.push_str(text);
             let id = self.items[i].id.clone();
             out.push(self.responses_sse("response.output_text.delta", serde_json::json!({
@@ -1466,13 +1505,20 @@ impl ResponsesResponseBuilder {
             .is_some_and(|i| matches!(self.items[i].kind, ResponsesItemKind::Message))
     }
 
+    /// A refusal item is open: the refusal the client is reading continues
+    /// in it, whatever round it streams in.
+    fn refusal_open(&self) -> bool {
+        self.open
+            .is_some_and(|i| matches!(self.items[i].kind, ResponsesItemKind::Refusal))
+    }
+
     /// Append an item at the next `output_index`, announcing it when
     /// `announce` — every item but a function call not yet identified.
     fn open_item(&mut self, kind: ResponsesItemKind, announce: bool, out: &mut Vec<String>) -> usize {
         let output_index = self.items.len();
         let prefix = match kind {
             ResponsesItemKind::Reasoning => "rs",
-            ResponsesItemKind::Message => "msg",
+            ResponsesItemKind::Message | ResponsesItemKind::Refusal => "msg",
             ResponsesItemKind::FunctionCall { .. } => "fc",
             ResponsesItemKind::WebSearchCall => "ws",
         };
@@ -1511,7 +1557,7 @@ impl ResponsesResponseBuilder {
                 ResponsesItemKind::Reasoning => {
                     serde_json::json!({"id": id, "type": "reasoning", "summary": []})
                 }
-                ResponsesItemKind::Message => serde_json::json!({
+                ResponsesItemKind::Message | ResponsesItemKind::Refusal => serde_json::json!({
                     "id": id, "type": "message", "status": "in_progress",
                     "role": "assistant", "content": []
                 }),
@@ -1543,18 +1589,31 @@ impl ResponsesResponseBuilder {
         }
     }
 
-    /// The open reasoning or message item of the kind asked for, opening one
-    /// (and closing whatever else is open first) when there is none.
-    fn text_item(&mut self, want_message: bool, out: &mut Vec<String>) -> usize {
+    /// The open reasoning, message or refusal item of the kind asked for,
+    /// opening one (and closing whatever else is open first) when there is
+    /// none.
+    fn text_item(&mut self, want: TextItem, out: &mut Vec<String>) -> usize {
         if let Some(i) = self.open {
-            match self.items[i].kind {
-                ResponsesItemKind::Message if want_message => return i,
-                ResponsesItemKind::Reasoning if !want_message => return i,
+            match (&self.items[i].kind, want) {
+                (ResponsesItemKind::Message, TextItem::Message)
+                | (ResponsesItemKind::Reasoning, TextItem::Reasoning)
+                | (ResponsesItemKind::Refusal, TextItem::Refusal) => return i,
                 _ => {}
             }
         }
         self.close_open(None, out);
-        let i = if want_message {
+        let i = if want == TextItem::Refusal {
+            let i = self.open_item(ResponsesItemKind::Refusal, true, out);
+            let id = self.items[i].id.clone();
+            out.push(self.responses_sse("response.content_part.added", serde_json::json!({
+                "type": "response.content_part.added",
+                "item_id": id,
+                "output_index": i,
+                "content_index": 0,
+                "part": {"type": "refusal", "refusal": ""}
+            })));
+            i
+        } else if want == TextItem::Message {
             let i = self.open_item(ResponsesItemKind::Message, true, out);
             let id = self.items[i].id.clone();
             out.push(self.responses_sse("response.content_part.added", serde_json::json!({
@@ -1621,7 +1680,31 @@ impl ResponsesResponseBuilder {
     fn close_text(&mut self, i: usize, turn_end: Option<Option<Incomplete>>, out: &mut Vec<String>) {
         let id = self.items[i].id.clone();
         let text = std::mem::take(&mut self.items[i].text);
-        let closed = if matches!(self.items[i].kind, ResponsesItemKind::Reasoning) {
+        let closed = if matches!(self.items[i].kind, ResponsesItemKind::Refusal) {
+            out.push(self.responses_sse("response.refusal.done", serde_json::json!({
+                "type": "response.refusal.done",
+                "item_id": id,
+                "output_index": i,
+                "content_index": 0,
+                "refusal": text
+            })));
+            let part = serde_json::json!({"type": "refusal", "refusal": text});
+            out.push(self.responses_sse("response.content_part.done", serde_json::json!({
+                "type": "response.content_part.done",
+                "item_id": id,
+                "output_index": i,
+                "content_index": 0,
+                "part": part
+            })));
+            let status = match turn_end {
+                Some(Some(_)) => "incomplete",
+                _ => "completed",
+            };
+            serde_json::json!({
+                "id": id, "type": "message", "status": status, "role": "assistant",
+                "content": [part]
+            })
+        } else if matches!(self.items[i].kind, ResponsesItemKind::Reasoning) {
             out.push(self.responses_sse("response.reasoning_summary_text.done", serde_json::json!({
                 "type": "response.reasoning_summary_text.done",
                 "item_id": id,
@@ -1741,7 +1824,10 @@ impl ResponsesResponseBuilder {
         // final response was sent: an item opened now could never be closed
         // or listed in it. The audit state records the content.
         if self.completed {
-            if matches!(event, DomainEvent::ReasoningDelta(_) | DomainEvent::TextDelta(_) | DomainEvent::ToolCallDelta { .. }) {
+            if matches!(
+                event,
+                DomainEvent::ReasoningDelta(_) | DomainEvent::TextDelta(_) | DomainEvent::RefusalDelta(_) | DomainEvent::ToolCallDelta { .. }
+            ) {
                 tracing::warn!("content streamed after the response ended; not sent to the client");
             }
             return out;
@@ -1767,7 +1853,7 @@ impl ResponsesResponseBuilder {
         match event.as_ref() {
             DomainEvent::FreeformCallEnd { .. } => {}
             DomainEvent::ReasoningDelta(text) => {
-                let i = self.text_item(false, &mut out);
+                let i = self.text_item(TextItem::Reasoning, &mut out);
                 self.items[i].text.push_str(text);
                 let id = self.items[i].id.clone();
                 out.push(self.responses_sse("response.reasoning_summary_text.delta", serde_json::json!({
@@ -1782,7 +1868,7 @@ impl ResponsesResponseBuilder {
                 if self.drop_round_text && !self.message_open() {
                     return out;
                 }
-                let i = self.text_item(true, &mut out);
+                let i = self.text_item(TextItem::Message, &mut out);
                 self.items[i].text.push_str(text);
                 let id = self.items[i].id.clone();
                 out.push(self.responses_sse("response.output_text.delta", serde_json::json!({
@@ -1792,6 +1878,35 @@ impl ResponsesResponseBuilder {
                     "content_index": 0,
                     "delta": text,
                     "logprobs": []
+                })));
+            }
+            // The model's refusal: a message of its own whose one part is a
+            // `refusal` part, as a Responses upstream writes it.
+            DomainEvent::RefusalDelta(text) => {
+                // Held to the round's text ordering, as a `TextDelta` is: the
+                // record keeps it either way.
+                if self.drop_round_text && !self.message_open() && !self.refusal_open() {
+                    return out;
+                }
+                // The visible-mode sources a turn cites go on its text: the
+                // message the refusal follows closes with them.
+                if !self.visible_mode_url_sources.is_empty()
+                    && let Some(i) = self.open.filter(|&i| matches!(self.items[i].kind, ResponsesItemKind::Message))
+                {
+                    self.open = None;
+                    self.close_text(i, Some(None), &mut out);
+                    // Cited once: a later message does not restate them.
+                    self.visible_mode_url_sources.clear();
+                }
+                let i = self.text_item(TextItem::Refusal, &mut out);
+                self.items[i].text.push_str(text);
+                let id = self.items[i].id.clone();
+                out.push(self.responses_sse("response.refusal.delta", serde_json::json!({
+                    "type": "response.refusal.delta",
+                    "item_id": id,
+                    "output_index": i,
+                    "content_index": 0,
+                    "delta": text
                 })));
             }
             // Bytes no call may take — of no call, or a custom call's text
@@ -2189,6 +2304,16 @@ pub fn chat_completions_to_responses_response(
             }]
         }));
     }
+    // The model's refusal → a message whose part is a `refusal` part.
+    if let Some(refusal) = message.and_then(crate::api::chat::message_refusal) {
+        output.push(serde_json::json!({
+            "id": format!("msg_{}_refusal", crate::ids::client_id(response_id)),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "refusal", "refusal": refusal}]
+        }));
+    }
 
     // Tool calls → function_call output items
     if let Some(tool_calls) = message
@@ -2539,6 +2664,7 @@ pub fn responses_response_to_chat_completions(
     model: &str,
 ) -> Value {
     let mut content_text = String::new();
+    let mut refusal_text = String::new();
     let mut reasoning_text = String::new();
     let mut tool_calls = Vec::new();
     let failed = responses_turn_failed(response_json);
@@ -2552,11 +2678,14 @@ pub fn responses_response_to_chat_completions(
                     if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                         for part in content {
                             let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                            // Handle both output_text and refusal content types
-                            if matches!(part_type, "output_text" | "refusal")
-                                && let Some(text) = crate::api::responses::part_text(part) {
-                                    content_text.push_str(text);
-                                }
+                            // A refusal part is the message's `refusal`.
+                            if let Some(refusal) = crate::api::responses::refusal_part_text(part) {
+                                refusal_text.push_str(refusal);
+                            } else if part_type == "output_text"
+                                && let Some(text) = crate::api::responses::part_text(part)
+                            {
+                                content_text.push_str(text);
+                            }
                         }
                     }
                 }
@@ -2632,6 +2761,9 @@ pub fn responses_response_to_chat_completions(
     });
     if !reasoning_text.is_empty() {
         message["reasoning"] = Value::String(reasoning_text);
+    }
+    if !refusal_text.is_empty() {
+        message["refusal"] = Value::String(refusal_text);
     }
 
     let mut usage_json = serde_json::json!({
@@ -3070,6 +3202,21 @@ impl ChatCompletionsResponseBuilder {
                 });
                 out.push(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
             }
+            // The chunk's delta carries the model's refusal in pieces, as its
+            // content.
+            DomainEvent::RefusalDelta(text) => {
+                let chunk = serde_json::json!({
+                    "id": self.response_id,
+                    "object": "chat.completion.chunk",
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"refusal": text},
+                        "finish_reason": null
+                    }]
+                });
+                out.push(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap_or_default()));
+            }
             DomainEvent::ReasoningDelta(text) => {
                 let chunk = serde_json::json!({
                     "id": self.response_id,
@@ -3355,7 +3502,8 @@ impl GeminiResponseBuilder {
         let event = event.as_tool_call_delta();
         match event.as_ref() {
             DomainEvent::FreeformCallEnd { .. } => {}
-            DomainEvent::TextDelta(text) => {
+            // Gemini has no refusal part: the model's refusal is its text.
+            DomainEvent::TextDelta(text) | DomainEvent::RefusalDelta(text) => {
                 let chunk = serde_json::json!({
                     "candidates": [{
                         "content": {
@@ -3850,6 +3998,10 @@ pub fn chat_completions_to_gemini_response(response_json: &Value) -> Value {
         .and_then(|m| crate::api::chat::content_text(m.get("content")))
     {
         parts.push(serde_json::json!({"text": content}));
+    }
+    // Gemini has no refusal part: the model's refusal is its text.
+    if let Some(refusal) = choice.and_then(|c| c.get("message")).and_then(crate::api::chat::message_refusal) {
+        parts.push(serde_json::json!({"text": refusal}));
     }
     if let Some(tool_calls) = choice
         .and_then(|c| c.get("message"))
@@ -5395,11 +5547,102 @@ mod tests {
         let result = responses_response_to_chat_completions(
             &response_json, "gpt-4o",
         );
+        // The Chat message's `refusal` — "the refusal message generated by
+        // the model" — not its content.
         let message = &result["choices"][0]["message"];
-        assert!(
-            message["content"].as_str().unwrap().contains("I cannot do that."),
-            "refusal text should appear in content"
-        );
+        assert_eq!(message["refusal"], "I cannot do that.");
+        assert!(message["content"].is_null(), "{message}");
+    }
+
+    /// A Chat answer's refusal reaches every client of another protocol: a
+    /// Responses client as a message whose part is a `refusal` part (the
+    /// spec's `ResponseOutputRefusal { refusal, type }`), an Anthropic or a
+    /// Gemini client, which have no refusal part, as text after the content.
+    #[test]
+    fn a_chat_refusal_reaches_every_translated_client() {
+        let chat = serde_json::json!({"id": "c1", "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "partly", "refusal": "I cannot do that."}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}});
+        let responses = chat_completions_to_responses_response(&chat, "m", "resp_1");
+        let output = responses["output"].as_array().unwrap();
+        assert_eq!(output[0]["content"][0]["text"], "partly");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"], serde_json::json!([{"type": "refusal", "refusal": "I cannot do that."}]));
+        let anthropic = openai_response_to_anthropic(&chat, "m", "r1", 1, None, None, 1024);
+        let texts: Vec<&str> = anthropic["content"].as_array().unwrap().iter().filter_map(|b| b["text"].as_str()).collect();
+        assert_eq!(texts, ["partly", "I cannot do that."]);
+        let gemini = chat_completions_to_gemini_response(&chat);
+        let parts: Vec<&str> = gemini["candidates"][0]["content"]["parts"].as_array().unwrap().iter().filter_map(|p| p["text"].as_str()).collect();
+        assert_eq!(parts, ["partly", "I cannot do that."]);
+        // Positive control: an answer that did not refuse gains nothing.
+        let plain = serde_json::json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": "ok", "refusal": null}}]});
+        assert_eq!(chat_completions_to_responses_response(&plain, "m", "resp_2")["output"].as_array().unwrap().len(), 1);
+    }
+
+    /// A refusal streamed by an upstream reaches each translated stream:
+    /// a Chat client as `delta.refusal`, a Responses client as a message of
+    /// its own carrying a `refusal` part (`content_part.added`,
+    /// `response.refusal.delta`, `response.refusal.done`, `content_part.done`,
+    /// as the spec's streaming events name them), and Anthropic and Gemini
+    /// clients as text.
+    #[test]
+    fn a_streamed_refusal_reaches_every_translated_stream() {
+        let refusal = DomainEvent::RefusalDelta("I cannot.".to_string());
+        let mut chat = ChatCompletionsResponseBuilder::new("m".to_string(), "chatcmpl-1".to_string());
+        let frames = chat.process_event(&refusal).join("");
+        assert!(frames.contains(r#""delta":{"refusal":"I cannot."}"#), "{frames}");
+
+        let mut responses = ResponsesResponseBuilder::new("resp_1".to_string(), "m".to_string());
+        let mut out = responses.process_event(&DomainEvent::TextDelta("partly".to_string()));
+        out.extend(responses.process_event(&refusal));
+        out.extend(responses.process_event(&DomainEvent::Done { finish_reason: Some(FinishReason::Stop), native_finish_reason: None }));
+        out.extend(responses.process_event(&DomainEvent::Usage(Usage { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3, ..Default::default() })));
+        let events: Vec<Value> = out
+            .iter()
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect();
+        let kinds: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+        let at = |kind: &str| kinds.iter().position(|k| *k == kind).unwrap_or_else(|| panic!("{kind} missing: {kinds:?}"));
+        assert!(at("response.output_text.done") < at("response.refusal.delta"), "{kinds:?}");
+        let delta = &events[at("response.refusal.delta")];
+        assert_eq!((delta["delta"].as_str(), delta["content_index"].as_u64()), (Some("I cannot."), Some(0)));
+        assert_eq!(events[at("response.refusal.done")]["refusal"], "I cannot.");
+        let completed = events.iter().find(|e| e["type"] == "response.completed").unwrap();
+        let output = completed["response"]["output"].as_array().unwrap();
+        assert_eq!(output[0]["content"][0]["text"], "partly");
+        assert_eq!(output[1]["content"], serde_json::json!([{"type": "refusal", "refusal": "I cannot."}]));
+        assert_ne!(output[0]["id"], output[1]["id"], "the refusal is a message of its own");
+
+        let mut gemini = GeminiResponseBuilder::new("m".to_string());
+        assert!(gemini.process_event(&refusal).join("").contains(r#""text":"I cannot.""#));
+
+        // Anthropic: a text block of its own after the text, as the whole
+        // answer's translation writes it.
+        let mut anthropic = AnthropicResponseBuilder::new("m".into(), "req1".into(), None, None, 0, 0);
+        let mut frames = anthropic.process_event(&DomainEvent::TextDelta("partly".to_string()));
+        frames.extend(anthropic.process_event(&refusal));
+        let starts: Vec<Value> = frames
+            .iter()
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter(|e| e["type"] == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2, "{frames:?}");
+        assert_ne!(starts[0]["index"], starts[1]["index"]);
+    }
+
+    /// In a visible-mode round a refusal is held to the round's text
+    /// ordering: no message opens ahead of the round's `web_search_call`.
+    #[test]
+    fn a_visible_mode_round_holds_a_refusal_as_it_holds_text() {
+        let mut builder = ResponsesResponseBuilder::new("resp_1".to_string(), "m".to_string());
+        builder.enter_visible_mode_round();
+        let out = builder.process_event(&DomainEvent::RefusalDelta("I cannot.".to_string()));
+        assert!(!out.iter().any(|f| f.contains("response.refusal.delta") || f.contains("output_item.added")), "{out:?}");
+        // Positive control: outside such a round it opens its message.
+        let mut plain = ResponsesResponseBuilder::new("resp_2".to_string(), "m".to_string());
+        assert!(plain.process_event(&DomainEvent::RefusalDelta("I cannot.".to_string())).iter().any(|f| f.contains("response.refusal.delta")));
     }
 
     #[test]
@@ -6039,6 +6282,34 @@ mod tests {
             joined.contains("response.output_item.done"),
             "flush emits output_item.done: {joined}"
         );
+    }
+
+    /// A turn whose cited text a refusal follows keeps the text's
+    /// `url_citation`s: the message closes with them as the refusal's item
+    /// opens.
+    #[test]
+    fn a_refusal_after_cited_text_keeps_the_texts_citations() {
+        let mut builder = ResponsesResponseBuilder::new("resp_cite1".to_string(), "m".to_string());
+        builder.enter_visible_mode_round();
+        builder.process_event(&DomainEvent::ServerToolCallDelta {
+            index: 0,
+            tool_use_id: "tu_cite".to_string(),
+            server_type: "web_search_preview".to_string(),
+            name: "web_search".to_string(),
+            input_delta: r#"{"query":"q"}"#.to_string(),
+        });
+        builder.process_event(&DomainEvent::ServerToolResult {
+            index: 0,
+            tool_use_id: "tu_cite".to_string(),
+            content: serde_json::json!({"hits": [{"url": "https://example.com/doc", "title": "Example Doc"}]}),
+        });
+        let mut out = builder.process_event(&DomainEvent::TextDelta("See https://example.com/doc for more.".to_string()));
+        out.extend(builder.process_event(&DomainEvent::RefusalDelta("I cannot go on.".to_string())));
+        out.extend(builder.process_event(&DomainEvent::Done { finish_reason: Some(FinishReason::Stop), native_finish_reason: None }));
+        out.extend(builder.flush_pending());
+        let joined = out.join("");
+        let annotation = joined.find("response.output_text.annotation.added").unwrap_or_else(|| panic!("no annotation: {joined}"));
+        assert!(annotation < joined.find("response.refusal.delta").unwrap(), "{joined}");
     }
 
     #[test]

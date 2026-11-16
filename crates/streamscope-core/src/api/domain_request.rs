@@ -474,6 +474,11 @@ pub enum DomainContentBlock {
         media_type: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControl>,
+        /// The detail the model is to see the image at, as the client set it
+        /// (Chat `image_url.detail`, Responses `input_image.detail`). Chat and
+        /// Responses have a place for it: their walks send it, any other names it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     ToolUse {
         id: String,
@@ -1453,26 +1458,122 @@ pub fn is_openai_platform(
     }) || matches!(transport, UpstreamTransport::AzureOpenAi | UpstreamTransport::AzureOpenAiEntra)
 }
 
+/// Whether an upstream is OpenAI's own API — the `openai` provider at an
+/// `api.openai.com` host, never Azure OpenAI — where a model is named as
+/// OpenAI's model pages name it; an Azure deployment is named by its
+/// operator.
+pub fn is_openai_own_api(
+    provider: &str,
+    transport: crate::config::upstream_transport::UpstreamTransport,
+    url: &str,
+) -> bool {
+    use crate::config::model_map::Provider;
+    use crate::config::upstream_transport::UpstreamTransport;
+    Provider::from_str_relaxed(provider) == Provider::OpenAi
+        && !matches!(transport, UpstreamTransport::AzureOpenAi | UpstreamTransport::AzureOpenAiEntra)
+        && is_openai_platform(provider, transport, url)
+}
+
 /// Whether an OpenAI model takes `reasoning_effort` / `reasoning.effort`
-/// `"none"`, which OpenAI's model pages state per model: GPT-5.1, 5.2, 5.5 and
-/// 5.6 ("Reasoning.effort supports: none, …", the `gpt-5.6` alias routing to
+/// `"none"`, which OpenAI's model pages state per model: GPT-5.1, 5.2, 5.4,
+/// 5.4 mini, 5.5 and 5.6 ("Reasoning.effort supports: none, …", the `gpt-5.6` alias routing to
 /// GPT-5.6 Sol) and GPT-6 Sol and Luna do; GPT-5 ("minimal, low, medium, and
 /// high") and GPT-6 Astra (`none` "returns HTTP 400") do not, and o3, o4-mini
-/// and the `-mini` / `-codex` / `-pro` variants document no `none`. So only the
+/// and the `-codex` / `-pro` variants document no `none`; of the `-mini`
+/// variants only GPT-5.4 mini does. So only the
 /// names the pages list, with an optional date stamp: a model they do not list
 /// is sent nothing rather than a value it may refuse.
 pub fn openai_model_takes_effort_none(model: &str) -> bool {
+    matches!(openai_model_base(model).as_str(), "gpt-5.1" | "gpt-5.2" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" | "gpt-5.6" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6-luna")
+}
+
+/// An OpenAI model's name, lowercase, without the date stamp that names a
+/// snapshot of it (`gpt-5.2-2025-12-11`).
+fn openai_model_base(model: &str) -> String {
     let lower = model.to_ascii_lowercase();
-    // A date stamp (`gpt-5.2-2025-12-11`) names a snapshot of the same model.
     let is_date = |s: &str| {
         s.len() == 11
             && s.char_indices().all(|(i, c)| if matches!(i, 0 | 5 | 8) { c == '-' } else { c.is_ascii_digit() })
     };
-    let base = match lower.len().checked_sub(11) {
-        Some(at) if lower.is_char_boundary(at) && is_date(&lower[at..]) => &lower[..at],
-        _ => lower.as_str(),
-    };
-    matches!(base, "gpt-5.1" | "gpt-5.2" | "gpt-5.5" | "gpt-5.6" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6-luna")
+    match lower.len().checked_sub(11) {
+        Some(at) if lower.is_char_boundary(at) && is_date(&lower[at..]) => lower[..at].to_string(),
+        _ => lower,
+    }
+}
+
+/// The efforts above `high` an OpenAI model takes, as its model page states
+/// ("Reasoning.effort supports: …"): `xhigh` on GPT-5.2, 5.2-Codex,
+/// 5.3-Codex, 5.4, 5.4 mini, 5.5 and 5.5 pro; `xhigh` and `max` on GPT-5.6,
+/// 5.6 Sol, GPT-6 Sol, Luna and Astra. GPT-5 and 5.1 stop at `high`, and so
+/// is a model the pages do not list taken to.
+pub fn openai_model_deep_efforts(model: &str) -> DeepEfforts {
+    match openai_model_base(model).as_str() {
+        "gpt-5.6" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6-astra" => DeepEfforts::ALL,
+        "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.5" | "gpt-5.5-pro" => {
+            DeepEfforts { xhigh: true, max: false }
+        }
+        _ => DeepEfforts::default(),
+    }
+}
+
+/// Whether an OpenAI model takes `prompt_cache_options` — "Supported for
+/// `gpt-5.6` and later models": the models from GPT-5.6 on whose pages are
+/// read here (GPT-5.6, 5.6 Sol, GPT-6 Sol, Luna and Astra), with an optional
+/// date stamp; a variant the pages do not list is sent none and it is named.
+pub fn openai_model_takes_prompt_cache_options(model: &str) -> bool {
+    matches!(openai_model_base(model).as_str(), "gpt-5.6" | "gpt-5.6-sol" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6-astra")
+}
+
+/// The efforts above `high` a Claude model takes, per Anthropic's effort
+/// guide: `max` "on Claude Fable 5.2, Claude Mythos 5.2, Claude Fable 5.1,
+/// Claude Mythos 5.1, Claude Fable 5, Claude Mythos 5, Claude Mythos Preview,
+/// Claude Opus 5.5, Claude Opus 5, Claude Opus 4.8, Claude Opus 4.7, Claude
+/// Opus 4.6, Claude Sonnet 5.5, Claude Sonnet 5, Claude Sonnet 4.6, and Claude
+/// Haiku 5.5", and `xhigh` on the same models but Mythos Preview, Opus 4.6
+/// and Sonnet 4.6 ("Not every model that supports `max` supports `xhigh`"). A
+/// Claude numbered past the ones it names is taken to take both, as the other
+/// model facts read it.
+pub fn anthropic_model_deep_efforts(model: &str) -> DeepEfforts {
+    let lower = model.to_ascii_lowercase();
+    let version = claude_version(model);
+    let family_from = |family: &str, from: (u32, u32)| lower.contains(family) && version.is_some_and(|v| v >= from);
+    DeepEfforts {
+        xhigh: (is_fable_or_mythos(model) && version.is_some())
+            || family_from("opus", (4, 7))
+            || family_from("sonnet", (5, 0))
+            || family_from("haiku", (5, 5)),
+        max: is_fable_or_mythos(model)
+            || family_from("opus", (4, 6))
+            || family_from("sonnet", (4, 6))
+            || family_from("haiku", (5, 5)),
+    }
+}
+
+/// The effort levels above `high` a model is known to take. Every protocol
+/// spells `xhigh` and `max`, but each model takes its own subset, and one it
+/// does not take is a 400: a level the model does not take is sent as the
+/// deepest one below it that it does ([`Self::spell`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeepEfforts {
+    pub xhigh: bool,
+    pub max: bool,
+}
+
+impl DeepEfforts {
+    /// Both levels: what a client's own request re-rendered in its own
+    /// protocol is sent, as it asked.
+    pub const ALL: Self = Self { xhigh: true, max: true };
+
+    /// `effort` as a model taking these levels is sent it.
+    fn spell(self, effort: &ReasoningEffort) -> &'static str {
+        match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::Max if self.max => "max",
+            ReasoningEffort::Max | ReasoningEffort::XHigh if self.xhigh => "xhigh",
+            ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
+        }
+    }
 }
 
 /// What a translation needs to know about the upstream it renders for, which
@@ -1506,6 +1607,24 @@ pub struct UpstreamFacts {
     /// verifies is rendered ([`DomainContentBlock::signed_for`]), and such a
     /// part is left out and named.
     pub rerenders_client_request: bool,
+    /// The efforts above `high` the serving model takes
+    /// ([`openai_model_deep_efforts`], [`anthropic_model_deep_efforts`]);
+    /// none where it is not known.
+    pub deep_efforts: DeepEfforts,
+    /// Whether the upstream takes `prompt_cache_options` — OpenAI's own API
+    /// serving a model documented to ([`openai_model_takes_prompt_cache_options`]).
+    /// Elsewhere it is named.
+    pub takes_prompt_cache_options: bool,
+}
+
+impl UpstreamFacts {
+    /// `effort` as the walk sends it: as asked on a same-protocol re-render
+    /// (the client's own request), else as the model takes it
+    /// ([`DeepEfforts::spell`]).
+    fn effort_sent(&self, effort: &ReasoningEffort) -> &'static str {
+        let deep = if self.rerenders_client_request { DeepEfforts::ALL } else { self.deep_efforts };
+        deep.spell(effort)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1513,18 +1632,26 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
-    /// Above `high` (`xhigh` / `XHIGH`): kept as asked, sent as `high` by
-    /// every walk ([`effort_to_str`]).
+    /// Above `high` (`xhigh` / `XHIGH`): kept as asked, sent as the model
+    /// takes it ([`UpstreamFacts::effort_sent`]).
     XHigh,
-    /// The deepest (`max`): kept as asked, sent as `high` by every walk
-    /// ([`effort_to_str`]).
+    /// The deepest (`max`): kept as asked, sent as the model takes it
+    /// ([`UpstreamFacts::effort_sent`]).
     Max,
 }
 
 // ─── Helpers ───
 
+/// A manual thinking budget for an effort level; the walk holds it inside
+/// what the request's cap allows.
 fn effort_to_budget(effort: &ReasoningEffort) -> u32 {
-    effort_str_to_budget(effort_to_str(effort))
+    match effort {
+        ReasoningEffort::Low => 4000,
+        ReasoningEffort::Medium => 10000,
+        ReasoningEffort::High => 32000,
+        ReasoningEffort::XHigh => 64000,
+        ReasoningEffort::Max => 128000,
+    }
 }
 
 /// An effort level as any of the four protocols spells it — Chat's
@@ -1552,19 +1679,6 @@ fn effort_from_str(s: &str) -> ReasoningEffort {
     effort_level(s).unwrap_or(ReasoningEffort::Low)
 }
 
-fn effort_to_str(effort: &ReasoningEffort) -> &'static str {
-    match effort {
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        // Every protocol spells both, but each model takes its own subset
-        // (Anthropic: `xhigh` only on some of the models that take `max`;
-        // OpenAI: "not all reasoning models support every value"), and no
-        // walk knows which: a translation sends `high`, which every model
-        // that reasons takes, and names the narrowing
-        // ([`DomainRequest::not_carried_to`]).
-        ReasoningEffort::High | ReasoningEffort::XHigh | ReasoningEffort::Max => "high",
-    }
-}
 
 fn budget_to_effort(budget: u32) -> ReasoningEffort {
     if budget < 5000 {
@@ -1727,6 +1841,7 @@ fn anthropic_thinking(
     upstream_model: &str,
     reasoning: &DomainReasoning,
     max_tokens: u32,
+    facts: &UpstreamFacts,
 ) -> (Option<ThinkingConfig>, Option<&'static str>) {
     const MIN_BUDGET: u32 = 1024;
     let config = |r#type: &str, budget_tokens| ThinkingConfig {
@@ -1741,7 +1856,7 @@ fn anthropic_thinking(
         // text — and 4.6 to "summarized", so a client's explicit ask either way
         // is stated; an unstated one leaves the model's default.
         adaptive.display = anthropic_display(reasoning.show);
-        return (Some(adaptive), reasoning.effort.as_ref().map(effort_to_str));
+        return (Some(adaptive), reasoning.effort.as_ref().map(|e| facts.effort_sent(e)));
     }
     let ceiling = max_tokens / 2;
     if ceiling < MIN_BUDGET {
@@ -1760,14 +1875,6 @@ fn anthropic_thinking(
         manual.display = anthropic_display(Some(false));
     }
     (Some(manual), None)
-}
-
-fn effort_str_to_budget(effort: &str) -> u32 {
-    match effort {
-        "low" => 4000,
-        "medium" => 10000,
-        _ => 32000,
-    }
 }
 
 /// A value that asks for nothing — `null`, `false`, an empty string or list
@@ -2016,7 +2123,7 @@ fn anthropic_image(source: &ImageSource, cache_control: &Option<CacheControl>) -
     } else {
         (source.data.clone(), source.media_type.clone())
     };
-    DomainContentBlock::Image { data, media_type, cache_control: cache_control.clone() }
+    DomainContentBlock::Image { detail: None, data, media_type, cache_control: cache_control.clone() }
 }
 
 /// An Anthropic document as a domain block — the one reading of a user
@@ -2611,17 +2718,20 @@ fn convert_chat_content_to_domain(content: Option<&MessageContent>) -> Vec<Domai
                     citations: Vec::new(),
                 },
                 ContentPart::ImageUrl { image_url, .. } => {
+                    let detail = image_url.detail.clone();
                     if let Some((media_type, data)) = split_data_uri(&image_url.url) {
-                            return DomainContentBlock::Image {
-                                data: data.to_string(),
-                                media_type: media_type.to_string(),
-                                cache_control: None,
-                            };
-                        }
+                        return DomainContentBlock::Image {
+                            data: data.to_string(),
+                            media_type: media_type.to_string(),
+                            cache_control: None,
+                            detail,
+                        };
+                    }
                     DomainContentBlock::Image {
                         data: image_url.url.clone(),
                         media_type: "image/url".to_string(),
                         cache_control: None,
+                        detail,
                     }
                 }
                 // An empty clip is not the clip the client sent: kept as the
@@ -2927,26 +3037,30 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
             .and_then(|u| u.as_str().or_else(|| u.get("url").and_then(Value::as_str)))
         {
             Some(url) => {
+                let detail = part.pointer("/image_url/detail").and_then(Value::as_str).map(String::from);
                 if let Some((mt, b64)) = split_data_uri(url) {
-                    return DomainContentBlock::Image { data: b64.to_string(), media_type: mt.to_string(), cache_control: None };
+                    return DomainContentBlock::Image { data: b64.to_string(), media_type: mt.to_string(), cache_control: None, detail };
                 }
-                DomainContentBlock::Image { data: url.to_string(), media_type: "image/url".to_string(), cache_control: None }
+                DomainContentBlock::Image { data: url.to_string(), media_type: "image/url".to_string(), cache_control: None, detail }
             }
             None => DomainContentBlock::Unknown { value: part.clone() },
         },
         "input_image" => {
             if let Some(url) = part.get("image_url").and_then(|u| u.as_str()) {
+                let detail = part.get("detail").and_then(Value::as_str).map(String::from);
                 if let Some((mt, b64)) = split_data_uri(url) {
                     return DomainContentBlock::Image {
                         data: b64.to_string(),
                         media_type: mt.to_string(),
                         cache_control: None,
+                        detail,
                     };
                 }
                 DomainContentBlock::Image {
                     data: url.to_string(),
                     media_type: "image/url".to_string(),
                     cache_control: None,
+                    detail,
                 }
             } else {
                 DomainContentBlock::Unknown { value: part.clone() }
@@ -2957,8 +3071,8 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
             None => DomainContentBlock::Unknown { value: part.clone() },
         },
         "input_file" => {
-            // Its `detail` rides the file or document it is read as; a file
-            // read as an image has none.
+            // Its `detail` rides the file, document or image it is read as
+            // (`auto` / `low` / `high`, values an image's detail takes too).
             let detail = part.get("detail").and_then(Value::as_str).map(String::from);
             let file_id = part
                 .get("file_id")
@@ -2981,6 +3095,7 @@ fn parse_responses_content_part(part: &Value) -> DomainContentBlock {
                         data: b64.to_string(),
                         media_type: mime.to_string(),
                         cache_control: None,
+                        detail,
                     };
                 }
                 // The decode range and the walks' inline range must be the SAME
@@ -3179,6 +3294,7 @@ fn counted(kinds: impl IntoIterator<Item = String>, label: impl Fn(&str) -> Stri
         })
         .collect()
 }
+
 
 /// Whether the walk for `target` sends an [`DomainContentBlock::Unknown`] held
 /// in an ASSISTANT turn — the one predicate those walks and
@@ -4094,7 +4210,7 @@ fn gemini_inline_block(mt: &str, data: &str) -> Option<DomainContentBlock> {
             cache_control: None,
             nested_content: None,
         }),
-        "image" => Some(DomainContentBlock::Image { data: standard(data)?, media_type: mt.to_string(), cache_control: None }),
+        "image" => Some(DomainContentBlock::Image { detail: None, data: standard(data)?, media_type: mt.to_string(), cache_control: None }),
         _ => None,
     }
 }
@@ -4281,7 +4397,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                     Some(ContentPart::text(text.clone()))
                 }
                 DomainContentBlock::Image {
-                    data, media_type, ..
+                    data, media_type, detail, ..
                 } => {
                     let url = if media_type == "image/url" {
                         data.clone()
@@ -4289,7 +4405,7 @@ fn domain_to_chat_content(blocks: &[DomainContentBlock], dialect: crate::api::mi
                         format!("data:{media_type};base64,{data}")
                     };
                     Some(ContentPart::ImageUrl {
-                        image_url: ImageUrl { url, detail: None },
+                        image_url: ImageUrl { url, detail: detail.clone() },
                         extra: BTreeMap::new(),
                     })
                 }
@@ -4597,13 +4713,17 @@ fn domain_to_responses_input_parts(blocks: &[DomainContentBlock]) -> Vec<Value> 
         DomainContentBlock::Text { text, .. } => {
             Some(serde_json::json!({"type": "input_text", "text": text}))
         }
-        DomainContentBlock::Image { data, media_type, .. } => {
+        DomainContentBlock::Image { data, media_type, detail, .. } => {
             let url = if media_type == "image/url" {
                 data.clone()
             } else {
                 format!("data:{media_type};base64,{data}")
             };
-            Some(serde_json::json!({"type": "input_image", "image_url": url}))
+            let mut part = serde_json::json!({"type": "input_image", "image_url": url});
+            if let Some(d) = detail {
+                part["detail"] = Value::String(d.clone());
+            }
+            Some(part)
         }
         DomainContentBlock::Audio { format, .. } => {
             // The Responses input union is `input_text` /
@@ -4804,10 +4924,12 @@ fn domain_to_anthropic_user_blocks(blocks: &[DomainContentBlock]) -> Vec<Content
                 cache_control: cache_control.clone(),
                 extra: citations_extra(citations),
             }),
+            // Anthropic's image has no detail: it is named.
             DomainContentBlock::Image {
                 data,
                 media_type,
                 cache_control,
+                ..
             } => Some(ContentBlock::Image {
                 source: domain_to_image_source(data, media_type),
                 cache_control: cache_control.clone(),
@@ -5812,7 +5934,9 @@ impl DomainRequest {
                 .filter(|m| matches!(m.role, DomainRole::Assistant))
                 .flat_map(|m| &m.content)
                 .filter_map(|b| match b {
-                    DomainContentBlock::Unknown { value } if !history_item_carried(target, value) => {
+                    DomainContentBlock::Unknown { value }
+                        if !history_item_carried(target, value) =>
+                    {
                         Some(unknown_part_kind(value).to_string())
                     }
                     _ => None,
@@ -5879,6 +6003,12 @@ impl DomainRequest {
                     let mut lost: Vec<String> = Vec::new();
                     if detail_lost {
                         lost.push(format!("detail of a file {place}"));
+                    }
+                    // An image's detail reaches a Chat or Responses image part.
+                    if matches!(b, DomainContentBlock::Image { detail: Some(_), .. })
+                        && !matches!(target, ApiVersion::ChatCompletions | ApiVersion::Responses)
+                    {
+                        lost.push(format!("detail of an image {place}"));
                     }
                     let members = match b {
                     // A file rendered as Anthropic's document: its name as the
@@ -5965,7 +6095,14 @@ impl DomainRequest {
         // The client's parameters the domain does not model reach no other
         // protocol's walk (the `gemini_*` knobs Gemini's walk restores are a
         // Gemini client's, never translated to Gemini).
-        out.extend(self.extra.iter().flat_map(|(k, v)| extra_not_carried(k, v)));
+        // `prompt_cache_options` reaches an OpenAI walk where the upstream
+        // takes it.
+        let carried = |key: &str| {
+            key == "prompt_cache_options"
+                && self.upstream.takes_prompt_cache_options
+                && matches!(target, ApiVersion::ChatCompletions | ApiVersion::Responses)
+        };
+        out.extend(self.extra.iter().filter(|(k, _)| !carried(k)).flat_map(|(k, v)| extra_not_carried(k, v)));
         // History parts no walk renders, named once per kind and role.
         out.extend(counted(
             self.history_parts.iter().map(|entry| {
@@ -6050,19 +6187,28 @@ impl DomainRequest {
         }
         // The plan the walk renders: without reasoning where the gate drops it.
         let mut reasoning_sent = target_reasons;
+        // Whether the effort goes on the wire: an Anthropic model thinking on
+        // a manual budget is sent none, its budget sized from it.
+        let mut effort_sent = true;
         if target == ApiVersion::AnthropicMessages {
             let reasoning = self.reasoning.as_ref().filter(|_| target_reasons);
             let plan = self.anthropic_reasoning_plan(upstream_model, reasoning);
             reasoning_sent &= plan.thinking.is_some() || plan.effort.is_some();
+            effort_sent = plan.effort.is_some();
             out.extend(plan.dropped);
         }
-        // A depth above `high` goes as `high` (`effort_to_str`), wherever the
-        // reasoning goes at all.
+        // A depth above `high` the model is not known to take goes as the
+        // deepest it does (`UpstreamFacts::effort_sent`), wherever the effort
+        // goes at all.
         if reasoning_sent
+            && effort_sent
             && let Some(effort @ (ReasoningEffort::XHigh | ReasoningEffort::Max)) = self.reasoning_on().and_then(|r| r.effort.as_ref())
         {
             let asked = if *effort == ReasoningEffort::Max { "max" } else { "xhigh" };
-            out.push(format!("reasoning effort {asked} (sent as high: not every model takes it)"));
+            let sent = self.upstream.effort_sent(effort);
+            if sent != asked {
+                out.push(format!("reasoning effort {asked} (sent as {sent}: the model is not known to take it)"));
+            }
         }
         out
     }
@@ -6388,7 +6534,7 @@ impl DomainRequest {
             Some(ReasoningRequest::On(reasoning)) => reasoning,
         };
         let (Some(thinking), effort) =
-            anthropic_thinking(upstream_model, reasoning, self.anthropic_max_tokens(upstream_model))
+            anthropic_thinking(upstream_model, reasoning, self.anthropic_max_tokens(upstream_model), &self.upstream)
         else {
             plan.dropped.push("reasoning (max_tokens leaves no room for a thinking budget)".into());
             return;
@@ -7163,7 +7309,7 @@ impl DomainRequest {
         match &self.reasoning {
             Some(ReasoningRequest::On(r)) => {
                 if let Some(effort) = &r.effort {
-                    extra.insert("reasoning_effort".to_string(), Value::from(effort_to_str(effort)));
+                    extra.insert("reasoning_effort".to_string(), Value::from(self.upstream.effort_sent(effort)));
                 }
             }
             // `none` only where the upstream is known to take it: OpenAI
@@ -7173,6 +7319,11 @@ impl DomainRequest {
             }
             Some(ReasoningRequest::Off) => {}
             None => {}
+        }
+        if self.upstream.takes_prompt_cache_options
+            && let Some(options) = self.extra.get("prompt_cache_options")
+        {
+            extra.insert("prompt_cache_options".to_string(), options.clone());
         }
         let (max_tokens, max_completion_tokens) = match cap_field {
             ChatCapField::MaxTokens => (self.max_output_tokens, None),
@@ -7471,7 +7622,7 @@ impl DomainRequest {
             Some(ReasoningRequest::On(r)) => {
                 let mut reasoning = serde_json::Map::new();
                 if let Some(effort) = &r.effort {
-                    reasoning.insert("effort".to_string(), Value::from(effort_to_str(effort)));
+                    reasoning.insert("effort".to_string(), Value::from(self.upstream.effort_sent(effort)));
                 }
                 if r.show == Some(true) {
                     reasoning.insert("summary".to_string(), Value::from("auto"));
@@ -7487,6 +7638,11 @@ impl DomainRequest {
             // Both json_object and json_schema are supported by OpenAI and vLLM >= 0.9.
             // Note: vLLM < 0.9 rejected json_object (vllm#32791).
             extra.insert("text".to_string(), serde_json::json!({"format": rf}));
+        }
+        if self.upstream.takes_prompt_cache_options
+            && let Some(options) = self.extra.get("prompt_cache_options")
+        {
+            extra.insert("prompt_cache_options".to_string(), options.clone());
         }
 
         ResponsesRequest {
@@ -8053,7 +8209,7 @@ impl DomainRequest {
             let thinking_config = self.reasoning_on().map(|r| {
                 GeminiThinkingConfig {
                     include_thoughts: Some(r.show != Some(false)),
-                    thinking_level: r.effort.as_ref().map(|e| effort_to_str(e).to_string()),
+                    thinking_level: r.effort.as_ref().map(|e| self.upstream.effort_sent(e).to_string()),
                     thinking_budget: r.budget_tokens.map(|b| b as i32),
                 }
             });
@@ -8872,7 +9028,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Image { data: "abc".into(), media_type: "image/png".into(), cache_control: None },
+                    DomainContentBlock::Image { detail: None, data: "abc".into(), media_type: "image/png".into(), cache_control: None },
                     DomainContentBlock::Text { text: "Describe".into(), cache_control: None, citations: Vec::new() },
                 ],
             }],
@@ -9384,7 +9540,7 @@ mod tests {
             role: DomainRole::User,
             content: vec![
                 DomainContentBlock::Text { text: "look".into(), cache_control: None, citations: Vec::new() },
-                DomainContentBlock::Image {
+                DomainContentBlock::Image { detail: None,
                     data: "AAAA".into(),
                     media_type: "image/png".into(),
                     cache_control: None,
@@ -9472,7 +9628,7 @@ mod tests {
                 role: DomainRole::User,
                 content: vec![
                     DomainContentBlock::Text { text: "look".into(), cache_control: None, citations: Vec::new() },
-                    DomainContentBlock::Image {
+                    DomainContentBlock::Image { detail: None,
                         data: "AAAA".into(),
                         media_type: "image/png".into(),
                         cache_control: None,
@@ -9513,7 +9669,7 @@ mod tests {
                         filename: None,
                         cache_control: None,
                     },
-                    DomainContentBlock::Image {
+                    DomainContentBlock::Image { detail: None,
                         data: "https://x/i.png".into(),
                         media_type: "image/url".into(),
                         cache_control: None,
@@ -9584,7 +9740,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Image {
+                    DomainContentBlock::Image { detail: None,
                         data: "AAAA".into(),
                         media_type: "image/png".into(),
                         cache_control: None,
@@ -9673,7 +9829,7 @@ mod tests {
         // so a URL-sourced document is NAMED — including its URL, so the model
         // can see what it was denied rather than nothing at all.
         let dr = user_turn(vec![
-            DomainContentBlock::Image {
+            DomainContentBlock::Image { detail: None,
                 data: "AAAA".into(),
                 media_type: "image/png".into(),
                 cache_control: None,
@@ -9737,7 +9893,7 @@ mod tests {
         // parts array; a translation sends a marker in its place (it is named)
         // and keeps the placeholder.
         let mut dr = user_turn(vec![
-            DomainContentBlock::Image {
+            DomainContentBlock::Image { detail: None,
                 data: "AAAA".into(),
                 media_type: "image/png".into(),
                 cache_control: None,
@@ -10172,7 +10328,7 @@ mod tests {
                             cache_control: None,
                             citations: Vec::new(),
                         },
-                        DomainContentBlock::Image {
+                        DomainContentBlock::Image { detail: None,
                             data: "AAAA".into(),
                             media_type: "image/png".into(),
                             cache_control: None,
@@ -10581,7 +10737,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Image { data: "abc".into(), media_type: "image/png".into(), cache_control: None },
+                    DomainContentBlock::Image { detail: None, data: "abc".into(), media_type: "image/png".into(), cache_control: None },
                     DomainContentBlock::Text { text: "Describe".into(), cache_control: None, citations: Vec::new() },
                 ],
             }],
@@ -10842,7 +10998,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Image {
+                    DomainContentBlock::Image { detail: None,
                         data: "https://example.com/img.jpg".into(),
                         media_type: "image/url".into(),
                         cache_control: None,
@@ -10873,7 +11029,7 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Image { data: "abc".into(), media_type: "image/png".into(), cache_control: None },
+                    DomainContentBlock::Image { detail: None, data: "abc".into(), media_type: "image/png".into(), cache_control: None },
                 ],
             }],
             ..empty_domain_request()
@@ -13559,18 +13715,18 @@ mod tests {
     #[test]
     fn a_manual_budget_stays_inside_anthropics_bounds() {
         let r = DomainReasoning { effort: Some(ReasoningEffort::High), budget_tokens: None, show: None };
-        let (t, _) = anthropic_thinking("claude-opus-4-5", &r, 3000);
+        let (t, _) = anthropic_thinking("claude-opus-4-5", &r, 3000, &UpstreamFacts::default());
         assert_eq!(t.unwrap().budget_tokens, Some(1500), "at most half of max_tokens, leaving the answer the rest");
         let low = DomainReasoning { effort: Some(ReasoningEffort::Low), budget_tokens: Some(200), show: None };
-        assert_eq!(anthropic_thinking("claude-opus-4-5", &low, 3000).0.unwrap().budget_tokens, Some(1024), "≥1024");
+        assert_eq!(anthropic_thinking("claude-opus-4-5", &low, 3000, &UpstreamFacts::default()).0.unwrap().budget_tokens, Some(1024), "≥1024");
         // The minimum fits exactly when half the cap is 1024, and not below.
-        assert_eq!(anthropic_thinking("claude-opus-4-5", &r, 2048).0.unwrap().budget_tokens, Some(1024));
-        assert_eq!(anthropic_thinking("claude-opus-4-5", &r, 2047).0.map(|t| t.r#type), None);
+        assert_eq!(anthropic_thinking("claude-opus-4-5", &r, 2048, &UpstreamFacts::default()).0.unwrap().budget_tokens, Some(1024));
+        assert_eq!(anthropic_thinking("claude-opus-4-5", &r, 2047, &UpstreamFacts::default()).0.map(|t| t.r#type), None);
         // No room for the minimum: no thinking rather than a 400.
-        assert_eq!(anthropic_thinking("claude-opus-4-5", &r, 1024).0.map(|t| t.r#type), None);
+        assert_eq!(anthropic_thinking("claude-opus-4-5", &r, 1024, &UpstreamFacts::default()).0.map(|t| t.r#type), None);
         // Positive control: an in-bounds budget travels unchanged.
         let ok = DomainReasoning { effort: Some(ReasoningEffort::Medium), budget_tokens: Some(5000), show: None };
-        assert_eq!(anthropic_thinking("claude-opus-4-5", &ok, 16000).0.unwrap().budget_tokens, Some(5000));
+        assert_eq!(anthropic_thinking("claude-opus-4-5", &ok, 16000, &UpstreamFacts::default()).0.unwrap().budget_tokens, Some(5000));
     }
 
     #[test]
@@ -13590,7 +13746,7 @@ mod tests {
         assert_eq!(default.to_responses().reasoning, None);
         let gemini_default = default.to_gemini().generation_config.and_then(|g| g.thinking_config).unwrap();
         assert_eq!((gemini_default.include_thoughts, gemini_default.thinking_level), (Some(true), None));
-        let (claude_adaptive, claude_effort) = anthropic_thinking("claude-opus-4-7", default.reasoning_on().unwrap(), 16000);
+        let (claude_adaptive, claude_effort) = anthropic_thinking("claude-opus-4-7", default.reasoning_on().unwrap(), 16000, &UpstreamFacts::default());
         assert_eq!((claude_adaptive.map(|t| t.r#type), claude_effort), (Some("adaptive".to_string()), None));
         // `disabled` asks for none.
         let off = DomainRequest::from_anthropic(&anthropic(serde_json::json!({"thinking": {"type": "disabled"}})));
@@ -14378,11 +14534,14 @@ mod tests {
         assert!(neither.reasoning.is_none());
     }
 
-    /// `xhigh` and `max` — each model takes its own subset, which no walk
-    /// knows — reach every target as `high`, which every model that reasons
-    /// takes, and the narrowing is named; `high` itself names nothing.
+    /// `xhigh` and `max` reach a target as the serving model takes them
+    /// (`UpstreamFacts::deep_efforts`): as asked where it does, else as the
+    /// deepest level below it does, and the narrowing is named; `high` itself
+    /// names nothing. A model nothing is known of is sent `high`.
     #[test]
-    fn the_deepest_efforts_go_as_high_and_are_named() {
+    fn the_deepest_efforts_go_as_the_model_takes_them_and_a_narrowing_is_named() {
+        let named = |dr: &DomainRequest, target, model| dr.not_carried_to(target, model, true);
+        let note = |asked: &str, sent: &str| format!("reasoning effort {asked} (sent as {sent}: the model is not known to take it)");
         for effort in ["xhigh", "max", "high"] {
             let dr = DomainRequest::from_chat_completions(&chat(serde_json::json!({"reasoning_effort": effort})));
             let responses = DomainRequest::from_responses(
@@ -14390,21 +14549,94 @@ mod tests {
             );
             assert_eq!(responses.to_chat_completions().extra.get("reasoning_effort"), Some(&serde_json::json!("high")));
             assert_eq!(dr.to_responses().reasoning.as_ref().and_then(|r| r.get("effort")), Some(&serde_json::json!("high")));
-            let anthropic = serde_json::to_value(dr.to_anthropic_for("claude-opus-5-5")).unwrap();
-            assert_eq!(anthropic["output_config"]["effort"], "high", "{anthropic}");
             let gemini = serde_json::to_value(dr.to_gemini()).unwrap();
             assert_eq!(gemini["generationConfig"]["thinkingConfig"]["thinkingLevel"], "high", "{gemini}");
             for target in [ApiVersion::ChatCompletions, ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini, ApiVersion::Responses] {
-                let named = dr.not_carried_to(target, "claude-opus-5-5", true);
-                assert_eq!(
-                    named.contains(&format!("reasoning effort {effort} (sent as high: not every model takes it)")),
-                    effort != "high",
-                    "{target:?}: {named:?}"
-                );
+                assert_eq!(named(&dr, target, "claude-opus-5-5").contains(&note(effort, "high")), effort != "high", "{target:?}");
                 // A target that does not reason is told nothing about depth.
                 assert!(!dr.not_carried_to(target, "m", false).iter().any(|n| n.starts_with("reasoning effort")));
             }
         }
+        let with = |effort: &str, deep_efforts: DeepEfforts| {
+            let mut dr = DomainRequest::from_chat_completions(&chat(serde_json::json!({"reasoning_effort": effort})));
+            dr.upstream.deep_efforts = deep_efforts;
+            dr
+        };
+        let effort_sent = |dr: &DomainRequest| dr.to_responses().reasoning.and_then(|r| r.get("effort").cloned());
+        // GPT-5.5 takes `xhigh`, not `max`: `max` goes as `xhigh`, named.
+        let gpt55 = openai_model_deep_efforts("gpt-5.5-2026-04-23");
+        assert_eq!(effort_sent(&with("xhigh", gpt55)), Some(serde_json::json!("xhigh")));
+        assert!(!named(&with("xhigh", gpt55), ApiVersion::Responses, "gpt-5.5").iter().any(|n| n.starts_with("reasoning effort")));
+        assert_eq!(effort_sent(&with("max", gpt55)), Some(serde_json::json!("xhigh")));
+        assert!(named(&with("max", gpt55), ApiVersion::Responses, "gpt-5.5").contains(&note("max", "xhigh")));
+        // GPT-5.6 takes both.
+        let gpt56 = openai_model_deep_efforts("gpt-5.6");
+        assert_eq!(with("max", gpt56).to_chat_completions().extra.get("reasoning_effort"), Some(&serde_json::json!("max")));
+        // Claude Opus 4.6 takes `max`, not `xhigh`: `xhigh` goes as `high`.
+        let opus46 = anthropic_model_deep_efforts("claude-opus-4-6");
+        let anthropic = |dr: DomainRequest| serde_json::to_value(dr.to_anthropic_for("claude-opus-4-6")).unwrap()["output_config"]["effort"].clone();
+        assert_eq!(anthropic(with("max", opus46)), "max");
+        assert_eq!(anthropic(with("xhigh", opus46)), "high");
+        assert!(named(&with("xhigh", opus46), ApiVersion::AnthropicMessages, "claude-opus-4-6").contains(&note("xhigh", "high")));
+        // A same-protocol re-render sends the client's own level as asked.
+        let mut rerender = with("max", DeepEfforts::default());
+        rerender.upstream.rerenders_client_request = true;
+        assert_eq!(rerender.to_chat_completions().extra.get("reasoning_effort"), Some(&serde_json::json!("max")));
+        // A model thinking on a manual budget is sent no effort, so none is
+        // named narrowed — its budget is sized from the level instead.
+        let manual = with("max", DeepEfforts::default());
+        assert!(!named(&manual, ApiVersion::AnthropicMessages, "claude-opus-4-5").iter().any(|n| n.starts_with("reasoning effort")));
+        assert!(effort_to_budget(&ReasoningEffort::Max) > effort_to_budget(&ReasoningEffort::XHigh));
+        assert!(effort_to_budget(&ReasoningEffort::XHigh) > effort_to_budget(&ReasoningEffort::High));
+    }
+
+    /// Each model's deep efforts as its page states them (OpenAI's model
+    /// pages, Anthropic's effort guide), and `prompt_cache_options` from
+    /// GPT-5.6 on.
+    #[test]
+    fn the_deep_efforts_and_prompt_cache_options_follow_the_model_pages() {
+        let none = DeepEfforts::default();
+        let xhigh = DeepEfforts { xhigh: true, max: false };
+        for (model, deep) in [
+            ("gpt-5", none), ("gpt-5.1", none), ("o3", none), ("gpt-5.2", xhigh), ("gpt-5.2-codex", xhigh),
+            ("gpt-5.4-mini", xhigh), ("gpt-5.5-pro", xhigh), ("GPT-5.6", DeepEfforts::ALL), ("gpt-6-astra", DeepEfforts::ALL),
+        ] {
+            assert_eq!(openai_model_deep_efforts(model), deep, "{model}");
+        }
+        for (model, deep) in [
+            ("claude-opus-4-5", none), ("claude-sonnet-4-5", none),
+            ("claude-opus-4-6", DeepEfforts { xhigh: false, max: true }),
+            ("claude-sonnet-4-6", DeepEfforts { xhigh: false, max: true }),
+            ("claude-mythos-preview", DeepEfforts { xhigh: false, max: true }),
+            ("claude-opus-4-7", DeepEfforts::ALL), ("claude-sonnet-5", DeepEfforts::ALL),
+            ("claude-haiku-4-5", none), ("claude-haiku-5-5", DeepEfforts::ALL), ("claude-fable-5", DeepEfforts::ALL),
+            ("anthropic.claude-opus-4-8-v1:0", DeepEfforts::ALL),
+        ] {
+            assert_eq!(anthropic_model_deep_efforts(model), deep, "{model}");
+        }
+        for (model, takes) in [
+            ("gpt-5.6", true), ("gpt-5.6-sol-2026-09-08", true), ("gpt-6-luna", true), ("gpt-5.5", false), ("gpt-5", false),
+            ("o3", false), ("gpt-4o", false), ("gpt-5.6-chat-latest", false), ("gpt-6", false),
+        ] {
+            assert_eq!(openai_model_takes_prompt_cache_options(model), takes, "{model}");
+        }
+    }
+
+    /// `prompt_cache_options` crosses between Chat and Responses where the
+    /// upstream takes it, and is named where it does not.
+    #[test]
+    fn prompt_cache_options_cross_between_chat_and_responses_where_the_model_takes_them() {
+        let options = serde_json::json!({"mode": "explicit", "ttl": "1h"});
+        let mut dr = DomainRequest::from_chat_completions(&chat(serde_json::json!({"prompt_cache_options": options})));
+        assert!(!dr.to_responses().extra.contains_key("prompt_cache_options"));
+        assert!(dr.not_carried_to(ApiVersion::Responses, "gpt-5.5", true).contains(&"parameter prompt_cache_options".to_string()));
+        dr.upstream.takes_prompt_cache_options = true;
+        assert_eq!(dr.to_responses().extra.get("prompt_cache_options"), Some(&options));
+        assert_eq!(dr.to_chat_completions().extra.get("prompt_cache_options"), Some(&options));
+        for target in [ApiVersion::ChatCompletions, ApiVersion::Responses] {
+            assert!(!dr.not_carried_to(target, "gpt-5.6", true).iter().any(|n| n.contains("prompt_cache_options")));
+        }
+        assert!(dr.not_carried_to(ApiVersion::AnthropicMessages, "m", true).contains(&"parameter prompt_cache_options".to_string()));
     }
 
     /// A file's `detail` reaches a Responses upstream on the `input_file` the
@@ -14438,6 +14670,46 @@ mod tests {
         // Positive control: a file sent without one names nothing.
         let plain = request(serde_json::json!({"type": "input_file", "file_id": "file-1"}));
         assert!(!plain.not_carried_to(ApiVersion::AnthropicMessages, "m", true).iter().any(|n| n.contains("detail")));
+    }
+
+    /// An image's `detail` (Chat `image_url.detail`, Responses
+    /// `input_image.detail` — both "auto", "low", "high" or "original" per the
+    /// spec) reaches the image part of either OpenAI walk, and is named on
+    /// Anthropic and Gemini, whose images have no such member.
+    #[test]
+    fn an_images_detail_reaches_both_openai_walks_and_is_named_elsewhere() {
+        let chat: crate::api::chat::ChatCompletionsRequest = serde_json::from_value(serde_json::json!({"model": "m", "messages": [
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": "original"}}]}]}))
+        .unwrap();
+        let from_chat = DomainRequest::from_chat_completions(&chat);
+        let responses = serde_json::to_value(from_chat.to_responses()).unwrap();
+        assert_eq!(
+            responses["input"][0]["content"][0],
+            serde_json::json!({"type": "input_image", "image_url": "https://x/a.png", "detail": "original"})
+        );
+        let from_responses = DomainRequest::from_responses(
+            &serde_json::from_value(serde_json::json!({"model": "m", "input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,iVBO", "detail": "low"}]}]}))
+            .unwrap(),
+        );
+        let chat_back = serde_json::to_value(from_responses.to_chat_completions()).unwrap();
+        assert_eq!(chat_back["messages"][0]["content"][0]["image_url"], serde_json::json!({"url": "data:image/png;base64,iVBO", "detail": "low"}));
+        for dr in [&from_chat, &from_responses] {
+            for target in [ApiVersion::ChatCompletions, ApiVersion::Responses] {
+                assert!(!dr.not_carried_to(target, "m", true).iter().any(|n| n.contains("detail")), "{target:?}");
+            }
+            for target in [ApiVersion::AnthropicMessages, ApiVersion::GoogleGemini] {
+                assert!(dr.not_carried_to(target, "m", true).contains(&"detail of an image in a user message".to_string()), "{target:?}");
+            }
+        }
+        // Positive control: an image sent without one names nothing.
+        let plain = DomainRequest::from_responses(
+            &serde_json::from_value(serde_json::json!({"model": "m", "input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": "https://x/a.png"}]}]}))
+            .unwrap(),
+        );
+        assert!(!plain.not_carried_to(ApiVersion::AnthropicMessages, "m", true).iter().any(|n| n.contains("detail")));
+        assert!(serde_json::to_value(plain.to_responses()).unwrap()["input"][0]["content"][0].get("detail").is_none());
     }
 
     /// An OpenAI history answer's annotations ride its text — a Responses
@@ -15887,7 +16159,7 @@ mod tests {
         // turn takes it; a text file is text everywhere, nothing else is
         // carried by Chat, Responses or Anthropic)
         let cases: [(DomainContentBlock, &str, &str, bool); 8] = [
-            (DomainContentBlock::Image { data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }, "SU1H", "image", true),
+            (DomainContentBlock::Image { detail: None, data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }, "SU1H", "image", true),
             (DomainContentBlock::Audio { data: "QVVE".into(), format: "wav".into(), cache_control: None }, "QVVE", "audio", true),
             (DomainContentBlock::Document { detail: None, data: "UERG".into(), media_type: "application/pdf".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "UERG", "document", true),
             (DomainContentBlock::Document { detail: None, data: "plain words".into(), media_type: "text/plain".into(), title: None, context: None, citations: None, cache_control: None, nested_content: None }, "plain words", "document", true),
@@ -16011,7 +16283,7 @@ mod tests {
 
         // An image with no bytes reaches no target, a YouTube video or a typed audio
         // reference no walk without its channel.
-        let hollow_image = with(DomainContentBlock::Image { data: String::new(), media_type: "image/png".into(), cache_control: None });
+        let hollow_image = with(DomainContentBlock::Image { detail: None, data: String::new(), media_type: "image/png".into(), cache_control: None });
         for target in all {
             assert!(named(&hollow_image, target, "image"), "{target:?}");
         }
@@ -16022,7 +16294,7 @@ mod tests {
         assert!(named(&heard, ApiVersion::Responses, "file"));
 
         // Nothing with no bytes of its own reaches Anthropic.
-        for empty in [document_of("", "text/plain"), DomainContentBlock::Image { data: String::new(), media_type: "image/png".into(), cache_control: None }] {
+        for empty in [document_of("", "text/plain"), DomainContentBlock::Image { detail: None, data: String::new(), media_type: "image/png".into(), cache_control: None }] {
             assert!(user_media_refused(ApiVersion::AnthropicMessages, &empty));
         }
         // A URI only its own store reads is a marker elsewhere, whatever its case.
@@ -16049,7 +16321,7 @@ mod tests {
         assert!(!named(&typed("image/png"), ApiVersion::AnthropicMessages, "file"));
         assert!(!named(&typed("application/zip"), ApiVersion::Responses, "file"));
 
-        let jpg = with(DomainContentBlock::Image { data: "AAEC".into(), media_type: "image/jpg".into(), cache_control: None });
+        let jpg = with(DomainContentBlock::Image { detail: None, data: "AAEC".into(), media_type: "image/jpg".into(), cache_control: None });
         assert!(!named(&jpg, ApiVersion::AnthropicMessages, "image"));
         assert_eq!(user_turn_wire(&jpg, ApiVersion::AnthropicMessages)[0]["source"]["media_type"], "image/jpeg");
     }
@@ -16194,7 +16466,7 @@ mod tests {
     fn a_user_turns_media_is_carried_or_named_on_every_target() {
         use ApiVersion::{AnthropicMessages as A, ChatCompletions as C};
         const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-        let image = |t: &str| DomainContentBlock::Image { data: "QllURVM".into(), media_type: t.into(), cache_control: None };
+        let image = |t: &str| DomainContentBlock::Image { detail: None, data: "QllURVM".into(), media_type: t.into(), cache_control: None };
         // (block, what marks it on the wire, its kind, the targets refusing it)
         let cases: Vec<(DomainContentBlock, &str, &str, &[ApiVersion])> = vec![
             (image("image/jpeg"), "QllURVM", "image", &[]),
@@ -16203,7 +16475,7 @@ mod tests {
             (image("image/webp"), "QllURVM", "image", &[]),
             (image("image/heic"), "QllURVM", "image", &[A]),
             (image("image/bmp"), "QllURVM", "image", &[A]),
-            (DomainContentBlock::Image { data: "https://x/y.heic".into(), media_type: "image/url".into(), cache_control: None }, "https://x/y.heic", "image", &[]),
+            (DomainContentBlock::Image { detail: None, data: "https://x/y.heic".into(), media_type: "image/url".into(), cache_control: None }, "https://x/y.heic", "image", &[]),
             (document_of("QllURVM", "application/pdf"), "QllURVM", "document", &[]),
             (document_of("QllURVM", DOCX), "QllURVM", "document", &[A, C]),
             (document_of("QllURVM", "application/octet-stream"), "QllURVM", "document", &[A, C]),
@@ -16248,12 +16520,12 @@ mod tests {
             messages: vec![DomainMessage { role: DomainRole::User, content: vec![block] }],
             ..empty_domain_request()
         };
-        let image = turn(DomainContentBlock::Image { data: "QllURVM".into(), media_type: "image/webp".into(), cache_control: None });
+        let image = turn(DomainContentBlock::Image { detail: None, data: "QllURVM".into(), media_type: "image/webp".into(), cache_control: None });
         assert_eq!(
             user_turn_wire(&image, ApiVersion::AnthropicMessages)[0],
             serde_json::json!({"type": "image", "source": {"type": "base64", "media_type": "image/webp", "data": "QllURVM"}}),
         );
-        let by_url = turn(DomainContentBlock::Image { data: "https://x/y.bmp".into(), media_type: "image/url".into(), cache_control: None });
+        let by_url = turn(DomainContentBlock::Image { detail: None, data: "https://x/y.bmp".into(), media_type: "image/url".into(), cache_control: None });
         assert_eq!(
             user_turn_wire(&by_url, ApiVersion::AnthropicMessages)[0],
             serde_json::json!({"type": "image", "source": {"type": "url", "url": "https://x/y.bmp"}}),
@@ -16292,8 +16564,8 @@ mod tests {
             messages: vec![DomainMessage {
                 role: DomainRole::User,
                 content: vec![
-                    DomainContentBlock::Image { data: "QllURVM".into(), media_type: "image/heic".into(), cache_control: Some(cache) },
-                    DomainContentBlock::Image { data: "QllURVM".into(), media_type: "image/bmp".into(), cache_control: None },
+                    DomainContentBlock::Image { detail: None, data: "QllURVM".into(), media_type: "image/heic".into(), cache_control: Some(cache) },
+                    DomainContentBlock::Image { detail: None, data: "QllURVM".into(), media_type: "image/bmp".into(), cache_control: None },
                 ],
             }],
             ..empty_domain_request()
@@ -16476,7 +16748,7 @@ mod tests {
                 text_msg(DomainRole::User, "q"),
                 DomainMessage {
                     role: DomainRole::Assistant,
-                    content: vec![DomainContentBlock::Image { data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }],
+                    content: vec![DomainContentBlock::Image { detail: None, data: "SU1H".into(), media_type: "image/png".into(), cache_control: None }],
                 },
             ],
             ..empty_domain_request()
@@ -16786,7 +17058,7 @@ mod tests {
     fn a_tool_results_block_a_target_refuses_goes_as_a_named_marker() {
         let mut dr = anthropic_tool_result_with_media();
         dr.messages[2].content = vec![
-            DomainContentBlock::Image { data: "AAAA".into(), media_type: "image/heic".into(), cache_control: None },
+            DomainContentBlock::Image { detail: None, data: "AAAA".into(), media_type: "image/heic".into(), cache_control: None },
             DomainContentBlock::Document { detail: None,
                 data: String::new(),
                 media_type: String::new(),

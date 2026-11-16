@@ -62,3 +62,14 @@ pub fn part_text(part: &Value) -> Option<&str> {
     let key = if part.get("type").and_then(Value::as_str) == Some("refusal") { "refusal" } else { "text" };
     part.get(key).and_then(Value::as_str)
 }
+
+/// The refusal a Responses answer's `refusal` part holds
+/// (`ResponseOutputRefusal { refusal, type }`), when it is a non-empty string
+/// — the reader of a part as the answer's refusal ([`part_text`] reads any
+/// part's text, a refusal's included, where the two are one text).
+pub fn refusal_part_text(part: &Value) -> Option<&str> {
+    (part.get("type").and_then(Value::as_str) == Some("refusal"))
+        .then(|| part_text(part))
+        .flatten()
+        .filter(|r| !r.is_empty())
+}

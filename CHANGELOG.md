@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.55]
+
+- **A model's refusal reaches every client.** A Chat model's refusal now reaches a Responses client as a
+  refusal part and an Anthropic or Gemini client as text, where it was left out; a Responses refusal
+  reaches a Chat client in the message's `refusal`, streamed or not, where it was folded into the
+  content. A refusal a round the gateway runs a tool in carries on to the model's next round. A
+  response script no longer rewrites a streamed Responses refusal (it never rewrote any other), and the
+  response PII guardrail scans a refusal on its own, as it masks it.
+- **Reasoning effort and prompt-cache options follow the serving model.** A reasoning effort of `xhigh`
+  or `max` now reaches a model documented to take it as asked — on OpenAI's API, `xhigh` on GPT-5.2,
+  5.2-Codex, 5.3-Codex, 5.4, 5.4 mini, 5.5 and 5.5 pro, and both on GPT-5.6, 5.6 Sol and GPT-6 Sol, Luna
+  and Astra; on Claude, `xhigh` on Opus 4.7 and later, Sonnet 5 and later, Haiku 5.5 and the numbered
+  Fable and Mythos models, `max` on those and on Opus 4.6, Sonnet 4.6 and Mythos Preview — and a model
+  taking fewer levels gets the deepest one it does, which the audit row names; a request the gateway
+  re-sends in the client's own protocol keeps its level. A thinking budget the gateway sizes from
+  `xhigh` or `max` is larger than the one for `high`. `prompt_cache_options` now crosses between Chat
+  Completions and Responses to OpenAI's GPT-5.6, 5.6 Sol and GPT-6 Sol, Luna and Astra. Both apply on
+  OpenAI's own API; an Azure deployment is sent `high` and no cache options, as before. The effort
+  `none` now also reaches GPT-5.4 and GPT-5.4 mini.
+- **An image's detail crosses between Chat Completions and Responses** (`image_url.detail`,
+  `input_image.detail`, `original` included), is named where Anthropic or Gemini cannot take it, and
+  shows in sessions as a file's does.
+- **Sessions record what the client was sent.** A streamed answer whose text a response script rewrote
+  no longer records the sources the client was not sent with it. A Chat stream carrying annotations,
+  which some servers send though the streaming format defines none, is no longer stored in the response
+  cache, where its replay lost them, and a client of another protocol is told they were not carried. A client's
+  request to compact the conversation shows as requested, apart from a compaction that happened.
+
 ## [2026.11.54]
 
 - **An OpenAI client is answered as the Chat Completions and Responses APIs define it.** A streaming
