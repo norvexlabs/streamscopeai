@@ -514,7 +514,7 @@ fn combined_ca_pem(base: Option<&std::path::Path>, extra: &[PathBuf]) -> Result<
 /// (`None` when there is none); on Windows, the user's and machine's root
 /// stores, written out.
 #[cfg(not(windows))]
-fn system_ca_pem() -> Result<Option<Vec<u8>>> {
+pub(crate) fn system_ca_pem() -> Result<Option<Vec<u8>>> {
     let Some(file) = [
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
@@ -529,7 +529,7 @@ fn system_ca_pem() -> Result<Option<Vec<u8>>> {
 }
 
 #[cfg(windows)]
-fn system_ca_pem() -> Result<Option<Vec<u8>>> {
+pub(crate) fn system_ca_pem() -> Result<Option<Vec<u8>>> {
     use base64::Engine;
     let found = rustls_native_certs::load_native_certs();
     if found.certs.is_empty() {

@@ -363,6 +363,32 @@ pub const AGENTS: &[AgentProfile] = &[
     },
 ];
 
+/// A package manager's cache, written by every tool it runs — an `npx` or
+/// `uvx` local MCP server, an agent's own `npx`/`uv run` — whatever runtime
+/// the client itself is written in: every child inherits the client's
+/// confinement. Granted read + write to every client, and created before
+/// confining when one of `tools` is on the run's PATH (Landlock grants only
+/// a path that exists; Seatbelt refuses the `mkdir` of an ungranted parent).
+/// Only at its default place: a cache a variable moves elsewhere is not
+/// followed. The one list of these paths: a toolchain profile never repeats one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct PackageCache {
+    pub dir: &'static str,
+    pub tools: &'static [&'static str],
+}
+
+/// Never a folder holding a credential: `~/.npmrc` and uv's
+/// `~/.local/share/uv/credentials` stay out, as does the rest of uv's data
+/// folder (the Pythons it installed included). Its `tools` folder, which `uvx`
+/// creates on every run, is in — like npm's cache, whose packages a later
+/// `npx` runs too.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub const PACKAGE_CACHES: &[PackageCache] = &[
+    PackageCache { dir: "~/.npm", tools: &["npm", "npx"] },
+    PackageCache { dir: "~/.cache/uv", tools: &["uv", "uvx"] },
+    PackageCache { dir: "~/.local/share/uv/tools", tools: &["uv", "uvx"] },
+];
+
 /// A language toolchain's dirs, applied on top of the agent profile when the
 /// agent's runtime is detected (by the launch command and/or PATH probing).
 /// Consumed by the Linux native-sandbox path (Landlock-only); the macOS Seatbelt
@@ -396,7 +422,6 @@ pub const TOOLCHAINS: &[ToolchainProfile] = &[
             "~/.local/share/fnm/node-versions/*/installation/bin",
             "~/.local/share/fnm/node-versions/*/installation/lib",
             "~/.local/share/fnm/node-versions/*/installation/share",
-            "~/.npm",
             "~/.config/npm",
             "~/.cache/npm",
             "~/.cache/node",
@@ -422,7 +447,6 @@ pub const TOOLCHAINS: &[ToolchainProfile] = &[
         dirs: &[
             "~/.cache/pip",
             "~/.config/pip",
-            "~/.cache/uv",
             "~/.config/uv",
             "~/.local/share/uv",
             "~/.local/state/uv",
@@ -474,6 +498,14 @@ pub const BASE_READ: &[&str] = &[
 /// against `SECRET_DENY` like every other grant. macOS needs no list:
 /// its Seatbelt profile already allows reads and exec everywhere outside the
 /// denied secrets.
+/// The Pythons uv installed, which `uvx` prefers to the system's: read and
+/// run by every client on Linux (macOS reads them already). Not in
+/// [`USER_TOOL_READ`]: a Python client may write the folder above it, so it is
+/// granted only where it really is (no link inside the home), like a package
+/// cache.
+#[cfg(target_os = "linux")]
+pub const UV_PYTHONS: &str = "~/.local/share/uv/python";
+
 #[cfg(target_os = "linux")]
 pub const USER_TOOL_READ: &[&str] = &[
     "~/.local/bin",

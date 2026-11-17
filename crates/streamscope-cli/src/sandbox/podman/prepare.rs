@@ -47,7 +47,7 @@ pub struct AgentUser {
 /// Prepare the images for `client` (its launch command `command`, its npm
 /// package `npm`). `force`: rebuild what is cached.
 pub fn prepare(root: &Path, config: &DockerConfig, command: &str, npm: Option<&str>, force: bool) -> Result<Prepared> {
-    let base = base_image(root, config, force)?;
+    let base = base_image(root, config, command, force)?;
     let base_id = inspect(&base, "{{.Id}}")?;
     // A prebuilt Dev Container image names its user in its metadata label
     // rather than in `USER` (which stays root for its build steps). As the Dev
@@ -95,12 +95,12 @@ pub fn prepare(root: &Path, config: &DockerConfig, command: &str, npm: Option<&s
 /// An engine inside makes the container privileged: `"docker": true` that
 /// was off at the project's last run (the agent can edit `sandbox.json`) is
 /// taken only after `ssai sandbox prepare`.
-fn engine_turned_on(before: Option<&Record>, engine: bool, force: bool) -> Result<()> {
+fn engine_turned_on(before: Option<&Record>, engine: bool, command: &str, force: bool) -> Result<()> {
     if !force && engine && before.is_some_and(|b| !b.engine) {
         bail!(
             "an engine inside (`\"docker\": true` in sandbox.json, or in your organisation's default image) is new \
              since the project's last run (an engine runs privileged) — check it, then run \
-             `ssai sandbox prepare <client>`"
+             `ssai sandbox prepare {command}`"
         );
     }
     Ok(())
@@ -112,12 +112,12 @@ fn engine_turned_on(before: Option<&Record>, engine: bool, force: bool) -> Resul
 /// network open before any guard. `ssai sandbox prepare` (`force`) does it
 /// after the developer has read the change; a project's first one needs no
 /// such step.
-fn changed_since_last_build(before: Option<&Record>, source: &str, force: bool) -> Result<()> {
+fn changed_since_last_build(before: Option<&Record>, source: &str, command: &str, force: bool) -> Result<()> {
     if !force && before.is_some_and(|b| b.source != source) {
         bail!(
             "the image (its reference — sandbox.json's or your organisation's default —, Dockerfile or \
              devcontainer.json) changed since the last run — read the change, then rebuild with \
-             `ssai sandbox prepare <client>`"
+             `ssai sandbox prepare {command}`"
         );
     }
     Ok(())
@@ -128,11 +128,11 @@ fn changed_since_last_build(before: Option<&Record>, source: &str, force: bool) 
 /// before any guard. Only a project's first image is built on a run; every
 /// later build (a changed recipe, or an image removed since) waits for `ssai
 /// sandbox prepare` (`force`), after the developer has read what it builds.
-fn rebuild_needs_prepare(before: Option<&Record>, force: bool) -> Result<()> {
+fn rebuild_needs_prepare(before: Option<&Record>, command: &str, force: bool) -> Result<()> {
     if !force && before.is_some() {
         bail!(
             "the project's image needs a rebuild (its Dockerfile, devcontainer.json or build context may have \
-             changed) — read them, then rebuild with `ssai sandbox prepare <client>`"
+             changed) — read them, then rebuild with `ssai sandbox prepare {command}`"
         );
     }
     Ok(())
@@ -200,10 +200,10 @@ fn metadata_users(entries: &[serde_json::Value]) -> (Option<String>, Option<Stri
 /// record names the image once it is there; an image the sandbox's pull added
 /// is marked as the sandbox's, for `ssai sandbox prune`. A run removes no
 /// image: disk is freed on the developer's request (`images`).
-fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String> {
+fn base_image(root: &Path, config: &DockerConfig, command: &str, force: bool) -> Result<String> {
     let before = images::read(root)?;
     let before = before.as_ref();
-    engine_turned_on(before, config.docker, force)?;
+    engine_turned_on(before, config.docker, command, force)?;
     if let ImageSource::Build { context, dockerfile, .. } = &config.source {
         confined(root, dockerfile, "dockerfile")?;
         confined(root, context, "context")?;
@@ -212,7 +212,7 @@ fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String>
     // A build under the tag `tag`, when absent or `force`.
     let build = |tag: &str, run: &dyn Fn() -> Result<()>| -> Result<()> {
         if force || !exists(tag)? {
-            rebuild_needs_prepare(before, force)?;
+            rebuild_needs_prepare(before, command, force)?;
             run()?;
         }
         images::write(root, &record(tag))
@@ -238,7 +238,7 @@ fn base_image(root: &Path, config: &DockerConfig, force: bool) -> Result<String>
                 images::write(root, &now)?;
                 return Ok(reference.clone());
             }
-            changed_since_last_build(before, &source, force)?;
+            changed_since_last_build(before, &source, command, force)?;
             eprintln!("ssai: pulling {reference} for the docker sandbox");
             podman(&["pull", reference]).with_context(|| format!("pull {reference}"))?;
             images::write(root, &now)?;
@@ -422,7 +422,17 @@ fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> R
         Some(_) => Some(NodeDist::for_image(base_id)?),
         None => None,
     };
-    let recipe = layer_dockerfile(base_id, npm.zip(node.as_ref()), engine);
+    // The host's store for the client's `npm install` (a TLS-inspecting
+    // proxy's root is in it). Best effort: none readable, none passed — nor
+    // one whose path podman's comma-separated `--secret` could not carry.
+    let build_dir = crate::state::cache_dir()?.join("sandbox-build");
+    let host_ca = match node {
+        Some(_) if super::plan::mountable(&build_dir.to_string_lossy()) => {
+            crate::commands::run::system_ca_pem().ok().flatten().filter(|pem| !pem.is_empty())
+        }
+        _ => None,
+    };
+    let recipe = layer_dockerfile(base_id, npm.zip(node.as_ref()), engine, host_ca.is_some());
     let tag = layer_tag(npm, engine, base_id, &recipe);
     if !force && exists(&tag)? {
         return Ok(tag);
@@ -432,16 +442,22 @@ fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> R
     // An empty, private context (the Dockerfile comes on stdin): created
     // new, never one that already exists. It holds only the Node archive.
     let context = private_build_dir("layer")?;
+    // The secret's source sits beside the context, never in it.
+    let secret = context.with_extension("host-ca.pem");
     let built = (|| {
         if let Some(node) = &node {
             let archive = node.fetch()?;
             std::fs::copy(&archive, context.join(node.file())).context("put the Node archive in the build context")?;
+        }
+        if let Some(pem) = &host_ca {
+            std::fs::write(&secret, pem).context("write the host's CA store for the build")?;
         }
         // A forced rebuild skips the layer cache, or the cached `npm install`
         // step would keep the release it installed last time.
         let mut child = Command::new("podman")
             .args(["build", "-t", &tag, "--label", &format!("{BASE_LABEL}={base_id}"), "-f", "-"])
             .args(force.then_some("--no-cache"))
+            .args(host_ca.as_ref().map(|_| format!("--secret=id={HOST_CA_SECRET},src={}", secret.display())))
             .arg(&context)
             .stdin(Stdio::piped())
             .spawn()
@@ -460,6 +476,7 @@ fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> R
         written
     })();
     let _ = std::fs::remove_dir_all(&context);
+    let _ = std::fs::remove_file(&secret);
     built.map(|()| tag)
 }
 
@@ -652,6 +669,9 @@ const ENGINE_INSTALL: &str = "if ! command -v dockerd >/dev/null 2>&1; then \
     fi; \
   fi";
 
+/// The build secret the host's system store is handed to the layer's build as.
+const HOST_CA_SECRET: &str = "ssai-host-ca";
+
 /// The layer's recipe: the engine when asked for, then the client with its
 /// Node, the client package's own install scripts approved by name (npm 12
 /// skips an unapproved one, and a client such as OpenCode then cannot start);
@@ -660,18 +680,38 @@ const ENGINE_INSTALL: &str = "if ! command -v dockerd >/dev/null 2>&1; then \
 /// put first on `PATH` as wrappers running it on the layer's Node; that Node
 /// is last on `PATH`, so the project's own `node` wins and an image without
 /// one still has `node`, `npm` and `npx` (an `npx` MCP server, say).
-fn layer_dockerfile(base_id: &str, client: Option<(&str, &NodeDist)>, engine: bool) -> String {
+///
+/// With `host_trust`, the client's `npm install` also trusts the host's
+/// system store, handed in as the [`HOST_CA_SECRET`] build secret — never a
+/// layer of the image — beside the image's own `NODE_EXTRA_CA_CERTS`, which
+/// Node would otherwise drop (it reads one such file).
+fn layer_dockerfile(base_id: &str, client: Option<(&str, &NodeDist)>, engine: bool, host_trust: bool) -> String {
     let mut df = format!("FROM {base_id}\nUSER root\n");
     if engine {
         df.push_str(&format!("RUN set -e; {ENGINE_INSTALL}\n"));
     }
     if let Some((package, node)) = client {
         let musl = if node.libc.is_empty() { "" } else { "command -v apk >/dev/null 2>&1 && apk add --no-cache libstdc++ libgcc; " };
+        let (mount, trust, untrust) = if host_trust {
+            (
+                format!("--mount=type=secret,id={HOST_CA_SECRET} "),
+                format!(
+                    "ca=/run/secrets/{HOST_CA_SECRET}; \
+                     if [ -n \"${{NODE_EXTRA_CA_CERTS:-}}\" ] && [ -r \"$NODE_EXTRA_CA_CERTS\" ]; then \
+                       {{ cat \"$NODE_EXTRA_CA_CERTS\"; echo; cat \"$ca\"; }} > /tmp/ssai-node-ca.pem; ca=/tmp/ssai-node-ca.pem; \
+                     fi; "
+                ),
+                "rm -f /tmp/ssai-node-ca.pem; ",
+            )
+        } else {
+            (String::new(), String::new(), "")
+        };
+        let node_ca = if host_trust { "NODE_EXTRA_CA_CERTS=$ca " } else { "" };
         df.push_str(&format!(
             "# node {sha}\nADD {file} {AGENT_PREFIX}/\n\
-             RUN set -e; {musl}mv {AGENT_PREFIX}/{dir} {AGENT_PREFIX}/node; \
-             PATH={AGENT_PREFIX}/node/bin:$PATH npm install -g --no-update-notifier --allow-scripts={package} --prefix {AGENT_PREFIX}/client {package}@latest; \
-             mkdir -p {AGENT_PREFIX}/bin; \
+             RUN {mount}set -e; {trust}{musl}mv {AGENT_PREFIX}/{dir} {AGENT_PREFIX}/node; \
+             {node_ca}PATH={AGENT_PREFIX}/node/bin:$PATH npm install -g --no-update-notifier --allow-scripts={package} --prefix {AGENT_PREFIX}/client {package}@latest; \
+             {untrust}mkdir -p {AGENT_PREFIX}/bin; \
              for f in {AGENT_PREFIX}/client/bin/*; do n=${{f##*/}}; \
                if head -n 1 \"$f\" | grep -q node; then \
                  printf '#!/bin/sh\\nexec {AGENT_PREFIX}/node/bin/node \"%s\" \"$@\"\\n' \"$f\" > {AGENT_PREFIX}/bin/$n; chmod 755 {AGENT_PREFIX}/bin/$n; \
@@ -951,10 +991,45 @@ mod tests {
         assert_eq!(features_recipe(&image), serde_json::json!({"image": "ubuntu", "features": {"f:1": {}}}));
     }
 
+    /// Each step that waits for a prepare names the command to run, for the
+    /// client being run.
+    #[test]
+    fn a_prepare_hint_names_the_client() {
+        let before = Record { source: "a".into(), engine: false, project: None };
+        for err in [
+            engine_turned_on(Some(&before), true, "claude", false).unwrap_err(),
+            changed_since_last_build(Some(&before), "b", "claude", false).unwrap_err(),
+            rebuild_needs_prepare(Some(&before), "claude", false).unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("`ssai sandbox prepare claude`"), "{err}");
+        }
+        // A project's first run, or a prepare itself, waits for nothing.
+        assert!(engine_turned_on(None, true, "claude", false).is_ok());
+        assert!(rebuild_needs_prepare(Some(&before), "claude", true).is_ok());
+    }
+
+    /// The host's store reaches the client's `npm install` as a build secret,
+    /// beside the image's own Node extra-CA file; without it, no secret is
+    /// mounted (a build given no secret would fail on one it mounts).
+    #[test]
+    fn the_layers_npm_install_trusts_the_hosts_store_beside_the_images_own() {
+        let node = NodeDist::new("x86_64", false).unwrap();
+        let df = layer_dockerfile("sha256:aa", Some(("x", &node)), false, true);
+        assert!(df.contains("RUN --mount=type=secret,id=ssai-host-ca set -e; "), "{df}");
+        // A newline between the two: a file ending without one would hide the next certificate.
+        assert!(df.contains(r#"{ cat "$NODE_EXTRA_CA_CERTS"; echo; cat "$ca"; } > /tmp/ssai-node-ca.pem"#), "{df}");
+        assert!(df.contains("NODE_EXTRA_CA_CERTS=$ca PATH=/opt/ssai-agent/node/bin:$PATH npm install"), "{df}");
+        assert!(df.contains("rm -f /tmp/ssai-node-ca.pem"), "{df}");
+        let without = layer_dockerfile("sha256:aa", Some(("x", &node)), false, false);
+        assert!(!without.contains("secret") && !without.contains("NODE_EXTRA_CA_CERTS"), "{without}");
+        // Trust changes the recipe, so the two are distinct layers.
+        assert_ne!(layer_tag(Some("x"), false, "sha256:aa", &df), layer_tag(Some("x"), false, "sha256:aa", &without));
+    }
+
     #[test]
     fn the_agent_layer_is_tagged_by_its_base_and_installs_the_latest_package() {
         let node = NodeDist::new("x86_64", false).unwrap();
-        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", Some(("@anthropic-ai/claude-code", &node)), false);
+        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", Some(("@anthropic-ai/claude-code", &node)), false, false);
         let tag = layer_tag(Some("@anthropic-ai/claude-code"), false, "sha256:0123456789abcdef0123", &recipe);
         let named = "localhost/ssai-agent-anthropic-ai-claude-code:0123456789ab-";
         assert!(tag.starts_with(named) && tag.len() == named.len() + 8, "{tag}");
@@ -979,18 +1054,18 @@ mod tests {
         assert!(df.ends_with("\nENV PATH=/opt/ssai-agent/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:/opt/ssai-agent/node/bin\n"), "{df}");
         assert!(!df.contains("dockerd"), "no engine unless asked: {df}");
         // The engine alone, and with the client: each its own recipe.
-        let engine = layer_dockerfile("sha256:aa", None, true);
+        let engine = layer_dockerfile("sha256:aa", None, true, false);
         assert!(engine.contains("command -v dockerd") && engine.contains("docker.io iptables") && !engine.contains("npm"), "{engine}");
-        let both = layer_dockerfile("sha256:aa", Some(("@anthropic-ai/claude-code", &node)), true);
+        let both = layer_dockerfile("sha256:aa", Some(("@anthropic-ai/claude-code", &node)), true, false);
         assert!(both.contains("command -v dockerd") && both.contains("npm install"), "{both}");
         // A musl image gets the musl build, and the C++ runtime it needs.
         let musl = NodeDist::new("x86_64", true).unwrap();
-        let df = layer_dockerfile("sha256:aa", Some(("x", &musl)), false);
+        let df = layer_dockerfile("sha256:aa", Some(("x", &musl)), false, false);
         assert!(df.contains("-linux-x64-musl.tar.gz") && df.contains("apk add --no-cache libstdc++"), "{df}");
         assert!(musl.url().starts_with("https://unofficial-builds.nodejs.org/"));
         assert!(node.url().starts_with("https://nodejs.org/dist/"));
         // The pin is in the recipe: a new pin is a new layer.
-        assert!(layer_dockerfile("sha256:aa", Some(("x", &node)), false).contains(node.sha256));
+        assert!(layer_dockerfile("sha256:aa", Some(("x", &node)), false, false).contains(node.sha256));
         assert!(NodeDist::new("riscv64", false).is_err());
         assert_eq!(NodeDist::new("aarch64", false).unwrap().arch, "arm64");
     }

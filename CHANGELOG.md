@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.59]
+
+- **Security: the console's web framework is updated** (SvelteKit 3.1.1), fixing two high-severity
+  advisories (GHSA-3r8g-jcqq-3p5j, GHSA-m9j8-jcmv-hp69) that 2026.11.58 was published with.
+- **`npx` and `uvx` work under the native sandbox whatever the client.** A local MCP server started
+  with `uvx` under OpenCode (or with `npx` under a client not written in Node, such as Codex) failed
+  on its package cache, as did an agent's own `uv run` or `npx`. Every client may now write npm's and
+  uv's caches and uv's tools folder — created on a first run when npm or uv is installed — and run
+  the Python versions uv installed, on Linux and macOS. uv's logins stay out of every client but the
+  Python-based ones.
+- **The container sandbox trusts the certificate authorities your machine trusts.** A client under
+  `ssai run --sandbox docker` could not reach a gateway whose certificate your machine's system store
+  already trusts (a corporate CA): the container knew only its image's public roots. Node in the
+  container now also trusts your machine's system store when neither the run nor the image names a
+  certificate file of its own, and the client's installation into the image trusts it too. A
+  container run that waits for `ssai sandbox prepare` now names the command for the client being run
+  (`ssai sandbox prepare claude`) instead of a placeholder.
+
 ## [2026.11.58]
 
 - **A gateway serving several hundred active users no longer stops answering.** Once enough users

@@ -29,6 +29,13 @@ use super::{guard, LaunchSpec};
 /// The loopback port the container's relay listens on.
 const RELAY_PORT: u16 = 3128;
 
+/// Node's additive trust variable: the one a docker run may set for the
+/// host's store without dropping the image's own roots.
+const NODE_CA_VAR: &str = "NODE_EXTRA_CA_CERTS";
+
+/// The host's system store, in the run dir.
+const HOST_CA_FILE: &str = "host-ca.pem";
+
 /// Launch `spec` in a container; the client's exit code.
 pub async fn launch(mut spec: LaunchSpec, verbose: bool) -> Result<i32> {
     let root = spec.project_root.clone();
@@ -434,6 +441,23 @@ async fn run_container(
         std::fs::write(run.run.join("ca.pem"), pem).context("write the combined CA bundle")?;
         let at = format!("{}/ca.pem", plan::RUN_MOUNT);
         env.splice(0..0, super::CA_BUNDLE_VARS.iter().map(|k| (k.to_string(), at.clone())));
+    }
+    // Node's one extra-CA file, when neither the run (no gateway bundle was
+    // captured, no `--ca-file`, no `-e`) nor the image or the project names
+    // one: the host's system store, so a gateway whose root the host trusts
+    // is trusted inside — the image holds only its own public roots. Node
+    // reads ONE such file, so an image's own is left as it is. Only Node's
+    // additive variable: the replacing ones would drop the image's roots.
+    // Best effort: a host with no readable store runs without it.
+    if !env.iter().any(|(k, _)| k == NODE_CA_VAR)
+        && lookup(&user_env, NODE_CA_VAR).is_none_or(|v| v.is_empty())
+        && let Ok(Some(pem)) = crate::commands::run::system_ca_pem()
+        && !pem.is_empty()
+    {
+        match std::fs::write(run.run.join(HOST_CA_FILE), pem) {
+            Ok(()) => env.insert(0, (NODE_CA_VAR.to_string(), format!("{}/{HOST_CA_FILE}", plan::RUN_MOUNT))),
+            Err(e) => eprintln!("ssai: the host's certificate store is not given to the sandbox ({e})"),
+        }
     }
     if let Some(engine) = super::profiles::agent_for(&spec.command).and_then(|a| a.engine) {
         env.extend(engine.env.iter().map(|(k, v)| (k.to_string(), v.to_string())));

@@ -176,6 +176,15 @@ fn profile_with_ttys(
             expand_tilde(d).ok().map(|p| p.to_string_lossy().into_owned())
         }));
     }
+    // Every package cache, whatever the client's own runtime: an `npx` or
+    // `uvx` child runs under this profile. No cache holds a secret
+    // (`PACKAGE_CACHES`).
+    if let Ok(home) = crate::state::home_dir() {
+        let deny = super::state_dirs::secret_deny(&home);
+        writes.extend(
+            super::state_dirs::package_caches(&home, &deny).into_iter().map(|(d, _)| d.to_string_lossy().into_owned()),
+        );
+    }
     writes.extend(project.extra_rw.iter().map(|d| d.to_string_lossy().into_owned()));
     for w in writes {
         push_allow_write(&mut p, &w);

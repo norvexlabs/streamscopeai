@@ -355,10 +355,13 @@ fn start_engine(start: &Start) -> Result<libc::pid_t> {
         .stdout(log.try_clone()?)
         .stderr(log)
         .spawn()
-        .context(
-            "start dockerd — the sandbox's image has no Docker Engine: run `ssai sandbox prepare <client>` to add \
-             one, or install it in the image",
-        )?;
+        .with_context(|| {
+            format!(
+                "start dockerd — the sandbox's image has no Docker Engine: run `ssai sandbox prepare {}` to add \
+                 one, or install it in the image",
+                start.argv.first().map(String::as_str).unwrap_or("<client>")
+            )
+        })?;
     let pid = child.id() as libc::pid_t;
     let deadline = std::time::Instant::now() + ENGINE_READY;
     while UnixStream::connect(ENGINE_SOCKET).is_err() {

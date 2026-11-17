@@ -14,7 +14,7 @@ use landlock::{
 };
 
 use super::scratch::ScratchDir;
-use super::state_dirs::{dir_touches_secret, resolve_in, secret_deny};
+use super::state_dirs::{dir_touches_secret, is_real_in_home, package_caches, resolve_in, secret_deny};
 use super::{profiles, LaunchSpec, SandboxPolicy};
 use crate::state::home_dir;
 
@@ -68,6 +68,10 @@ fn build_policy_in(home: &Path, spec: &LaunchSpec, scratch: &Path) -> Result<San
     if let Some(agent) = profiles::agent_for(&spec.command) {
         rw.extend(granted_dirs(home, agent.state_dirs, &deny));
     }
+    // Every package cache, whatever the client's own runtime: an `npx` or
+    // `uvx` child inherits this domain.
+    // Re-judged here: a cache made a link since it was created is not granted.
+    rw.extend(package_caches(home, &deny).into_iter().map(|(dir, _)| dir));
     if let Some(tc) = profiles::toolchain_for(&runtime_of(&spec.command)) {
         rw.extend(granted_dirs(home, tc.dirs, &deny));
     }
@@ -95,6 +99,12 @@ fn build_policy_in(home: &Path, spec: &LaunchSpec, scratch: &Path) -> Result<San
     // The user's own toolchain, read + execute: `from_read` carries Landlock's
     // EXECUTE right, and these are never writable.
     ro.extend(user_tool_dirs(home, &deny));
+    if let (Some(rel), Ok(real_home)) = (profiles::UV_PYTHONS.strip_prefix("~/"), std::fs::canonicalize(home)) {
+        let pythons = home.join(rel);
+        if is_real_in_home(home, &real_home, &pythons) && !dir_touches_secret(&pythons, &deny) {
+            ro.push(pythons);
+        }
+    }
     ro.extend(spec.ca_files.iter().cloned());
     // This binary, read + execute: `ssai __connect` is the ProxyCommand that
     // takes `ssh` through the guard (`GIT_SSH_COMMAND`).
@@ -785,7 +795,7 @@ fn write_override(dirs: &[PathBuf]) -> Result<()> {
 #[cfg(test)]
 mod learn_tests {
     use super::*;
-    use crate::sandbox::state_dirs::{create_state_dirs, Create};
+    use crate::sandbox::state_dirs::{create_package_caches, create_state_dirs, Create};
 
     #[test]
     fn reduce_config_cache_local_and_bare() {
@@ -931,6 +941,112 @@ mod learn_tests {
         // the client writes itself, and `~/.opencode` is the client's to make.
         assert!(!home.join(".opencode.json").exists());
         assert!(!home.join(".opencode").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An `npx` or `uvx` child inherits its client's domain, so every client
+    /// — a Rust one (codex), a Node one (opencode), a Python one (aider) — is
+    /// granted the package caches, created on a first run when their tool is
+    /// on PATH; uv's logins and interpreters are granted to none of them.
+    #[test]
+    fn every_client_is_granted_every_package_cache_and_no_other_runtimes_data() {
+        let home = std::env::temp_dir().join(format!("ss-caches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::fs::create_dir_all(home.join(".local/share/uv/credentials")).unwrap();
+        let caches = package_caches(&home, &secret_deny(&home));
+        // Neither tool on PATH: nothing is created.
+        create_package_caches(&caches, &|_| false);
+        assert!(!home.join(".npm").exists() && !home.join(".cache/uv").exists());
+        // `uvx` alone on PATH: only uv's folders are created.
+        create_package_caches(&caches, &|t| t == "uvx");
+        assert!(home.join(".cache/uv").is_dir() && home.join(".local/share/uv/tools").is_dir());
+        assert!(!home.join(".npm").exists());
+        create_package_caches(&caches, &|t| t == "npx");
+        assert!(home.join(".npm").is_dir());
+        std::fs::create_dir_all(home.join(".local/share/uv/python/cpython-3.13")).unwrap();
+        for command in ["codex", "opencode", "aider"] {
+            let spec = LaunchSpec {
+                command: command.into(),
+                args: vec![],
+                project_root: home.join("proj"),
+                cwd: home.join("proj"),
+                proxy_origins: vec![],
+                destinations: Default::default(),
+                network: None,
+                default_image: None,
+                env: vec![],
+                ca_files: vec![],
+                ca_bundle: None,
+                home_files: vec![],
+                client_files: vec![],
+                private_project: false,
+                opencode: None,
+            };
+            let policy = build_policy_in(&home, &spec, &home.join(".cache/streamscopeai/tmp/run")).unwrap();
+            for dir in [home.join(".npm"), home.join(".cache/uv"), home.join(".local/share/uv/tools")] {
+                assert!(policy.fs_rw.contains(&dir), "{command}: {} not granted: {:?}", dir.display(), policy.fs_rw);
+            }
+            // The Pythons uv installed: read and run, never written.
+            let pythons = home.join(".local/share/uv/python");
+            assert!(policy.fs_ro.contains(&pythons), "{command}: uv's Pythons not readable: {:?}", policy.fs_ro);
+            if command != "aider" {
+                // Grants under this home only: the fixture's home is under `/tmp`, granted to every run.
+                for kept in [home.join(".local/share/uv/credentials"), home.join(".local/share/uv/python")] {
+                    // Reached by none but a Python client (whose toolchain holds uv's folder).
+                    let covers = |g: &PathBuf| g.starts_with(&home) && kept.starts_with(g);
+                    assert!(!policy.fs_rw.iter().any(covers), "{command}: {} granted: {:?}", kept.display(), policy.fs_rw);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A grant follows a symlink: a cache folder — or a folder above it — that
+    /// is a link inside the home is neither created nor granted, wherever it
+    /// leads (here `~/.ssh`, and a harmless folder); a real one is (the positive
+    /// control).
+    #[test]
+    fn a_package_cache_behind_a_link_is_neither_created_nor_granted() {
+        let home = std::env::temp_dir().join(format!("ss-cache-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for dir in [".ssh", ".local/share/uv", "elsewhere", ".npm"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join(".local/share/uv/tools")).unwrap();
+        // `~/.cache` itself a link: `~/.cache/uv` would be made inside its target.
+        std::os::unix::fs::symlink(home.join("elsewhere"), home.join(".cache")).unwrap();
+        let caches = package_caches(&home, &secret_deny(&home));
+        create_package_caches(&caches, &|_| true);
+        let kept: Vec<PathBuf> = caches.into_iter().map(|(d, _)| d).collect();
+        assert_eq!(kept, [home.join(".npm")], "only the real cache is kept");
+        assert!(!home.join("elsewhere/uv").exists(), "a cache was created through a linked folder");
+        // uv's Pythons made a link onto `~/.ssh`: not granted either; a real one is.
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join(".local/share/uv/python")).unwrap();
+        let spec = |home: &Path| LaunchSpec {
+            command: "codex".into(),
+            args: vec![],
+            project_root: home.join("proj"),
+            cwd: home.join("proj"),
+            proxy_origins: vec![],
+            destinations: Default::default(),
+            network: None,
+            default_image: None,
+            env: vec![],
+            ca_files: vec![],
+            ca_bundle: None,
+            home_files: vec![],
+            client_files: vec![],
+            private_project: false,
+            opencode: None,
+        };
+        let policy = build_policy_in(&home, &spec(&home), &home.join("scratch")).unwrap();
+        let pythons = home.join(".local/share/uv/python");
+        assert!(!policy.fs_ro.contains(&pythons) && !policy.fs_rw.contains(&pythons), "{:?}", policy.fs_ro);
+        std::fs::remove_file(&pythons).unwrap();
+        std::fs::create_dir_all(&pythons).unwrap();
+        let policy = build_policy_in(&home, &spec(&home), &home.join("scratch")).unwrap();
+        assert!(policy.fs_ro.contains(&pythons), "{:?}", policy.fs_ro);
         let _ = std::fs::remove_dir_all(&home);
     }
 

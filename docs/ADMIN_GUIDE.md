@@ -3311,7 +3311,14 @@ keeps beside its programs), where a registry token is stored. Volta is the excep
 tool can write its whole directory, because Volta's own launchers run from all of it. On macOS the
 npm configuration inside Volta is still out of reach; on Linux it is not, so use nvm or fnm there if
 a registry token is kept in it. A Python-based tool (Aider, Vibe) may write to uv's and pipx's
-folders and the pip and uv caches, where a `uv tool install` or `pipx install` puts it. Gemini CLI reads a project's `.gemini/.env` only in a folder you have trusted, so trust the project
+folders and the pip cache, where a `uv tool install` or `pipx install` puts it. Every tool, whatever it
+is written in, may write npm's and uv's package caches (`~/.npm`, `~/.cache/uv`) and uv's tools folder
+(`~/.local/share/uv/tools`) — at those places only, not where a variable moves them, and never one
+that is a link (`run` names one it leaves out) — created on a first run when npm or uv is installed,
+and may read and run the Python versions uv installed (unless that folder is a link); so an `npx` or
+`uvx` local MCP server, or the agent's own `npx` or `uv run`, works under any client — except an `npx`
+installed by Volta, whose folder only a Node-based tool may reach. The rest of uv's folder, its
+logins included, is writable by a Python-based tool only. Gemini CLI reads a project's `.gemini/.env` only in a folder you have trusted, so trust the project
 folder in Gemini (or pass it `--skip-trust`). The shared skills folder `~/.agents/skills` is readable
 inside the sandbox, and a tool's own state folders are created on its first run there. Each run
 gets its own private temporary folder under your cache folder (`~/.cache/streamscopeai/tmp`, or
@@ -3643,7 +3650,13 @@ of its own kept between runs of that tool in that project (filled from the image
 what a rebuilt image changes under the home reaches it only after `ssai sandbox prune`), and, for a tool provisioned in your home
 directory, its provisioned configuration — read-only, so a tool that rewrites its own configuration
 cannot save it there (a provisioned file `run` cannot hand over is named, and the tool runs without it). Beside these, only the files `run` hands the tool are mounted, read-only: the
-CA bundles (`--ca-file` and the gateway's) and any file or directory an `-e KEY=/path` names. Nothing
+CA bundles (`--ca-file` and the gateway's) and any file or directory an `-e KEY=/path` names. When
+`run` gives Node no certificate file of its own (no gateway certificate was captured — your machine
+already trusts it, a corporate CA for instance — and neither `--ca-file` nor `-e NODE_EXTRA_CA_CERTS`
+names one), and the image or `devcontainer.json` names none either, Node in the container also
+trusts your machine's system certificate store; an image's own `NODE_EXTRA_CA_CERTS` is left as it is
+(Node reads one such file). The tool's installation into the image (its `npm install`) trusts your
+machine's system store beside the image's own. The other certificate variables are left to the image. Nothing
 else of your machine is: not your home, your SSH keys, nor the host's Podman or Docker socket. The container has no network: everything leaves through the same guard
 and the same destinations as the native sandbox, and `run` names what it refused. With `"docker": true`, nothing
 needs a proxy setting: every TCP connection made in the container — the tool's, the engine's pulls, and those of

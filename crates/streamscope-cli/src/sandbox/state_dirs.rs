@@ -13,6 +13,17 @@ use crate::state::home_dir;
 /// directories need to exist (see [`create_state_dirs`]). Kept out of policy
 /// building, which reads HOME and never changes it.
 pub(super) fn prepare_state_dirs(spec: &LaunchSpec) -> Result<()> {
+    if let Ok(home) = home_dir() {
+        let path = spec.env.iter().rev().find(|(k, _)| k == "PATH").map(|(_, v)| std::ffi::OsStr::new(v.as_str()));
+        let on_path = |tool: &str| crate::program::find_on(tool, path, None).is_some();
+        let caches = package_caches(&home, &secret_deny(&home));
+        for cache in profiles::PACKAGE_CACHES {
+            if !caches.iter().any(|(_, c)| std::ptr::eq(*c, cache)) {
+                eprintln!("ssai: {} is behind a link (or touches a secret), so it is not given to the sandbox", cache.dir);
+            }
+        }
+        create_package_caches(&caches, &on_path);
+    }
     let Some(agent) = profiles::agent_for(&spec.command) else {
         return Ok(());
     };
@@ -29,6 +40,45 @@ pub(super) fn prepare_state_dirs(spec: &LaunchSpec) -> Result<()> {
 /// grants a missing path, so macOS creates only the XDG base above it and
 /// leaves the client's own directory to the client.
 const BACKEND_CREATES: Create = if cfg!(target_os = "linux") { Create::Dir } else { Create::Base };
+
+/// Each [`profiles::PACKAGE_CACHES`] folder under `home`, kept only where it
+/// really is: its deepest existing folder (itself, once it exists) must be,
+/// resolved, exactly that path under the resolved home. A grant follows a
+/// symlink, so a cache — or a folder above it — that is a link anywhere
+/// inside the home is neither created nor granted, wherever it leads. Never
+/// one touching `deny` ([`secret_deny`]).
+pub(super) fn package_caches(home: &Path, deny: &[PathBuf]) -> Vec<(PathBuf, &'static profiles::PackageCache)> {
+    let Ok(real_home) = std::fs::canonicalize(home) else { return Vec::new() };
+    profiles::PACKAGE_CACHES
+        .iter()
+        .filter_map(|cache| {
+            let dir = home.join(cache.dir.strip_prefix("~/")?);
+            (is_real_in_home(home, &real_home, &dir) && !dir_touches_secret(&dir, deny)).then_some((dir, cache))
+        })
+        .collect()
+}
+
+/// Is `dir` (under `home`) where it says it is: its deepest existing folder,
+/// resolved, exactly that path under the resolved home — no link anywhere
+/// between the home and it? A grant follows a link, so one that is not real
+/// could reach anything.
+pub(super) fn is_real_in_home(home: &Path, real_home: &Path, dir: &Path) -> bool {
+    let Some(existing) = dir.ancestors().find(|a| a.exists()) else { return false };
+    let Ok(rel) = existing.strip_prefix(home) else { return false };
+    std::fs::canonicalize(existing).is_ok_and(|real| real == real_home.join(rel))
+}
+
+/// Create each cache folder of `caches` ([`package_caches`]) that is missing
+/// and whose tool `on_path` finds, so the grant every client gets has a folder
+/// to reach. Best effort, like [`create_state_dirs`]: one that cannot be
+/// created is simply not granted.
+pub(super) fn create_package_caches(caches: &[(PathBuf, &profiles::PackageCache)], on_path: &dyn Fn(&str) -> bool) {
+    for (dir, cache) in caches {
+        if !dir.exists() && cache.tools.iter().any(|t| on_path(t)) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+}
 
 /// How much of a state-directory entry [`create_state_dirs`] creates.
 #[derive(Clone, Copy, PartialEq, Eq)]
