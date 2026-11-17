@@ -21129,9 +21129,9 @@ export interface components {
         /**
          * @description Lazy-fetch a single deduplicated tool-definition blob by hash. Mirrors
          *     `get_media_blob` shape, but returns JSON (tool definitions are JSON, not
-         *     binary). The UI uses this when expanding a `tools_changed` event banner so
-         *     it can render the diff between the previous and current tool sets without
-         *     inlining the blobs on every turn.
+         *     binary). The UI uses this when expanding a `tools_changed` event banner, and
+         *     a session turn's "Request parameters" panel (with `protocol`, for `tools`),
+         *     so a session never inlines one catalog per turn.
          */
         ToolDefinitionBlobResponse: {
             /** @description The tools array as the client declared it, in its own protocol's shape. */
@@ -21139,6 +21139,12 @@ export interface components {
             hash: string;
             /** Format: int64 */
             size_bytes: number;
+            /**
+             * @description The catalog read in the protocol the request names (`protocol`); `None`
+             *     without one, and where the blob holds no tool that protocol reads (an
+             *     empty catalog, entries without a name, a blob of another protocol).
+             */
+            tools?: components["schemas"]["DomainToolSummary"][] | null;
         };
         /** @description A tool-definition set, keyed by its content hash within the tenant. */
         ToolDefinitionContent: {
@@ -23075,9 +23081,22 @@ export interface components {
         /**
          * @description `DomainRequestMeta` tagged with its turn number so the UI can attach the
          *     "Request parameters" / "Tools available" side panel to the matching turn.
+         *
+         *     The session view leaves the tool catalog out of `params`: it names it by
+         *     `tools_hash`, and the panel reads it on demand from
+         *     `/audit/tool-definitions/{hash}?protocol=<protocol>`. Keep it out — a
+         *     session whose tool set changes on every turn would otherwise carry, and
+         *     build in memory at once, one whole catalog per turn.
          */
         TurnParams: {
             params: components["schemas"]["DomainRequestMeta"];
+            /** @description The turn's inbound protocol — the shape its tool catalog is stored in. */
+            protocol: components["schemas"]["ApiVersion"];
+            /**
+             * @description The tool catalog the client declared on this turn, by its content hash;
+             *     null when it declared none.
+             */
+            tools_hash?: string | null;
             /** Format: int32 */
             turn: number;
         };
@@ -26740,7 +26759,13 @@ export interface operations {
     };
     get_tool_definition_blob: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description The inbound protocol of the turn that declared the catalog
+                 *     (`TurnParams.protocol`). Absent = the blob alone, no `tools`.
+                 */
+                protocol?: components["schemas"]["ApiVersion"];
+            };
             header?: never;
             path: {
                 /** @description SHA-256 content hash of the tool-definition blob */
@@ -26757,6 +26782,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ToolDefinitionBlobResponse"];
+                };
+            };
+            /** @description Unknown protocol */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
             /** @description Unauthorized */
@@ -44665,6 +44699,11 @@ export interface operations {
                  *     when it shares with its members. Absent = your own rows only.
                  */
                 workspace_id?: string;
+                /**
+                 * @description The inbound protocol of the turn that declared the catalog
+                 *     (`TurnParams.protocol`). Absent = the blob alone, no `tools`.
+                 */
+                protocol?: components["schemas"]["ApiVersion"];
             };
             header?: never;
             path: {
@@ -44682,6 +44721,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ToolDefinitionBlobResponse"];
+                };
+            };
+            /** @description Unknown protocol */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
             /** @description Unauthorized */

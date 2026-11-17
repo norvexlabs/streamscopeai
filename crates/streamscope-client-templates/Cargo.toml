@@ -24,3 +24,6 @@ openapi = ["dep:utoipa"]
 [dev-dependencies]
 proptest = "1"
 shlex = { workspace = true }
+
+[lints]
+workspace = true

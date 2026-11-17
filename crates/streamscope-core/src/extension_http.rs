@@ -288,7 +288,8 @@ fn held_for(
         Some((bundle, clients)) if bundle == ca => Some(clients.clone()),
         _ => None,
     };
-    if let Some(clients) = current(&held.read().unwrap_or_else(std::sync::PoisonError::into_inner), &ca()) {
+    let found = current(&held.read().unwrap_or_else(std::sync::PoisonError::into_inner), &ca());
+    if let Some(clients) = found {
         return clients;
     }
     // Built under the write lock for the bundle read again under it: of the

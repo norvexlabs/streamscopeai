@@ -8,6 +8,8 @@
 
 use crate::db::Global;
 use std::collections::HashMap;
+use streamscope_core::api::domain_request::DomainToolSummary;
+use streamscope_core::api::sse::ApiVersion;
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
@@ -967,14 +969,6 @@ pub enum ToolCallRow {
     },
 }
 
-fn tool_call_row_timestamp(row: &ToolCallRow) -> chrono::DateTime<chrono::Utc> {
-    match row {
-        ToolCallRow::Llm { entry } => entry.timestamp,
-        ToolCallRow::Mcp { entry } => entry.timestamp,
-        ToolCallRow::Web { entry } => entry.timestamp,
-    }
-}
-
 #[derive(Serialize, Clone, ToSchema)]
 pub struct ToolInvocation {
     pub invocation_id: String,
@@ -1146,54 +1140,94 @@ pub async fn tool_calls(
         )));
     }
 
-    // `kind == All` — over-fetch each side, merge by timestamp DESC, slice.
-    // Identical structure to `audit_store::logs::list_audit_logs_all`.
+    // `kind == All` — every arm's first `offset + limit + 1` entries, merged by
+    // timestamp DESC and sliced. The MCP and web arms contribute KEYS (no
+    // payload), and only the page's own keys are read back whole — one read
+    // per arm — so the merge holds `offset + limit + 1` keys per arm plus the
+    // page's rows, whatever an MCP row's params and result weigh.
+    use crate::audit_store::logs::{
+        page_len, read_mcp, read_web, rows_of_query, ArmKey, ArmRead,
+    };
+    enum Slot {
+        Llm(Box<ToolInvocation>),
+        Mcp(ArmKey),
+        Web(ArmKey),
+    }
     let (llm_invs, hit_cap) =
         collect_tool_invocations(&mut db, &q, &scope, target as usize).await?;
     let mcp_query = make_audit_query(
         AuditKind::Mcp,
         Some("tools/call,resources/read,prompts/get".into()),
     );
-    let mcp_rows = crate::audit_store::logs::list_audit_logs_mcp(
-        db.conn(),
-        &mcp_query,
-        &scope,
-        target,
-        0,
-    )
-    .await?;
+    let mcp_keys: Vec<ArmKey> =
+        read_mcp(db.conn(), &mcp_query, &scope, ArmRead::Keys, target, 0).await?;
     let web_query = make_audit_query(AuditKind::Web, None);
-    let web_rows = crate::audit_store::logs::list_audit_logs_web(
-        db.conn(),
-        &web_query,
-        &scope,
-        target,
-        0,
-        None,
-    )
-    .await?;
+    let web_keys: Vec<ArmKey> =
+        read_web(db.conn(), &web_query, &scope, ArmRead::Keys, target, 0, None).await?;
 
-    let mut all: Vec<ToolCallRow> =
-        Vec::with_capacity(llm_invs.len() + mcp_rows.len() + web_rows.len());
-    for inv in llm_invs {
-        all.push(ToolCallRow::Llm { entry: Box::new(inv) });
-    }
-    for row in mcp_rows {
-        all.push(ToolCallRow::Mcp { entry: Box::new(row) });
-    }
-    for row in web_rows {
-        all.push(ToolCallRow::Web { entry: Box::new(row) });
-    }
-    // A stable sort on the timestamp: rows sharing one keep their arm's own
+    let mut all: Vec<Slot> =
+        Vec::with_capacity(llm_invs.len() + mcp_keys.len() + web_keys.len());
+    all.extend(llm_invs.into_iter().map(|inv| Slot::Llm(Box::new(inv))));
+    all.extend(mcp_keys.into_iter().map(Slot::Mcp));
+    all.extend(web_keys.into_iter().map(Slot::Web));
+    // A stable sort on the timestamp: entries sharing one keep their arm's own
     // order (each arm is totally ordered — the turn walk and the MCP / web
     // queries break a tie on the request id), and arms tie in the order they
     // were appended, so the merged order is total and a page boundary exact.
-    all.sort_by_key(|row| std::cmp::Reverse(tool_call_row_timestamp(row)));
-
+    all.sort_by_key(|slot| {
+        std::cmp::Reverse(match slot {
+            Slot::Llm(inv) => inv.timestamp,
+            Slot::Mcp(k) | Slot::Web(k) => k.timestamp,
+        })
+    });
     let start = (offset as usize).min(all.len());
     let end = ((offset + limit + 1) as usize).min(all.len());
-    let page_rows: Vec<ToolCallRow> = all.drain(start..end).collect();
+    let page_slots: Vec<Slot> = all.drain(start..end).collect();
+    drop(all);
+
+    // The page's MCP and web rows, read whole by their keys.
+    let mcp_page: Vec<ArmKey> = page_slots
+        .iter()
+        .filter_map(|s| if let Slot::Mcp(k) = s { Some(*k) } else { None })
+        .collect();
+    let web_page: Vec<ArmKey> = page_slots
+        .iter()
+        .filter_map(|s| if let Slot::Web(k) = s { Some(*k) } else { None })
+        .collect();
+    let mut mcp_rows: std::collections::HashMap<Uuid, super::audit::McpAuditLogEntry> =
+        match rows_of_query(&mcp_page) {
+            Some(rq) => read_mcp(db.conn(), &rq, &scope, ArmRead::RowsOf(&mcp_page), page_len(&mcp_page), 0)
+                .await?
+                .into_iter()
+                .map(|e: super::audit::McpAuditLogEntry| (e.request_id, e))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        };
+    let mut web_rows: std::collections::HashMap<Uuid, super::audit::WebAuditLogEntry> =
+        match rows_of_query(&web_page) {
+            Some(rq) => read_web(db.conn(), &rq, &scope, ArmRead::RowsOf(&web_page), page_len(&web_page), 0, None)
+                .await?
+                .into_iter()
+                .map(|e: super::audit::WebAuditLogEntry| (e.request_id, e))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        };
+    // In the merge's order, the page's own `limit` slots alone: a row purged
+    // between the two passes leaves the page one row short — never the
+    // over-fetched row in its place, which the next page starts with —
+    // and whether more follow is the key pass's answer.
+    let more = page_slots.len() as i64 > limit;
+    let page_rows: Vec<ToolCallRow> = page_slots
+        .into_iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .filter_map(|slot| match slot {
+            Slot::Llm(entry) => Some(ToolCallRow::Llm { entry }),
+            Slot::Mcp(k) => mcp_rows.remove(&k.request_id).map(|e| ToolCallRow::Mcp { entry: Box::new(e) }),
+            Slot::Web(k) => web_rows.remove(&k.request_id).map(|e| ToolCallRow::Web { entry: Box::new(e) }),
+        })
+        .collect();
     let mut page = super::OffsetPage::from_overfetched(page_rows, limit, offset);
+    page.has_more = more;
     if hit_cap {
         page.has_more = true;
     }
@@ -1213,6 +1247,29 @@ fn json_values_contain(value: &serde_json::Value, term: &str) -> bool {
         serde_json::Value::Object(map) => map.values().any(|v| json_values_contain(v, term)),
         serde_json::Value::Null => false,
     }
+}
+
+/// A tool set's definitions the feed keeps, by tool name.
+type NamedDefinitions = std::collections::HashMap<String, DomainToolSummary>;
+
+/// The definitions of `set` (a stored tool set, in `proto`'s shape) whose
+/// names are in `names`, protocol-normalized by `parse_stored_tools` — the
+/// same helper the session view uses; never parse a raw set here. A name the
+/// set declares twice keeps its first definition. The rest of the set is not
+/// kept: a client can declare a large set on every turn, and the feed shows
+/// only the definitions of the tools a turn called.
+fn named_tool_definitions(
+    proto: ApiVersion,
+    set: &serde_json::Value,
+    names: &std::collections::HashSet<String>,
+) -> NamedDefinitions {
+    let mut found = std::collections::HashMap::new();
+    for def in streamscope_core::api::domain_request::parse_stored_tools(proto, set).unwrap_or_default() {
+        if names.contains(&def.name) && !found.contains_key(&def.name) {
+            found.insert(def.name.clone(), def);
+        }
+    }
+    found
 }
 
 /// Walk session turns synthesizing `ToolInvocation` rows until we have
@@ -1321,6 +1378,12 @@ async fn collect_tool_invocations(
                     ApiError::internal("database query failed")
                 })?;
 
+        // Pass 1: each turn's own call events, and per declared tool set the
+        // names the feed looks a definition up by — the calls' and the
+        // response-phase block records'.
+        let mut prepared = Vec::with_capacity(batch.len());
+        let mut wanted: std::collections::HashMap<String, Vec<(ApiVersion, std::collections::HashSet<String>)>> =
+            std::collections::HashMap::new();
     for (r, answer) in batch.into_iter().zip(answer_hashes) {
         let Some(proto) = stored_protocol(&r.api_version, r.request_id) else {
             continue;
@@ -1340,7 +1403,9 @@ async fn collect_tool_invocations(
             protocol: proto,
             system_prompt: None,
             messages_json: &messages_arr,
-            request_tools: r.request_tools.as_deref(),
+            // The tool set feeds only the turn's request metadata, which the
+            // feed does not read; a call's definition is resolved below.
+            request_tools: None,
             // Hashes not needed here — invocations feed doesn't surface
             // ToolsChanged events (they belong on the session viewer).
             tools_available_hash: None,
@@ -1365,7 +1430,49 @@ async fn collect_tool_invocations(
                 continue;
             }
         };
+        if let Some(hash) = &r.request_tools_hash {
+            let names = call_events
+                .iter()
+                .filter_map(|ev| match ev {
+                    ConversationEvent::ToolCall { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .chain(
+                    parsed_transform_diff
+                        .iter()
+                        .flat_map(|diff| diff.response_blocked_tools.iter().flatten())
+                        .map(|info| info.name.clone()),
+                );
+            let per_set = wanted.entry(hash.clone()).or_default();
+            match per_set.iter_mut().find(|(p, _)| *p == proto) {
+                Some((_, set)) => set.extend(names),
+                None => per_set.push((proto, names.collect())),
+            }
+        }
+        prepared.push((r, answer, proto, parsed_transform_diff, call_events));
+    }
 
+        // The definitions those names resolve to, read one bounded chunk of
+        // tool sets at a time; only the named definitions are kept.
+        let set_hashes: Vec<String> = wanted.keys().cloned().collect();
+        let mut definitions: std::collections::HashMap<String, Vec<(ApiVersion, NamedDefinitions)>> =
+            std::collections::HashMap::new();
+        crate::content_store::tool_definitions::for_each(db.conn(), tenant_id, &set_hashes, |hash, set| {
+            let Some(per_set) = wanted.get(hash) else { return };
+            let found = per_set
+                .iter()
+                .map(|(proto, names)| (*proto, named_tool_definitions(*proto, set, names)))
+                .collect();
+            definitions.insert(hash.to_string(), found);
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("collect_tool_invocations tool-set fetch: {e}");
+            ApiError::internal("database query failed")
+        })?;
+        drop(wanted);
+
+    for (r, answer, proto, parsed_transform_diff, call_events) in prepared {
         let (result_events, result_req_id) = if let (Some(next_req_id), Some(next_turn_number)) =
             (r.next_request_id, r.next_turn_number)
         {
@@ -1417,7 +1524,8 @@ async fn collect_tool_invocations(
                     // those, so it is left out.
                     system_prompt: None,
                     messages_json: &next_messages_filtered,
-                    request_tools: r.next_request_tools.as_deref(),
+                    // Its request metadata is not read.
+                    request_tools: None,
                     tools_available_hash: None,
                     tools_effective_hash: None,
                     request_params: r.next_request_params.as_ref(),
@@ -1455,17 +1563,16 @@ async fn collect_tool_invocations(
             .as_ref()
             .and_then(|diff| diff.response_blocked_tools.as_deref())
             .unwrap_or_default();
-        // Canonical, protocol-normalized tool definitions — same helper the
-        // proxy/session view uses. Never parse raw `request_tools` JSON here.
-        let normalized_tools: Vec<streamscope_core::api::domain_request::DomainToolSummary> = r
-            .request_tools
-            .as_deref()
-            .and_then(|v| {
-                streamscope_core::api::domain_request::parse_stored_tools(proto, v)
-            })
-            .unwrap_or_default();
-        let find_tool_def = |name: &str| -> Option<streamscope_core::api::domain_request::DomainToolSummary> {
-            normalized_tools.iter().find(|t| t.name == name).cloned()
+        // The canonical, protocol-normalized definition of a called tool,
+        // resolved above (`named_tool_definitions`).
+        let turn_definitions = r
+            .request_tools_hash
+            .as_ref()
+            .and_then(|h| definitions.get(h))
+            .and_then(|per_set| per_set.iter().find(|(p, _)| *p == proto))
+            .map(|(_, by_name)| by_name);
+        let find_tool_def = |name: &str| -> Option<DomainToolSummary> {
+            turn_definitions.and_then(|by_name| by_name.get(name)).cloned()
         };
 
         // The SQL predicate admitted this turn on its calls' names and arguments
@@ -3870,6 +3977,36 @@ pub async fn cross_attention(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_feed_keeps_of_a_tool_set_only_the_definitions_it_names() {
+        use super::named_tool_definitions;
+        use streamscope_core::api::sse::ApiVersion;
+        let set = serde_json::json!([
+            {"type": "function", "function": {"name": "Read", "description": "first",
+                "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Write", "description": "big",
+                "parameters": {"type": "object", "properties": {"content": {}}}}},
+            {"type": "function", "function": {"name": "Read", "description": "second"}}
+        ]);
+        let names: std::collections::HashSet<String> =
+            ["Read".to_string(), "Absent".to_string()].into_iter().collect();
+        let found = named_tool_definitions(ApiVersion::ChatCompletions, &set, &names);
+        // Only the named tool the set declares is kept, as `parse_stored_tools`
+        // normalizes it, first declaration first.
+        assert_eq!(found.len(), 1, "{found:?}");
+        let expected = streamscope_core::api::domain_request::parse_stored_tools(ApiVersion::ChatCompletions, &set)
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "Read")
+            .unwrap();
+        let read = &found["Read"];
+        assert_eq!(read.description.as_deref(), Some("first"));
+        assert_eq!(read.name, expected.name);
+        assert_eq!(read.parameters, expected.parameters);
+        // Nothing named: nothing kept.
+        assert!(named_tool_definitions(ApiVersion::ChatCompletions, &set, &Default::default()).is_empty());
+    }
 
     #[test]
     fn a_budget_band_turns_at_its_share_and_at_its_cap_on_both_sides() {

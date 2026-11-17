@@ -149,17 +149,17 @@ impl PendingMap {
     /// to the event sink (where they'd surface as bogus server-initiated
     /// events).
     fn is_abandoned(&self, id_key: &str) -> bool {
-        let cutoff = Instant::now() - abandoned_ttl();
-        match self.abandoned.get(id_key) {
-            Some(stamp) if *stamp >= cutoff => true,
-            Some(_) => {
-                // Expired; clear it so the map stays bounded.
-                drop(self.abandoned.get(id_key));
-                self.abandoned.remove(id_key);
-                false
-            }
-            None => false,
+        // A clock younger than the TTL: nothing has expired yet.
+        let Some(cutoff) = Instant::now().checked_sub(abandoned_ttl()) else {
+            return self.abandoned.contains_key(id_key);
+        };
+        // An expired marker is cleared on the way. Each call takes the shard
+        // lock alone: a guard of `abandoned` still alive at a later call on it
+        // waits on its own lock, and parks the worker for good.
+        if self.abandoned.remove_if(id_key, |_, stamp| *stamp < cutoff).is_some() {
+            return false;
         }
+        self.abandoned.contains_key(id_key)
     }
 
     /// Drop every pending oneshot. Drives every awaiting `call_request` to
@@ -174,16 +174,10 @@ impl PendingMap {
         for k in keys {
             self.inner.remove(&k);
         }
-        // Periodic abandoned-set GC piggybacks on drain calls.
-        let cutoff = Instant::now() - abandoned_ttl();
-        let stale: Vec<String> = self
-            .abandoned
-            .iter()
-            .filter(|kv| *kv.value() < cutoff)
-            .map(|kv| kv.key().clone())
-            .collect();
-        for k in stale {
-            self.abandoned.remove(&k);
+        // Abandoned markers past their TTL go here too. `retain` decides under
+        // each shard's lock, so an id abandoned afresh meanwhile keeps its marker.
+        if let Some(cutoff) = Instant::now().checked_sub(abandoned_ttl()) {
+            self.abandoned.retain(|_, stamp| *stamp >= cutoff);
         }
         n
     }
@@ -278,7 +272,8 @@ impl LegacySseSession {
         if n > 0 {
             tracing::debug!(session = ?self.key, n, "legacy SSE session cancelled — pending drained");
         }
-        if let Some(handle) = self.drain_handle.lock_or_poisoned().take() {
+        let handle = self.drain_handle.lock_or_poisoned().take();
+        if let Some(handle) = handle {
             handle.abort();
         }
     }
@@ -408,7 +403,8 @@ impl Drop for LegacySseSession {
         // the spawned drain task so a session that's evicted from the map
         // never leaves a dangling tokio task pumping to a closed sink.
         self.cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(handle) = self.drain_handle.lock_or_poisoned().take() {
+        let handle = self.drain_handle.lock_or_poisoned().take();
+        if let Some(handle) = handle {
             handle.abort();
         }
     }
@@ -753,6 +749,39 @@ impl LegacySseSessionMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `f` on its own thread and fails if it has not returned within 10 s:
+    /// a self-deadlock parks that thread for good instead of failing.
+    fn returns_in_time<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("the call did not return: it waits on a lock it holds"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the call panicked (its own message is above)"),
+        }
+    }
+
+    #[test]
+    fn an_expired_abandoned_id_is_cleared_and_the_call_returns() {
+        let pending = std::sync::Arc::new(PendingMap::new());
+        let expired = Instant::now()
+            .checked_sub(abandoned_ttl() + Duration::from_secs(1))
+            .expect("the clock is past one TTL");
+        pending.abandoned.insert("n:1".into(), expired);
+        let p = pending.clone();
+        assert!(!returns_in_time(move || p.is_abandoned("n:1")));
+        assert!(!pending.abandoned.contains_key("n:1"));
+
+        // Positive control: an id abandoned now is still reported, and kept.
+        pending.abandon("n:2");
+        let p = pending.clone();
+        assert!(returns_in_time(move || p.is_abandoned("n:2")));
+        assert!(pending.abandoned.contains_key("n:2"));
+        assert!(!pending.is_abandoned("n:3"));
+    }
 
     #[test]
     fn id_key_handles_number_and_string() {

@@ -10,6 +10,12 @@ members = [
     "crates/streamscope-edge-api",
 ]
 
+# A lock guard alive in an `if let` / `match` scrutinee lives through the whole
+# body: a call there that takes the same lock waits on itself for good. Every
+# member opts in with `[lints] workspace = true`, which reaches its test targets.
+[workspace.lints.clippy]
+significant_drop_in_scrutinee = "warn"
+
 [workspace.package]
 edition = "2024"
 version = "0.0.0" # not used at runtime — real version comes from CHANGELOG.md via build.rs

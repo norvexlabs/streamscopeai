@@ -113,7 +113,8 @@ pub async fn fetch_builtin(
             if let Some(ssrf_err) = refusal_handle.take_refusal() {
                 return Err(map_ssrf(ssrf_err));
             }
-            if let Some(ssrf_err) = policy_refusal.lock().unwrap().take() {
+            let refused = policy_refusal.lock().unwrap().take();
+            if let Some(ssrf_err) = refused {
                 return Err(map_ssrf(ssrf_err));
             }
             if e.is_redirect() {

@@ -68,3 +68,25 @@ pub(crate) async fn get_many(
     .await?;
     Ok(rows.into_iter().collect())
 }
+
+/// How many tool sets [`for_each`] holds at once. A client that declares a
+/// large set and changes it every turn stores one per turn, so a reader that
+/// needs many sets walks them by chunk, keeping only what it takes from each.
+pub(crate) const SET_CHUNK: usize = 16;
+
+/// Visit the tool sets of `tenant_id` named by `hashes`, read [`SET_CHUNK`] at
+/// a time; a set is dropped once visited. A hash the tenant holds no set for
+/// is not visited.
+pub(crate) async fn for_each(
+    conn: &mut Scoped,
+    tenant_id: uuid::Uuid,
+    hashes: &[String],
+    mut visit: impl FnMut(&str, &serde_json::Value),
+) -> sqlx::Result<()> {
+    for chunk in hashes.chunks(SET_CHUNK) {
+        for (hash, set) in get_many(&mut *conn, tenant_id, chunk).await? {
+            visit(&hash, &set);
+        }
+    }
+    Ok(())
+}

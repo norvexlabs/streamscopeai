@@ -2043,10 +2043,21 @@ pub struct ConversationResponse {
 
 /// `DomainRequestMeta` tagged with its turn number so the UI can attach the
 /// "Request parameters" / "Tools available" side panel to the matching turn.
+///
+/// The session view leaves the tool catalog out of `params`: it names it by
+/// `tools_hash`, and the panel reads it on demand from
+/// `/audit/tool-definitions/{hash}?protocol=<protocol>`. Keep it out — a
+/// session whose tool set changes on every turn would otherwise carry, and
+/// build in memory at once, one whole catalog per turn.
 #[derive(Serialize, ToSchema)]
 pub struct TurnParams {
     pub turn: i32,
     pub params: streamscope_core::api::domain_request::DomainRequestMeta,
+    /// The tool catalog the client declared on this turn, by its content hash;
+    /// null when it declared none.
+    pub tools_hash: Option<String>,
+    /// The turn's inbound protocol — the shape its tool catalog is stored in.
+    pub protocol: streamscope_core::api::sse::ApiVersion,
 }
 
 /// Extract `<think>...</think>` blocks from model output.
@@ -2322,7 +2333,8 @@ pub async fn get_session_conversation_impl(
     //    turn whose parent is not a row before it), the added slice on every
     //    other.
     //    The raw format returns every turn's system prompt; the parsed ones
-    //    read it only where the turn `opens_view`, the one place it renders.
+    //    read it only where the turn opens the view (`timeline::turns`), the
+    //    only place it may render.
     let rows = timeline::turns(&mut *conn, session_id, format == ResponseFormat::Raw)
     .await?;
 
@@ -2379,25 +2391,10 @@ pub async fn get_session_conversation_impl(
     let msg_map: HashMap<String, serde_json::Value> =
         crate::content_store::messages::get_many(&mut *conn, tenant_id, &all_hashes).await?;
 
-    // 3b. Batch-load all referenced tool definitions in ONE query.
-    // Tool blobs are the dominant repeated payload — fetching once across all
-    // turns and zipping back by hash is the whole point of the dedup.
-    //
-    // Only `tools_available_hash` is consumed by the per-turn `TurnRow.request_tools`
-    // hydration below. The `tools_effective_hash` blob is fetched lazily by
-    // the UI via `/audit/tool-definitions/{hash}` when an operator expands a
-    // `ToolsChanged{PolicyModified}` event banner — pre-loading it here
-    // would waste a query in the common case where nobody clicks.
-    let mut tool_hashes: Vec<String> = Vec::new();
-    for row in &rows {
-        if let Some(h) = &row.tools_available_hash
-            && !tool_hashes.contains(h)
-        {
-            tool_hashes.push(h.clone());
-        }
-    }
-    let tool_map: HashMap<String, serde_json::Value> =
-        crate::content_store::tool_definitions::get_many(&mut *conn, tenant_id, &tool_hashes).await?;
+    // No tool catalog is loaded here: a turn names its catalog by hash
+    // (`TurnParams.tools_hash`, `ToolsChanged`), and the UI reads one through
+    // `/audit/tool-definitions/{hash}` when it is opened. Loading them would
+    // hold every distinct catalog of the session in memory at once.
 
     // 3c. The system prompts `turns` named — where a turn opens the view, or
     // on every turn in the raw format — in ONE read.
@@ -2619,16 +2616,20 @@ pub async fn get_session_conversation_impl(
     let mut guardrail_by_tool_use: std::collections::HashMap<String, Vec<streamscope_core::proxy::content::GuardrailStepDiff>> =
         std::collections::HashMap::new();
     // Tracks the last-emitted RequestParams signature so we only push a new
-    // `TurnParams` entry when the sampling params / tool catalog / model
-    // actually change. Matches what the RequestParamsPanel component renders,
-    // so `system_prompt` is excluded (it's surfaced separately via the
-    // System Prompt event on turn 0 / baseline). Stored as `serde_json::Value`
-    // (not a serialized string) so the comparison is insensitive to HashMap
-    // iteration order inside `DomainRequestMeta.extra`.
+    // `TurnParams` entry when the sampling params, the tool catalog's hash, its
+    // protocol or the model actually change. Matches what the RequestParamsPanel
+    // component renders, so `system_prompt` is excluded (the System Prompt
+    // event surfaces it). Stored as a `serde_json::Value`, whose object
+    // equality ignores key order.
     let mut last_params_signature: Option<serde_json::Value> = None;
     // Tracks the previous turn's `tools_available_hash` so we emit a
     // `ToolsChanged{BetweenTurns}` event when the client swaps the tool set.
     let mut last_tools_available_hash: Option<String> = None;
+    // The system prompts the view has shown: a turn that opens the view shows
+    // its prompt only the first time, so a session of many baselines —
+    // side-by-side agents alternating their prompts included — never repeats
+    // one per baseline.
+    let mut shown_prompts: HashSet<String> = HashSet::new();
     let mut seen_hashes: HashSet<String> = HashSet::new();
     // Signatures of captured assistant responses from prior turns. A history
     // assistant message whose signature matches one of these is treated as
@@ -2665,11 +2666,16 @@ pub async fn get_session_conversation_impl(
             }
         }
 
-        // Compaction marker — clear seen hashes + assistant signatures
-        // (new baseline). Skip for media turns which have no message hashes.
+        // Compaction / context-reset marker on a baseline. What the view has
+        // already shown stays seen: a baseline renders only the messages the
+        // session has not rendered yet, never its whole history again — a
+        // session whose turns are mostly baselines would otherwise render
+        // turns × history. Skip for media turns which have no message hashes.
         let mut compaction_emitted = false;
         if event_type != "media" && is_baseline && turn_idx > 0 {
-            seen_hashes.clear();
+            // Client-fabricated history is judged against this context's
+            // captured answers only; an echo already shown is dropped by its
+            // hash before the signature is read.
             seen_assistant_signatures.clear();
             let current_msg_count = usize::try_from(row.message_count).unwrap_or(0);
 
@@ -2733,8 +2739,8 @@ pub async fn get_session_conversation_impl(
         } else {
             // Chat turn — emit events via canonical domain normalization.
             //
-            // Dedup filter: keep a message only when the turn is baseline/first OR
-            // the hash was first seen in this turn. For non-assistant roles the
+            // Dedup filter: keep a message only when its hash was first seen in
+            // this turn — on every turn, a baseline's included. For non-assistant roles the
             // hash check alone is sufficient. For assistant history, we additionally
             // check the content signature against `seen_assistant_signatures` —
             // when the signature matches a prior captured response, the message is
@@ -2743,16 +2749,12 @@ pub async fn get_session_conversation_impl(
             // client-fabricated (not produced by any captured upstream call) and we
             // keep it; `build_events` will tag the emitted Message
             // event with `is_from_history: true` so the UI can flag it.
-            let is_baseline_or_first = row.opens_view;
             let new_messages: Vec<&serde_json::Value> = hashes
                 .iter()
                 .filter_map(|h| {
                     let msg = msg_map.get(h)?;
                     let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
                     let unseen = !seen_hashes.contains(h);
-                    if is_baseline_or_first {
-                        return Some(msg);
-                    }
                     if !unseen {
                         return None;
                     }
@@ -2772,9 +2774,6 @@ pub async fn get_session_conversation_impl(
 
             let row_tools_available_hash = &row.tools_available_hash;
             let row_tools_effective_hash = &row.tools_effective_hash;
-            let row_request_tools: Option<serde_json::Value> = row_tools_available_hash
-                .as_deref()
-                .and_then(|h| tool_map.get(h).cloned());
             let row_request_params = &row.request_params;
 
             // Emit BetweenTurns when the available tool set differs from the
@@ -2810,13 +2809,18 @@ pub async fn get_session_conversation_impl(
                 .or_else(|| row.model_requested.clone())
                 .unwrap_or_default();
 
+            // Read only where the turn opens the view (`turns`); shown only the
+            // first time the view meets it.
+            let turn_prompt = system_prompt_of(row).filter(|_| {
+                row.system_prompt_hash.as_ref().is_some_and(|h| !shown_prompts.contains(h))
+            });
             let turn_row = |protocol| TurnRow {
                 turn_number,
                 protocol,
-                // Read only where the turn opens the view (`turns`).
-                system_prompt: system_prompt_of(row).map(String::as_str),
+                system_prompt: turn_prompt.map(String::as_str),
                 messages_json: &messages_arr,
-                request_tools: row_request_tools.as_ref(),
+                // Named by `TurnParams.tools_hash`, read on demand.
+                request_tools: None,
                 tools_available_hash: row_tools_available_hash.as_deref(),
                 tools_effective_hash: row_tools_effective_hash.as_deref(),
                 request_params: row_request_params.as_ref(),
@@ -2827,9 +2831,9 @@ pub async fn get_session_conversation_impl(
                 model: &model_ref,
                 metadata: Some(meta.clone()),
                 include_raw,
-                // Session view pre-filters messages_json above (new_messages
-                // / is_baseline_or_first) so every surviving history entry
-                // is genuinely first-seen in this turn.
+                // Session view pre-filters messages_json above (new_messages)
+                // so every surviving history entry is genuinely first-seen in
+                // this turn.
                 dedup_filtered: true,
                 transform_diff: transform_diff.as_ref().map(|j| &j.0),
             };
@@ -2837,36 +2841,44 @@ pub async fn get_session_conversation_impl(
             // blow up the whole session view. On error, emit a marker message
             // carrying the raw payload so the UI still shows something.
             match protocol.and_then(|p| {
-                build_events(&turn_row(p)).map_err(|e| e.to_string())
+                build_events(&turn_row(p)).map(|built| (p, built)).map_err(|e| e.to_string())
             }) {
-                Ok(mut built) => {
+                Ok((turn_protocol, mut built)) => {
+                    // Shown only once the turn rendered: a turn that fails to
+                    // build shows no prompt, so a later one still does.
+                    if turn_prompt.is_some()
+                        && let Some(h) = &row.system_prompt_hash
+                    {
+                        shown_prompts.insert(h.clone());
+                    }
                     carried.stamp(&mut built.events, row.request_id);
                     events.extend(built.events);
                     // Dedupe identical per-turn request params: the client
-                    // typically sends the same sampling params + tool catalog
-                    // on every turn of a session, so shipping and rendering
-                    // an identical ~N KB tool list per turn is pure waste.
-                    // Compare on everything *except* `system_prompt` (the
-                    // panel doesn't render it; the dashed System Prompt
-                    // event already handles it).
-                    // We go through `serde_json::Value` rather than a string:
-                    // `DomainRequestMeta.extra` is a `HashMap<String, Value>`,
-                    // and Rust's `HashMap` iteration order is non-deterministic.
-                    // `Value` equality on `Object` is order-insensitive
-                    // (`serde_json::Map` sorts keys when `preserve_order` is off,
-                    // which is our default), so two calls with identical content
-                    // compare equal regardless of the HashMap's internal order.
+                    // typically sends the same sampling params and tool
+                    // catalog on every turn, so an entry is pushed only where
+                    // they change. The catalog is compared by its hash and the
+                    // protocol it is read in; the params on everything *except*
+                    // `system_prompt` (the panel doesn't render it; the System
+                    // Prompt event does), as a `serde_json::Value`, whose object
+                    // equality ignores key order.
                     let signature = {
                         let mut sig = built.params.clone();
                         sig.system_prompt = None;
-                        serde_json::to_value(&sig).ok()
+                        serde_json::to_value(&sig)
+                            .ok()
+                            .map(|params| serde_json::json!([params, row_tools_available_hash, turn_protocol]))
                     };
                     let changed = match (&last_params_signature, &signature) {
                         (Some(a), Some(b)) => a != b,
                         _ => true,
                     };
                     if changed {
-                        turn_params.push(TurnParams { turn: turn_number, params: built.params });
+                        turn_params.push(TurnParams {
+                            turn: turn_number,
+                            params: built.params,
+                            tools_hash: row_tools_available_hash.clone(),
+                            protocol: turn_protocol,
+                        });
                         last_params_signature = signature;
                     }
                 }
@@ -2939,10 +2951,10 @@ pub async fn get_session_conversation_impl(
         // Update state for next iteration — cumulative seen hashes plus the
         // captured assistant signature so subsequent turns can recognise their
         // own history echoes. A turn that read only its added slice has its
-        // prefix from its parent, inserted when the parent was walked; one
-        // that read its whole history without opening the view (its parent
-        // not a row before it) went through the `seen_hashes`
-        // filter above, so only what it really added was rendered.
+        // prefix from its parent, inserted when the parent was walked; every
+        // turn that read its whole history — a baseline included — went
+        // through the `seen_hashes` filter above, so only what it really
+        // added was rendered.
         for h in hashes {
             seen_hashes.insert(h.clone());
         }
@@ -3703,9 +3715,9 @@ pub(crate) fn media_blob_response(media_type: String, data: Vec<u8>) -> impl Int
 
 /// Lazy-fetch a single deduplicated tool-definition blob by hash. Mirrors
 /// `get_media_blob` shape, but returns JSON (tool definitions are JSON, not
-/// binary). The UI uses this when expanding a `tools_changed` event banner so
-/// it can render the diff between the previous and current tool sets without
-/// inlining the blobs on every turn.
+/// binary). The UI uses this when expanding a `tools_changed` event banner, and
+/// a session turn's "Request parameters" panel (with `protocol`, for `tools`),
+/// so a session never inlines one catalog per turn.
 #[derive(Serialize, ToSchema)]
 pub struct ToolDefinitionBlobResponse {
     pub hash: String,
@@ -3713,6 +3725,31 @@ pub struct ToolDefinitionBlobResponse {
     #[schema(value_type = Object)]
     pub definition: serde_json::Value,
     pub size_bytes: i64,
+    /// The catalog read in the protocol the request names (`protocol`); `None`
+    /// without one, and where the blob holds no tool that protocol reads (an
+    /// empty catalog, entries without a name, a blob of another protocol).
+    pub tools: Option<Vec<streamscope_core::api::domain_request::DomainToolSummary>>,
+}
+
+/// The protocol a tool-definition blob is read in, for its `tools` summaries.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ToolDefinitionQuery {
+    /// The inbound protocol of the turn that declared the catalog
+    /// (`TurnParams.protocol`). Absent = the blob alone, no `tools`.
+    pub protocol: Option<streamscope_core::api::sse::ApiVersion>,
+}
+
+/// The response for one stored catalog — the admin and portal endpoints alike.
+pub(crate) fn tool_definition_response(
+    hash: String,
+    definition: serde_json::Value,
+    size_bytes: i64,
+    protocol: Option<streamscope_core::api::sse::ApiVersion>,
+) -> ToolDefinitionBlobResponse {
+    let tools = protocol
+        .and_then(|p| streamscope_core::api::domain_request::parse_stored_tools(p, &definition));
+    ToolDefinitionBlobResponse { hash, definition, size_bytes, tools }
 }
 
 #[utoipa::path(
@@ -3721,9 +3758,11 @@ pub struct ToolDefinitionBlobResponse {
     tag = "Audit",
     params(
         ("hash" = String, Path, description = "SHA-256 content hash of the tool-definition blob"),
+        ToolDefinitionQuery,
     ),
     responses(
         (status = 200, description = "Tool-definition JSON blob", body = ToolDefinitionBlobResponse),
+        (status = 400, description = "Unknown protocol", body = ApiErrorResponse),
         (status = 404, description = "Hash not found", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -3733,6 +3772,7 @@ pub struct ToolDefinitionBlobResponse {
 pub async fn get_tool_definition_blob(
     mut db: TenantConn,
     Path(hash): Path<String>,
+    Query(q): Query<ToolDefinitionQuery>,
 ) -> Result<Json<ToolDefinitionBlobResponse>, ApiError> {
     let tenant_id = db.tenant_uuid();
     let row = crate::content_store::tool_definitions::get(db.conn(), tenant_id, &hash)
@@ -3748,11 +3788,7 @@ pub async fn get_tool_definition_blob(
         );
     };
 
-    Ok(Json(ToolDefinitionBlobResponse {
-        hash,
-        definition,
-        size_bytes: size_bytes as i64,
-    }))
+    Ok(Json(tool_definition_response(hash, definition, size_bytes as i64, q.protocol)))
 }
 
 #[cfg(test)]

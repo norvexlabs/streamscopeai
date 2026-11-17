@@ -1096,5 +1096,12 @@
   "portal_page_hidden_title": "Cette page n'est pas disponible",
   "portal_page_hidden_body": "Votre administrateur a masqué cette page pour vos espaces de travail.",
   "portal_page_hidden_home": "Retour à l'accueil",
-  "browse_content_hidden": "Le contenu des conversations est masqué pour vos espaces de travail : chaque requête affiche son modèle, ses jetons, son coût et son statut, et ne s'ouvre pas."
+  "browse_content_hidden": "Le contenu des conversations est masqué pour vos espaces de travail : chaque requête affiche son modèle, ses jetons, son coût et son statut, et ne s'ouvre pas.",
+  "event_tools_loading": "Chargement des outils…",
+  "event_tools_load_failed": "Impossible de charger les outils de ce tour.",
+  "event_tools_none_readable": "La liste d'outils de ce tour ne contient aucun outil lisible.",
+  "event_tools_summary": "outils",
+  "event_tools_count_one": "1 outil",
+  "event_tools_count": "{count} outils",
+  "event_tools_available": "Outils disponibles ({count})"
 }

@@ -129,7 +129,15 @@ the minimum.
 at every boot the database, the gateway and the admin API are each given a share of its memory
 (30 %, 20 % and 10 %, up to 16 GB, 8 GB and 4 GB), and the database sizes its cache from its share.
 A VM given more memory uses it from its next boot.
-Its network is tuned at each boot for its size and for the gateway's many connections (the
+
+**Users** — with 500 active users (each opening one of their sessions every 20 seconds in the portal,
+coding agents sending turns, a few administrators on the console), every service's measured peak
+stayed well inside the share a 4 GB VM gives it. Large requests cost memory while they are handled: the
+gateway holds about 15 MB for each 256K-token turn in flight (60 MB for a million tokens), and the
+admin API about 25 MB for each 256K-token session being opened (100 MB for a million). With many
+such at the same moment, choose the recommended size or larger.
+
+The VM's network is tuned at each boot for its size and for the gateway's many connections (the
 `network` profile).
 
 **Disk** — the sizes above are the space for the appliance's data (the database, audit and session
@@ -1609,6 +1617,9 @@ enforcement before relying on them.
   share request limits across the fleet, so adding pods adds throughput with no shared state to
   manage. When the control plane autoscales, set its replica upper bound so per-pod rate limits add up
   to the intended total (the chart wires this from the autoscaling `maxReplicas`).
+- **Per-pod memory.** The gateway and control-plane pods request 512 MiB and are limited to 1 GiB
+  each, the console to 384 MiB; for what large coding-agent turns cost while in flight, see *Users*
+  in § B. The autoscaler adds replicas on CPU, not memory.
 - **Per-pod CPU sizing.** Each gateway and control-plane pod sizes its internal worker pool to the
   CPU it is granted, not to the node's core count. The chart sets no CPU *limit* by default (a CPU
   limit would let the scheduler throttle the latency-sensitive gateway), so it pins a worker-thread
@@ -1645,7 +1656,8 @@ anything you configure afterwards is identical.
   to 16 GB, 8 GB and 4 GB), never less than the base stack's own limits. The shares are ceilings:
   the gateway and the admin API reach them only under load, while the database keeps a quarter of
   its share as its cache, filled as data is read. On Docker Desktop, whose containers run in a VM of their own, the services
-  keep the base limits.
+  keep the base limits (512 MB for the gateway and the admin API), which hold a few large
+  coding-agent turns at once — what each costs is under *Users* in § B.
 - Access to the release registry (§ A). Nothing else — no source tree, no language runtimes, no
   database to prepare.
 

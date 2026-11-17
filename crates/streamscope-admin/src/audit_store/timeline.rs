@@ -187,17 +187,14 @@ pub(crate) struct TimelineTurn {
     /// The sources the answer's text cites, each a `Citation`.
     pub(crate) response_citations: Option<serde_json::Value>,
     /// The system prompt's hash; NULL except where the conversation renders
-    /// the prompt — on a turn that [`Self::opens_view`] — unless [`turns`] was
+    /// the prompt — on a turn that opens the view — unless [`turns`] was
     /// asked for every prompt (the raw format). The caller reads the bodies
     /// from the content store.
     pub(crate) system_prompt_hash: Option<String>,
     pub(crate) transform_diff: RawJson,
-    /// The session's first turn (exactly one: the first row by turn number,
-    /// timestamp and request id) or a baseline turn: the conversation renders
-    /// its whole history unfiltered and resets what it has seen.
-    pub(crate) opens_view: bool,
-    /// [`Self::message_hashes`] is the turn's whole history: a turn that
-    /// [`Self::opens_view`], one whose slice is counted from no landed
+    /// [`Self::message_hashes`] is the turn's whole history: a turn that opens
+    /// the view (the session's first turn — exactly one: the first row by turn
+    /// number, timestamp and request id — or a baseline), one whose slice is counted from no landed
     /// parent (`added_from = 0`), or one whose parent is not a row of the
     /// session ordered before it.
     pub(crate) reads_whole: bool,
@@ -282,8 +279,8 @@ impl RawJson {
 /// week, or never in this session): its prefix renders nowhere else. Every
 /// other turn reads the slice it added (`added_hashes`), so the read is
 /// linear in the session's messages rather than in turns × history. The two
-/// predicates are computed here once, as `opens_view` and `reads_whole`, and
-/// the caller branches on them alone. The system prompt's hash is read where
+/// predicates are computed here once, as `opens_view` (which decides where the
+/// prompt is read) and `reads_whole`, which the caller branches on. The system prompt's hash is read where
 /// the prompt is rendered — where the turn opens the view — unless
 /// `every_prompt`.
 pub(crate) async fn turns(
@@ -295,7 +292,7 @@ pub(crate) async fn turns(
         "SELECT t.request_id, t.timestamp, t.turn_number, \
          t.is_baseline, t.response_content, t.response_tool_calls, t.response_citations, \
          CASE WHEN $2 OR v.opens_view THEN t.system_prompt_hash END AS system_prompt_hash, \
-         t.transform_diff, v.opens_view, v.reads_whole, \
+         t.transform_diff, v.reads_whole, \
          CASE WHEN v.reads_whole THEN t.message_hashes ELSE t.added_hashes END AS message_hashes, \
          t.message_count, t.parent_request_id, t.added_from, t.tools_available_hash, t.tools_effective_hash, t.request_params, \
          t.event_type, \

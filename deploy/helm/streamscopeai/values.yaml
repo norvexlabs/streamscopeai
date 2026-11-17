@@ -206,8 +206,8 @@ adminApi:
   # is plenty.
   workerThreads: 2
   resources:
-    requests: { cpu: 100m, memory: 256Mi }
-    limits:   { memory: 512Mi }
+    requests: { cpu: 100m, memory: 512Mi }
+    limits:   { memory: 1Gi }
   autoscaling:
     enabled: false
     minReplicas: 2
@@ -232,8 +232,8 @@ proxy:
   # to a cgroup CPU limit if you add one, else uses the shared-host policy).
   workerThreads: 2
   resources:
-    requests: { cpu: 100m, memory: 256Mi }
-    limits:   { memory: 512Mi }
+    requests: { cpu: 100m, memory: 512Mi }
+    limits:   { memory: 1Gi }
   autoscaling:
     enabled: true
     minReplicas: 2
@@ -248,7 +248,7 @@ adminUi:
   port: 3000
   resources:
     requests: { cpu: 50m, memory: 128Mi }
-    limits:   { memory: 256Mi }
+    limits:   { memory: 384Mi }
   extraEnv: []
 
 # The chart runs no backup job and no disk-pressure purge of its own. They exist

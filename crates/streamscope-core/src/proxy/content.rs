@@ -2453,7 +2453,7 @@ fn epoch_millis() -> u64 {
 /// compaction (where the message array is replaced with a summary).
 ///
 /// **Two-tier memory model**:
-/// - `recent_turns` — heavy LRU (message hashes, request IDs, ~1.5KB/entry).
+/// - `recent_turns` — heavy (each entry keeps its turn's message hashes, ~90 B a message).
 ///   Evicted aggressively to cap memory.
 /// - `session_high_water` — lightweight map (session_id → max turn_number,
 ///   ~20 bytes/entry). Survives LRU eviction so that X-Session-Id sessions
@@ -2466,10 +2466,12 @@ fn epoch_millis() -> u64 {
 pub struct SessionDetector {
     recent_turns: dashmap::DashMap<(Uuid, Uuid), Vec<TurnEntry>>,
     max_entries_per_user: usize,
-    /// Maximum total entries across all users (memory safety net).
-    /// When exceeded, expired entries are pruned first; if still over,
-    /// the oldest entry from a random user is evicted. Set to 0 for unlimited.
+    /// Maximum total entries across all users (memory safety net). Past it,
+    /// [`Self::shrink_to_low_water`] drops the expired entries and then the
+    /// oldest across all users. Set to 0 for unlimited.
     max_total_entries: usize,
+    /// A [`Self::shrink_to_low_water`] pass is running.
+    shrinking: std::sync::atomic::AtomicBool,
     /// Approximate count of entries across all users. Updated atomically
     /// on insert (+1) and eviction (-N). Used to check the global cap
     /// without scanning the DashMap.
@@ -2496,16 +2498,15 @@ impl SessionDetector {
         Self::with_capacity(max_entries_per_user, entry_ttl, 0)
     }
 
-    /// Create a session detector with a global entry cap.
-    /// When `max_total_entries` > 0 and the count is exceeded, expired
-    /// entries are pruned first. If still over, the oldest entry from
-    /// a random user is evicted (O(1) via DashMap iterator).
+    /// Create a session detector with a global entry cap (`max_total_entries`,
+    /// 0 for none): past it, [`Self::shrink_to_low_water`].
     pub fn with_capacity(max_entries_per_user: usize, entry_ttl: std::time::Duration, max_total_entries: usize) -> Self {
         let now_ms = epoch_millis();
         Self {
             recent_turns: dashmap::DashMap::new(),
             max_entries_per_user,
             max_total_entries,
+            shrinking: std::sync::atomic::AtomicBool::new(false),
             entry_count: std::sync::atomic::AtomicUsize::new(0),
             entry_ttl,
             dirty: std::sync::atomic::AtomicBool::new(false),
@@ -2572,10 +2573,88 @@ impl SessionDetector {
             removed += before - entries.len();
             !entries.is_empty()
         });
-        if removed > 0 {
-            self.entry_count.fetch_sub(removed, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.uncount(removed);
         removed
+    }
+
+    /// Bring the map back to [`Self::low_water`] entries: every expired entry
+    /// goes ([`Self::prune_expired_users`]), then the oldest ones across all
+    /// users — never one user's alone, so no user loses its newest turns to a
+    /// cap the others filled. Age is `recorded_at`, then depth: entries restored
+    /// from a snapshot share one stamp, and among them the deepest in their
+    /// user's list (the oldest) go first. One caller at a time: another one past the
+    /// cap meanwhile records and goes on, and a pass leaves room for a tenth of
+    /// the cap before the next one is needed.
+    ///
+    /// Each step reads or writes the map in its own statement, with no guard of
+    /// it alive across another call on it: a guard held there waits on its own
+    /// lock and parks the worker for good.
+    fn shrink_to_low_water(&self) {
+        use std::sync::atomic::Ordering;
+        if self.shrinking.swap(true, Ordering::Acquire) {
+            return;
+        }
+        // Cleared however the pass ends: a flag left set would turn the cap off.
+        struct Running<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _running = Running(&self.shrinking);
+        self.prune_expired_users();
+        // (stamp, depth from the user's newest, user, request): the entries
+        // chosen are removed by request id AND stamp, so a record running beside
+        // the pass never loses an entry the pass did not choose.
+        type Age = (std::time::Instant, std::cmp::Reverse<usize>, (Uuid, Uuid), Uuid);
+        let mut ages: Vec<Age> = Vec::new();
+        for user in self.recent_turns.iter() {
+            let n = user.value().len();
+            ages.extend(
+                user.value().iter().enumerate().map(|(i, e)| (e.recorded_at, std::cmp::Reverse(n - 1 - i), *user.key(), e.request_id)),
+            );
+        }
+        let excess = ages.len().saturating_sub(self.low_water());
+        type Chosen = std::collections::HashSet<(Uuid, std::time::Instant)>;
+        let mut take: std::collections::HashMap<(Uuid, Uuid), Chosen> = std::collections::HashMap::new();
+        if excess > 0 {
+            ages.select_nth_unstable_by(excess - 1, |x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+            for (stamp, _, key, request) in &ages[..excess] {
+                take.entry(*key).or_default().insert((*request, *stamp));
+            }
+        }
+        drop(ages);
+        let mut removed = 0usize;
+        for (key, requests) in take {
+            let emptied = match self.recent_turns.get_mut(&key) {
+                Some(mut turns) => {
+                    let before = turns.len();
+                    turns.retain(|e| !requests.contains(&(e.request_id, e.recorded_at)));
+                    removed += before - turns.len();
+                    turns.is_empty()
+                }
+                None => false,
+            };
+            if emptied {
+                // A concurrent record may have refilled it since: keep it then.
+                self.recent_turns.remove_if(&key, |_, turns| turns.is_empty());
+            }
+        }
+        self.uncount(removed);
+    }
+
+    /// What a pass past the global cap leaves: nine tenths of it, below it
+    /// for a small cap too, and never nothing (the turn just recorded stays).
+    fn low_water(&self) -> usize {
+        self.max_total_entries.saturating_sub((self.max_total_entries / 10).max(1)).max(1)
+    }
+
+    /// Take `n` entries off the approximate count, never below zero: a wrapped
+    /// count would read as past the cap on every record.
+    fn uncount(&self, n: usize) {
+        if n > 0 {
+            self.entry_count.update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |c| c.saturating_sub(n));
+        }
     }
 
     /// Export DashMap contents for periodic snapshot persistence.
@@ -2592,12 +2671,17 @@ impl SessionDetector {
         result
     }
 
-    /// Import snapshot entries into the DashMap (startup recovery).
-    /// All entries get `recorded_at = Instant::now()` via serde default,
-    /// giving them a fresh TTL window.
+    /// Import snapshot entries into the DashMap (startup recovery). Every
+    /// entry is stamped with ONE `recorded_at` (now: a fresh TTL window), which
+    /// the global cap relies on to age restored entries by their depth in their
+    /// user's list rather than by the order users were restored in.
     pub fn import_entries(&self, entries: SessionSnapshot) {
+        let restored_at = std::time::Instant::now();
         let mut total = 0usize;
-        for (key, turns) in entries {
+        for (key, mut turns) in entries {
+            for turn in &mut turns {
+                turn.recorded_at = restored_at;
+            }
             total += turns.len();
             for turn in &turns {
                 self.session_high_water
@@ -2839,7 +2923,7 @@ impl SessionDetector {
             // Net change: +1 - removed. If removed >= 1, do sub then no add needed
             // if removed == 1 (break-even). Otherwise handle carefully.
             if removed > 1 {
-                self.entry_count.fetch_sub(removed - 1, std::sync::atomic::Ordering::Relaxed);
+                self.uncount(removed - 1);
             } else {
                 // removed == 1: new entry replaces one removed, net zero change
             }
@@ -2847,28 +2931,12 @@ impl SessionDetector {
             self.entry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        // Global memory cap: prune expired first, then evict oldest if still over.
+        // Global memory cap: past it, one batch takes the whole map back to its
+        // low-water mark, oldest entries first.
         if self.max_total_entries > 0
             && self.entry_count.load(std::sync::atomic::Ordering::Relaxed) > self.max_total_entries
         {
-            self.prune_expired_users();
-
-            // If still over after pruning, evict oldest entry from first shard (O(1)).
-            while self.entry_count.load(std::sync::atomic::Ordering::Relaxed) > self.max_total_entries {
-                if let Some(mut first) = self.recent_turns.iter_mut().next() {
-                    if !first.value().is_empty() {
-                        first.value_mut().remove(0);
-                        self.entry_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    if first.value().is_empty() {
-                        let shard_key = *first.key();
-                        drop(first);
-                        self.recent_turns.remove(&shard_key);
-                    }
-                } else {
-                    break; // DashMap empty
-                }
-            }
+            self.shrink_to_low_water();
         }
     }
 }
@@ -3914,6 +3982,123 @@ mod tests {
         }
 
         assert_eq!(detector.recent_turns.get(&(user_id, key_id)).unwrap().len(), 2);
+    }
+
+    /// Runs `f` on its own thread and fails if it has not returned within 10 s:
+    /// a self-deadlock parks that thread for good instead of failing.
+    fn returns_in_time<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("the call did not return: it waits on a lock it holds"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the call panicked (its own message is above)"),
+        }
+    }
+
+    fn baseline() -> SessionInfo {
+        SessionInfo { session_id: Uuid::new_v4(), parent_request_id: None, turn_number: 0, is_baseline: true }
+    }
+
+    #[test]
+    fn the_global_cap_evicts_a_whole_user_and_returns() {
+        // Two entries in all: the third user's record goes over the global cap,
+        // and the pass (down to one) empties the first two users' lists,
+        // removing them from the map.
+        let detector = std::sync::Arc::new(SessionDetector::with_capacity(1, std::time::Duration::from_secs(1800), 2));
+        let (first, middle, second, key_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (i, user_id) in [first, middle, second].into_iter().enumerate() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let d = detector.clone();
+            returns_in_time(move || d.record(user_id, key_id, Uuid::new_v4(), &baseline(), vec![format!("hash_{i}")], None));
+        }
+        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(detector.recent_turns.get(&(first, key_id)).is_none());
+        assert!(detector.recent_turns.get(&(middle, key_id)).is_none());
+        assert_eq!(detector.recent_turns.get(&(second, key_id)).map(|t| t.len()), Some(1));
+    }
+
+    #[test]
+    fn past_the_global_cap_the_oldest_entries_of_all_users_go_first() {
+        // Five users, two rounds of one turn each: the cap of 10 is full. One
+        // more turn goes past it, and the pass leaves nine tenths of the cap,
+        // 9: the two oldest turns go (the first round's first two users'),
+        // whoever recorded last, and every user keeps its newest turn.
+        let detector = SessionDetector::with_capacity(50, std::time::Duration::from_secs(1800), 10);
+        let key_id = Uuid::new_v4();
+        let users: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+        let mut turn = 0;
+        let mut record = |user: Uuid| {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            detector.record(user, key_id, Uuid::new_v4(), &baseline(), vec![format!("hash_{turn}")], None);
+            turn += 1;
+        };
+        for _round in 0..2 {
+            for &u in &users {
+                record(u);
+            }
+        }
+        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 10, "at the cap, nothing goes");
+        record(users[4]);
+        let held = |u: Uuid| detector.recent_turns.get(&(u, key_id)).map(|t| t.iter().map(|e| e.message_hashes[0].clone()).collect::<Vec<_>>());
+        assert_eq!(held(users[0]), Some(vec!["hash_5".to_string()]));
+        assert_eq!(held(users[1]), Some(vec!["hash_6".to_string()]));
+        assert_eq!(held(users[2]), Some(vec!["hash_2".to_string(), "hash_7".to_string()]));
+        assert_eq!(held(users[4]), Some(vec!["hash_4".to_string(), "hash_9".to_string(), "hash_10".to_string()]));
+        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 9);
+        assert_eq!(detector.recent_turns.iter().map(|e| e.value().len()).sum::<usize>(), 9);
+    }
+
+    #[test]
+    fn after_a_restore_the_global_cap_takes_each_users_oldest_turns_first() {
+        // Restored entries share one stamp: the pass ages them by depth, so of
+        // three equal lists each loses its oldest turn before any loses a
+        // second, and the turn just recorded stays.
+        let detector = SessionDetector::with_capacity(50, std::time::Duration::from_secs(1800), 11);
+        let key_id = Uuid::new_v4();
+        let users: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let snapshot: SessionSnapshot = users
+            .iter()
+            .map(|&u| {
+                let turns = (0..4)
+                    .map(|i| TurnEntry {
+                        request_id: Uuid::new_v4(),
+                        session_id: Uuid::new_v4(),
+                        turn_number: i,
+                        message_hashes: vec![format!("{u}-{i}")],
+                        client_session_id: None,
+                        recorded_at: std::time::Instant::now(),
+                    })
+                    .collect();
+                ((u, key_id), turns)
+            })
+            .collect();
+        detector.import_entries(snapshot);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let newcomer = Uuid::new_v4();
+        detector.record(newcomer, key_id, Uuid::new_v4(), &baseline(), vec!["new".into()], None);
+        // 13 entries past a cap of 11: down to 10, three go — each user's oldest.
+        for &u in &users {
+            let held: Vec<i32> = detector.recent_turns.get(&(u, key_id)).unwrap().iter().map(|e| e.turn_number).collect();
+            assert_eq!(held, vec![1, 2, 3], "{u}");
+        }
+        assert_eq!(detector.recent_turns.get(&(newcomer, key_id)).map(|t| t.len()), Some(1));
+        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn under_the_global_cap_every_user_keeps_its_entries() {
+        let detector = SessionDetector::with_capacity(2, std::time::Duration::from_secs(1800), 4);
+        let key_id = Uuid::new_v4();
+        for user_id in [Uuid::new_v4(), Uuid::new_v4()] {
+            for i in 0..2 {
+                detector.record(user_id, key_id, Uuid::new_v4(), &baseline(), vec![format!("hash_{i}")], None);
+            }
+        }
+        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert_eq!(detector.recent_turns.len(), 2);
     }
 
     #[test]

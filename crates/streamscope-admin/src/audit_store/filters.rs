@@ -113,6 +113,7 @@ enum FilterBind {
 /// …)` does not compile. Widening any of these back to `&str` would silently
 /// reopen that surface; the bound is load-bearing, not incidental.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct AnalyticsFilterBuilder {
     sql: String,
     next_idx: u32,

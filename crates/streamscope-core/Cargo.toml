@@ -102,3 +102,6 @@ tower = { workspace = true, features = ["util"] }
 # so the unused-dependency gate must not flag it. See the comment on the dep above.
 [package.metadata.cargo-machete]
 ignored = ["rustls"]
+
+[lints]
+workspace = true

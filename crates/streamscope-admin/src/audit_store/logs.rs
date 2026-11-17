@@ -158,18 +158,89 @@ const ALL_COLUMNS: &str = "\
     ak.name as key_name, ak.key_prefix, \
     sa.alert_level AS session_alert_level, sa.alert_expert_axis AS session_alert_axis";
 
-/// The search's FROM: the join starts from the keys the walk found, each one
-/// primary-key probe. Keep it driven from the keys: as an IN filter after the
-/// joins, the planner (which estimates one row for the gateway ⋈ llm join)
-/// joins the tenant's whole audit first — minutes at 100k rows, for five hits.
-/// The keys are made distinct first, so a key the lookup returned twice is
-/// still one row.
-static SEARCH_KEYS_JOIN: LazyLock<String> = LazyLock::new(|| {
+/// A FROM driven from a set of keys bound as `$1` (request ids) and `$2`
+/// (timestamps): each key one primary-key probe into `join`. Keep a read of
+/// known keys driven from them: as an IN filter after the joins, the planner
+/// (which estimates one row for the gateway ⋈ fact join) joins the tenant's
+/// whole audit first — minutes at 100k rows, for five hits. The keys are made
+/// distinct first, so a key given twice is still one row.
+fn keys_driven(join: &'static str) -> String {
     format!(
         "(SELECT DISTINCT rid, ts FROM unnest($1::uuid[], $2::timestamptz[]) AS u(rid, ts)) AS k \
-         JOIN ({AUDIT_LOG_JOIN}) ON g.request_id = k.rid AND g.timestamp = k.ts"
+         JOIN ({join}) ON g.request_id = k.rid AND g.timestamp = k.ts"
     )
-});
+}
+
+/// The LLM search's FROM: the keys the walk found, driven as [`keys_driven`].
+static SEARCH_KEYS_JOIN: LazyLock<String> = LazyLock::new(|| keys_driven(AUDIT_LOG_JOIN));
+
+/// A row's place in its arm's order — `(timestamp, request_id)`, newest first —
+/// read without the row. The `kind=all` merges order these, not rows.
+#[derive(sqlx::FromRow, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArmKey {
+    pub request_id: Uuid,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// The select list of an [`ArmRead::Keys`] read: the key, no payload column.
+const KEY_COLUMNS: &str = "g.request_id, g.timestamp";
+
+/// What one arm's list statement reads.
+#[derive(Clone, Copy)]
+pub(crate) enum ArmRead<'k> {
+    /// Its rows, whole: the arm's own page.
+    Rows,
+    /// Each row's [`ArmKey`] alone — a merge's first pass, which holds
+    /// `offset + limit + 1` keys per arm and no payload.
+    Keys,
+    /// These rows, whole, driven from their keys — a merge's second pass,
+    /// which reads only the page. Run under [`rows_of_query`]'s query, so the
+    /// read is windowed on the keys' own span.
+    RowsOf(&'k [ArmKey]),
+}
+
+impl ArmRead<'_> {
+    /// The select list, the FROM and the first free bind of an arm whose whole
+    /// row is `columns` over `join`.
+    fn shape(self, columns: &'static str, join: &'static str) -> (&'static str, String, u32) {
+        match self {
+            ArmRead::Rows => (columns, join.to_string(), 1),
+            ArmRead::Keys => (KEY_COLUMNS, join.to_string(), 1),
+            ArmRead::RowsOf(_) => (columns, keys_driven(join), 3),
+        }
+    }
+
+    /// Bind the keys of an [`ArmRead::RowsOf`] read as `$1` and `$2`.
+    fn bind_keys<'q, T>(
+        self,
+        q: sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
+    ) -> sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments> {
+        match self {
+            ArmRead::RowsOf(keys) => q
+                .bind(keys.iter().map(|k| k.request_id).collect::<Vec<_>>())
+                .bind(keys.iter().map(|k| k.timestamp).collect::<Vec<_>>()),
+            ArmRead::Rows | ArmRead::Keys => q,
+        }
+    }
+}
+
+/// The query an [`ArmRead::RowsOf`] read of `keys` runs under: their own span
+/// as its window — `[oldest, newest]`, stated on every fact the read joins —
+/// and no other filter, since the first pass already chose the rows. `None`
+/// for no key: there is nothing to read.
+pub(crate) fn rows_of_query(keys: &[ArmKey]) -> Option<AuditQuery> {
+    let oldest = keys.iter().map(|k| k.timestamp).min()?;
+    let newest = keys.iter().map(|k| k.timestamp).max()?;
+    let mut query = AuditQuery::default();
+    query.start = Some(oldest);
+    // The window's end is exclusive; Postgres keeps microseconds.
+    query.end = Some(newest + chrono::Duration::microseconds(1));
+    Some(query)
+}
+
+/// Every row type an arm's list reads.
+pub(crate) trait ArmRow: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin {}
+impl<T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin> ArmRow for T {}
 
 /// The LLM-side audit list, shared by the `kind=llm` and `kind=all` paths and
 /// the portal. `limit` is the per-side cap the caller wants (the helper adds
@@ -187,28 +258,53 @@ pub(crate) async fn list_audit_logs_llm(
     limit: i64,
     offset: i64,
 ) -> Result<SearchRows<AuditLogEntry>, ApiError> {
-    let fail = |e: sqlx::Error| {
-        tracing::error!("list audit logs (llm): {e}");
-        ApiError::internal("Failed to query audit logs")
-    };
+    let found = read_llm::<AuditLogEntry>(conn, query, scope, ArmRead::Rows, limit, offset).await?;
+    Ok(SearchRows { rows: finish_rows(found.rows), scan_cut: found.scan_cut })
+}
+
+/// The LLM arm's statement up to its ORDER BY: `columns` over `from`, the
+/// filters of `query` and `scope` numbered from `first_bind`.
+fn llm_list_sql(
+    query: &AuditQuery,
+    scope: &AuditScope,
+    columns: &'static str,
+    from: &str,
+    first_bind: u32,
+) -> (String, LlmFilters) {
+    let filters = llm_filters(query, scope, first_bind);
     // The turn is outer-joined, so its window rides the join's ON clause: a
     // WHERE bound would drop every row that has no turn. The session is joined
     // by a key computed in its own fenced lateral (`OFFSET 0`): joined on the
     // COALESCE inline, the key is not an index condition and every listed row
     // is compared against every session of the tenant.
-    let select = |from: &'static str, filters: &LlmFilters| {
-        format!(
-            "SELECT {ALL_COLUMNS} FROM {from} \
-             LEFT JOIN users u ON g.user_id = u.id \
-             LEFT JOIN upstream_servers us ON us.id = a.upstream_server_id \
-             LEFT JOIN api_keys ak ON ak.id = g.key_id \
-             LEFT JOIN workspaces ws ON ws.id = g.workspace_id \
-             LEFT JOIN conversation_turns ct ON ct.request_id = a.request_id AND ct.timestamp = a.timestamp{} \
-             LEFT JOIN LATERAL (SELECT COALESCE(ct.session_id, g.session_id) AS session_id OFFSET 0) sk ON true \
-             LEFT JOIN sessions sa ON sa.session_id = sk.session_id \
-             WHERE ",
-            filters.turn_window
-        )
+    let sql = format!(
+        "SELECT {columns} FROM {from} \
+         LEFT JOIN users u ON g.user_id = u.id \
+         LEFT JOIN upstream_servers us ON us.id = a.upstream_server_id \
+         LEFT JOIN api_keys ak ON ak.id = g.key_id \
+         LEFT JOIN workspaces ws ON ws.id = g.workspace_id \
+         LEFT JOIN conversation_turns ct ON ct.request_id = a.request_id AND ct.timestamp = a.timestamp{} \
+         LEFT JOIN LATERAL (SELECT COALESCE(ct.session_id, g.session_id) AS session_id OFFSET 0) sk ON true \
+         LEFT JOIN sessions sa ON sa.session_id = sk.session_id \
+         WHERE 1=1{}",
+        filters.turn_window, filters.sql
+    );
+    (sql, filters)
+}
+
+/// [`list_audit_logs_llm`] for any [`ArmRead`]; an [`AuditLogEntry`] row is
+/// returned unfinished — the caller passes it through [`finish_rows`].
+async fn read_llm<T: ArmRow>(
+    conn: &mut Scoped,
+    query: &AuditQuery,
+    scope: &AuditScope,
+    read: ArmRead<'_>,
+    limit: i64,
+    offset: i64,
+) -> Result<SearchRows<T>, ApiError> {
+    let fail = |e: sqlx::Error| {
+        tracing::error!("list audit logs (llm): {e}");
+        ApiError::internal("Failed to query audit logs")
     };
 
     // A media category no endpoint belongs to matches nothing: answer that
@@ -220,10 +316,22 @@ pub(crate) async fn list_audit_logs_llm(
         return Ok(SearchRows { rows: Vec::new(), scan_cut: false });
     }
 
+    let (columns, _, _) = read.shape(ALL_COLUMNS, AUDIT_LOG_JOIN);
+
+    if let ArmRead::RowsOf(keys) = read {
+        let (mut sql, filters) = llm_list_sql(query, scope, columns, &SEARCH_KEYS_JOIN, 3);
+        sql.push_str(&format!(" ORDER BY g.timestamp DESC, g.request_id DESC LIMIT ${}", filters.next_idx));
+        let rows = bind_llm_filters(read.bind_keys(sqlx::query_as(sqlx::AssertSqlSafe(&*sql))), query, scope)
+            .bind(i64::try_from(keys.len()).unwrap_or(i64::MAX))
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(fail)?;
+        return Ok(SearchRows { rows, scan_cut: false });
+    }
+
     let Some(pattern) = search_pattern(query.search.as_deref()) else {
-        let filters = llm_filters(query, scope, 1);
+        let (mut sql, filters) = llm_list_sql(query, scope, columns, AUDIT_LOG_JOIN, 1);
         let bind_idx = filters.next_idx;
-        let mut sql = format!("{}1=1{}", select(AUDIT_LOG_JOIN, &filters), filters.sql);
         sql.push_str(&format!(
             " ORDER BY g.timestamp DESC, g.request_id DESC LIMIT ${bind_idx} OFFSET ${}",
             bind_idx + 1
@@ -235,18 +343,18 @@ pub(crate) async fn list_audit_logs_llm(
             .fetch_all(&mut *conn)
             .await
             .map_err(fail)?;
-        return Ok(SearchRows { rows: finish_rows(rows), scan_cut: false });
+        return Ok(SearchRows { rows, scan_cut: false });
     };
 
-    let filters = llm_filters(query, scope, 3);
+    // The walk's keys are bound as `$1` / `$2`.
+    let (mut sql, filters) = llm_list_sql(query, scope, columns, &SEARCH_KEYS_JOIN, 3);
     let (limit_idx, post_filtered) = (filters.next_idx, filters.post_filtered);
-    let mut sql = format!("{}1=1{}", select(&SEARCH_KEYS_JOIN, &filters), filters.sql);
     // The page keeps only the rows it still needs.
     sql.push_str(&format!(" ORDER BY g.timestamp DESC, g.request_id DESC LIMIT ${limit_idx}"));
 
     let workspaces = scope.workspace_ids();
     let mut walk = SearchWalk::new(offset.saturating_add(limit).saturating_add(1), post_filtered);
-    let mut rows: Vec<AuditLogEntry> = Vec::new();
+    let mut rows: Vec<T> = Vec::new();
     loop {
         let (cursor_ts, cursor_id) = walk.cursor().unzip();
         let keys = sqlx::query_as::<_, (Uuid, chrono::DateTime<chrono::Utc>)>(
@@ -286,7 +394,7 @@ pub(crate) async fn list_audit_logs_llm(
         .skip(usize::try_from(offset).unwrap_or(0))
         .take(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX))
         .collect();
-    Ok(SearchRows { rows: finish_rows(rows), scan_cut: walk.cut() })
+    Ok(SearchRows { rows, scan_cut: walk.cut() })
 }
 
 /// Fill each row's computed fields: the `finish_reason_display` label, and the
@@ -424,11 +532,11 @@ fn llm_filters(query: &AuditQuery, scope: &AuditScope, mut bind_idx: u32) -> Llm
 }
 
 /// Bind [`llm_filters`]' parameters, in its order.
-fn bind_llm_filters<'q>(
-    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, AuditLogEntry, sqlx::postgres::PgArguments>,
+fn bind_llm_filters<'q, T>(
+    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
     query: &AuditQuery,
     scope: &'q AuditScope,
-) -> sqlx::query::QueryAs<'q, sqlx::Postgres, AuditLogEntry, sqlx::postgres::PgArguments> {
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments> {
     if let Some(user_id) = scope.user_id() {
         q = q.bind(user_id);
     }
@@ -484,30 +592,35 @@ pub(crate) async fn list_audit_logs_mcp(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<McpAuditLogEntry>, ApiError> {
-    let search = search_pattern(query.search.as_deref());
-    let has_search = search.is_some();
+    read_mcp(conn, query, scope, ArmRead::Rows, limit, offset).await
+}
 
+/// An MCP list row, whole.
+const MCP_COLUMNS: &str = "\
+    request_id, timestamp, g.user_id, g.app_id, g.session_id, \
+    m.mcp_session_id, m.virtual_server_id, vs.slug AS virtual_server_slug, \
+    m.upstream_server_id, up.name AS upstream_server_name, \
+    m.method, m.tool_id, m.prompt_id, m.resource_uri, \
+    g.status_code, m.error_code, m.error_message, \
+    g.latency_total_ms, m.upstream_latency_ms, \
+    m.request_bytes, m.response_bytes, \
+    m.protocol_version, m.badges, m.transform_diff, \
+    m.params, m.result, \
+    u.email AS user_email";
+
+/// The MCP arm's statement for `read`; [`read_mcp`] binds it in the same order.
+fn mcp_list_sql(query: &AuditQuery, scope: &AuditScope, read: ArmRead<'_>) -> String {
+    let has_search = search_pattern(query.search.as_deref()).is_some();
+    let (columns, from, mut bind_idx) = read.shape(MCP_COLUMNS, crate::audit_store::filters::MCP_AUDIT_JOIN);
     let mut sql = format!(
-        "SELECT \
-            request_id, timestamp, g.user_id, g.app_id, g.session_id, \
-            m.mcp_session_id, m.virtual_server_id, vs.slug AS virtual_server_slug, \
-            m.upstream_server_id, up.name AS upstream_server_name, \
-            m.method, m.tool_id, m.prompt_id, m.resource_uri, \
-            g.status_code, m.error_code, m.error_message, \
-            g.latency_total_ms, m.upstream_latency_ms, \
-            m.request_bytes, m.response_bytes, \
-            m.protocol_version, m.badges, m.transform_diff, \
-            m.params, m.result, \
-            u.email AS user_email \
-         FROM {join} \
+        "SELECT {columns} \
+         FROM {from} \
          LEFT JOIN mcp_virtual_servers vs ON vs.id = m.virtual_server_id \
          LEFT JOIN mcp_upstream_servers up ON up.id = m.upstream_server_id \
          LEFT JOIN users u ON u.id = g.user_id \
-         WHERE g.kind = 'mcp'",
-        join = crate::audit_store::filters::MCP_AUDIT_JOIN,
+         WHERE g.kind = 'mcp'"
     );
 
-    let mut bind_idx: u32 = 1;
     if scope.user_id().is_some() {
         sql.push_str(&format!(" AND g.user_id = ${bind_idx}"));
         bind_idx += 1;
@@ -597,8 +710,28 @@ pub(crate) async fn list_audit_logs_mcp(
         " ORDER BY timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
         bind_idx + 1
     ));
+    sql
+}
 
-    let mut q = sqlx::query_as::<_, McpAuditLogEntry>(sqlx::AssertSqlSafe(&*sql));
+/// [`list_audit_logs_mcp`] for any [`ArmRead`].
+pub(crate) async fn read_mcp<T: ArmRow>(
+    conn: &mut Scoped,
+    query: &AuditQuery,
+    scope: &AuditScope,
+    read: ArmRead<'_>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<T>, ApiError> {
+    let sql = mcp_list_sql(query, scope, read);
+    let search = search_pattern(query.search.as_deref());
+    let method_filter: Vec<String> = query
+        .methods
+        .as_deref()
+        .map(parse_method_filter)
+        .unwrap_or_default();
+    let has_method_filter = !method_filter.is_empty();
+
+    let mut q = read.bind_keys(sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(&*sql)));
     if let Some(user_id) = scope.user_id() {
         q = q.bind(user_id);
     }
@@ -674,8 +807,36 @@ pub(crate) async fn list_audit_logs_web(
     offset: i64,
     parent_request_id_filter: Option<Uuid>,
 ) -> Result<Vec<WebAuditLogEntry>, ApiError> {
-    let search = search_pattern(query.search.as_deref());
-    let has_search = search.is_some();
+    read_web(conn, query, scope, ArmRead::Rows, limit, offset, parent_request_id_filter).await
+}
+
+/// A web list row, whole.
+const WEB_COLUMNS: &str = "\
+    request_id, timestamp, g.user_id, u.email AS user_email, \
+    g.app_id, g.session_id, \
+    w.upstream_server_id, up.name AS upstream_server_name, \
+    w.operation, w.backend, w.query, w.result_count, \
+    w.bytes_in, w.bytes_out, \
+    COALESCE(w.upstream_latency_ms, 0) AS upstream_latency_ms, \
+    w.upstream_status, \
+    g.status_code, g.error_category, g.error_detail, \
+    g.latency_total_ms, w.surface, w.parent_request_id, \
+    w.badges, \
+    w.url_results, w.filter_chain, \
+    w.request_args, w.response_summary, \
+    w.provider_request, w.provider_response, \
+    w.fetch_content_summary, \
+    w.transform_diff";
+
+/// The web arm's statement for `read`; [`read_web`] binds it in the same
+/// order. Refuses an unknown `surface` or `operation`.
+fn web_list_sql(
+    query: &AuditQuery,
+    scope: &AuditScope,
+    read: ArmRead<'_>,
+    parent_request_id_filter: Option<Uuid>,
+) -> Result<String, ApiError> {
+    let has_search = search_pattern(query.search.as_deref()).is_some();
     // Reject unknown surface / operation values here rather than silently
     // dropping the filter. The handler doesn't see them otherwise — the
     // tool-calls dispatcher constructs `AuditQuery` directly.
@@ -696,31 +857,15 @@ pub(crate) async fn list_audit_logs_web(
         )));
     }
 
+    let (columns, from, mut bind_idx) = read.shape(WEB_COLUMNS, crate::audit_store::filters::WEB_AUDIT_JOIN);
     let mut sql = format!(
-        "SELECT \
-            request_id, timestamp, g.user_id, u.email AS user_email, \
-            g.app_id, g.session_id, \
-            w.upstream_server_id, up.name AS upstream_server_name, \
-            w.operation, w.backend, w.query, w.result_count, \
-            w.bytes_in, w.bytes_out, \
-            COALESCE(w.upstream_latency_ms, 0) AS upstream_latency_ms, \
-            w.upstream_status, \
-            g.status_code, g.error_category, g.error_detail, \
-            g.latency_total_ms, w.surface, w.parent_request_id, \
-            w.badges, \
-            w.url_results, w.filter_chain, \
-            w.request_args, w.response_summary, \
-            w.provider_request, w.provider_response, \
-            w.fetch_content_summary, \
-            w.transform_diff \
-         FROM {join} \
+        "SELECT {columns} \
+         FROM {from} \
          LEFT JOIN mcp_upstream_servers up ON up.id = w.upstream_server_id \
          LEFT JOIN users u ON u.id = g.user_id \
-         WHERE g.kind = 'web'",
-        join = crate::audit_store::filters::WEB_AUDIT_JOIN,
+         WHERE g.kind = 'web'"
     );
 
-    let mut bind_idx: u32 = 1;
     if scope.user_id().is_some() {
         sql.push_str(&format!(" AND g.user_id = ${bind_idx}"));
         bind_idx += 1;
@@ -792,8 +937,23 @@ pub(crate) async fn list_audit_logs_web(
         " ORDER BY timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
         bind_idx + 1
     ));
+    Ok(sql)
+}
 
-    let mut q = sqlx::query_as::<_, WebAuditLogEntry>(sqlx::AssertSqlSafe(&*sql));
+/// [`list_audit_logs_web`] for any [`ArmRead`].
+pub(crate) async fn read_web<T: ArmRow>(
+    conn: &mut Scoped,
+    query: &AuditQuery,
+    scope: &AuditScope,
+    read: ArmRead<'_>,
+    limit: i64,
+    offset: i64,
+    parent_request_id_filter: Option<Uuid>,
+) -> Result<Vec<T>, ApiError> {
+    let sql = web_list_sql(query, scope, read, parent_request_id_filter)?;
+    let search = search_pattern(query.search.as_deref());
+
+    let mut q = read.bind_keys(sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(&*sql)));
     if let Some(user_id) = scope.user_id() {
         q = q.bind(user_id);
     }
@@ -856,29 +1016,35 @@ pub(crate) async fn list_audit_logs_a2a(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<A2aAuditLogEntry>, ApiError> {
-    let search = search_pattern(query.search.as_deref());
-    let has_search = search.is_some();
+    read_a2a(conn, query, scope, ArmRead::Rows, limit, offset).await
+}
 
+/// An A2A list row, whole.
+const A2A_COLUMNS: &str = "\
+    request_id, timestamp, g.user_id, g.app_id, g.session_id, \
+    a2.agent_id, ag.slug AS agent_slug, ag.name AS agent_name, \
+    a2.method, a2.a2a_context_id, a2.a2a_task_id, a2.task_state, \
+    g.status_code, g.error_category, g.error_detail, \
+    a2.error_code, a2.error_message, \
+    g.latency_total_ms, a2.upstream_latency_ms, \
+    a2.request_bytes, a2.response_bytes, \
+    a2.protocol_version, a2.badges, a2.transform_diff, \
+    a2.params, a2.result, a2.stream_events, \
+    u.email AS user_email";
+
+/// The A2A arm's statement for `read`; [`read_a2a`] binds it in the same
+/// order. Refuses an unknown task state or method.
+fn a2a_list_sql(query: &AuditQuery, scope: &AuditScope, read: ArmRead<'_>) -> Result<String, ApiError> {
+    let has_search = search_pattern(query.search.as_deref()).is_some();
+    let (columns, from, mut bind_idx) = read.shape(A2A_COLUMNS, crate::audit_store::filters::A2A_AUDIT_JOIN);
     let mut sql = format!(
-        "SELECT \
-            request_id, timestamp, g.user_id, g.app_id, g.session_id, \
-            a2.agent_id, ag.slug AS agent_slug, ag.name AS agent_name, \
-            a2.method, a2.a2a_context_id, a2.a2a_task_id, a2.task_state, \
-            g.status_code, g.error_category, g.error_detail, \
-            a2.error_code, a2.error_message, \
-            g.latency_total_ms, a2.upstream_latency_ms, \
-            a2.request_bytes, a2.response_bytes, \
-            a2.protocol_version, a2.badges, a2.transform_diff, \
-            a2.params, a2.result, a2.stream_events, \
-            u.email AS user_email \
-         FROM {join} \
+        "SELECT {columns} \
+         FROM {from} \
          LEFT JOIN a2a_upstream_agents ag ON ag.id = a2.agent_id \
          LEFT JOIN users u ON u.id = g.user_id \
-         WHERE g.kind = 'a2a'",
-        join = crate::audit_store::filters::A2A_AUDIT_JOIN,
+         WHERE g.kind = 'a2a'"
     );
 
-    let mut bind_idx: u32 = 1;
     if scope.user_id().is_some() {
         sql.push_str(&format!(" AND g.user_id = ${bind_idx}"));
         bind_idx += 1;
@@ -987,8 +1153,29 @@ pub(crate) async fn list_audit_logs_a2a(
         " ORDER BY timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
         bind_idx + 1
     ));
+    Ok(sql)
+}
 
-    let mut q = sqlx::query_as::<_, A2aAuditLogEntry>(sqlx::AssertSqlSafe(&*sql));
+/// [`list_audit_logs_a2a`] for any [`ArmRead`].
+pub(crate) async fn read_a2a<T: ArmRow>(
+    conn: &mut Scoped,
+    query: &AuditQuery,
+    scope: &AuditScope,
+    read: ArmRead<'_>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<T>, ApiError> {
+    let sql = a2a_list_sql(query, scope, read)?;
+    let search = search_pattern(query.search.as_deref());
+    let task_state = query.task_state.as_deref().filter(|s| !s.is_empty());
+    let method_filter: Vec<String> = query
+        .methods
+        .as_deref()
+        .map(parse_a2a_method_filter)
+        .unwrap_or_default();
+    let has_method_filter = !method_filter.is_empty();
+
+    let mut q = read.bind_keys(sqlx::query_as::<_, T>(sqlx::AssertSqlSafe(&*sql)));
     if let Some(user_id) = scope.user_id() {
         q = q.bind(user_id);
     }
@@ -1079,13 +1266,26 @@ pub(crate) async fn list_audit_rows(
     })
 }
 
-/// `kind=all` merge — run the LLM, MCP, web, and A2A queries server-side,
-/// then interleave by `timestamp DESC` and slice the requested page. Each
-/// helper already over-fetches its side, so for the merge we ask each for
-/// the prefix `[0, offset + limit + 1]` and slice. The cost grows with
+/// The arms of the `kind=all` merge.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    Llm,
+    Mcp,
+    Web,
+    A2a,
+}
+
+/// `kind=all` merge — the LLM, MCP, web, and A2A lists interleaved by
+/// `(timestamp, request_id)` DESC, one page of `limit` from `offset`.
+///
+/// Only the merge knows where an arm's row N lands, so each arm contributes
+/// its first `offset + limit + 1` rows — as KEYS ([`ArmRead::Keys`]), never
+/// rows: the merge orders keys, and only the page's own keys are read back
+/// whole ([`ArmRead::RowsOf`], one read per arm). What the merge holds is
+/// therefore bounded by `4 × (offset + limit + 1)` keys plus `limit + 1` rows,
+/// whatever an MCP or A2A row's payload weighs. The key pass still grows with
 /// `offset` on every side, so a deeper offset than `MAX_MERGED_OFFSET` is
-/// refused here (`routes::check_merged_offset`); the partition pruning on
-/// `timestamp` keeps single-side fetches fast.
+/// refused here (`routes::check_merged_offset`).
 pub(crate) async fn list_audit_logs_all(
     conn: &mut Scoped,
     query: &AuditQuery,
@@ -1094,9 +1294,6 @@ pub(crate) async fn list_audit_logs_all(
     offset: i64,
 ) -> Result<OffsetPage<AuditLogRow>, ApiError> {
     crate::routes::check_merged_offset(offset)?;
-    // Each side fetches `[0, offset+limit+1]`. We can't ask the side
-    // helpers for "starting at offset N" in the merged ordering — only
-    // the global merge knows where each side's row N lands.
     let target = offset.saturating_add(limit).saturating_add(1);
 
     // `methods` names an operation in ONE protocol's vocabulary — MCP's
@@ -1116,77 +1313,193 @@ pub(crate) async fn list_audit_logs_all(
     let llm = if methods.is_some() {
         SearchRows { rows: Vec::new(), scan_cut: false }
     } else {
-        list_audit_logs_llm(conn, query, scope, target, 0).await?
+        read_llm::<ArmKey>(conn, query, scope, ArmRead::Keys, target, 0).await?
     };
-    let llm_rows = llm.rows;
     // `has_guardrail` is an LLM/web/A2A concept — the MCP arm has no guardrail
     // badge and ignores the predicate, so under `kind=all` it would otherwise
     // flood the interleave with every MCP row and make a `?has_guardrail=true`
     // deep-link look unfiltered. Exclude the MCP arm entirely when the guardrail
     // filter is requested (it can never contribute a match).
-    let mcp_rows = if query.has_guardrail == Some(true) || !mcp_named {
+    let mcp_keys = if query.has_guardrail == Some(true) || !mcp_named {
         Vec::new()
     } else {
-        list_audit_logs_mcp(conn, query, scope, target, 0).await?
+        read_mcp::<ArmKey>(conn, query, scope, ArmRead::Keys, target, 0).await?
     };
-    let web_rows = if methods.is_some() {
+    let web_keys = if methods.is_some() {
         Vec::new()
     } else {
-        list_audit_logs_web(conn, query, scope, target, 0, None).await?
+        read_web::<ArmKey>(conn, query, scope, ArmRead::Keys, target, 0, None).await?
     };
     // A2A rows DO carry guardrail badges (both hops screen), so the arm filters
     // on the badge rather than being excluded — a guardrail deep-link that hid
     // exactly the agent calls the guardrail flagged would be the one place an
     // operator cannot look.
-    let a2a_rows = if a2a_named {
-        list_audit_logs_a2a(conn, query, scope, target, 0).await?
+    let a2a_keys = if a2a_named {
+        read_a2a::<ArmKey>(conn, query, scope, ArmRead::Keys, target, 0).await?
     } else {
         Vec::new()
     };
 
-    let mut all: Vec<AuditLogRow> = Vec::with_capacity(
-        llm_rows.len() + mcp_rows.len() + web_rows.len() + a2a_rows.len(),
+    let page = merge_page(
+        vec![(Arm::Llm, llm.rows), (Arm::Mcp, mcp_keys), (Arm::Web, web_keys), (Arm::A2a, a2a_keys)],
+        offset,
+        limit,
     );
-    for row in llm_rows {
-        all.push(AuditLogRow::Llm { entry: Box::new(row) });
+    let of = |arm: Arm| page.iter().filter(|(a, _)| *a == arm).map(|(_, k)| *k).collect::<Vec<ArmKey>>();
+
+    // The page's rows, read whole: one read per arm, of its own keys alone.
+    let mut rows: std::collections::HashMap<Uuid, AuditLogRow> = std::collections::HashMap::with_capacity(page.len());
+    let keys = of(Arm::Llm);
+    if let Some(q) = rows_of_query(&keys) {
+        let found = read_llm::<AuditLogEntry>(conn, &q, scope, ArmRead::RowsOf(&keys), 0, 0).await?;
+        rows.extend(
+            finish_rows(found.rows)
+                .into_iter()
+                .map(|entry| (entry.request_id, AuditLogRow::Llm { entry: Box::new(entry) })),
+        );
     }
-    for row in mcp_rows {
-        all.push(AuditLogRow::Mcp { entry: Box::new(row) });
+    let keys = of(Arm::Mcp);
+    if let Some(q) = rows_of_query(&keys) {
+        let found: Vec<McpAuditLogEntry> = read_mcp(conn, &q, scope, ArmRead::RowsOf(&keys), page_len(&keys), 0).await?;
+        rows.extend(found.into_iter().map(|entry| (entry.request_id, AuditLogRow::Mcp { entry: Box::new(entry) })));
     }
-    for row in web_rows {
-        all.push(AuditLogRow::Web { entry: Box::new(row) });
+    let keys = of(Arm::Web);
+    if let Some(q) = rows_of_query(&keys) {
+        let found: Vec<WebAuditLogEntry> =
+            read_web(conn, &q, scope, ArmRead::RowsOf(&keys), page_len(&keys), 0, None).await?;
+        rows.extend(found.into_iter().map(|entry| (entry.request_id, AuditLogRow::Web { entry: Box::new(entry) })));
     }
-    for row in a2a_rows {
-        all.push(AuditLogRow::A2a { entry: Box::new(row) });
+    let keys = of(Arm::A2a);
+    if let Some(q) = rows_of_query(&keys) {
+        let found: Vec<A2aAuditLogEntry> = read_a2a(conn, &q, scope, ArmRead::RowsOf(&keys), page_len(&keys), 0).await?;
+        rows.extend(found.into_iter().map(|entry| (entry.request_id, AuditLogRow::A2a { entry: Box::new(entry) })));
     }
 
-    // Each arm's own order — newest first, then request id — so every arm's
-    // rows keep their order in the merge and a page boundary is exact.
-    all.sort_by_key(|row| std::cmp::Reverse(audit_log_row_order(row)));
-
-    // Slice [offset, offset+limit+1) — `OffsetPage::from_overfetched`
-    // turns the trailing `+1` into `has_more`.
-    let start = (offset as usize).min(all.len());
-    let end = ((offset + limit + 1) as usize).min(all.len());
-    let page_rows: Vec<AuditLogRow> = all.drain(start..end).collect();
-
-    Ok(OffsetPage::from_overfetched(page_rows, limit, offset).with_scan_cut(llm.scan_cut))
+    // In the merge's order, the page's own `limit` keys alone: a row purged
+    // between the two passes leaves the page one row short — never the
+    // over-fetched row in its place, which the next page starts with —
+    // and whether more follow is the key pass's answer.
+    let more = page.len() as i64 > limit;
+    let page_rows: Vec<AuditLogRow> = page
+        .iter()
+        .take(usize::try_from(limit).unwrap_or(usize::MAX))
+        .filter_map(|(_, k)| rows.remove(&k.request_id))
+        .collect();
+    let mut found = OffsetPage::from_overfetched(page_rows, limit, offset).with_scan_cut(llm.scan_cut);
+    found.has_more = more;
+    Ok(found)
 }
 
-/// A row's place in the `kind=all` merge: `(timestamp, request_id)`, the
-/// order every arm's query sorts by (descending).
-fn audit_log_row_order(row: &AuditLogRow) -> (chrono::DateTime<chrono::Utc>, Uuid) {
-    match row {
-        AuditLogRow::Llm { entry } => (entry.timestamp, entry.request_id),
-        AuditLogRow::Mcp { entry } => (entry.timestamp, entry.request_id),
-        AuditLogRow::Web { entry } => (entry.timestamp, entry.request_id),
-        AuditLogRow::A2a { entry } => (entry.timestamp, entry.request_id),
-    }
+/// The `limit` of an [`ArmRead::RowsOf`] read of `keys`: all of them.
+pub(crate) fn page_len(keys: &[ArmKey]) -> i64 {
+    i64::try_from(keys.len()).unwrap_or(i64::MAX)
+}
+
+/// A merge's page: every arm's keys, each list newest first as its arm's query
+/// orders it, interleaved by `(timestamp, request_id)` DESC — the order every
+/// arm sorts by, so each arm's keys keep their order and a page boundary is
+/// exact — then sliced to `[offset, offset + limit + 1)`, the trailing `+1`
+/// being what `OffsetPage::from_overfetched` turns into `has_more`.
+fn merge_page<A: Copy>(arms: Vec<(A, Vec<ArmKey>)>, offset: i64, limit: i64) -> Vec<(A, ArmKey)> {
+    let mut all: Vec<(A, ArmKey)> =
+        arms.into_iter().flat_map(|(arm, keys)| keys.into_iter().map(move |k| (arm, k))).collect();
+    all.sort_by_key(|(_, k)| std::cmp::Reverse((k.timestamp, k.request_id)));
+    all.into_iter()
+        .skip(usize::try_from(offset).unwrap_or(0))
+        .take(usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(secs: i64, id: u128) -> ArmKey {
+        ArmKey {
+            request_id: Uuid::from_u128(id),
+            timestamp: chrono::DateTime::from_timestamp(secs, 0).expect("a valid instant"),
+        }
+    }
+
+    /// The select list of a statement: what stands between its SELECT and FROM.
+    fn select_list(sql: &str) -> &str {
+        let body = sql.strip_prefix("SELECT ").expect("a SELECT");
+        body.split(" FROM ").next().expect("a FROM").trim()
+    }
+
+    /// Every arm's statement for `read`, as its read builds it, with the
+    /// arm's whole row.
+    fn arm_statements(read: ArmRead<'_>, query: &AuditQuery) -> Vec<(&'static str, String, &'static str)> {
+        let scope = AuditScope::tenant(None, None);
+        let (llm_columns, llm_from, llm_first) = read.shape(ALL_COLUMNS, AUDIT_LOG_JOIN);
+        let llm_from = match read {
+            ArmRead::RowsOf(_) => SEARCH_KEYS_JOIN.clone(),
+            ArmRead::Rows | ArmRead::Keys => llm_from,
+        };
+        vec![
+            ("llm", llm_list_sql(query, &scope, llm_columns, &llm_from, llm_first).0, ALL_COLUMNS),
+            ("mcp", mcp_list_sql(query, &scope, read), MCP_COLUMNS),
+            ("web", web_list_sql(query, &scope, read, None).expect("a web statement"), WEB_COLUMNS),
+            ("a2a", a2a_list_sql(query, &scope, read).expect("an A2A statement"), A2A_COLUMNS),
+        ]
+    }
+
+    #[test]
+    fn the_merges_key_pass_reads_no_payload_column() {
+        let query = AuditQuery::default();
+        for (arm, sql, _) in arm_statements(ArmRead::Keys, &query) {
+            assert_eq!(select_list(&sql), KEY_COLUMNS, "{arm}: the key pass selects the key alone");
+        }
+        // Positive control: an arm's own page reads the whole row, payload included.
+        for (arm, sql, whole) in arm_statements(ArmRead::Rows, &query) {
+            assert_eq!(select_list(&sql), whole.trim(), "{arm}: a page reads its rows whole");
+        }
+        assert!(MCP_COLUMNS.contains("m.params") && A2A_COLUMNS.contains("a2.stream_events"));
+    }
+
+    #[test]
+    fn the_merges_row_pass_reads_only_its_keys_inside_their_window() {
+        let keys = [key(100, 1), key(300, 2), key(200, 3)];
+        let query = rows_of_query(&keys).expect("keys to read");
+        let end = query.end.expect("an end");
+        assert!(query.start == Some(keys[0].timestamp), "the window starts at the oldest key");
+        assert!(end > keys[1].timestamp && end <= keys[1].timestamp + chrono::Duration::milliseconds(1));
+        assert!(rows_of_query(&[]).is_none());
+        for (arm, sql, whole) in arm_statements(ArmRead::RowsOf(&keys), &query) {
+            assert_eq!(select_list(&sql), whole.trim(), "{arm}: the page's rows are read whole");
+            assert!(
+                sql.contains(
+                    "FROM (SELECT DISTINCT rid, ts FROM unnest($1::uuid[], $2::timestamptz[]) AS u(rid, ts)) AS k JOIN ("
+                ),
+                "{arm}: the read is driven from the page's keys: {sql}"
+            );
+            assert!(
+                sql.contains(" AND g.timestamp >= $3") && sql.contains(" AND g.timestamp < $4"),
+                "{arm}: the read is windowed: {sql}"
+            );
+        }
+        // Positive control: an arm's own page is not driven from keys.
+        for (arm, sql, _) in arm_statements(ArmRead::Rows, &AuditQuery::default()) {
+            assert!(!sql.contains("unnest($1"), "{arm}: {sql}");
+        }
+    }
+
+    #[test]
+    fn a_merged_page_interleaves_every_arm_newest_first_and_holds_one_page() {
+        // Two arms interleaved in time, with a tie on the timestamp broken by the id.
+        let a = vec![key(500, 9), key(300, 6), key(100, 5)];
+        let b = vec![key(400, 8), key(300, 7), key(200, 4)];
+        let order = |page: &[(char, ArmKey)]| {
+            page.iter().map(|(arm, k)| (*arm, k.request_id.as_u128())).collect::<Vec<_>>()
+        };
+        let all = merge_page(vec![('a', a.clone()), ('b', b.clone())], 0, 10);
+        assert_eq!(order(&all), vec![('a', 9), ('b', 8), ('b', 7), ('a', 6), ('b', 4), ('a', 5)]);
+        // A deep page is the same slice of that order, `limit + 1` long at most.
+        let page = merge_page(vec![('a', a.clone()), ('b', b.clone())], 2, 2);
+        assert_eq!(order(&page), vec![('b', 7), ('a', 6), ('b', 4)]);
+        let last = merge_page(vec![('a', a), ('b', b)], 5, 2);
+        assert_eq!(order(&last), vec![('a', 5)]);
+    }
 
     #[test]
     fn a_session_alert_badge_reads_only_the_structured_columns() {

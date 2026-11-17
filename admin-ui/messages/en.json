@@ -1096,5 +1096,12 @@
   "portal_page_hidden_title": "This page is not available",
   "portal_page_hidden_body": "Your administrator has hidden this page for your workspaces.",
   "portal_page_hidden_home": "Back to Home",
-  "browse_content_hidden": "Conversation content is hidden for your workspaces: each request shows its model, tokens, cost and status, and does not open."
+  "browse_content_hidden": "Conversation content is hidden for your workspaces: each request shows its model, tokens, cost and status, and does not open.",
+  "event_tools_loading": "Loading tools…",
+  "event_tools_load_failed": "Could not load this turn's tools.",
+  "event_tools_none_readable": "This turn's tool list holds no tool that can be read.",
+  "event_tools_summary": "tools",
+  "event_tools_count_one": "1 tool",
+  "event_tools_count": "{count} tools",
+  "event_tools_available": "Tools available ({count})"
 }

@@ -2652,7 +2652,7 @@ admin-console only (read-only accounts see them too).
   and a file or an image the detail it was sent with. An answer that is the model's refusal shows the refusal after
   any text it wrote and carries the **Refusal** badge. A program the model ran (OpenAI programmatic tool calling) shows as a tool
   call with its code, its output as the call's result, and a client's request to compact the
-  conversation as **Compaction requested by the client**, apart from a compaction that happened. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
+  conversation as **Compaction requested by the client**, apart from a compaction that happened. A session shows each message once: a turn that starts afresh — a compaction, a rewritten history, agents running side by side under one session id — shows a marker with its message count, and the messages the session has not shown yet; its full request is in the turn's trace. Each system prompt shows the first time it appears, and a turn's **Request Params** panel loads that turn's tools when you open it. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
   **badges** flag sessions the experts found noteworthy.
 - **Tool Calls** (`/tool-calls`) — every tool invocation (LLM and MCP) with the policy rule that
   classified, blocked, or rewrote it shown inline — the fastest way to audit what agents are doing.

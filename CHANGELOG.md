@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.58]
+
+- **A gateway serving several hundred active users no longer stops answering.** Once enough users
+  were active within a week, the gateway could stop accepting requests entirely — health checks
+  hung, nothing was logged and the process used no CPU — until it was restarted. A remote MCP server
+  on the older SSE transport answering a request long after the gateway gave up on it could do the
+  same.
+- **Memory limits sized for more users.** The console's limit rises from 256 MB to 384 MB (it used
+  159 MB at 500 active users), and on Kubernetes the gateway and admin API pods' from 512 MiB to 1 GiB,
+  with a 512 MiB request. The Operator Guide now says what was measured: 500 active users within a
+  4 GB VM's memory, and what large coding-agent turns and long sessions cost while in flight.
+
+## [2026.11.57]
+
+- **The tool dashboards and the audit list stay within the admin API's memory on a busy
+  deployment.** The tool inventory (the dashboard, and the agent's tool review every cycle), each
+  tool rule's activity on the Tool rules page, the tool-call feed and tool field discovery read the
+  whole window's tool calls, or every tool list it named, at once — a client sending large file
+  writes or a changing tool list could restart the admin API at its memory limit. The inventory and
+  rule activity now read the window's tool calls one at a time, and the feed and field discovery
+  read tool lists a few at a time. The merged request list ("All" kinds, console and portal) no
+  longer holds the full content of every row up to the page it shows, nor does the tool-call feed
+  for its MCP and web calls.
+
+## [2026.11.56]
+
+- **A long agent session opens without exhausting the admin API's memory.** Opening a session of a
+  few hundred turns or more could grow the admin API by gigabytes until its memory limit restarted
+  it — notably an OpenCode session whose subagents ran side by side, which share the root session
+  and so make nearly every turn a fresh start. A session now shows each message once: a turn that
+  starts afresh shows only what the session has not shown yet, and each system prompt shows once. A turn's tools load when its Request
+  Parameters panel is opened, in the console and the portal alike, rather than one tool list per
+  turn. **BREAKING** for API clients: a session's `turn_params[].params` no longer holds `tools`;
+  each entry names its tool list by `tools_hash` with its `protocol`, and
+  `GET …/audit/tool-definitions/{hash}?protocol=<protocol>` returns its `tools`.
+- **A Gemini turn lists every tool it offered.** The Request Parameters panel and the tool-call
+  feed showed only the first function of each Gemini tool group and none of its built-in tools
+  (Google Search, code execution, …); they now list them all.
+
 ## [2026.11.55]
 
 - **A model's refusal reaches every client.** A Chat model's refusal now reaches a Responses client as a

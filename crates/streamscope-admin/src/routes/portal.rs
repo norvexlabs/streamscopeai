@@ -794,7 +794,8 @@ async fn accessible_providers(
 use super::audit::{
     get_session_conversation_impl, get_trace_impl, AuditKind, AuditLogRow,
     AuditQuery, SessionLinkage, SessionSort, ConversationResponse, LinkedSessions, ResponseFormat,
-    SessionListQuery, SessionNotFound, SessionSummary, ToolDefinitionBlobResponse, TraceResponse,
+    SessionListQuery, SessionNotFound, SessionSummary, ToolDefinitionBlobResponse, ToolDefinitionQuery, TraceResponse,
+    tool_definition_response,
 };
 use crate::audit_store::AuditScope;
 use crate::audit_store::logs::list_audit_rows;
@@ -1445,10 +1446,12 @@ pub async fn my_media(
     tag = "Portal",
     params(
         PortalScopeQuery,
+        ToolDefinitionQuery,
         ("hash" = String, Path, description = "SHA-256 content hash of the tool-definition blob"),
     ),
     responses(
         (status = 200, description = "Tool-definition JSON blob", body = ToolDefinitionBlobResponse),
+        (status = 400, description = "Unknown protocol", body = ApiErrorResponse),
         (status = 404, description = "Hash not found or not owned", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 403, description = "Conversation content is hidden for the caller's workspaces — `sessions` in `hidden_pages` (`portal_page_hidden`)", body = ApiErrorResponse),
@@ -1461,6 +1464,7 @@ pub async fn my_tool_definition_blob(
     Extension(user): Extension<PortalUser>,
     Path(hash): Path<String>,
     Query(q): Query<PortalScopeQuery>,
+    Query(tq): Query<ToolDefinitionQuery>,
 ) -> Result<Json<ToolDefinitionBlobResponse>, ApiError> {
     let scope = PortalDataScope::resolve(db.conn(), &user, q.workspace_id).await?;
     assert_tool_definition_owned(db.conn(), &hash, &scope).await?;
@@ -1479,5 +1483,5 @@ pub async fn my_tool_definition_blob(
         );
     };
 
-    Ok(Json(ToolDefinitionBlobResponse { hash, definition, size_bytes: size_bytes as i64 }))
+    Ok(Json(tool_definition_response(hash, definition, size_bytes as i64, tq.protocol)))
 }

@@ -750,12 +750,20 @@ pub(crate) async fn aggregate_field_coverage(
     let hashes = crate::audit_store::tool_activity::recent_tool_set_hashes(&mut *conn, tenant_id, lookback)
         .await
         .map_err(scan_err)?;
-    let distinct: Vec<String> = hashes.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect();
-    let sets = crate::content_store::tool_definitions::get_many(&mut *conn, tenant_id, &distinct)
-        .await
-        .map_err(scan_err)?;
-
-    let counts = count_tool_fields(&hashes, &sets);
+    // Each distinct set is read once, a bounded chunk of sets at a time, and
+    // folded into the counts weighted by the turns that declared it: what is
+    // held is one chunk of sets plus the counts, whatever `lookback` reaches.
+    let weights = turns_per_set(&hashes);
+    drop(hashes);
+    let distinct: Vec<String> = weights.keys().cloned().collect();
+    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    crate::content_store::tool_definitions::for_each(&mut *conn, tenant_id, &distinct, |hash, set| {
+        if let Some(&turns) = weights.get(hash) {
+            add_set_fields(set, turns, &mut counts);
+        }
+    })
+    .await
+    .map_err(scan_err)?;
 
     // Determine which pairs are already covered by an existing profile, and
     // surface a `tool_id` suggestion for unprofiled rows when the registry
@@ -815,22 +823,30 @@ pub(crate) async fn aggregate_field_coverage(
     Ok(fields)
 }
 
-/// `(tool_name, field)` → occurrences over the turns' tool sets: each turn
-/// counts its set once, so a set several turns declared weighs as many; a set
-/// no longer stored counts for nothing. A set is the raw model-facing tools
-/// list (its shape varies by protocol).
-fn count_tool_fields(
-    turn_hashes: &[String],
-    sets: &std::collections::HashMap<String, serde_json::Value>,
-) -> BTreeMap<(String, String), usize> {
-    let mut counts: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for val in turn_hashes.iter().filter_map(|h| sets.get(h)) {
-        let Some(arr) = val.as_array() else { continue };
-        for tool in arr {
-            collect_tool_fields(tool, &mut counts);
-        }
+/// How many of the turns declared each set: `turn_hashes` names one set per
+/// turn, a set several turns declared repeating.
+fn turns_per_set(turn_hashes: &[String]) -> BTreeMap<String, usize> {
+    let mut weights: BTreeMap<String, usize> = BTreeMap::new();
+    for hash in turn_hashes {
+        *weights.entry(hash.clone()).or_insert(0) += 1;
     }
-    counts
+    weights
+}
+
+/// Add one set's `(tool_name, field)` occurrences to `counts`, weighted by
+/// the `turns` that declared it: each turn counts its set once, so a set
+/// several turns declared weighs as many, and a set no longer stored — never
+/// added — counts for nothing. A set is the raw model-facing tools list (its
+/// shape varies by protocol).
+fn add_set_fields(set: &serde_json::Value, turns: usize, counts: &mut BTreeMap<(String, String), usize>) {
+    let Some(arr) = set.as_array() else { return };
+    let mut once: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for tool in arr {
+        collect_tool_fields(tool, &mut once);
+    }
+    for (pair, n) in once {
+        *counts.entry(pair).or_insert(0) += n * turns;
+    }
 }
 
 /// Walk a single tool definition and pull out (tool_name, field) pairs from
@@ -1494,17 +1510,55 @@ pub(crate) async fn upsert_builtin_profile(
 mod tests {
     use super::*;
 
+    /// The counts over `turns`, each distinct set read once from `sets` (a
+    /// hash absent from it is a set no longer stored).
+    fn counts_over(
+        turns: &[&str],
+        sets: &std::collections::HashMap<&str, serde_json::Value>,
+    ) -> BTreeMap<(String, String), usize> {
+        let turns: Vec<String> = turns.iter().map(|h| h.to_string()).collect();
+        let mut counts = BTreeMap::new();
+        for (hash, n) in turns_per_set(&turns) {
+            if let Some(set) = sets.get(hash.as_str()) {
+                add_set_fields(set, n, &mut counts);
+            }
+        }
+        counts
+    }
+
     #[test]
     fn each_turn_counts_its_set_once_and_a_set_no_longer_stored_counts_for_nothing() {
         let set = serde_json::json!([
             {"name": "Read", "input_schema": {"properties": {"file_path": {"type": "string"}}}}
         ]);
-        let sets: std::collections::HashMap<String, serde_json::Value> =
-            [("a".to_string(), set)].into_iter().collect();
-        let turns: Vec<String> = ["a", "a", "gone", "a"].iter().map(|h| h.to_string()).collect();
-        let counts = count_tool_fields(&turns, &sets);
+        let sets: std::collections::HashMap<&str, serde_json::Value> = [("a", set)].into_iter().collect();
+        let counts = counts_over(&["a", "a", "gone", "a"], &sets);
         assert_eq!(counts.get(&("Read".to_string(), "file_path".to_string())), Some(&3));
         assert_eq!(counts.len(), 1);
-        assert!(count_tool_fields(&["gone".to_string()], &sets).is_empty());
+        assert!(counts_over(&["gone"], &sets).is_empty());
+    }
+
+    #[test]
+    fn a_set_read_once_weighs_what_each_turn_reading_it_would() {
+        // A set declaring one tool twice, and a second set sharing a pair with
+        // it: reading each distinct set once, weighted, gives what adding the
+        // set once per turn gives.
+        let a = serde_json::json!([
+            {"name": "Read", "input_schema": {"properties": {"file_path": {}, "limit": {}}}},
+            {"name": "Read", "input_schema": {"properties": {"file_path": {}}}}
+        ]);
+        let b = serde_json::json!([
+            {"type": "function", "function": {"name": "Read", "parameters": {"properties": {"file_path": {}}}}}
+        ]);
+        let sets: std::collections::HashMap<&str, serde_json::Value> =
+            [("a", a.clone()), ("b", b.clone())].into_iter().collect();
+        let turns = ["a", "b", "a", "a", "b"];
+        let mut per_turn = BTreeMap::new();
+        for hash in turns {
+            add_set_fields(&sets[hash], 1, &mut per_turn);
+        }
+        assert_eq!(counts_over(&turns, &sets), per_turn);
+        assert_eq!(per_turn.get(&("Read".to_string(), "file_path".to_string())), Some(&(3 * 2 + 2)));
+        assert_eq!(per_turn.get(&("Read".to_string(), "limit".to_string())), Some(&3));
     }
 }

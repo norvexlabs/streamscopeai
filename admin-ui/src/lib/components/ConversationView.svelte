@@ -51,9 +51,8 @@
 
   type ConversationEvent = components['schemas']['ConversationEvent'];
   type DetectedSpawnPoint = components['schemas']['DetectedSpawnPoint'];
-  type DomainRequestMeta = components['schemas']['DomainRequestMeta'];
   type WebAuditLogEntry = components['schemas']['WebAuditLogEntry'];
-  type TurnParam = { turn: number; params: DomainRequestMeta };
+  type TurnParam = components['schemas']['TurnParams'];
   type TransformDiff = components['schemas']['TransformDiff'];
 
   interface Props {
@@ -204,10 +203,10 @@
     return map;
   });
 
-  /** Map of turn number → DomainRequestMeta (request params + tool catalog). */
+  /** Map of turn number → its request params (the tool catalog named by hash). */
   const paramsByTurn = $derived.by(() => {
-    const map = new Map<number, DomainRequestMeta>();
-    for (const tp of turnParams) map.set(tp.turn, tp.params);
+    const map = new Map<number, TurnParam>();
+    for (const tp of turnParams) map.set(tp.turn, tp);
     return map;
   });
 
@@ -632,7 +631,8 @@
 
           <!-- Canonical request parameters + tools available (from domain normalization) -->
           {#if paramsByTurn.has(turnNum)}
-            <RequestParamsPanel params={paramsByTurn.get(turnNum) ?? null} />
+            {@const turnParam = paramsByTurn.get(turnNum)!}
+            <RequestParamsPanel params={turnParam.params} toolsHash={turnParam.tools_hash} protocol={turnParam.protocol} />
           {/if}
 
         <!-- System Prompt -->

@@ -153,7 +153,8 @@ impl UpstreamListener {
 
     fn cancel(&self) {
         self.shared.cancelled.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.task.lock_or_poisoned().take() {
+        let handle = self.task.lock_or_poisoned().take();
+        if let Some(handle) = handle {
             handle.abort();
         }
     }

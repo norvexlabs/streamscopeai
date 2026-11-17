@@ -1085,67 +1085,76 @@ pub fn parse_stored_tools(protocol: ApiVersion, tools: &Value) -> Option<Vec<Dom
     let arr = tools.as_array()?;
     let list: Vec<DomainToolSummary> = arr
         .iter()
-        .filter_map(|t| match protocol {
-            ApiVersion::ChatCompletions | ApiVersion::Responses => {
-                // A function or custom (freeform) tool nests its definition on
-                // Chat (`{type:"function", function:{…}}`, `{type:"custom",
-                // custom:{…}}`) and declares it flat on Responses; any other
-                // type is a Responses hosted tool (`{type:"mcp", …}`).
-                let ty = t.get("type").and_then(|s| s.as_str()).unwrap_or("function");
-                if matches!(ty, "function" | "custom") {
-                    let def = t.get(ty).unwrap_or(t);
-                    Some(DomainToolSummary {
-                        name: def.get("name").and_then(|s| s.as_str())?.to_string(),
-                        description: def.get("description").and_then(|s| s.as_str()).map(String::from),
-                        server_type: (ty == "custom").then(|| ty.to_string()),
-                        parameters: def.get("parameters").cloned(),
-                    })
-                } else {
-                    // Non-function Responses tool — use `type` as display name.
-                    let name = t.get("name").and_then(|s| s.as_str()).unwrap_or(ty).to_string();
-                    Some(DomainToolSummary {
-                        name,
-                        description: t.get("description").and_then(|s| s.as_str()).map(String::from),
-                        server_type: Some(ty.to_string()),
-                        parameters: None,
-                    })
-                }
-            }
-            ApiVersion::AnthropicMessages => {
-                // Anthropic: `{name, description, input_schema}` or server-defined `{type, name, ...}`.
-                let name = t.get("name").and_then(|s| s.as_str())?.to_string();
-                // `type: "custom"` is the spec's spelling of an ordinary client tool.
-                let ty = t.get("type").and_then(|s| s.as_str()).filter(|t| *t != "custom");
-                Some(DomainToolSummary {
-                    name,
-                    description: t.get("description").and_then(|s| s.as_str()).map(String::from),
-                    server_type: ty.map(String::from),
-                    parameters: t.get("input_schema").cloned(),
-                })
-            }
-            ApiVersion::GoogleGemini => {
-                // Gemini: `{functionDeclarations: [{name, description, parameters}]}`.
-                // Caller typically passes one wrapper object; we flatten by treating each
-                // declaration as a tool. If the array element IS a declaration, accept it directly.
-                if let Some(decls) = t.get("functionDeclarations").and_then(|v| v.as_array()) {
-                    let first = decls.iter().next()?;
-                    return Some(DomainToolSummary {
-                        name: first.get("name").and_then(|s| s.as_str())?.to_string(),
-                        description: first
-                            .get("description")
+        .flat_map(|t| -> Vec<DomainToolSummary> {
+            match protocol {
+                ApiVersion::ChatCompletions | ApiVersion::Responses => {
+                    // A function or custom (freeform) tool nests its definition on
+                    // Chat (`{type:"function", function:{…}}`, `{type:"custom",
+                    // custom:{…}}`) and declares it flat on Responses; any other
+                    // type is a Responses hosted tool (`{type:"mcp", …}`).
+                    let ty = t.get("type").and_then(|s| s.as_str()).unwrap_or("function");
+                    if matches!(ty, "function" | "custom") {
+                        let def = t.get(ty).unwrap_or(t);
+                        def.get("name")
                             .and_then(|s| s.as_str())
-                            .map(String::from),
-                        server_type: None,
-                        parameters: first.get("parameters").cloned(),
-                    });
+                            .map(|name| DomainToolSummary {
+                                name: name.to_string(),
+                                description: def.get("description").and_then(|s| s.as_str()).map(String::from),
+                                server_type: (ty == "custom").then(|| ty.to_string()),
+                                parameters: def.get("parameters").cloned(),
+                            })
+                            .into_iter()
+                            .collect()
+                    } else {
+                        // Non-function Responses tool — use `type` as display name.
+                        let name = t.get("name").and_then(|s| s.as_str()).unwrap_or(ty).to_string();
+                        vec![DomainToolSummary {
+                            name,
+                            description: t.get("description").and_then(|s| s.as_str()).map(String::from),
+                            server_type: Some(ty.to_string()),
+                            parameters: None,
+                        }]
+                    }
                 }
-                let name = t.get("name").and_then(|s| s.as_str())?.to_string();
-                Some(DomainToolSummary {
-                    name,
-                    description: t.get("description").and_then(|s| s.as_str()).map(String::from),
-                    server_type: None,
-                    parameters: t.get("parameters").cloned(),
-                })
+                ApiVersion::AnthropicMessages => {
+                    // Anthropic: `{name, description, input_schema}` or server-defined `{type, name, ...}`.
+                    // `type: "custom"` is the spec's spelling of an ordinary client tool.
+                    let ty = t.get("type").and_then(|s| s.as_str()).filter(|t| *t != "custom");
+                    t.get("name")
+                        .and_then(|s| s.as_str())
+                        .map(|name| DomainToolSummary {
+                            name: name.to_string(),
+                            description: t.get("description").and_then(|s| s.as_str()).map(String::from),
+                            server_type: ty.map(String::from),
+                            parameters: t.get("input_schema").cloned(),
+                        })
+                        .into_iter()
+                        .collect()
+                }
+                ApiVersion::GoogleGemini => {
+                    // Gemini: a `Tool` object holds its functions in
+                    // `functionDeclarations`, each one tool; any other member is a
+                    // hosted tool, listed by the member's name. An element that IS
+                    // a declaration (`{name, …}`) is accepted directly.
+                    if t.get("name").is_some() {
+                        return gemini_declaration(t).into_iter().collect();
+                    }
+                    let Some(obj) = t.as_object() else { return Vec::new() };
+                    obj.iter()
+                        .flat_map(|(member, value)| -> Vec<DomainToolSummary> {
+                            if member == "functionDeclarations" {
+                                value.as_array().into_iter().flatten().filter_map(gemini_declaration).collect()
+                            } else {
+                                vec![DomainToolSummary {
+                                    name: member.clone(),
+                                    description: None,
+                                    server_type: Some(member.clone()),
+                                    parameters: None,
+                                }]
+                            }
+                        })
+                        .collect()
+                }
             }
         })
         .collect();
@@ -1154,6 +1163,16 @@ pub fn parse_stored_tools(protocol: ApiVersion, tools: &Value) -> Option<Vec<Dom
     } else {
         Some(list)
     }
+}
+
+/// One Gemini `FunctionDeclaration` as a tool summary; `None` without a name.
+fn gemini_declaration(d: &Value) -> Option<DomainToolSummary> {
+    Some(DomainToolSummary {
+        name: d.get("name").and_then(|s| s.as_str())?.to_string(),
+        description: d.get("description").and_then(|s| s.as_str()).map(String::from),
+        server_type: None,
+        parameters: d.get("parameters").cloned(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -15048,6 +15067,34 @@ mod tests {
         let flat = serde_json::json!([{"type": "function", "name": "shell", "parameters": {"type": "object"}}]);
         let summary = parse_stored_tools(ApiVersion::Responses, &flat).unwrap();
         assert_eq!((summary[0].name.as_str(), summary[0].server_type.as_deref()), ("shell", None));
+    }
+
+    /// A Gemini `Tool` object lists every one of its function declarations and
+    /// names each hosted tool it carries — the catalog a turn's panel shows is
+    /// the one the model was offered, never its first function alone.
+    #[test]
+    fn every_gemini_declaration_and_hosted_tool_is_listed() {
+        let tools = serde_json::json!([
+            {"functionDeclarations": [
+                {"name": "read", "description": "Read a file", "parameters": {"type": "object"}},
+                {"name": "write"},
+                {"description": "no name: not a tool"}
+            ]},
+            {"googleSearch": {}},
+            {"name": "bare_declaration"}
+        ]);
+        let listed = parse_stored_tools(ApiVersion::GoogleGemini, &tools).unwrap();
+        let names: Vec<(&str, Option<&str>)> =
+            listed.iter().map(|t| (t.name.as_str(), t.server_type.as_deref())).collect();
+        assert_eq!(names, vec![
+            ("read", None),
+            ("write", None),
+            ("googleSearch", Some("googleSearch")),
+            ("bare_declaration", None),
+        ]);
+        assert_eq!(listed[0].description.as_deref(), Some("Read a file"));
+        // Nothing readable is still nothing: no tool is invented.
+        assert!(parse_stored_tools(ApiVersion::GoogleGemini, &serde_json::json!([{"functionDeclarations": []}])).is_none());
     }
 
     /// A Chat history may hold a call to a custom tool (`{type: "custom",

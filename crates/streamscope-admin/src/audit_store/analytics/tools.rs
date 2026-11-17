@@ -8,9 +8,11 @@ use std::collections::HashMap;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use streamscope_core::config::tool_rules::classify_tool_call;
+use futures::TryStreamExt;
 use uuid::Uuid;
 
 use crate::audit_store::AuditScope;
+use crate::audit_store::tool_activity::ToolCallScan;
 use crate::audit_store::filters::{
     AUDIT_LOG_JOIN, AUDIT_LOG_TURN_WINDOW, AUDIT_LOG_WINDOW, AnalyticsFilterBuilder, WEB_AUDIT_JOIN, window_sql,
 };
@@ -24,22 +26,6 @@ use crate::routes::analytics::{
     TransformStatEntry, TransformStatsResponse, UnprofiledTool, evaluate_budget_scopes,
     load_field_profiles, load_risk_rules,
 };
-
-/// Per-turn row for argument-aware risk classification in tool inventory.
-/// The turn's `response_tool_calls` JSON is decoded in Rust via the canonical
-/// domain layer (`domain_assistant_content_from_stored`) so every inbound
-/// protocol lands on a single `DomainContentBlock::ToolUse` shape — no SQL
-/// COALESCE on `function.name` / `function_name` / `input` fallbacks.
-#[derive(sqlx::FromRow)]
-struct InventoryTurnRow {
-    request_id: Uuid,
-    api_version: String,
-    response_tool_calls: Option<serde_json::Value>,
-    app_id: Option<String>,
-    session_id: Uuid,
-    user_id: Uuid,
-    timestamp: chrono::DateTime<chrono::Utc>,
-}
 
 /// Core tool inventory logic — callable from both HTTP handler and agent code.
 ///
@@ -70,104 +56,6 @@ pub(crate) async fn tool_inventory_impl(
         filters.push_exists_workspaces("ct.request_id", "ct.timestamp", "ct.tenant_id", (lo, hi), ws);
     }
     let where_extra = filters.where_sql();
-
-    // Fetch one row per turn and decode `response_tool_calls` in Rust via the
-    // canonical domain layer — every inbound protocol (Anthropic Messages,
-    // OpenAI Chat Completions, OpenAI Responses, Gemini) flows through the
-    // same `domain_assistant_content_from_stored` helper the session/audit
-    // viewers use, so adding a new protocol never forces a parallel SQL
-    // change here.
-    let turns_sql = format!(
-        r#"SELECT
-                ct.request_id,
-                ct.api_version,
-                ct.response_tool_calls,
-                s.app_id,
-                s.session_id,
-                s.user_id,
-                ct.timestamp
-            FROM conversation_turns ct
-            JOIN sessions s ON s.session_id = ct.session_id
-            WHERE ct.tenant_id = $1
-              AND ct.response_tool_calls IS NOT NULL
-              AND ct.response_tool_calls != 'null'::jsonb
-              AND jsonb_array_length(ct.response_tool_calls) > 0
-              {where_extra}"#
-    );
-
-    let turns_query = filters.apply_query_as(
-        sqlx::query_as::<_, InventoryTurnRow>(sqlx::AssertSqlSafe(&*turns_sql)).bind(tenant_id),
-    );
-
-    let turn_rows = turns_query
-        .fetch_all(&mut *conn)
-        .await?;
-
-    // Decode each turn's stored tool calls into canonical `DomainContentBlock::ToolUse`
-    // blocks, then flatten into the `(name, args, session/user/app/ts)` tuples the
-    // aggregation loop below consumes — one row per individual tool call. Tool-name
-    // and argument normalization lives in one place, the domain layer, never in
-    // SQL.
-    struct InventoryCall {
-        tool_name: String,
-        arguments: serde_json::Value,
-        app_id: Option<String>,
-        session_id: Uuid,
-        user_id: Uuid,
-        timestamp: chrono::DateTime<chrono::Utc>,
-    }
-    let mut call_rows: Vec<InventoryCall> = Vec::with_capacity(turn_rows.len());
-    for row in &turn_rows {
-        // `decode_stored_tool_call` is shape-driven — it recognizes every
-        // stored wire format (accumulator / OpenAI CC / Anthropic / Gemini /
-        // Responses raw) regardless of the `protocol` arg, which only
-        // influences the synthetic id prefix for calls with no stored id.
-        let Some(proto) = crate::conversation::stored_protocol(&row.api_version, row.request_id) else {
-            continue;
-        };
-        let blocks = streamscope_core::api::domain_request::domain_assistant_content_from_stored(
-            proto,
-            None,
-            row.response_tool_calls.as_ref(),
-            None,
-        );
-        for block in blocks {
-            if let streamscope_core::api::domain_request::DomainContentBlock::ToolUse {
-                name,
-                input,
-                input_raw,
-                ..
-            } = block
-            {
-                if name.is_empty() {
-                    continue;
-                }
-                // Prefer the parsed object. When the model emitted malformed
-                // JSON the domain layer already tried parsing and stashed the
-                // raw string in `input_raw`; don't try again — pass the raw
-                // through as `Value::String` so regex-based risk rules still
-                // fire against the substring they'd have matched in JSON form.
-                // Falling back to `{}` would silently pass every
-                // argument-based rule for malformed calls.
-                let arguments = if input.is_null() {
-                    match input_raw {
-                        Some(s) => serde_json::Value::String(s),
-                        None => serde_json::Value::Object(serde_json::Map::new()),
-                    }
-                } else {
-                    input
-                };
-                call_rows.push(InventoryCall {
-                    tool_name: name,
-                    arguments,
-                    app_id: row.app_id.clone(),
-                    session_id: row.session_id,
-                    user_id: row.user_id,
-                    timestamp: row.timestamp,
-                });
-            }
-        }
-    }
 
     // Load risk classification rules + field profiles from system_settings.
     // Field profiles drive `tool_id` resolution; classification falls back to
@@ -210,82 +98,153 @@ pub(crate) async fn tool_inventory_impl(
         match r { "danger" => 3, "caution" => 2, "unknown" => 1, _ => 0 }
     }
 
-    for row in &call_rows {
-        let name = row.tool_name.clone();
-        // Inventory aggregation runs across all models for this tenant; pass
-        // None as the model filter so model_filter rules don't suppress
-        // classifications in the per-tool stats. Per-model breakdowns (when
-        // we add them) should switch this to the row's model_used.
-        let result = classify_tool_call(
-            &risk_rules,
+    /// One tool call of a turn, as the aggregation below reads it.
+    struct InventoryCall<'a> {
+        tool_name: String,
+        arguments: serde_json::Value,
+        app_id: Option<&'a str>,
+        session_id: Uuid,
+        user_id: Uuid,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    }
+
+    // The window's tool-call turns, streamed (`ToolCallScan`): each turn is
+    // classified into the aggregates below as it arrives, so what is held is
+    // one turn, whatever the window. Each
+    // turn's stored calls decode through the canonical domain layer
+    // (`domain_assistant_content_from_stored`), so every inbound protocol lands
+    // on one `DomainContentBlock::ToolUse` shape — no SQL fallbacks on
+    // `function.name` / `input`.
+    let scan = ToolCallScan::new(tenant_id, filters.clone());
+    let mut rows = scan.rows(&mut *conn);
+    while let Some(turn) = rows.try_next().await? {
+        let turn = &turn;
+        // `decode_stored_tool_call` is shape-driven — it recognizes every
+        // stored wire format (accumulator / OpenAI CC / Anthropic / Gemini /
+        // Responses raw) regardless of the `protocol` arg, which only
+        // influences the synthetic id prefix for calls with no stored id.
+        let Some(proto) = crate::conversation::stored_protocol(&turn.api_version, turn.request_id) else {
+            continue;
+        };
+        let blocks = streamscope_core::api::domain_request::domain_assistant_content_from_stored(
+            proto,
             None,
-            row.app_id.as_deref(),
-            Some(&field_profiles),
-            &name,
-            Some(&row.arguments),
+            turn.response_tool_calls.as_ref(),
+            None,
         );
+        for block in blocks {
+            let streamscope_core::api::domain_request::DomainContentBlock::ToolUse {
+                name,
+                input,
+                input_raw,
+                ..
+            } = block
+            else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            // Prefer the parsed object. When the model emitted malformed
+            // JSON the domain layer already tried parsing and stashed the
+            // raw string in `input_raw`; don't try again — pass the raw
+            // through as `Value::String` so regex-based risk rules still
+            // fire against the substring they'd have matched in JSON form.
+            // Falling back to `{}` would silently pass every
+            // argument-based rule for malformed calls.
+            let arguments = if input.is_null() {
+                match input_raw {
+                    Some(s) => serde_json::Value::String(s),
+                    None => serde_json::Value::Object(serde_json::Map::new()),
+                }
+            } else {
+                input
+            };
+            let row = InventoryCall {
+                tool_name: name,
+                arguments,
+                app_id: turn.app_id.as_deref(),
+                session_id: turn.session_id,
+                user_id: turn.user_id,
+                timestamp: turn.timestamp,
+            };
+            let name = row.tool_name.clone();
+            // Inventory aggregation runs across all models for this tenant; pass
+            // None as the model filter so model_filter rules don't suppress
+            // classifications in the per-tool stats. Per-model breakdowns (when
+            // we add them) should switch this to the row's model_used.
+            let result = classify_tool_call(
+                &risk_rules,
+                None,
+                row.app_id,
+                Some(&field_profiles),
+                &name,
+                Some(&row.arguments),
+            );
 
-        total_calls += 1;
+            total_calls += 1;
 
-        // Per-risk-level counts
-        *risk_counts.entry(result.risk.clone()).or_insert(0) += 1;
+            // Per-risk-level counts
+            *risk_counts.entry(result.risk.clone()).or_insert(0) += 1;
 
-        // Profile coverage: classify_tool_call already walks the field-profile
-        // registry; reading `result.tool_id` here avoids a second resolve call.
-        if result.tool_id.is_some() {
-            profiled_calls += 1;
-        } else {
-            *unprofiled_call_counts.entry(name.clone()).or_insert(0) += 1;
-        }
-
-        // Per-tool aggregation
-        let agg = tool_aggs.entry(name.clone()).or_insert_with(|| ToolAgg {
-            tool_id: None,
-            call_count: 0,
-            blocked_count: 0,
-            not_applied_count: 0,
-            safe_count: 0,
-            caution_count: 0,
-            danger_count: 0,
-            unknown_count: 0,
-            sessions: std::collections::HashSet::new(),
-            users: std::collections::HashSet::new(),
-            app_ids: std::collections::HashSet::new(),
-            last_used: row.timestamp,
-            worst_risk: "safe".to_string(),
-            worst_title: None,
-            worst_description: None,
-        });
-        agg.call_count += 1;
-        match result.risk.as_str() {
-            "safe" => agg.safe_count += 1,
-            "caution" => agg.caution_count += 1,
-            "danger" => agg.danger_count += 1,
-            _ => agg.unknown_count += 1,
-        }
-        agg.sessions.insert(row.session_id);
-        agg.users.insert(row.user_id);
-        if let Some(app) = &row.app_id { agg.app_ids.insert(app.clone()); }
-        if row.timestamp >= agg.last_used {
-            agg.last_used = row.timestamp;
-            // Last-seen tool_id wins — covers the case where a profile is
-            // added or refined mid-window.
+            // Profile coverage: classify_tool_call already walks the field-profile
+            // registry; reading `result.tool_id` here avoids a second resolve call.
             if result.tool_id.is_some() {
-                agg.tool_id = result.tool_id.clone();
+                profiled_calls += 1;
+            } else {
+                *unprofiled_call_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+
+            // Per-tool aggregation
+            let agg = tool_aggs.entry(name.clone()).or_insert_with(|| ToolAgg {
+                tool_id: None,
+                call_count: 0,
+                blocked_count: 0,
+                not_applied_count: 0,
+                safe_count: 0,
+                caution_count: 0,
+                danger_count: 0,
+                unknown_count: 0,
+                sessions: std::collections::HashSet::new(),
+                users: std::collections::HashSet::new(),
+                app_ids: std::collections::HashSet::new(),
+                last_used: row.timestamp,
+                worst_risk: "safe".to_string(),
+                worst_title: None,
+                worst_description: None,
+            });
+            agg.call_count += 1;
+            match result.risk.as_str() {
+                "safe" => agg.safe_count += 1,
+                "caution" => agg.caution_count += 1,
+                "danger" => agg.danger_count += 1,
+                _ => agg.unknown_count += 1,
+            }
+            agg.sessions.insert(row.session_id);
+            agg.users.insert(row.user_id);
+            if let Some(app) = row.app_id { agg.app_ids.insert(app.to_string()); }
+            if row.timestamp >= agg.last_used {
+                agg.last_used = row.timestamp;
+                // Last-seen tool_id wins — covers the case where a profile is
+                // added or refined mid-window.
+                if result.tool_id.is_some() {
+                    agg.tool_id = result.tool_id.clone();
+                }
+            }
+            if risk_severity(&result.risk) > risk_severity(&agg.worst_risk) {
+                agg.worst_risk = result.risk;
+                agg.worst_title = result.title;
+                agg.worst_description = result.description;
+            }
+            // First-seen tool_id wins when last_used didn't advance (e.g. equal
+            // timestamps in the same turn). Prevents an entry from staying `None`
+            // when the very first row already resolved.
+            if agg.tool_id.is_none() && result.tool_id.is_some() {
+                agg.tool_id = result.tool_id;
             }
         }
-        if risk_severity(&result.risk) > risk_severity(&agg.worst_risk) {
-            agg.worst_risk = result.risk;
-            agg.worst_title = result.title;
-            agg.worst_description = result.description;
-        }
-        // First-seen tool_id wins when last_used didn't advance (e.g. equal
-        // timestamps in the same turn). Prevents an entry from staying `None`
-        // when the very first row already resolved.
-        if agg.tool_id.is_none() && result.tool_id.is_some() {
-            agg.tool_id = result.tool_id;
-        }
     }
+    drop(rows);
 
     // Fetch blocked tools from transform_diff (request-side + response-side).
     // Both UNION branches reference the same placeholders, so binds happen
@@ -494,24 +453,15 @@ pub(crate) struct InvocationRow {
     pub(crate) api_version: String,
     pub(crate) model_used: Option<String>,
     pub(crate) model_requested: Option<String>,
+    /// The tool set the call turn declared. The feed reads from it only the
+    /// definitions of the tools the turn called (`routes::analytics::named_tool_definitions`).
     pub(crate) request_tools_hash: Option<String>,
-    /// The tool set `request_tools_hash` names, read by [`ToolCallTurns::batch`]
-    /// from the content store; `None` when the turn has none or (defensively)
-    /// the tenant holds no such set.
-    /// Shared: rows of one batch naming the same set hold one copy.
-    #[sqlx(skip)]
-    pub(crate) request_tools: Option<std::sync::Arc<serde_json::Value>>,
     pub(crate) request_params: Option<serde_json::Value>,
     pub(crate) response_content: Option<String>,
     pub(crate) response_tool_calls: Option<serde_json::Value>,
     pub(crate) transform_diff: Option<serde_json::Value>,
     pub(crate) next_request_id: Option<Uuid>,
     pub(crate) next_api_version: Option<String>,
-    pub(crate) next_request_tools_hash: Option<String>,
-    /// The tool set `next_request_tools_hash` names, read like
-    /// [`Self::request_tools`].
-    #[sqlx(skip)]
-    pub(crate) next_request_tools: Option<std::sync::Arc<serde_json::Value>>,
     pub(crate) next_request_params: Option<serde_json::Value>,
     /// The answering turn's real turn number (`trace::answer_laterals`).
     pub(crate) next_turn_number: Option<i32>,
@@ -662,7 +612,6 @@ impl ToolCallTurns {
             ct.transform_diff,
             nxt.request_id         AS next_request_id,
             nxt.api_version        AS next_api_version,
-            nxt.tools_available_hash AS next_request_tools_hash,
             nxt.request_params     AS next_request_params,
             nxt.turn_number        AS next_turn_number,
             nxt.sliced             AS next_sliced,
@@ -687,7 +636,7 @@ impl ToolCallTurns {
             -- the planner probes it per page row, never resolving (walking
             -- the history of) every turn of the window to join them.
             SELECT r.request_id, r.timestamp, r.turn_number, r.api_version,
-                   r.tools_available_hash, r.request_params,
+                   r.request_params,
                    r.transform_diff, ans.answer_sliced AS sliced,
                    CASE WHEN ans.answer_sliced THEN r.added_hashes ELSE r.message_hashes END AS hashes
             FROM conversation_turns_resolved r
@@ -702,8 +651,7 @@ impl ToolCallTurns {
         Self { tenant_id, filters, sql, search }
     }
 
-    /// The next batch after `cursor` (`None`: the first), each row's tool sets
-    /// read from the content store in one more round trip.
+    /// The next batch after `cursor` (`None`: the first).
     pub(crate) async fn batch(
         &self,
         conn: &mut Scoped,
@@ -719,26 +667,7 @@ impl ToolCallTurns {
         if let Some((contains, prefix)) = &self.search {
             sqlx_query = sqlx_query.bind(contains.clone()).bind(prefix.clone());
         }
-        let mut rows = sqlx_query.fetch_all(&mut *conn).await?;
-        let hashes: Vec<String> = rows
-            .iter()
-            .flat_map(|r| [r.request_tools_hash.as_ref(), r.next_request_tools_hash.as_ref()])
-            .flatten()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let sets: std::collections::HashMap<String, std::sync::Arc<serde_json::Value>> =
-            crate::content_store::tool_definitions::get_many(&mut *conn, self.tenant_id, &hashes)
-                .await?
-                .into_iter()
-                .map(|(h, v)| (h, std::sync::Arc::new(v)))
-                .collect();
-        for r in &mut rows {
-            r.request_tools = r.request_tools_hash.as_ref().and_then(|h| sets.get(h).cloned());
-            r.next_request_tools = r.next_request_tools_hash.as_ref().and_then(|h| sets.get(h).cloned());
-        }
-        Ok(rows)
+        sqlx_query.fetch_all(&mut *conn).await
     }
 }
 

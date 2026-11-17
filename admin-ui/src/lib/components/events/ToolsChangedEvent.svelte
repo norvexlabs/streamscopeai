@@ -1,7 +1,6 @@
 <script lang="ts">
-  import { adminApi } from '#lib/api-client.js';
-  import { portalApi } from '#lib/portal-client.js';
-  import { isSelfScoped, portalWorkspace, workspaceQuery } from '#lib/selfScoped.js';
+  import { isSelfScoped, portalWorkspace } from '#lib/selfScoped.js';
+  import { fetchToolDefinition } from '#lib/toolDefinitions.js';
   import { m } from '#lib/paraglide/messages.js';
   import type { components } from '#lib/generated/api-types.js';
 
@@ -19,8 +18,7 @@
   // Capture the plane at init — `isSelfScoped()` reads Svelte context, which is
   // only legal during component initialization, never inside the async fetch
   // that the click handler kicks off (that would throw and wedge `loading`).
-  const selfScoped = isSelfScoped();
-  const viewedWorkspace = portalWorkspace();
+  const plane = { selfScoped: isSelfScoped(), workspaceId: portalWorkspace() };
 
   let expanded = $state(false);
   let loading = $state(false);
@@ -28,22 +26,13 @@
   let current = $state<Definition | null>(null);
   let error = $state('');
 
-  // Plane-aware: the portal member plane has its own ownership-gated endpoint
-  // and a path-scoped cookie, so an admin-path fetch there 401s. Mirror the
-  // media-blob leaf, which branches the same way.
   async function fetchDefinition(hash: string): Promise<Definition | null> {
-    const { data, error: err } = selfScoped
-      ? await portalApi.GET('/api/v1/portal/audit/tool-definitions/{hash}', {
-          params: { path: { hash }, query: workspaceQuery(viewedWorkspace()) },
-        })
-      : await adminApi.GET('/api/v1/admin/audit/tool-definitions/{hash}', {
-          params: { path: { hash } },
-        });
-    if (err) {
+    const found = await fetchToolDefinition(plane, hash);
+    if (!found) {
       error = m.event_failed_fetch_tool_def({ hash: hash.slice(0, 8) });
       return null;
     }
-    return data?.definition ?? null;
+    return found.definition ?? null;
   }
 
   async function toggle() {

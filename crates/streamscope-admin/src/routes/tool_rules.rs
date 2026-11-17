@@ -12,6 +12,7 @@
 //!
 //! A mutation reaches the proxies through the config change triggers.
 
+use futures::TryStreamExt;
 use super::is_unique_violation;
 
 use axum::extract::{Path, Query};
@@ -1674,7 +1675,7 @@ async fn compute_rule_activity(
     workspace_ids: Option<Vec<uuid::Uuid>>,
 ) -> anyhow::Result<std::collections::HashMap<String, RuleActivity>> {
     let activity = crate::audit_store::tool_activity::rule_activity_rows(
-        conn,
+        &mut *conn,
         tenant_id,
         time,
         app_id.as_deref(),
@@ -1713,7 +1714,11 @@ async fn compute_rule_activity(
     let risk_rules = crate::routes::analytics::load_risk_rules(&mut *conn).await;
     let field_profiles = crate::routes::analytics::load_field_profiles(&mut *conn).await;
 
-    for row in &activity.turns {
+    // Streamed: each turn is classified as it arrives, so what is held is one
+    // turn plus the buckets, whatever the window.
+    let mut rows = activity.turns.rows(&mut *conn);
+    while let Some(row) = rows.try_next().await? {
+        let row = &row;
         let Some(proto) = crate::conversation::stored_protocol(&row.api_version, row.request_id) else {
             continue;
         };
@@ -1758,6 +1763,7 @@ async fn compute_rule_activity(
             bump(&mut buckets, rule_id, Some(name.clone()), row.timestamp);
         }
     }
+    drop(rows);
 
     // ── Source 2: block actions — read transform_diff arrays directly ────
     // Bucketed by the `rule_id` every blocked entry persists.
@@ -1919,3 +1925,4 @@ async fn renumber_rules(
     }
     Ok(())
 }
+

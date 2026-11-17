@@ -190,7 +190,8 @@ services:
   admin-ui:
     <<: *security-defaults
     image: ${STOWAGE_IMAGE_ADMIN_UI}
-    mem_limit: 256M
+    # Fixed: 159 MB was measured at 500 active users (111 MB at 200).
+    mem_limit: 384M
     # No `env_file:` — same rule as the proxy, and for a sharper reason: this is
     # the browser-facing surface and it executes JavaScript, so a dependency
     # compromise reads whatever its environment holds. It is a presentation layer

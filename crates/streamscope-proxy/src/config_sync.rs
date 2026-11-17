@@ -89,7 +89,8 @@ impl<T: ?Sized> Interned<T> {
             return parse().into();
         };
         let lock = || self.by_digest.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(held) = lock().get(&digest).and_then(std::sync::Weak::upgrade) {
+        let held = lock().get(&digest).and_then(std::sync::Weak::upgrade);
+        if let Some(held) = held {
             return held;
         }
         // Parsed outside the lock; two tenants parsing one value at once keep
