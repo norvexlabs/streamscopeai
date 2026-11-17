@@ -82,7 +82,9 @@ pub struct ProxySettings {
     // -- Session detector --
     /// LRU entries per user. Env: `SESSION_DETECTOR_CAPACITY`. Default: 50.
     pub session_detector_capacity: usize,
-    /// Global memory cap (~30 MB at 1.5 KB/entry). Env: `SESSION_DETECTOR_MAX_ENTRIES`. Default: 20000.
+    /// Global cap, in entries; each entry holds its turn's message hashes (32 B
+    /// each), so a long session's entry is tens of KB. Env:
+    /// `SESSION_DETECTOR_MAX_ENTRIES`. Default: 20000.
     pub session_detector_max_entries: usize,
     /// Entry TTL. Must survive weekends/holidays. Env: `SESSION_DETECTOR_TTL_SECS`. Default: 604800 (7 days).
     pub session_detector_ttl: Duration,

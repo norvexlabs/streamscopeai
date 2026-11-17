@@ -2307,13 +2307,51 @@ pub fn extract_response_content(
 // Session Detection
 // ---------------------------------------------------------------------------
 
+/// A message's link hash in its 32 bytes, not its 64-character hex text: the
+/// detector keeps one per message of every recent turn, and a long session's
+/// turn repeats every hash before it. A lowercase hex hash (what the link
+/// hashes are) is its own bytes; any other text is held as a domain-separated
+/// SHA-256 of it, which no hex hash's bytes can equal short of a preimage.
+/// Written (the restart snapshot) as hex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkHash([u8; 32]);
+
+impl LinkHash {
+    pub fn of(hash: &str) -> Self {
+        let mut bytes = [0u8; 32];
+        let canonical = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if canonical && hex::decode_to_slice(hash, &mut bytes).is_ok() {
+            return Self(bytes);
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"streamscope-link-hash\0");
+        digest.update(hash.as_bytes());
+        Self(digest.finalize().into())
+    }
+}
+
+impl serde::Serialize for LinkHash {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut text = [0u8; 64];
+        hex::encode_to_slice(self.0, &mut text).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(std::str::from_utf8(&text).map_err(serde::ser::Error::custom)?)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LinkHash {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        Ok(Self::of(&text))
+    }
+}
+
 /// Entry tracking a recent turn for session detection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TurnEntry {
     pub request_id: Uuid,
     pub session_id: Uuid,
     pub turn_number: i32,
-    pub message_hashes: Vec<String>,
+    pub message_hashes: Vec<LinkHash>,
     pub client_session_id: Option<String>,
     /// When this entry was recorded. Not serialized — on deserialization,
     /// defaults to `Instant::now()` so restored entries get a fresh TTL window.
@@ -2453,7 +2491,7 @@ fn epoch_millis() -> u64 {
 /// compaction (where the message array is replaced with a summary).
 ///
 /// **Two-tier memory model**:
-/// - `recent_turns` — heavy (each entry keeps its turn's message hashes, ~90 B a message).
+/// - `recent_turns` — heavy (each entry keeps its turn's message hashes, 32 B a message).
 ///   Evicted aggressively to cap memory.
 /// - `session_high_water` — lightweight map (session_id → max turn_number,
 ///   ~20 bytes/entry). Survives LRU eviction so that X-Session-Id sessions
@@ -2732,6 +2770,7 @@ impl SessionDetector {
     ///    the current message hashes start with a previous turn's hashes.
     /// 3. **New session** — no match found, start a new session.
     pub fn detect(&self, user_id: Uuid, key_id: Uuid, tenant_id: Uuid, current_hashes: &[String], client_session_id: Option<&str>) -> SessionInfo {
+        let current_hashes: Vec<LinkHash> = current_hashes.iter().map(|h| LinkHash::of(h)).collect();
         if current_hashes.is_empty() && client_session_id.is_none() {
             return SessionInfo {
                 session_id: Uuid::new_v4(),
@@ -2891,7 +2930,7 @@ impl SessionDetector {
             request_id,
             session_id: info.session_id,
             turn_number: info.turn_number,
-            message_hashes,
+            message_hashes: message_hashes.iter().map(|h| LinkHash::of(h)).collect(),
             client_session_id,
             recorded_at: now,
         };
@@ -4042,13 +4081,36 @@ mod tests {
         }
         assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 10, "at the cap, nothing goes");
         record(users[4]);
-        let held = |u: Uuid| detector.recent_turns.get(&(u, key_id)).map(|t| t.iter().map(|e| e.message_hashes[0].clone()).collect::<Vec<_>>());
-        assert_eq!(held(users[0]), Some(vec!["hash_5".to_string()]));
-        assert_eq!(held(users[1]), Some(vec!["hash_6".to_string()]));
-        assert_eq!(held(users[2]), Some(vec!["hash_2".to_string(), "hash_7".to_string()]));
-        assert_eq!(held(users[4]), Some(vec!["hash_4".to_string(), "hash_9".to_string(), "hash_10".to_string()]));
+        let held = |u: Uuid| detector.recent_turns.get(&(u, key_id)).map(|t| t.iter().map(|e| e.message_hashes[0]).collect::<Vec<_>>());
+        assert_eq!(held(users[0]), Some(vec![LinkHash::of("hash_5")]));
+        assert_eq!(held(users[1]), Some(vec![LinkHash::of("hash_6")]));
+        assert_eq!(held(users[2]), Some(vec![LinkHash::of("hash_2"), LinkHash::of("hash_7")]));
+        assert_eq!(held(users[4]), Some(vec![LinkHash::of("hash_4"), LinkHash::of("hash_9"), LinkHash::of("hash_10")]));
         assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 9);
         assert_eq!(detector.recent_turns.iter().map(|e| e.value().len()).sum::<usize>(), 9);
+    }
+
+    /// A hex link hash is held as its 32 bytes and written back as the same
+    /// hex; any other text is held by a separate digest, and a snapshot's hex
+    /// reads back to the same value.
+    #[test]
+    fn a_link_hash_is_its_32_bytes_and_round_trips_as_hex() {
+        let hex_hash = "ab".repeat(32);
+        let held = LinkHash::of(&hex_hash);
+        assert_eq!(held.0, [0xab; 32]);
+        assert_eq!(serde_json::to_string(&held).unwrap(), format!("\"{hex_hash}\""));
+        assert_eq!(serde_json::from_str::<LinkHash>(&format!("\"{hex_hash}\"")).unwrap(), held);
+        // Not a hex hash (upper case, another length, a non-hex character): its
+        // digest, never its bytes.
+        assert_ne!(LinkHash::of(&"AB".repeat(32)), held);
+        assert_ne!(LinkHash::of(&"ab".repeat(33)).0[..], [0xab; 33][..32]);
+        assert_ne!(LinkHash::of(&format!("{}zz", "ab".repeat(31))).0[..31], [0xab; 31]);
+        // Never the bytes of the hex of a text's own digest.
+        let digest_hex = hex::encode(Sha256::digest(b"h1"));
+        assert_ne!(LinkHash::of("h1"), LinkHash::of(&digest_hex));
+        assert_eq!(LinkHash::of("h1"), LinkHash::of("h1"));
+        assert_ne!(LinkHash::of("h1"), LinkHash::of("h2"));
+        assert_eq!(std::mem::size_of::<LinkHash>(), 32);
     }
 
     #[test]
@@ -4067,7 +4129,7 @@ mod tests {
                         request_id: Uuid::new_v4(),
                         session_id: Uuid::new_v4(),
                         turn_number: i,
-                        message_hashes: vec![format!("{u}-{i}")],
+                        message_hashes: vec![LinkHash::of(&format!("{u}-{i}"))],
                         client_session_id: None,
                         recorded_at: std::time::Instant::now(),
                     })

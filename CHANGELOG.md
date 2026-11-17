@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.60]
+
+- **The gateway's session tracking uses less memory.** The record of recent turns the gateway links
+  sessions with keeps each message's hash as 32 bytes rather than as text, about a third of the memory
+  per hash; long coding-agent sessions, whose every turn repeats the earlier messages' hashes, gain
+  the most.
+
 ## [2026.11.59]
 
 - **Security: the console's web framework is updated** (SvelteKit 3.1.1), fixing two high-severity

@@ -65,6 +65,7 @@ pub fn load_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use streamscope_core::proxy::content::LinkHash;
     use super::*;
 
     #[test]
@@ -82,7 +83,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 session_id: Uuid::new_v4(),
                 turn_number: 3,
-                message_hashes: vec!["h1".into(), "h2".into()],
+                message_hashes: vec![LinkHash::of("h1"), LinkHash::of("h2")],
                 client_session_id: Some("cs1".into()),
                 recorded_at: std::time::Instant::now(),
             }],
@@ -94,7 +95,7 @@ mod tests {
         let turns = loaded.get(&(user_id, key_id)).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].turn_number, 3);
-        assert_eq!(turns[0].message_hashes, vec!["h1", "h2"]);
+        assert_eq!(turns[0].message_hashes, vec![LinkHash::of("h1"), LinkHash::of("h2")]);
         assert_eq!(turns[0].client_session_id.as_deref(), Some("cs1"));
     }
 
