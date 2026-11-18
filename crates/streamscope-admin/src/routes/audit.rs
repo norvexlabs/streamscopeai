@@ -1805,6 +1805,64 @@ impl SessionListQuery {
     }
 }
 
+/// What a session is to the session it is linked to.
+#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLinkKind {
+    /// A sub-agent it spawned.
+    SubAgent,
+    /// The same conversation, continued after a compaction.
+    Continuation,
+}
+
+/// What a session link was read from.
+#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLinkEvidence {
+    /// The linked session's opening quotes the other's content: a call's
+    /// argument, or an answer.
+    Quote,
+    /// An expert's judgement, stated with high confidence.
+    AgentHigh,
+    /// An expert's judgement, stated with medium confidence.
+    AgentMedium,
+}
+
+/// Where in its parent's conversation a sub-agent was spawned.
+#[derive(Serialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct SpawnAnchor {
+    /// The parent's turn, as the conversation's events number it.
+    pub turn_number: i32,
+    /// The spawning tool call in that turn; absent when only the turn is
+    /// known (an expert's estimate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// The session a session is linked to, and how.
+#[derive(Serialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct SessionLink {
+    /// The session it is linked to: the parent of a sub-agent, the
+    /// conversation a continuation continues.
+    pub session_id: Uuid,
+    pub kind: SessionLinkKind,
+    pub evidence: SessionLinkEvidence,
+    /// A sub-agent's spawn point in `session_id`; absent for every other kind,
+    /// and when it is not known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawned_at: Option<SpawnAnchor>,
+}
+
+/// The sessions linked to a session, by kind.
+#[derive(Serialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct LinkedCounts {
+    /// Sub-agents it spawned.
+    pub sub_agents: i64,
+    /// The session that continues it after a compaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continued_in: Option<Uuid>,
+}
+
 /// Session summary for list view.
 // Decoded only inside the session store's row type, which fills `spend`.
 #[derive(Serialize, ToSchema, sqlx::FromRow)]
@@ -1842,19 +1900,16 @@ pub struct SessionSummary {
     pub alert_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_user_prompt: Option<String>,
+    /// The session this one is linked to, and how; absent when it is linked to
+    /// none the caller may see.
+    #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<Uuid>,
+    pub link: Option<SessionLink>,
+    /// The sessions linked to this one that the caller may see; absent when
+    /// there are none.
+    #[sqlx(skip)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub linkage_confidence: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub linkage_spawn_turn: Option<i32>,
-    /// Tool-call id of the spawn call in the parent this session was spawned from
-    /// (a CHILD only). The UI anchors the child card to the composite
-    /// `(linkage_spawn_turn, linkage_spawn_tool_call_id)` on the parent's stream.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub linkage_spawn_tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub child_count: Option<i64>,
+    pub links: Option<LinkedCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2003,17 +2058,14 @@ pub struct ConversationResponse {
     pub alert_expert_axis: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alert_note: Option<String>,
+    /// The session this one is linked to, and how; absent when it is linked to
+    /// none the caller may see.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<Uuid>,
+    pub link: Option<SessionLink>,
+    /// The sessions linked to this one that the caller may see; absent when
+    /// there are none.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub linkage_confidence: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub linkage_spawn_turn: Option<i32>,
-    /// This session's own spawn anchor as a CHILD — the tool-call id in its parent.
-    /// Present only when a spawn call was confirmed; the parent's stream anchors the
-    /// child card on `(linkage_spawn_turn, linkage_spawn_tool_call_id)`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub linkage_spawn_tool_call_id: Option<String>,
+    pub links: Option<LinkedCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2032,13 +2084,6 @@ pub struct ConversationResponse {
     pub end_user_groups: Vec<String>,
     /// Canonical request-level parameters per turn. Keyed by turn number.
     pub turn_params: Vec<TurnParams>,
-    /// Subagent spawn points detected in THIS session's own stream (the parent
-    /// side): each `Agent`/`Task`-style tool call, with the turn, id and a prompt
-    /// preview. Computed on read from the built events. The cluster judge confirms
-    /// a child↔spawn link from it, and the UI anchors child cards + content-matches
-    /// header-linked children that carry no stored anchor.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub detected_spawn_points: Vec<crate::conversation::DetectedSpawnPoint>,
 }
 
 /// `DomainRequestMeta` tagged with its turn number so the UI can attach the
@@ -2337,6 +2382,29 @@ pub async fn get_session_conversation_impl(
     //    only place it may render.
     let rows = timeline::turns(&mut *conn, session_id, format == ResponseFormat::Raw)
     .await?;
+    // The client session ids the session's turns came under, and its own id
+    // (an MCP-only session's, or one named by its client session id): what its
+    // MCP, web and A2A calls are correlated by.
+    let mut correlation: Vec<Uuid> = rows.iter().filter_map(|r| r.gateway_session_id).chain([session_id]).collect();
+    correlation.sort_unstable();
+    correlation.dedup();
+    // While the conversation was under way, give or take half an hour (MCP
+    // set-up before the first prompt, a long tool call after the last answer):
+    // a client session id outlives one conversation, so its calls outside that
+    // span are another's. A session with no turn (MCP-only) is its calls,
+    // whenever they were made. Only what the reader's view admits: one user's
+    // calls under one header may go through keys of several workspaces.
+    let span = {
+        const MARGIN: chrono::Duration = chrono::Duration::minutes(30);
+        let started = rows.iter().map(|r| r.timestamp - chrono::Duration::milliseconds(r.latency_total_ms.unwrap_or(0))).min();
+        let ended = rows.iter().map(|r| r.timestamp).max();
+        let (since, until) = match (started, ended) {
+            (Some(started), Some(ended)) => (started - MARGIN, ended + MARGIN),
+            _ => (chrono::DateTime::UNIX_EPOCH, chrono::Utc::now() + chrono::Duration::days(1)),
+        };
+        let (user, workspaces) = linked.linked_view();
+        timeline::CallScope { since, until, user, workspaces }
+    };
 
     // Fetch session-level alert + linkage info + app_id (the latter feeds
     // post-process re-classification so rules with `app_filter` evaluate
@@ -2367,11 +2435,9 @@ pub async fn get_session_conversation_impl(
         alert_level,
         alert_expert_axis,
         alert_note,
-        parent_session_id,
-        linkage_confidence,
-        linkage_spawn_turn,
+        link,
+        links,
         app_id: session_app_id,
-        linkage_spawn_tool_call_id,
     } = session_row.unwrap_or_default();
 
     // 2. Collect all unique message hashes across all turns
@@ -2586,10 +2652,8 @@ pub async fn get_session_conversation_impl(
             alert_level: alert_level.clone(),
             alert_expert_axis: alert_expert_axis.clone(),
             alert_note: alert_note.clone(),
-            parent_session_id,
-            linkage_confidence: linkage_confidence.clone(),
-            linkage_spawn_turn,
-            linkage_spawn_tool_call_id: linkage_spawn_tool_call_id.clone(),
+            link: link.clone(),
+            links: links.clone(),
             key_name: key_name.clone(),
             key_prefix: key_prefix.clone(),
             workspace_name: workspace_name.clone(),
@@ -2597,9 +2661,6 @@ pub async fn get_session_conversation_impl(
             end_user: end_user.clone(),
             end_user_groups: end_user_groups.clone(),
             turn_params: Vec::new(),
-            // Raw-turns format skips the event projection, so there is nothing to
-            // scan for spawn points.
-            detected_spawn_points: Vec::new(),
         });
     }
 
@@ -3004,8 +3065,10 @@ pub async fn get_session_conversation_impl(
     // the LLM and MCP paths — keyed on `user_id`, NOT `key_id`. So when
     // the agent stamps the same logical session id on `X-Session-Id`
     // (LLM) and `Mcp-Session-Id` (MCP), the two streams hash to the
-    // same UUID and join on `g.session_id` — never on `m.mcp_session_id`,
-    // which is the MCP transport's own session, not the client's.
+    // same UUID, and the MCP calls join on the `g.session_id` of the
+    // session's turns (`correlation`) — never on `m.mcp_session_id`,
+    // which is the MCP transport's own session, not the client's. A
+    // conversation's own id is its thread's, apart from that header.
     //
     // We collect MCP calls ordered by timestamp ASC, then merge them
     // into the LLM event stream by walking the existing `TurnBoundary`
@@ -3013,7 +3076,7 @@ pub async fn get_session_conversation_impl(
     // boundary whose timestamp exceeds the call's, matching the
     // agentic workflow (LLM proposes a tool → MCP dispatch happens
     // between turns → result → next turn picks up).
-    let mcp_rows = timeline::mcp_calls(&mut *conn, session_id)
+    let mcp_rows = timeline::mcp_calls(&mut *conn, &correlation, &span)
     .await
     .unwrap_or_else(|e| {
         tracing::warn!("session conversation mcp fetch: {e}");
@@ -3029,7 +3092,7 @@ pub async fn get_session_conversation_impl(
     // gateway row isn't stamped with the session id), so thread those by the
     // session's turn request ids. `w.tool_use_id` joins a substitution row to
     // its intercepted `ToolCall` + `guardrail_steps`.
-    let web_rows = timeline::web_calls(&mut *conn, session_id, &turn_request_ids)
+    let web_rows = timeline::web_calls(&mut *conn, &correlation, &turn_request_ids, &span)
     .await
     .unwrap_or_else(|e| {
         tracing::warn!("session conversation web fetch: {e}");
@@ -3040,12 +3103,23 @@ pub async fn get_session_conversation_impl(
     // same way: `gateway_audit.session_id` is hashed from the client's
     // `X-Session-Id` on every path, so an agent's LLM turns, its MCP tool calls,
     // and the agent-to-agent exchanges they triggered all join on one id.
-    let a2a_rows = timeline::a2a_calls(&mut *conn, session_id)
+    let a2a_rows = timeline::a2a_calls(&mut *conn, &correlation, &span)
     .await
     .unwrap_or_else(|e| {
         tracing::warn!("session conversation a2a fetch: {e}");
         Vec::new()
     });
+
+    // Media calls made under the same client session ids: a media call is a
+    // turn of the session its client session id names, so the conversations
+    // under that id show it where it was made, as they show its MCP calls.
+    let media_rows = timeline::correlated_media(&mut *conn, session_id, &correlation, &span)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("session conversation media fetch: {e}");
+        Vec::new()
+    });
+    let events = interleave_media_calls(events, media_rows);
 
     // A `/mcp/web` call writes BOTH an mcp_audit and a web_audit row (same
     // request_id). Render it once — as the richer `web_call` — by dropping the
@@ -3073,7 +3147,6 @@ pub async fn get_session_conversation_impl(
         if !a2a_rows.is_empty() {
             merged = interleave_a2a_calls(merged, a2a_rows);
         }
-        let detected_spawn_points = crate::conversation::detect_spawn_points(&merged);
         return Ok(ConversationResponse {
             session_id,
             model,
@@ -3085,10 +3158,8 @@ pub async fn get_session_conversation_impl(
             alert_level,
             alert_expert_axis,
             alert_note,
-            parent_session_id,
-            linkage_confidence,
-            linkage_spawn_turn,
-            linkage_spawn_tool_call_id: linkage_spawn_tool_call_id.clone(),
+            link,
+            links,
             key_name,
             key_prefix,
             workspace_name,
@@ -3096,11 +3167,9 @@ pub async fn get_session_conversation_impl(
             end_user,
             end_user_groups,
             turn_params,
-            detected_spawn_points,
         });
     }
 
-    let detected_spawn_points = crate::conversation::detect_spawn_points(&events);
     Ok(ConversationResponse {
         session_id,
         model,
@@ -3112,10 +3181,8 @@ pub async fn get_session_conversation_impl(
         alert_level,
         alert_expert_axis,
         alert_note,
-        parent_session_id,
-        linkage_confidence,
-        linkage_spawn_turn,
-        linkage_spawn_tool_call_id,
+        link,
+        links,
         key_name,
         key_prefix,
         workspace_name,
@@ -3123,7 +3190,6 @@ pub async fn get_session_conversation_impl(
         end_user,
         end_user_groups,
         turn_params,
-        detected_spawn_points,
     })
 }
 
@@ -3194,6 +3260,44 @@ fn interleave_mcp_calls(
     merged
 }
 
+
+/// Splice the media calls made under the conversation's client session ids
+/// (`rows`, oldest first) into its events, each as a `MediaApiCall` just
+/// before the first turn boundary later than it — after the last one when
+/// none is — numbered as the turn before it (`0` before any).
+fn interleave_media_calls(events: Vec<ConversationEvent>, rows: Vec<timeline::TimelineTurn>) -> Vec<ConversationEvent> {
+    if rows.is_empty() {
+        return events;
+    }
+    let event_of = |row: &timeline::TimelineTurn, turn: i32| -> Option<ConversationEvent> {
+        let call: streamscope_core::api::domain_request::DomainMediaCall = row.media_call.decode("media_call", row.request_id)?;
+        let transform_diff = row.transform_diff.transform_diff(row.request_id);
+        Some(ConversationEvent::MediaApiCall {
+            media_call: Box::new(call),
+            turn,
+            is_new: true,
+            metadata: Some(turn_metadata(row, transform_diff)),
+        })
+    };
+    let mut merged: Vec<ConversationEvent> = Vec::with_capacity(events.len() + rows.len());
+    let mut rows = rows.into_iter().peekable();
+    let mut current_turn: i32 = 0;
+    for ev in events {
+        if let ConversationEvent::TurnBoundary { turn, timestamp: Some(ts) } = &ev
+            && let Ok(at) = chrono::DateTime::parse_from_rfc3339(ts)
+        {
+            while let Some(row) = rows.next_if(|r| r.timestamp <= at) {
+                merged.extend(event_of(&row, current_turn));
+            }
+            current_turn = *turn;
+        }
+        merged.push(ev);
+    }
+    for row in rows {
+        merged.extend(event_of(&row, current_turn));
+    }
+    merged
+}
 
 /// Sibling of `interleave_mcp_calls` — splices web rows into an already-merged
 /// (LLM + MCP) event stream by timestamp. Web rows that fire after the final

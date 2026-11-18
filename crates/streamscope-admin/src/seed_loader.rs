@@ -1726,33 +1726,6 @@ let y = 2;
         );
     }
 
-    /// The spawn-tool vocabulary the judge is taught (seed prose) MUST match the
-    /// code's single source of truth (`conversation::spawn::SPAWN_TOOL_NAMES`) —
-    /// detection and the prompt hint would silently drift otherwise. Both snippets
-    /// carry the exact backticked, comma-separated run built from the constant.
-    #[test]
-    fn seed_spawn_tool_list_matches_constant() {
-        let expected = crate::conversation::spawn::SPAWN_TOOL_NAMES
-            .iter()
-            .map(|n| format!("`{n}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let snippets: std::collections::HashMap<String, String> = repo_seed_loader()
-            .load_snippets()
-            .into_iter()
-            .map(|s| (s.key, s.content))
-            .collect();
-        for key in ["session_label", "session_cluster"] {
-            let content = snippets
-                .get(key)
-                .unwrap_or_else(|| panic!("snippet {key} missing from seeds/snippets"));
-            assert!(
-                content.contains(&expected),
-                "snippet {key} spawn-tool list drifted from SPAWN_TOOL_NAMES; expected the run: {expected}"
-            );
-        }
-    }
-
     #[test]
     fn seed_expert_frontmatter_matches_default_pools() {
         // The seeded topology this release ships: 5 session-path axes (incl.

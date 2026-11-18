@@ -9,7 +9,7 @@
   import { page } from '$app/state';
   import { scopeHref } from '#lib/tenant.js';
   import { tagClasses } from '#lib/components/TagBadge.svelte';
-  import { linkageTag } from '#lib/colormaps/linkage.js';
+  import { linkageTag, linkEvidenceLabel, linkedSessionLabel } from '#lib/colormaps/linkage.js';
   import { setSelfScoped, portalWorkspace, sessionHref } from '#lib/selfScoped.js';
   import { auditHref } from '#lib/deeplinks.js';
   import { eventMetadata, eventRaw, eventTurn, assertNever } from '#lib/api-types.js';
@@ -50,7 +50,6 @@
   import 'highlight.js/styles/github-dark-dimmed.css';
 
   type ConversationEvent = components['schemas']['ConversationEvent'];
-  type DetectedSpawnPoint = components['schemas']['DetectedSpawnPoint'];
   type WebAuditLogEntry = components['schemas']['WebAuditLogEntry'];
   type TurnParam = components['schemas']['TurnParams'];
   type TransformDiff = components['schemas']['TransformDiff'];
@@ -58,10 +57,9 @@
   interface Props {
     events: ConversationEvent[];
     turnParams?: TurnParam[];
+    /** Sessions linked under this one; a child is placed on the call its
+     *  `link.spawned_at` names. */
     linkedChildren?: LinkedSession[];
-    /** Spawn points detected in THIS session's stream — anchors child cards to
-     *  the exact `Agent`/`Task` call (and content-matches header-linked children). */
-    detectedSpawnPoints?: DetectedSpawnPoint[];
     /** Bindable OUT: session_ids of linked children this component rendered inline
      *  (anchored to a spawn call, or at a rendered turn boundary). The page excludes
      *  them from its bottom "Child Sessions" list so each child appears exactly once. */
@@ -82,7 +80,6 @@
     events,
     turnParams = [],
     linkedChildren = [],
-    detectedSpawnPoints = [],
     placedChildIds = $bindable(new Set<string>()),
     renderMode,
     viewMode,
@@ -107,53 +104,26 @@
   // A tool_call id is only turn-unique (Gemini/legacy synthesize a per-turn
   // `call_0`), so a child anchors to the composite (turn, id).
   const spawnKey = (turn: number, id: string) => `${turn}:${id}`;
-  const normPrompt = (s: string | null | undefined) =>
-    (s ?? '').toLowerCase().replace(/\s+/g, ' ').trim().slice(0, 120);
+  // Every tool call the stream renders, by its (turn, id).
+  const toolCallKeys = $derived.by(() => {
+    const keys = new Set<string>();
+    for (const e of events) if (e.type === 'tool_call') keys.add(spawnKey(e.turn, e.id));
+    return keys;
+  });
 
-  // Content-match a child's first message to a detected spawn point: exact
-  // normalized equality first, else the LONGEST prefix-overlap match, and only for
-  // a prompt long enough to disambiguate (short prompts over-match). Prevents
-  // anchoring the wrong sibling when previews share a prefix.
-  function contentMatch(child: LinkedSession): DetectedSpawnPoint | undefined {
-    const cp = normPrompt(child.first_user_prompt);
-    if (cp.length < 12) return undefined;
-    let best: DetectedSpawnPoint | undefined;
-    let bestLen = -1;
-    for (const p of detectedSpawnPoints) {
-      const pp = normPrompt(p.prompt_preview);
-      if (pp.length === 0) continue;
-      if (pp === cp) return p; // exact wins outright
-      if ((pp.startsWith(cp) || cp.startsWith(pp)) && pp.length > bestLen) {
-        best = p;
-        bestLen = pp.length;
-      }
-    }
-    return best;
-  }
-
-  /** Resolve each linked child to the EXACT spawn call it anchors to, when one is
-   *  identifiable: (1) the stored agent-confirmed anchor matched against a detected
-   *  point; (2) content-match of the child's first message to a detected point
-   *  (covers header-linked children that carry no stored anchor). Unmatched children
-   *  are left to the by-turn / linked-sessions fallback — never dropped. */
+  /** Each linked child placed on the call its `link.spawned_at` names, when the
+   *  stream renders that call. The rest fall to the by-turn placement, then
+   *  to the page's linked-sessions list — never dropped. */
   const spawnAnchoredChildren = $derived.by(() => {
     const byKey = new Map<string, LinkedSession[]>();
     const claimed = new Set<LinkedSession>();
     for (const child of linkedChildren) {
-      let match: DetectedSpawnPoint | undefined;
-      if (child.linkage_spawn_tool_call_id) {
-        match = detectedSpawnPoints.find(
-          (p) =>
-            p.tool_call_id === child.linkage_spawn_tool_call_id &&
-            (child.linkage_spawn_turn == null || p.turn_number === child.linkage_spawn_turn),
-        );
-      }
-      if (!match) match = contentMatch(child);
-      if (match) {
-        const key = spawnKey(match.turn_number, match.tool_call_id);
-        (byKey.get(key) ?? byKey.set(key, []).get(key)!).push(child);
-        claimed.add(child);
-      }
+      const at = child.link?.spawned_at;
+      if (!at?.tool_call_id) continue;
+      const key = spawnKey(at.turn_number, at.tool_call_id);
+      if (!toolCallKeys.has(key)) continue;
+      (byKey.get(key) ?? byKey.set(key, []).get(key)!).push(child);
+      claimed.add(child);
     }
     return { byKey, claimed };
   });
@@ -165,7 +135,7 @@
     const { claimed } = spawnAnchoredChildren;
     for (const child of linkedChildren) {
       if (claimed.has(child)) continue;
-      const turn = child.linkage_spawn_turn ?? -1;
+      const turn = child.link?.spawned_at?.turn_number ?? -1;
       if (!map.has(turn)) map.set(turn, []);
       map.get(turn)!.push(child);
     }
@@ -259,16 +229,18 @@
 {#snippet childCard(child: LinkedSession)}
   <a href={sessionHref(slug, page.url.pathname, child.session_id, viewedWorkspace())} class="mt-2 flex items-center gap-3 px-4 py-3 rounded-lg border border-(--accent) bg-(--accent)/5 hover:bg-(--accent)/10 transition-colors">
     <div class="flex-1 min-w-0">
-      <p class="text-sm text-(--text-primary) line-clamp-1">{child.first_user_prompt || m.conv_sub_agent_session()}</p>
+      <p class="text-sm text-(--text-primary) line-clamp-1">{child.first_user_prompt || (child.link ? linkedSessionLabel(child.link.kind) : '--')}</p>
       <div class="flex items-center gap-2 mt-0.5 text-[10px] text-(--text-secondary)">
         {#if child.app_id}<span>{child.app_id}</span><span>&middot;</span>{/if}
         <span>{child.turn_count === 1 ? m.conv_turn({ count: child.turn_count }) : m.conv_turns({ count: child.turn_count })}</span>
         <span>&middot;</span>
         <span>{formatTokens(child.total_tokens)}</span>
-        {#if child.linkage_confidence}
+        {#if child.link}
+          <span>&middot;</span>
+          <span>{linkedSessionLabel(child.link.kind)}</span>
           <span class="px-1.5 py-0.5 text-[9px] font-semibold rounded-full border border-current/30
-            {tagClasses(linkageTag(child.linkage_confidence))}">
-            {child.linkage_confidence}
+            {tagClasses(linkageTag(child.link.evidence))}">
+            {linkEvidenceLabel(child.link.evidence)}
           </span>
         {/if}
       </div>

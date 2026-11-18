@@ -14,6 +14,7 @@ pub mod azure_entra;
 pub mod cache_embed;
 pub mod client;
 pub mod dispatch_gate;
+pub mod fingerprint;
 pub mod content;
 pub mod forward_body;
 pub mod google_sa;
@@ -26,6 +27,7 @@ pub mod media;
 pub mod minted_token;
 pub mod response_cache;
 pub mod routing;
+pub mod session_detector;
 
 /// Truncate `s` to at most `max_chars` UTF-8 characters. When truncation occurs,
 /// appends the Unicode ellipsis `…` (U+2026) as a surface marker so operators /
@@ -148,7 +150,7 @@ pub struct AppState {
     pub http_client: UpstreamClient,
     pub tenant_registry: crate::config::TenantRegistry,
     pub audit_tx: crate::audit::AuditSender<AuditRecord>,
-    pub session_detector: content::SessionDetector,
+    pub session_detector: session_detector::SessionDetector,
     /// In-flight request-phase snapshots for out-of-band inline-AI (`/v1/analyze`)
     /// exchanges, held between the request-phase and response-phase calls so the
     /// response half can finalize one complete audit row through the real
@@ -261,7 +263,11 @@ pub struct ContentMeta {
     pub transform_diff: Option<serde_json::Value>,
     /// The session-link hash of each message (`RequestContent::link_hashes`) — never a content-store key.
     pub link_hashes: Vec<String>,
-    pub session_info: content::SessionInfo,
+    pub session_info: session_detector::SessionInfo,
+    /// Where the message the conversation opens with is among
+    /// `request_messages_json` (`RequestContent::opening`); `None` when the
+    /// request names no thread.
+    pub opening: Option<usize>,
     pub request_size_bytes: usize,
     pub first_user_prompt: Option<String>,
 }
@@ -308,8 +314,10 @@ pub struct RequestMeta {
     /// substitution) stores this same hashed form — never the raw header —
     /// so cross-protocol rows correlate directly on the column.
     pub session_id: Option<uuid::Uuid>,
-    /// Deterministic UUID derived from `X-Parent-Session-Id` header (hierarchical session linking).
-    pub parent_session_id: Option<uuid::Uuid>,
+    /// The conversation session the session detector gave the request — what
+    /// the mixed-pending park files a result under, for the conversation's
+    /// next turn. `None` where nothing is parked (`/v1/analyze`).
+    pub conversation_session_id: Option<uuid::Uuid>,
     pub user_agent: Option<String>,
     pub detection_method: Option<String>,
     /// Forwarded end-client identity — set only for Inline AI traffic, where a
@@ -383,12 +391,12 @@ pub struct RequestMeta {
     /// until the LAST copy goes, which is the end of the request by any path.
     pub gate_permit: Option<Arc<crate::proxy::dispatch_gate::GatePermit>>,
     /// The request's place among those being served
-    /// ([`content::SessionDetector::detect_serving`]): an identical request is
+    /// ([`session_detector::SessionDetector::detect_serving`]): an identical request is
     /// a re-send of it until it is released — by a streamed body the moment it
     /// ends, else with the last copy of the meta (the end of the request by any
     /// path). The audit task keeps the meta past a stream's last byte, which is
     /// why the body releases it first.
-    pub serving: Option<Arc<content::ServingGuard>>,
+    pub serving: Option<Arc<session_detector::ServingGuard>>,
     /// Tool-definition rewrites produced by `Substitute` / `InterceptOnly`
     /// rules at request phase. Empty when no such rules fired. Carried into
     /// the response pipeline so the `BlockAccumulator` (and the substitution
@@ -1230,7 +1238,7 @@ async fn proxy_handler_inner(
     // What makes a later request this same one sent again: read by the
     // detector (a re-send is the same turn) and the dispatch gate (it replaces
     // its waiting copy). Taken from the request as the client sent it.
-    let request_key = content::request_key(
+    let request_key = session_detector::request_key(
         ctx.user.user_id,
         key_id,
         attr.session_id.as_deref(),
@@ -1249,6 +1257,9 @@ async fn proxy_handler_inner(
         key_id,
         ctx.user.tenant_id,
         &pre_content.session_hashes,
+        // The gateway's MCP sampling loopback is activity of the MCP session
+        // its `X-Session-Id` names, never a conversation of its own.
+        pre_content.thread_root.filter(|_| !attr.mcp_sampling),
         attr.session_id.as_deref(),
         request_key,
     );
@@ -1385,9 +1396,9 @@ async fn proxy_handler_inner(
     let needs_translation = client_api_version != upstream_api_version;
 
     // 7d. Inbound mixed-pending splice. When the prior request in this
-    // session emitted both real and intercepted `tool_use` blocks in one
+    // conversation emitted both real and intercepted `tool_use` blocks in one
     // round, the agent loop dispatched the intercepted call and parked the
-    // result in `state.mixed_pending_cache`. Drain those entries here and
+    // result in `state.mixed_pending_cache` under the detected session. Drain those entries here and
     // append a synthesised `assistant tool_use → user tool_result` pair to
     // the conversation so the model sees what it asked for. No-op when the
     // cache is empty for this session (the typical case).
@@ -1396,8 +1407,7 @@ async fn proxy_handler_inner(
             &mut api_request,
             &state.mixed_pending_cache,
             ctx.user.tenant_id,
-            ctx.user.user_id,
-            attr.session_id.as_deref(),
+            session_info.session_id,
             client_api_version,
         );
 
@@ -1525,7 +1535,7 @@ async fn proxy_handler_inner(
     if flags.compression_applied {
         is_baseline = true;
     }
-    let final_info = content::SessionInfo {
+    let final_info = session_detector::SessionInfo {
         session_id: session_info.session_id,
         parent_request_id: session_info.parent_request_id,
         turn_number: session_info.turn_number,
@@ -1536,8 +1546,8 @@ async fn proxy_handler_inner(
         key_id,
         request_id,
         &final_info,
-        pre_content.session_hashes.clone(),
-        attr.session_id.clone(),
+        &pre_content.session_hashes,
+        attr.session_id.as_deref(),
     );
 
     // Emit the captured request content + transform diff to the audit row only
@@ -1573,6 +1583,7 @@ async fn proxy_handler_inner(
             transform_diff: serde_json::to_value(&transform_diff).ok(),
             link_hashes: pre_content.link_hashes,
             session_info: final_info,
+            opening: pre_content.opening.filter(|_| !attr.mcp_sampling),
             request_size_bytes: pre_content.request_size_bytes,
             first_user_prompt: pre_content.first_user_prompt,
         })
@@ -2220,9 +2231,6 @@ async fn proxy_handler_inner(
         badges.add_modified();
     }
 
-    // Derive deterministic UUID from X-Parent-Session-Id header (same SHA256 method as X-Session-Id).
-    // Hash is keyed on `user_id` so child sessions correlate across both LLM and MCP keys.
-    let parent_session_uuid = attr.parent_session_id.as_deref().map(|psid| content::session_id_from_client(psid, ctx.user.tenant_id, ctx.user.user_id));
     // A request that ran somewhere other than where it was sent says so: the
     // serving replica is on the row either way, so the move itself is the part
     // nothing else records.
@@ -2269,7 +2277,7 @@ async fn proxy_handler_inner(
             .session_id
             .as_deref()
             .map(|sid| content::session_id_from_client(sid, ctx.user.tenant_id, ctx.user.user_id)),
-        parent_session_id: parent_session_uuid,
+        conversation_session_id: Some(session_info.session_id),
         user_agent: attr.user_agent,
         detection_method: attr.detection_method,
         client_ip: attr.client_ip,
@@ -2503,12 +2511,12 @@ impl Drop for ActiveStreamGuard {
 fn hold_until_body_ends(
     response: Response,
     guard: ActiveStreamGuard,
-    serving: Option<Arc<content::ServingGuard>>,
+    serving: Option<Arc<session_detector::ServingGuard>>,
 ) -> Response {
     use futures::StreamExt;
     /// Releases the request's serving guard when the body ends or the client
     /// goes away — before the audit of it finishes, which holds the guard too.
-    struct ReleaseAtEnd(Option<Arc<content::ServingGuard>>);
+    struct ReleaseAtEnd(Option<Arc<session_detector::ServingGuard>>);
     impl Drop for ReleaseAtEnd {
         fn drop(&mut self) {
             if let Some(serving) = &self.0 {
@@ -3485,13 +3493,13 @@ pub(crate) mod tests {
             fn inc_http2(&self) {}
             fn inc_http11(&self) {}
         }
-        let detector = content::SessionDetector::new(20, std::time::Duration::from_secs(1800));
+        let detector = session_detector::SessionDetector::new(20, std::time::Duration::from_secs(1800));
         let (user, key) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-        let hashes = vec!["a".to_string()];
-        let request_key = content::request_key(user, key, None, "chat_completions", "m", true, b"a");
-        let served = |d: &content::SessionDetector| d.detect_serving(user, key, uuid::Uuid::nil(), &hashes, None, request_key);
+        let hashes = vec![session_detector::LinkHash::of("a")];
+        let request_key = session_detector::request_key(user, key, None, "chat_completions", "m", true, b"a");
+        let served = |d: &session_detector::SessionDetector| d.detect_serving(user, key, uuid::Uuid::nil(), &hashes, hashes.first().copied(), None, request_key);
         let (first, guard) = served(&detector);
-        detector.record(user, key, uuid::Uuid::new_v4(), &first, hashes.clone(), None);
+        detector.record(user, key, uuid::Uuid::new_v4(), &first, &hashes, None);
         let audit_share = Arc::new(guard);
         let (tx, rx) = futures::channel::mpsc::unbounded::<Result<bytes::Bytes, std::io::Error>>();
         let response = hold_until_body_ends(
@@ -3536,7 +3544,7 @@ pub(crate) mod tests {
             key_id: None,
             app_id: None,
             session_id: None,
-            parent_session_id: None,
+            conversation_session_id: None,
             user_agent: None,
             detection_method: None,
             client_ip: None,

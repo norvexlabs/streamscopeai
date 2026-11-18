@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::api::sse::ApiVersion;
+use crate::proxy::fingerprint::TurnFingerprints;
 use crate::settings::core_settings;
 
 /// Serde default for a conversion multiplier: no conversion.
@@ -420,9 +421,13 @@ pub struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_user_prompt: Option<String>,
 
-    // Hierarchical session linking (from X-Parent-Session-Id header)
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub parent_session_id: Option<uuid::Uuid>,
+    /// What a later conversation may quote of this turn — its answer and its
+    /// tool calls' arguments — and, on a turn that continues no earlier one,
+    /// what its opening message may quote. Read by the ingest to link
+    /// conversations by content.
+    #[serde(skip_serializing_if = "TurnFingerprints::is_empty", default)]
+    pub fingerprints: TurnFingerprints,
+
 
     // Upstream tracking
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -618,7 +623,7 @@ impl Default for AuditRecord {
             message_hashes: None,
             link_hashes: None,
             first_user_prompt: None,
-            parent_session_id: None,
+            fingerprints: TurnFingerprints::default(),
             upstream_server_id: None,
             endpoint_id: None,
             endpoint_url: None,

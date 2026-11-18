@@ -10,6 +10,7 @@ use crate::AdminState;
 
 pub mod auth;
 pub mod blobs;
+pub mod content_links;
 pub mod events;
 pub mod history;
 pub mod ingest;

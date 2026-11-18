@@ -51,9 +51,9 @@ const MAX_ENTRIES_PER_SESSION: usize = 32;
 #[derive(Debug, Clone)]
 pub struct MixedPendingEntry {
     /// Tenant guard: every read checks this matches the requesting tenant
-    /// before splicing. Defence-in-depth — the session_id UUID is already
-    /// tenant-scoped via `session_id_from_client(_, tenant_id, _)`, but a
-    /// hash collision or an internal bug shouldn't leak across tenants.
+    /// before splicing. Defence-in-depth — the conversation session id is
+    /// already random or hashed with the tenant (the session detector), but a
+    /// collision or an internal bug shouldn't leak across tenants.
     pub tenant_id: Uuid,
     /// Upstream-supplied `tool_use_id` for the intercepted call. Used as the
     /// `id` on the synthesised `assistant tool_use` block and the
@@ -245,8 +245,8 @@ mod tests {
         // belt-and-suspenders: a session UUID collision across tenants
         // shouldn't surface anything to either side, and the bucket
         // semantically belongs to whichever tenant queried first. In
-        // practice session_id_from_client incorporates tenant_id so a
-        // collision is cryptographically impossible.
+        // practice a conversation session id is random or hashed with the
+        // tenant, so a collision is cryptographically impossible.
         assert!(cache.drain_for_session(tenant_a, session).is_empty());
     }
 

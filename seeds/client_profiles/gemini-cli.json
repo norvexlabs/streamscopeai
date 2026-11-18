@@ -1,7 +1,7 @@
 {
   "id": "gemini-cli",
   "label": "Gemini CLI",
-  "targeted_client_version": "0.45.2",
+  "targeted_client_version": "0.68.0",
   "homepage": "https://google-gemini.github.io/gemini-cli/docs/get-started/configuration.html",
   "supports_llm": true,
   "supports_mcp": true,
@@ -15,7 +15,7 @@
       "project_filename": ".gemini/settings.json",
       "format": "json",
       "title": "Gemini CLI",
-      "instructions": "Place at the path above (or in a project-local `.gemini/settings.json`). Gemini CLI's settings.json does not have an `env` block — export the two API-key env vars in your shell (or in `~/.gemini/.env`, which the CLI auto-loads):\n\n```\nGEMINI_API_KEY={{api_key}}\nGOOGLE_GEMINI_BASE_URL={{base_url}}\n```\n\n{{#unless forward_auth}}The default model is pinned to `{{model_alias}}` in `settings.json`, so a bare `gemini -p \"...\"` uses it — override per run with `--model`. {{else}}This is a BYOK setup — set `GEMINI_API_KEY` to your own Google key (the gateway forwards it upstream) and your own models pass through; pick one per run with `gemini -p \"...\" --model <model>`. {{/unless}}Run with `gemini -p \"...\" --approval-mode yolo`. Usage statistics to Google and the update check are off (`privacy.usageStatisticsEnabled`, `general.enableAutoUpdate`, `general.enableAutoUpdateNotification`); an admin who wants them back can edit this template.",
+      "instructions": "Place at the path above (or in a project-local `.gemini/settings.json`). Gemini CLI's settings.json does not have an `env` block — export the two API-key env vars in your shell (or in `~/.gemini/.env`, which the CLI auto-loads):\n\n```\nGEMINI_API_KEY={{api_key}}\nGOOGLE_GEMINI_BASE_URL={{base_url}}\n```\n\n{{#unless forward_auth}}The default model is pinned to `{{model_alias}}` in `settings.json`, so a bare `gemini -p \"...\"` uses it — override per run with `--model`. The built-in subagents that name a Google model of their own (`codebase_investigator`, `cli_help`, `browser_agent`) are pinned to it too, under `agents.overrides`, and stay on it whatever `--model` says; `generalist` follows the session model. {{else}}This is a BYOK setup — set `GEMINI_API_KEY` to your own Google key (the gateway forwards it upstream) and your own models pass through; pick one per run with `gemini -p \"...\" --model <model>`. {{/unless}}Run with `gemini -p \"...\" --approval-mode yolo`. Usage statistics to Google and the update check are off (`privacy.usageStatisticsEnabled`, `general.enableAutoUpdate`, `general.enableAutoUpdateNotification`); an admin who wants them back can edit this template.",
       "mcp_auth_mode": "static",
       "companions": [
         {
@@ -27,7 +27,7 @@
         }
       ],
       "local_mcp": "config",
-      "body": "{\n  \"privacy\": { \"usageStatisticsEnabled\": false },\n  \"general\": { \"enableAutoUpdate\": false, \"enableAutoUpdateNotification\": false },\n  \"security\": { \"auth\": { \"selectedType\": \"gemini-api-key\" } }{{#unless forward_auth}},\n  \"model\": { \"name\": \"{{model_alias}}\" }{{/unless}}{{#if mcp_servers}},\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {{#if local}}{\n      \"command\": \"{{command}}\",\n      \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}},\n      \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{else}}{\n      \"httpUrl\": \"{{url}}\"{{#if headers}},\n      \"headers\": { {{#each headers}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{/if}}{{#unless @last}},{{/unless}}\n{{/each}}  }{{/if}}\n}\n"
+      "body": "{\n  \"privacy\": { \"usageStatisticsEnabled\": false },\n  \"general\": { \"enableAutoUpdate\": false, \"enableAutoUpdateNotification\": false },\n  \"security\": { \"auth\": { \"selectedType\": \"gemini-api-key\" } }{{#unless forward_auth}},\n  \"model\": { \"name\": \"{{model_alias}}\" },\n  \"agents\": { \"overrides\": {\n    \"codebase_investigator\": { \"modelConfig\": { \"model\": \"{{model_alias}}\" } },\n    \"cli_help\": { \"modelConfig\": { \"model\": \"{{model_alias}}\" } },\n    \"browser_agent\": { \"modelConfig\": { \"model\": \"{{model_alias}}\" } }\n  } }{{/unless}}{{#if mcp_servers}},\n  \"mcpServers\": {\n{{#each mcp_servers}}    \"{{slug}}\": {{#if local}}{\n      \"command\": \"{{command}}\",\n      \"args\": [{{#each args}}\"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}}]{{#if env}},\n      \"env\": { {{#each env}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{else}}{\n      \"httpUrl\": \"{{url}}\"{{#if headers}},\n      \"headers\": { {{#each headers}}\"{{name}}\": \"{{value}}\"{{#unless @last}}, {{/unless}}{{/each}} }{{/if}}\n    }{{/if}}{{#unless @last}},{{/unless}}\n{{/each}}  }{{/if}}\n}\n"
     },
     {
       "kind": "mcp",

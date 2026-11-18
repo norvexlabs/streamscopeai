@@ -82,10 +82,10 @@ pub struct ProxySettings {
     // -- Session detector --
     /// LRU entries per user. Env: `SESSION_DETECTOR_CAPACITY`. Default: 50.
     pub session_detector_capacity: usize,
-    /// Global cap, in entries; each entry holds its turn's message hashes (32 B
-    /// each), so a long session's entry is tens of KB. Env:
-    /// `SESSION_DETECTOR_MAX_ENTRIES`. Default: 20000.
-    pub session_detector_max_entries: usize,
+    /// Memory ceiling of the detector's recorded turns, in MB; unset sizes it
+    /// from the memory limit ([`ProxySettings::session_detector_max_bytes`]),
+    /// 0 is no ceiling. Env: `SESSION_DETECTOR_MAX_MB`. Default: unset.
+    pub session_detector_max_mb: Option<u64>,
     /// Entry TTL. Must survive weekends/holidays. Env: `SESSION_DETECTOR_TTL_SECS`. Default: 604800 (7 days).
     pub session_detector_ttl: Duration,
     /// Expired entry sweep interval. Env: `SESSION_PRUNE_INTERVAL_SECS`. Default: 3600.
@@ -302,7 +302,7 @@ impl Default for ProxySettings {
             qos_max_held_requests: 512,
             qos_metrics_poll_secs: 2,
             session_detector_capacity: 50,
-            session_detector_max_entries: 20_000,
+            session_detector_max_mb: None,
             session_detector_ttl: Duration::from_secs(7 * 24 * 3600),
             session_prune_interval: Duration::from_secs(3600),
             session_snapshot_interval_secs: 30,
@@ -351,20 +351,28 @@ impl Default for ProxySettings {
     }
 }
 
-/// The response cache's share of the process's memory limit when
-/// `RESPONSE_CACHE_MAX_MB` is unset, and its ceiling when the process has none.
-const RESPONSE_CACHE_LIMIT_PERCENT: u64 = 15;
-const RESPONSE_CACHE_NO_LIMIT_MB: u64 = 256;
+/// A cache's share of the process's memory: `percent` of the limit, never
+/// under `floor_mb`, and `no_limit_mb` when the process has no limit.
+struct MemoryShare {
+    percent: u64,
+    floor_mb: u64,
+    no_limit_mb: u64,
+}
 
-/// The response cache's byte ceiling: `explicit_mb` when set (0 refuses
-/// every store), else [`RESPONSE_CACHE_LIMIT_PERCENT`] of the process's memory
-/// `limit`, else [`RESPONSE_CACHE_NO_LIMIT_MB`].
-fn response_cache_bytes(explicit_mb: Option<u64>, limit: Option<u64>) -> u64 {
+/// The response cache when `RESPONSE_CACHE_MAX_MB` is unset.
+const RESPONSE_CACHE_SHARE: MemoryShare = MemoryShare { percent: 15, floor_mb: 0, no_limit_mb: 256 };
+/// The session detector when `SESSION_DETECTOR_MAX_MB` is unset: the floor is
+/// room for well over 20 000 recorded turns of long agent sessions.
+const SESSION_DETECTOR_SHARE: MemoryShare = MemoryShare { percent: 10, floor_mb: 32, no_limit_mb: 256 };
+
+/// A byte ceiling: `explicit_mb` when set (its 0 means what the setting says),
+/// else the `share` of the process's memory `limit`.
+fn memory_share_bytes(explicit_mb: Option<u64>, limit: Option<u64>, share: &MemoryShare) -> u64 {
     const MB: u64 = 1024 * 1024;
     match (explicit_mb, limit) {
         (Some(mb), _) => mb.saturating_mul(MB),
-        (None, Some(limit)) => limit / 100 * RESPONSE_CACHE_LIMIT_PERCENT,
-        (None, None) => RESPONSE_CACHE_NO_LIMIT_MB * MB,
+        (None, Some(limit)) => (limit / 100 * share.percent).max(share.floor_mb * MB),
+        (None, None) => share.no_limit_mb * MB,
     }
 }
 
@@ -455,7 +463,7 @@ impl ProxySettings {
             cfg.response_cache_max_entries_per_tenant
         );
         parse_setting!("SESSION_DETECTOR_CAPACITY", cfg.session_detector_capacity);
-        parse_setting!("SESSION_DETECTOR_MAX_ENTRIES", cfg.session_detector_max_entries);
+        parse_setting!("SESSION_DETECTOR_MAX_MB", cfg.session_detector_max_mb, opt);
         parse_setting!("SESSION_DETECTOR_TTL_SECS", cfg.session_detector_ttl, secs);
         parse_setting!("SESSION_PRUNE_INTERVAL_SECS", cfg.session_prune_interval, secs);
         parse_setting!("SESSION_SNAPSHOT_INTERVAL_SECS", cfg.session_snapshot_interval_secs);
@@ -567,8 +575,8 @@ impl ProxySettings {
                 self.session_detector_capacity.to_string(),
             ),
             (
-                "SESSION_DETECTOR_MAX_ENTRIES".to_string(),
-                self.session_detector_max_entries.to_string(),
+                "SESSION_DETECTOR_MAX_MB".to_string(),
+                self.session_detector_max_mb.map_or_else(String::new, |mb| mb.to_string()),
             ),
             (
                 "SESSION_DETECTOR_TTL_SECS".to_string(),
@@ -685,7 +693,14 @@ impl ProxySettings {
     /// Response-cache byte ceiling: the explicit `RESPONSE_CACHE_MAX_MB`, else
     /// 15% of this process's memory limit, else 256 MB when no limit is set.
     pub fn response_cache_max_bytes(&self) -> u64 {
-        response_cache_bytes(self.response_cache_max_mb, streamscope_core::cgroup::memory_limit_bytes())
+        memory_share_bytes(self.response_cache_max_mb, streamscope_core::cgroup::memory_limit_bytes(), &RESPONSE_CACHE_SHARE)
+    }
+
+    /// The session detector's byte ceiling (0 for none): `SESSION_DETECTOR_MAX_MB`
+    /// when set, else 10% of this process's memory limit but at least 32 MB,
+    /// else 256 MB when no limit is set.
+    pub fn session_detector_max_bytes(&self) -> u64 {
+        memory_share_bytes(self.session_detector_max_mb, streamscope_core::cgroup::memory_limit_bytes(), &SESSION_DETECTOR_SHARE)
     }
 
     /// Log any settings that differ from their compiled-in default.
@@ -718,6 +733,7 @@ mod tests {
     #[test]
     fn the_response_cache_is_explicit_else_15_percent_of_the_limit_else_256_mb() {
         const MB: u64 = 1024 * 1024;
+        let response_cache_bytes = |mb, limit| memory_share_bytes(mb, limit, &RESPONSE_CACHE_SHARE);
         assert_eq!(response_cache_bytes(None, Some(512 * MB)), 512 * MB / 100 * 15);
         assert_eq!(response_cache_bytes(None, Some(2048 * MB)), 2048 * MB / 100 * 15);
         assert_eq!(response_cache_bytes(None, None), 256 * MB);
@@ -725,6 +741,24 @@ mod tests {
         assert_eq!(response_cache_bytes(Some(1), Some(512 * MB)), MB);
         assert_eq!(response_cache_bytes(Some(300), None), 300 * MB);
         assert_eq!(response_cache_bytes(Some(u64::MAX), None), u64::MAX);
+    }
+
+    /// Unset sizes the detector from the limit (10%, never under 32 MB), with
+    /// no limit 256 MB; an explicit value wins, and 0 is no ceiling.
+    #[test]
+    fn the_session_detector_is_explicit_else_10_percent_of_the_limit_floored_else_256_mb() {
+        const MB: u64 = 1024 * 1024;
+        let session_detector_bytes = |mb, limit| memory_share_bytes(mb, limit, &SESSION_DETECTOR_SHARE);
+        assert_eq!(session_detector_bytes(None, Some(1024 * MB)), 1024 * MB / 100 * 10);
+        assert_eq!(session_detector_bytes(None, Some(4096 * MB)), 4096 * MB / 100 * 10);
+        // The floor, both sides of it.
+        assert_eq!(session_detector_bytes(None, Some(320 * MB)), 32 * MB);
+        assert_eq!(session_detector_bytes(None, Some(100 * MB)), 32 * MB);
+        assert_eq!(session_detector_bytes(None, Some(400 * MB)), 400 * MB / 100 * 10);
+        assert_eq!(session_detector_bytes(None, None), 256 * MB);
+        assert_eq!(session_detector_bytes(Some(0), Some(512 * MB)), 0);
+        assert_eq!(session_detector_bytes(Some(5), Some(512 * MB)), 5 * MB);
+        assert_eq!(session_detector_bytes(Some(u64::MAX), None), u64::MAX);
     }
 
     /// A blank value must read as "not set", because blank is itself the

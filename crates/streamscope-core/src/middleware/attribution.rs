@@ -9,8 +9,7 @@
 //!    only where a request carries a prompt
 //!    ([`Attribution::classify_by_system_prompt`]).
 //!
-//! Session and parent-session IDs are extracted from `X-Session-Id` and
-//! `X-Parent-Session-Id` headers for hierarchical session linking.
+//! The client session id is extracted from the `X-Session-Id` header.
 
 use axum::http::HeaderMap;
 
@@ -65,8 +64,10 @@ pub struct Attribution {
     pub user_id: uuid::Uuid,
     pub app_id: Option<String>,
     pub session_id: Option<String>,
-    /// Raw `X-Parent-Session-Id` header value (for hierarchical session linking).
-    pub parent_session_id: Option<String>,
+    /// The request is the gateway's own MCP sampling loopback
+    /// (`X-Mcp-Sampling-Depth`): its conversation is the MCP session its
+    /// `X-Session-Id` names, not a thread of its own.
+    pub mcp_sampling: bool,
     /// Raw User-Agent string (truncated to 256 chars).
     pub user_agent: Option<String>,
     /// How app_id was detected: "header", "referer", "user_agent", or None.
@@ -126,10 +127,7 @@ pub fn extract_attribution(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    let parent_session_id = headers
-        .get("x-parent-session-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    let mcp_sampling = headers.contains_key("x-mcp-sampling-depth");
 
     let user_agent = ua.map(|s| {
         if s.len() > MAX_USER_AGENT_LEN {
@@ -166,7 +164,7 @@ pub fn extract_attribution(
         user_id,
         app_id,
         session_id,
-        parent_session_id,
+        mcp_sampling,
         user_agent,
         detection_method,
         client_ip,
@@ -424,18 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parent_session_id_extracted() {
+    fn the_mcp_sampling_loopback_is_marked_by_its_header() {
         let mut headers = HeaderMap::new();
-        headers.insert("x-parent-session-id", HeaderValue::from_static("parent-abc-123"));
-        let attr = extract_attribution(&headers, uuid::Uuid::nil(), &test_patterns(), false);
-        assert_eq!(attr.parent_session_id.as_deref(), Some("parent-abc-123"));
-    }
-
-    #[test]
-    fn test_parent_session_id_absent() {
-        let headers = HeaderMap::new();
-        let attr = extract_attribution(&headers, uuid::Uuid::nil(), &test_patterns(), false);
-        assert_eq!(attr.parent_session_id, None);
+        assert!(!extract_attribution(&headers, uuid::Uuid::nil(), &[], false).mcp_sampling);
+        headers.insert("x-mcp-sampling-depth", "1".parse().unwrap());
+        assert!(extract_attribution(&headers, uuid::Uuid::nil(), &[], false).mcp_sampling);
     }
 
     fn prompt_patterns() -> Vec<AppPattern> {

@@ -966,6 +966,7 @@ pub async fn wipe_audit_sessions(
     for sql in [
         "DELETE FROM program_suggestions",
         "DELETE FROM tool_rule_suggestions",
+        "DELETE FROM turn_fingerprints",
         "DELETE FROM sessions",
     ] {
         sqlx::query(sql)

@@ -70,8 +70,10 @@ impl MixedPendingSpliceOutcome {
 /// outcome so the handler can attach the badge + injection blocks to its
 /// audit row.
 ///
-/// `client_session_id` — the client's `X-Session-Id` header. `None`
-/// short-circuits to a no-op (no cross-request continuity possible).
+/// `conversation_session_id` — the session the session detector gave this
+/// request: what parked the results is the turn it continues, in that session
+/// (a client session id shared by two conversations never carries one's
+/// results into the other).
 ///
 /// `client_api_version` — the protocol the client sent on. The splice
 /// re-serialises the modified `DomainRequest` back to this protocol so the
@@ -81,20 +83,13 @@ pub fn apply_inbound_mixed_pending_splice(
     api_request: &mut ApiRequest,
     cache: &MixedPendingCache,
     tenant_id: Uuid,
-    user_id: Uuid,
-    client_session_id: Option<&str>,
+    conversation_session_id: Uuid,
     client_api_version: ApiVersion,
 ) -> MixedPendingSpliceOutcome {
-    let Some(client_sid) = client_session_id else {
-        return MixedPendingSpliceOutcome::empty();
-    };
     if cache.ttl().is_zero() {
         return MixedPendingSpliceOutcome::empty();
     }
-    let session_uuid = crate::proxy::content::session_id_from_client(
-        client_sid, tenant_id, user_id,
-    );
-    let entries = cache.drain_for_session(tenant_id, session_uuid);
+    let entries = cache.drain_for_session(tenant_id, conversation_session_id);
     if entries.is_empty() {
         return MixedPendingSpliceOutcome::empty();
     }
@@ -315,26 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn no_session_id_is_noop() {
-        let cache = MixedPendingCache::new(Duration::from_secs(60));
-        let mut req = make_anthropic_request(None);
-        let out = apply_inbound_mixed_pending_splice(
-            &mut req,
-            &cache,
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            None,
-            ApiVersion::AnthropicMessages,
-        );
-        assert_eq!(out.spliced_count, 0);
-        assert_eq!(out.failed_count, 0);
-        // Original request untouched (3 messages).
-        if let ApiRequest::AnthropicMessages(r) = &req {
-            assert_eq!(r.messages.len(), 3);
-        }
-    }
-
-    #[test]
     fn empty_cache_is_noop() {
         let cache = MixedPendingCache::new(Duration::from_secs(60));
         let mut req = make_anthropic_request(None);
@@ -342,8 +317,7 @@ mod tests {
             &mut req,
             &cache,
             Uuid::new_v4(),
-            Uuid::new_v4(),
-            Some("client-session-1"),
+            crate::proxy::content::session_id_from_client("client-session-1", Uuid::new_v4(), Uuid::new_v4()),
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out.spliced_count, 0);
@@ -369,8 +343,7 @@ mod tests {
             &mut req,
             &cache,
             tenant,
-            user,
-            Some("client-session-1"),
+            session_uuid,
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out.spliced_count, 0);
@@ -393,8 +366,7 @@ mod tests {
             &mut req,
             &cache,
             tenant,
-            user,
-            Some("client-session-1"),
+            session_uuid,
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out.spliced_count, 1);
@@ -422,7 +394,7 @@ mod tests {
             let session = crate::proxy::content::session_id_from_client("s", tenant, user);
             cache.record(session, MixedPendingEntry { thought_signature: Some("Sig1".into()), ..make_entry(tenant) });
             let mut req = ApiRequest::parse(client, &bytes::Bytes::from(body.to_string())).unwrap();
-            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, user, Some("s"), client);
+            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, crate::proxy::content::session_id_from_client("s", tenant, user), client);
             (req, out)
         };
         let (req, out) = splice(
@@ -467,7 +439,7 @@ mod tests {
                     {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu_real", "content": "ok"}]}]}))
                 .unwrap(),
             );
-            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, user, Some("s"), ApiVersion::AnthropicMessages);
+            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, crate::proxy::content::session_id_from_client("s", tenant, user), ApiVersion::AnthropicMessages);
             assert_eq!(out.spliced_count, 1);
             let ApiRequest::AnthropicMessages(r) = &req else { unreachable!() };
             let kept = serde_json::to_value(&r.messages[1]).unwrap();
@@ -517,7 +489,7 @@ mod tests {
             let (tenant, user) = (Uuid::new_v4(), Uuid::new_v4());
             cache.record(crate::proxy::content::session_id_from_client("s", tenant, user), make_entry(tenant));
             let mut req = client.clone();
-            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, user, Some("s"), version);
+            let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, crate::proxy::content::session_id_from_client("s", tenant, user), version);
             assert_eq!(out.spliced_count, 1, "{version:?}");
             let sent: serde_json::Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
             let sent = sent[key].as_array().unwrap();
@@ -544,8 +516,7 @@ mod tests {
             &mut req1,
             &cache,
             tenant,
-            user,
-            Some("client-session-1"),
+            session_uuid,
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out1.spliced_count, 1);
@@ -555,8 +526,7 @@ mod tests {
             &mut req2,
             &cache,
             tenant,
-            user,
-            Some("client-session-1"),
+            session_uuid,
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out2.spliced_count, 0);
@@ -573,14 +543,13 @@ mod tests {
             user,
         );
         cache.record(session_a, make_entry(tenant));
-        // Different client session id → different gateway UUID → no splice.
+        // Another conversation session: no splice.
         let mut req = make_anthropic_request(None);
         let out = apply_inbound_mixed_pending_splice(
             &mut req,
             &cache,
             tenant,
-            user,
-            Some("session-b"),
+            crate::proxy::content::session_id_from_client("session-b", tenant, user),
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out.spliced_count, 0);
@@ -609,8 +578,7 @@ mod tests {
             &mut req,
             &cache,
             tenant_b,
-            user,
-            Some("client-session-1"),
+            crate::proxy::content::session_id_from_client("client-session-1", tenant_b, user),
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out.spliced_count, 0);
@@ -633,8 +601,7 @@ mod tests {
             &mut req,
             &cache,
             tenant,
-            user,
-            Some("client-session-1"),
+            session_uuid,
             ApiVersion::AnthropicMessages,
         );
         if let ApiRequest::AnthropicMessages(r) = &req {
@@ -671,8 +638,7 @@ mod tests {
             &mut req,
             &cache,
             tenant,
-            user,
-            Some("client-session-cc"),
+            crate::proxy::content::session_id_from_client("client-session-cc", tenant, user),
             ApiVersion::ChatCompletions,
         );
         assert_eq!(out.spliced_count, 1);
@@ -730,8 +696,7 @@ mod tests {
             &mut req,
             &cache,
             tenant,
-            user,
-            Some("client-session-1"),
+            session_uuid,
             ApiVersion::AnthropicMessages,
         );
         assert_eq!(out.spliced_count, 1);

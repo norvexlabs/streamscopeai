@@ -67,10 +67,10 @@ fn rig_with_metadata_cap(metadata_cap: u32) -> TestRig {
             .expect("upstream client builds offline"),
         tenant_registry: streamscope_core::config::new_tenant_registry(),
         audit_tx,
-        session_detector: streamscope_core::proxy::content::SessionDetector::with_capacity(
+        session_detector: streamscope_core::proxy::session_detector::SessionDetector::with_capacity(
             16,
             Duration::from_secs(60),
-            64,
+            1 << 20,
         ),
         inline_exchanges: streamscope_core::proxy::inline_exchange::InlineExchangeStore::default(),
         script_engine: Arc::new(streamscope_core::scripting::ScriptEngine::new()),

@@ -240,6 +240,9 @@ pub(crate) struct TimelineTurn {
     pub(crate) client_ip: Option<String>,
     pub(crate) end_user: Option<String>,
     pub(crate) end_user_groups: Option<Vec<String>>,
+    /// The client session id the turn came under (`gateway_audit.session_id`,
+    /// the hashed header): what its MCP, web and A2A calls are correlated by.
+    pub(crate) gateway_session_id: Option<Uuid>,
 }
 
 /// A JSON column read as stored, decoded into its type by the reader that
@@ -269,6 +272,11 @@ impl RawJson {
     }
 }
 
+/// The columns of a [`TimelineTurn`], read from `conversation_turns_resolved
+/// t` and its `g` / `a` / `us` / `ws` / `u` / `ak` joins, with `$2` (every
+/// prompt) and a `v` row (`opens_view`, `reads_whole`) in scope.
+const TURN_COLUMNS: &str = "t.request_id, t.timestamp, t.turn_number, t.is_baseline, t.response_content, t.response_tool_calls, t.response_citations, CASE WHEN $2 OR v.opens_view THEN t.system_prompt_hash END AS system_prompt_hash, t.transform_diff, v.reads_whole, CASE WHEN v.reads_whole THEN t.message_hashes ELSE t.added_hashes END AS message_hashes, t.message_count, t.parent_request_id, t.added_from, t.tools_available_hash, t.tools_effective_hash, t.request_params, t.event_type, t.api_version, a.prompt_tokens, a.completion_tokens, a.cache_creation_tokens, a.cache_read_tokens, a.reasoning_tokens, a.cost, a.cost_currency, a.finish_reason, a.latency_ttft_ms, g.latency_total_ms, a.model_used, a.model_requested, a.badges, g.error_category, g.status_code, g.error_detail, a.provider, a.media_call, a.chat_media_summary, us.name as upstream_server_name, ws.name as workspace_name, u.email as user_email, ak.name as key_name, ak.key_prefix, g.client_ip, g.end_user, g.end_user_groups, g.session_id AS gateway_session_id";
+
 /// Every turn of a session with its audit row, ordered by turn number.
 ///
 /// A turn's history is read whole on the session's first turn (one row: the
@@ -288,27 +296,8 @@ pub(crate) async fn turns(
     session_id: Uuid,
     every_prompt: bool,
 ) -> sqlx::Result<Vec<TimelineTurn>> {
-    sqlx::query_as(
-        "SELECT t.request_id, t.timestamp, t.turn_number, \
-         t.is_baseline, t.response_content, t.response_tool_calls, t.response_citations, \
-         CASE WHEN $2 OR v.opens_view THEN t.system_prompt_hash END AS system_prompt_hash, \
-         t.transform_diff, v.reads_whole, \
-         CASE WHEN v.reads_whole THEN t.message_hashes ELSE t.added_hashes END AS message_hashes, \
-         t.message_count, t.parent_request_id, t.added_from, t.tools_available_hash, t.tools_effective_hash, t.request_params, \
-         t.event_type, \
-         t.api_version, \
-         a.prompt_tokens, a.completion_tokens, \
-         a.cache_creation_tokens, a.cache_read_tokens, a.reasoning_tokens, \
-         a.cost, a.cost_currency, a.finish_reason, \
-         a.latency_ttft_ms, g.latency_total_ms, a.model_used, a.model_requested, a.badges, \
-         g.error_category, g.status_code, g.error_detail, \
-         a.provider, \
-         a.media_call, a.chat_media_summary, \
-         us.name as upstream_server_name, \
-         ws.name as workspace_name, \
-         u.email as user_email, \
-         ak.name as key_name, ak.key_prefix, \
-         g.client_ip, g.end_user, g.end_user_groups \
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {TURN_COLUMNS} \
          FROM conversation_turns_resolved t \
          LEFT JOIN gateway_audit g ON t.request_id = g.request_id AND t.timestamp = g.timestamp \
          LEFT JOIN llm_audit a ON t.request_id = a.request_id AND t.timestamp = a.timestamp \
@@ -331,17 +320,82 @@ pub(crate) async fn turns(
                              FROM (SELECT t.is_baseline OR t.request_id = f.first AS opens_view) o) v \
          WHERE t.session_id = $1 \
          ORDER BY t.turn_number, t.timestamp, t.request_id",
-    )
+    )))
     .bind(session_id)
     .bind(every_prompt)
     .fetch_all(&mut *conn)
     .await
 }
 
-/// The session's MCP gateway calls, joined on `g.session_id`, oldest first.
-pub(crate) async fn mcp_calls(
+/// The media calls made under the client session ids a conversation's turns
+/// came under (`correlation`) within `span` ([`CallScope`]), from other sessions than
+/// `session_id`: a media call under a client session id is a turn of the
+/// session that id names, and shows in the conversations that carry it. Read
+/// as [`turns`] reads a turn, oldest first.
+pub(crate) async fn correlated_media(
     conn: &mut Scoped,
     session_id: Uuid,
+    correlation: &[Uuid],
+    span: &CallScope,
+) -> sqlx::Result<Vec<TimelineTurn>> {
+    sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {TURN_COLUMNS} \
+         FROM conversation_turns_resolved t \
+         LEFT JOIN gateway_audit g ON t.request_id = g.request_id AND t.timestamp = g.timestamp {g_window} \
+         LEFT JOIN llm_audit a ON t.request_id = a.request_id AND t.timestamp = a.timestamp {a_window} \
+         LEFT JOIN upstream_servers us ON us.id = a.upstream_server_id \
+         LEFT JOIN api_keys ak ON ak.id = g.key_id \
+         LEFT JOIN workspaces ws ON ws.id = g.workspace_id \
+         LEFT JOIN users u ON g.user_id = u.id \
+         CROSS JOIN (SELECT false AS opens_view, false AS reads_whole) v \
+         WHERE t.session_id = ANY($1) AND t.session_id <> $3 AND t.event_type = 'media' {t_window} {view} \
+         ORDER BY t.timestamp, t.request_id",
+        view = call_view_sql(6, 7),
+        g_window = crate::audit_store::filters::window_sql(&["g.timestamp"], 4, 5),
+        a_window = crate::audit_store::filters::window_sql(&["a.timestamp"], 4, 5),
+        t_window = crate::audit_store::filters::window_sql(&["t.timestamp"], 4, 5),
+    )))
+    .bind(correlation)
+    .bind(false)
+    .bind(session_id)
+    .bind(span.since)
+    .bind(span.until)
+    .bind(span.user)
+    .bind(&span.workspaces)
+    .fetch_all(&mut *conn)
+    .await
+}
+
+/// Which of a session's correlated calls a read returns: those made from
+/// `since` to `until` — a client session id outlives one conversation (a
+/// constant header, a subagent under its parent's), so its calls are the
+/// conversation's only while it was under way — and only those the reader's
+/// view admits ([`AuditScope::linked_view`]: the portal member's own rows or a
+/// shared workspace's; `None` both, the whole tenant). One user's calls under
+/// one header may go through keys of several workspaces, and a call's content
+/// is shown only to a reader who may see its workspace.
+///
+/// [`AuditScope::linked_view`]: crate::audit_store::scope::AuditScope::linked_view
+pub(crate) struct CallScope {
+    pub(crate) since: chrono::DateTime<chrono::Utc>,
+    pub(crate) until: chrono::DateTime<chrono::Utc>,
+    pub(crate) user: Option<Uuid>,
+    pub(crate) workspaces: Option<Vec<Uuid>>,
+}
+
+/// The view condition of a correlated read on `g`, its user bound at `$u` and
+/// its workspaces at `$w`.
+fn call_view_sql(u: u32, w: u32) -> String {
+    format!(" AND (${u}::uuid IS NULL OR g.user_id = ${u}) AND (${w}::uuid[] IS NULL OR g.workspace_id = ANY(${w}))")
+}
+
+/// The session's MCP gateway calls — those under the client session ids its
+/// turns came under (`correlation`, [`TimelineTurn::gateway_session_id`], with
+/// the session's own id) within `span` ([`CallScope`]) — oldest first.
+pub(crate) async fn mcp_calls(
+    conn: &mut Scoped,
+    correlation: &[Uuid],
+    span: &CallScope,
 ) -> sqlx::Result<Vec<McpCallRowForSession>> {
     sqlx::query_as::<_, McpCallRowForSession>(sqlx::AssertSqlSafe(&*format!(
         "SELECT request_id, timestamp, m.method, m.tool_id, m.prompt_id, \
@@ -352,49 +406,71 @@ pub(crate) async fn mcp_calls(
          FROM {join} \
          LEFT JOIN mcp_virtual_servers vs ON vs.id = m.virtual_server_id \
          LEFT JOIN mcp_upstream_servers up ON up.id = m.upstream_server_id \
-         WHERE g.session_id = $1 \
+         WHERE g.session_id = ANY($1) {window} {view} \
          ORDER BY timestamp ASC",
         join = crate::audit_store::filters::MCP_AUDIT_JOIN,
+        window = crate::audit_store::filters::window_sql(crate::audit_store::filters::MCP_AUDIT_WINDOW, 2, 3),
+        view = call_view_sql(4, 5),
     )))
-    .bind(session_id)
+    .bind(correlation)
+    .bind(span.since)
+    .bind(span.until)
+    .bind(span.user)
+    .bind(&span.workspaces)
     .fetch_all(&mut *conn)
     .await
 }
 
-/// The session's web calls: the direct ones joined on `g.session_id`, and the
-/// substitution children of its turns (`turn_request_ids`), oldest first.
+/// The session's web calls within `span` ([`CallScope`]): the direct ones under the client
+/// session ids its turns came under (`correlation`, as [`mcp_calls`]), and
+/// the substitution children of its turns (`turn_request_ids`), oldest first.
 pub(crate) async fn web_calls(
     conn: &mut Scoped,
-    session_id: Uuid,
+    correlation: &[Uuid],
     turn_request_ids: &[Uuid],
+    span: &CallScope,
 ) -> sqlx::Result<Vec<WebCallRowForSession>> {
     sqlx::query_as::<_, WebCallRowForSession>(sqlx::AssertSqlSafe(&*format!(
         "SELECT {WEB_CALL_COLUMNS} \
          FROM {join} \
-         WHERE g.session_id = $1 \
-            OR w.parent_request_id = ANY($2) \
+         WHERE (g.session_id = ANY($1) \
+            OR w.parent_request_id = ANY($2)) {window} {view} \
          ORDER BY timestamp ASC",
         join = crate::audit_store::filters::WEB_AUDIT_JOIN,
+        window = crate::audit_store::filters::window_sql(crate::audit_store::filters::WEB_AUDIT_WINDOW, 3, 4),
+        view = call_view_sql(5, 6),
     )))
-    .bind(session_id)
+    .bind(correlation)
     .bind(turn_request_ids)
+    .bind(span.since)
+    .bind(span.until)
+    .bind(span.user)
+    .bind(&span.workspaces)
     .fetch_all(&mut *conn)
     .await
 }
 
-/// The session's A2A gateway calls, joined on `g.session_id`, oldest first.
+/// The session's A2A gateway calls, under the client session ids its turns
+/// came under (`correlation`, as [`mcp_calls`]) within `span` ([`CallScope`]), oldest first.
 pub(crate) async fn a2a_calls(
     conn: &mut Scoped,
-    session_id: Uuid,
+    correlation: &[Uuid],
+    span: &CallScope,
 ) -> sqlx::Result<Vec<A2aCallRowForSession>> {
     sqlx::query_as::<_, A2aCallRowForSession>(sqlx::AssertSqlSafe(&*format!(
         "SELECT {A2A_CALL_COLUMNS} \
          FROM {join} {A2A_CALL_JOINS} \
-         WHERE g.session_id = $1 \
+         WHERE g.session_id = ANY($1) {window} {view} \
          ORDER BY timestamp ASC",
         join = crate::audit_store::filters::A2A_AUDIT_JOIN,
+        window = crate::audit_store::filters::window_sql(crate::audit_store::filters::A2A_AUDIT_WINDOW, 2, 3),
+        view = call_view_sql(4, 5),
     )))
-    .bind(session_id)
+    .bind(correlation)
+    .bind(span.since)
+    .bind(span.until)
+    .bind(span.user)
+    .bind(&span.workspaces)
     .fetch_all(&mut *conn)
     .await
 }

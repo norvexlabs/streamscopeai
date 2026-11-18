@@ -16,7 +16,8 @@ use crate::db::tenant::Scoped;
 use crate::routes::{ApiError, SpendTotal, spend_total};
 use streamscope_core::pricing::Currency;
 use crate::routes::audit::{
-    LinkedSessions, SessionLinkage, SessionListQuery, SessionSort, SessionSummary,
+    LinkedCounts, LinkedSessions, SessionLink, SessionLinkEvidence, SessionLinkKind, SessionLinkage,
+    SessionListQuery, SessionSort, SessionSummary, SpawnAnchor,
 };
 use crate::routes::portal::PortalDataScope;
 
@@ -28,8 +29,8 @@ pub(crate) const SESSIONS_DEFAULT_LIMIT: i64 = 50;
 /// [`AuditScope::linked_view`] — both NULL for a tenant-wide reader. A linked
 /// session outside the view is not named: a child's parent id and its link's
 /// confidence, spawn turn and anchor read NULL, and a parent's hidden children
-/// are not counted. Session linkage is written per tenant (the agent's expert
-/// path, a client's parent header), so without this a portal row would say
+/// are not counted. Session links are written per tenant (the ingest's quote
+/// links, the agent's expert path), so without this a portal row would say
 /// that another member's session exists and how it is linked.
 #[derive(Clone, Copy)]
 struct LinkedView {
@@ -58,60 +59,148 @@ impl LinkedView {
         )
     }
 
-    /// The linkage relation where the session whose id is `child` is the
-    /// CHILD, joined to its parent member `pm`, kept only when the view admits
-    /// the parent. The one-parent-per-child partial-unique index makes it
-    /// single-valued.
-    fn as_child(self, child: &'static str) -> String {
+    /// The relation that links the session whose id is `linked` to the one it
+    /// came from — as a `child` of its parent or the `successor` of the
+    /// conversation it continues — joined to that other member `pm`, kept only
+    /// when the view admits it.
+    /// Every writer links a session at most once, so it is single-valued; a
+    /// read that needs one row takes [`UPWARD_ORDER`]'s first.
+    fn as_linked(self, linked: &'static str) -> String {
         format!(
             "FROM cross_session_relation_members cm \
-               JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = 'parent' \
-               JOIN cross_session_relations r ON r.id = cm.relation_id AND r.kind = 'linkage' \
-               WHERE cm.session_id = {child} AND cm.role = 'child' AND {admits}",
+               JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = {OTHER_ROLE} \
+               JOIN cross_session_relations r ON r.id = cm.relation_id AND r.kind IN {LINK_KINDS} \
+               WHERE cm.session_id = {linked} AND cm.role IN {UPWARD_ROLES} AND {admits}",
             admits = self.admits("pm.session_id"),
         )
     }
 
-    /// The lateral join `lk` carrying session `s`'s link as a CHILD, read once
-    /// per row: its parent, the link's confidence (`'header'` for a
-    /// header-origin link, `'high'`/`'medium'` for an agent link, as stored),
-    /// spawn turn, and spawn anchor — the tool-call id of the `Agent`/`Task`
-    /// call in the parent it was spawned from (NULL for header-origin linkage
-    /// and unconfirmed agent links). Every read of [`LINKAGE_COLUMNS`] or
-    /// [`LINKAGE_SPAWN_ANCHOR`] joins it after `sessions s`.
+    /// The lateral joins carrying session `s`'s links, read once per row:
+    /// - `lk`, its own link ([`Self::as_linked`]): the session it is linked
+    ///   to, the link's kind, its confidence as stored (`'content'` for a link
+    ///   the ingest read from a quote, `'high'`/`'medium'` for an agent link),
+    ///   spawn turn, and spawn anchor —
+    ///   the tool-call id of the call in the parent a child was spawned from
+    ///   (NULL for every other link);
+    /// - `lf`, the sessions linked to it ([`Self::linked_from`]): how many
+    ///   children, and the first continuation.
+    ///
+    /// Every read of [`LINKAGE_COLUMNS`] joins it after `sessions s`.
     fn join(self) -> String {
         format!(
-            "LEFT JOIN LATERAL (SELECT pm.session_id AS parent_session_id, \
+            "LEFT JOIN LATERAL (SELECT pm.session_id AS parent_session_id, r.kind AS linkage_kind, \
                r.confidence AS linkage_confidence, r.spawn_turn AS linkage_spawn_turn, \
                r.spawn_tool_call_id AS linkage_spawn_tool_call_id \
-               {child} LIMIT 1) lk ON true",
-            child = self.as_child("s.session_id"),
+               {linked} ORDER BY {UPWARD_ORDER} LIMIT 1) lk ON true \
+             LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE r.kind = 'linkage')::bigint AS sub_agents, \
+               (array_agg(cm.session_id ORDER BY r.created_at, r.id) \
+                  FILTER (WHERE r.kind = 'continuation'))[1] AS continued_in \
+               {linked_from}) lf ON true",
+            linked = self.as_linked("s.session_id"),
+            linked_from = self.linked_from(),
         )
     }
 
-    /// Number of children the view admits linked to session `s` (it is the
-    /// `parent` member of each relation, whose one child is `cm`).
-    fn child_count(self) -> String {
+    /// The sessions linked to session `s` — its children, its continuation —
+    /// that the view admits: `s` is the other member `m` of each
+    /// relation, whose linked member is `cm`.
+    fn linked_from(self) -> String {
         format!(
-            "(SELECT COUNT(*) FROM cross_session_relation_members m \
-               JOIN cross_session_relation_members cm ON cm.relation_id = m.relation_id AND cm.role = 'child' \
-               WHERE m.session_id = s.session_id AND m.role = 'parent' AND {admits})::bigint",
+            "FROM cross_session_relation_members m \
+               JOIN cross_session_relation_members cm ON cm.relation_id = m.relation_id AND cm.role IN {UPWARD_ROLES} \
+               JOIN cross_session_relations r ON r.id = m.relation_id AND r.kind IN {LINK_KINDS} \
+               WHERE m.session_id = s.session_id AND m.role = {OTHER_ROLE} AND {admits}",
             admits = self.admits("cm.session_id"),
         )
     }
 }
 
+/// The relation kinds that link one session to another; `issue` groups.
+const LINK_KINDS: &str = "('linkage', 'continuation')";
+/// The role of the session a link starts from, in each kind.
+const UPWARD_ROLES: &str = "('child', 'successor')";
+/// The role of the session the linked member `cm` is linked to.
+const OTHER_ROLE: &str = "(CASE cm.role WHEN 'child' THEN 'parent' ELSE 'predecessor' END)";
+/// Which of a session's links a one-row read names, should two writers have
+/// raced past each other's guard: a child link first, then the oldest.
+const UPWARD_ORDER: &str = "(cm.role <> 'child'), r.created_at, r.id";
+
 /// The view of a read whose one own parameter is `$1`: the view's user and
 /// workspaces are bound at `$2` / `$3`, right after it.
 const LINKED_AT_2: LinkedView = LinkedView { user: 2, workspaces: 3 };
 
-/// The `(parent_session_id, linkage_confidence, linkage_spawn_turn)` trio, read
-/// from [`LinkedView::join`]'s `lk`.
-const LINKAGE_COLUMNS: &str =
-    "lk.parent_session_id, lk.linkage_confidence, lk.linkage_spawn_turn";
+/// A session's links as [`LinkColumns`] decodes them, read from
+/// [`LinkedView::join`]'s `lk` and `lf`.
+const LINKAGE_COLUMNS: &str = "lk.parent_session_id AS link_session_id, lk.linkage_kind AS link_kind, \
+     lk.linkage_confidence AS link_confidence, lk.linkage_spawn_turn AS link_spawn_turn, \
+     lk.linkage_spawn_tool_call_id AS link_spawn_tool_call_id, \
+     lf.sub_agents AS links_sub_agents, \
+     lf.continued_in AS links_continued_in";
 
-/// The spawn anchor, read from [`LinkedView::join`]'s `lk`.
-const LINKAGE_SPAWN_ANCHOR: &str = "lk.linkage_spawn_tool_call_id";
+/// A session's links as [`LINKAGE_COLUMNS`] reads them: its own link and the
+/// sessions linked to it, in the store's vocabulary until [`Self::link`] and
+/// [`Self::links`] state them in the API's.
+#[derive(sqlx::FromRow, Default)]
+pub(crate) struct LinkColumns {
+    link_session_id: Option<Uuid>,
+    link_kind: Option<String>,
+    link_confidence: Option<String>,
+    link_spawn_turn: Option<i32>,
+    link_spawn_tool_call_id: Option<String>,
+    links_sub_agents: Option<i64>,
+    links_continued_in: Option<Uuid>,
+}
+
+impl LinkColumns {
+    /// The session this one is linked to, and how. A spawn point is stated for
+    /// a sub-agent only, and only when its turn is known.
+    fn link(&self) -> Option<SessionLink> {
+        let kind = link_kind(self.link_kind.as_deref()?)?;
+        let spawned_at = (kind == SessionLinkKind::SubAgent)
+            .then_some(self.link_spawn_turn)
+            .flatten()
+            .map(|turn_number| SpawnAnchor {
+                turn_number,
+                tool_call_id: self.link_spawn_tool_call_id.clone(),
+            });
+        Some(SessionLink {
+            session_id: self.link_session_id?,
+            kind,
+            evidence: link_evidence(self.link_confidence.as_deref()),
+            spawned_at,
+        })
+    }
+
+    /// The sessions linked to this one; `None` when there are none.
+    fn links(&self) -> Option<LinkedCounts> {
+        let counts = LinkedCounts {
+            sub_agents: self.links_sub_agents.unwrap_or(0),
+            continued_in: self.links_continued_in,
+        };
+        (counts.sub_agents > 0 || counts.continued_in.is_some()).then_some(counts)
+    }
+}
+
+/// A link kind as stored, in the API's vocabulary. [`LINK_KINDS`] is the set
+/// a read admits, so any other value is no link.
+fn link_kind(stored: &str) -> Option<SessionLinkKind> {
+    match stored {
+        "linkage" => Some(SessionLinkKind::SubAgent),
+        "continuation" => Some(SessionLinkKind::Continuation),
+        _ => None,
+    }
+}
+
+/// A link's stored confidence as the evidence it names. The ingest writes
+/// `content`; every other value is an expert's, whose parser reads anything
+/// but `high` as `medium`.
+fn link_evidence(stored: Option<&str>) -> SessionLinkEvidence {
+    match stored {
+        Some("content") => SessionLinkEvidence::Quote,
+        Some("high") => SessionLinkEvidence::AgentHigh,
+        _ => SessionLinkEvidence::AgentMedium,
+    }
+}
 
 /// A [`SessionSummary`] as the row states it: the summary's own columns, and
 /// the session's spend still as its running total and the classification of
@@ -122,6 +211,8 @@ const LINKAGE_SPAWN_ANCHOR: &str = "lk.linkage_spawn_tool_call_id";
 struct SessionSummaryRow {
     #[sqlx(flatten)]
     summary: SessionSummary,
+    #[sqlx(flatten)]
+    links: LinkColumns,
     total_cost: f64,
     cost_currency: Option<String>,
     cost_currency_count: i16,
@@ -156,6 +247,8 @@ impl SessionSummaryRow {
     fn into_summary(self, fallback: Currency) -> SessionSummary {
         SessionSummary {
             spend: session_spend(self.cost_currency_count, self.cost_currency, self.total_cost, fallback),
+            link: self.links.link(),
+            links: self.links.links(),
             ..self.summary
         }
     }
@@ -174,8 +267,8 @@ async fn into_summaries(conn: &mut Scoped, rows: Vec<SessionSummaryRow>) -> Vec<
 
 /// The columns of a [`SessionSummary`] every read takes from `sessions s` and
 /// its linkage, named as the [`SessionSummaryRow`]'s fields. Each read adds the rest by name
-/// — `model_requested`, `child_count`, `workspace_name`, `provider`,
-/// `key_name`, `key_prefix`, `linkage_spawn_tool_call_id` — as a typed NULL
+/// — `model_requested`, `workspace_name`, `provider`, `key_name`,
+/// `key_prefix` — as a typed NULL
 /// where it has none, so the summary decodes by name, never by position. A read
 /// of them joins its view's [`LinkedView::join`].
 fn summary_columns() -> &'static str {
@@ -223,20 +316,18 @@ async fn linked_sessions(
 ) -> Result<LinkedSessions, ApiError> {
     let (view_user, view_workspaces) = scope.linked_view();
 
-    // The session's parent, from the linkage relation where it is the child,
-    // only when the view admits it.
+    // The session it is linked to (its parent, the conversation it
+    // continues), only when the view admits it.
     let parent = sqlx::query_as::<_, SessionSummaryRow>(sqlx::AssertSqlSafe(&*format!(
         "SELECT {summary}, \
-         NULL::text AS model_requested, {child_count} AS child_count, \
+         NULL::text AS model_requested, \
          NULL::text AS workspace_name, NULL::text AS provider, \
-         NULL::text AS key_name, NULL::text AS key_prefix, \
-         NULL::text AS linkage_spawn_tool_call_id \
+         NULL::text AS key_name, NULL::text AS key_prefix \
          FROM sessions s {join} \
-         WHERE s.session_id = (SELECT pm.session_id {child} LIMIT 1)",
+         WHERE s.session_id = (SELECT pm.session_id {linked} ORDER BY {UPWARD_ORDER} LIMIT 1)",
         summary = summary_columns(),
         join = LINKED_AT_2.join(),
-        child_count = LINKED_AT_2.child_count(),
-        child = LINKED_AT_2.as_child("$1"),
+        linked = LINKED_AT_2.as_linked("$1"),
     )))
     .bind(session_id)
     .bind(view_user)
@@ -248,19 +339,20 @@ async fn linked_sessions(
         ApiError::internal("Failed to query linked parent session")
     })?;
 
-    // The children (sessions whose parent is this one) the view admits. Only a
-    // CHILD anchors to a spawn call.
+    // The sessions linked to this one (its children, its continuation) the
+    // view admits, each naming its link. Only a sub-agent anchors
+    // to a spawn point.
     let children = sqlx::query_as::<_, SessionSummaryRow>(sqlx::AssertSqlSafe(&*format!(
         "SELECT {summary}, \
-         NULL::text AS model_requested, 0::bigint AS child_count, \
+         NULL::text AS model_requested, \
          NULL::text AS workspace_name, NULL::text AS provider, \
-         NULL::text AS key_name, NULL::text AS key_prefix, \
-         {LINKAGE_SPAWN_ANCHOR} \
+         NULL::text AS key_name, NULL::text AS key_prefix \
          FROM sessions s {join} \
-         WHERE EXISTS (SELECT 1 FROM cross_session_relation_members cm \
-                JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = 'parent' \
-                WHERE cm.session_id = s.session_id AND cm.role = 'child' AND pm.session_id = $1) \
-         AND {admits} \
+         WHERE s.session_id IN (SELECT cm.session_id FROM cross_session_relation_members pm \
+                JOIN cross_session_relation_members cm ON cm.relation_id = pm.relation_id \
+                  AND cm.role IN {UPWARD_ROLES} AND pm.role = {OTHER_ROLE} \
+                WHERE pm.session_id = $1) \
+         AND lk.parent_session_id = $1 AND {admits} \
          ORDER BY s.created_at",
         summary = summary_columns(),
         join = LINKED_AT_2.join(),
@@ -283,20 +375,29 @@ async fn linked_sessions(
     Ok(LinkedSessions { parent, children: summaries })
 }
 
-/// A session's alert, linkage and `app_id`, for its conversation.
-#[derive(sqlx::FromRow, Default)]
+/// A session's alert, links and `app_id`, for its conversation.
+#[derive(Default)]
 pub(crate) struct ConversationSessionRow {
     pub alert_level: Option<String>,
     pub alert_expert_axis: Option<String>,
     pub alert_note: Option<String>,
-    pub parent_session_id: Option<Uuid>,
-    pub linkage_confidence: Option<String>,
-    pub linkage_spawn_turn: Option<i32>,
+    pub link: Option<SessionLink>,
+    pub links: Option<LinkedCounts>,
     pub app_id: Option<String>,
-    pub linkage_spawn_tool_call_id: Option<String>,
 }
 
-/// The conversation's session row; its linkage names a parent only when
+/// [`ConversationSessionRow`] as the row states it.
+#[derive(sqlx::FromRow)]
+struct ConversationSessionColumns {
+    alert_level: Option<String>,
+    alert_expert_axis: Option<String>,
+    alert_note: Option<String>,
+    app_id: Option<String>,
+    #[sqlx(flatten)]
+    links: LinkColumns,
+}
+
+/// The conversation's session row; its links name a session only when
 /// `scope`'s [`AuditScope::linked_view`] admits it.
 pub(crate) async fn conversation_session(
     conn: &mut Scoped,
@@ -304,9 +405,8 @@ pub(crate) async fn conversation_session(
     scope: &AuditScope,
 ) -> sqlx::Result<Option<ConversationSessionRow>> {
     let (view_user, view_workspaces) = scope.linked_view();
-    sqlx::query_as(sqlx::AssertSqlSafe(&*format!(
-        "SELECT s.alert_level, s.alert_expert_axis, s.alert_note, {LINKAGE_COLUMNS}, s.app_id, \
-         {LINKAGE_SPAWN_ANCHOR} \
+    let row = sqlx::query_as::<_, ConversationSessionColumns>(sqlx::AssertSqlSafe(&*format!(
+        "SELECT s.alert_level, s.alert_expert_axis, s.alert_note, {LINKAGE_COLUMNS}, s.app_id \
          FROM sessions s {join} WHERE s.session_id = $1",
         join = LINKED_AT_2.join(),
     )))
@@ -314,23 +414,28 @@ pub(crate) async fn conversation_session(
     .bind(view_user)
     .bind(view_workspaces)
     .fetch_optional(&mut *conn)
-    .await
+    .await?;
+    Ok(row.map(|r| ConversationSessionRow {
+        link: r.links.link(),
+        links: r.links.links(),
+        alert_level: r.alert_level,
+        alert_expert_axis: r.alert_expert_axis,
+        alert_note: r.alert_note,
+        app_id: r.app_id,
+    }))
 }
 
 /// A list row's columns: the summary's, and those [`MODEL_REQUESTED_JOIN`] and
-/// [`WORKSPACE_JOIN`] supply. List rows don't anchor a child card; the anchor is
-/// read with the linked-children query on the parent's session page. The linked
-/// sessions a row names are confined by the view, bound ahead of the read's own
+/// [`WORKSPACE_JOIN`] supply. The linked sessions a row names are confined by
+/// the view its [`LinkedView::join`] reads, bound ahead of the read's own
 /// filters.
-fn session_cols(linked: LinkedView) -> String {
+fn session_cols() -> String {
     format!(
         "{summary}, \
-         mr.model_requested, {child_count} AS child_count, \
+         mr.model_requested, \
          ws.name AS workspace_name, mr.provider AS provider, \
-         ak.name AS key_name, ak.key_prefix, \
-         NULL::text AS linkage_spawn_tool_call_id",
+         ak.name AS key_name, ak.key_prefix",
         summary = summary_columns(),
-        child_count = linked.child_count(),
     )
 }
 
@@ -507,7 +612,7 @@ pub(crate) async fn list_sessions_landed(
     let sql = format!(
         "SELECT {cols} FROM unnest($1::uuid[]) AS k(sid) \
          JOIN sessions s ON s.session_id = k.sid {join} {MODEL_REQUESTED_JOIN} {WORKSPACE_JOIN}",
-        cols = session_cols(LINKED_AT_2),
+        cols = session_cols(),
         join = LINKED_AT_2.join(),
     );
     let ids: Vec<Uuid> = keys.iter().map(|k| k.0).collect();
@@ -565,7 +670,7 @@ pub(crate) async fn list_sessions_impl(
         let linked = LinkedView { user: 1, workspaces: 2 };
         let mut sql = format!(
             "SELECT {cols} FROM sessions s {join} {model_req_join} {workspace_join} WHERE 1=1",
-            cols = session_cols(linked),
+            cols = session_cols(),
             join = linked.join(),
         );
         let (bind_idx, _) = push_session_filters(&mut sql, &query, scope, linked, 3);
@@ -599,7 +704,7 @@ pub(crate) async fn list_sessions_impl(
         " ORDER BY k.ord LIMIT ${limit_idx}) \
          SELECT {cols} FROM page p JOIN sessions s ON s.session_id = p.session_id \
          {join} {model_req_join} {workspace_join} ORDER BY p.ord",
-        cols = session_cols(LINKED_AT_2),
+        cols = session_cols(),
         join = LINKED_AT_2.join(),
     ));
 
@@ -731,12 +836,13 @@ fn push_session_filters(
     // `parent_session_id` asks about links whatever the view:
     // `list_sessions_impl` refuses it to a confined scope.
     if query.parent_session_id.is_some() {
-        // Children of the given parent: this session is a `child` member of a
-        // linkage relation whose `parent` member is the queried session.
+        // The sessions linked to the given one: each is the linked member of a
+        // relation whose other member is the queried session.
         sql.push_str(&format!(
             " AND EXISTS (SELECT 1 FROM cross_session_relation_members cm \
-                JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = 'parent' \
-                WHERE cm.session_id = s.session_id AND cm.role = 'child' AND pm.session_id = ${bind_idx})"
+                JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = {OTHER_ROLE} \
+                JOIN cross_session_relations r ON r.id = cm.relation_id AND r.kind IN {LINK_KINDS} \
+                WHERE cm.session_id = s.session_id AND cm.role IN {UPWARD_ROLES} AND pm.session_id = ${bind_idx})"
         ));
         bind_idx += 1;
         post_filtered = true;
@@ -756,17 +862,12 @@ fn push_session_filters(
         ));
         bind_idx += 1;
     }
-    // Linkage as the row states it through the view: a child the view
-    // admits (what `child_count` counts), a parent it admits (what
-    // `parent_session_id` names). A link to a session outside the view is no
+    // Linkage as the row states it through the view: a linked session the
+    // view admits (what `links` counts), a session it is linked to that the
+    // view admits (what `link` names). A link to a session outside the view is no
     // link here, so the filter never says one exists.
-    let has_children = format!(
-        "EXISTS (SELECT 1 FROM cross_session_relation_members m \
-           JOIN cross_session_relation_members cm ON cm.relation_id = m.relation_id AND cm.role = 'child' \
-           WHERE m.session_id = s.session_id AND m.role = 'parent' AND {admits})",
-        admits = view.admits("cm.session_id"),
-    );
-    let has_parent = format!("EXISTS (SELECT 1 {child})", child = view.as_child("s.session_id"));
+    let has_children = format!("EXISTS (SELECT 1 {linked})", linked = view.linked_from());
+    let has_parent = format!("EXISTS (SELECT 1 {linked})", linked = view.as_linked("s.session_id"));
     match query.linked {
         Some(SessionLinkage::HasChildren) => sql.push_str(&format!(" AND {has_children}")),
         Some(SessionLinkage::HasParent) => sql.push_str(&format!(" AND {has_parent}")),
@@ -849,5 +950,78 @@ mod spend_tests {
             let got = session_spend(count, currency.map(str::to_string), total, eur());
             assert_eq!(got.map(|s| (s.currency, s.amount)), expect, "count {count:?} currency {currency:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+
+    use super::*;
+
+    fn columns(kind: &str, confidence: &str) -> LinkColumns {
+        LinkColumns {
+            link_session_id: Some(Uuid::nil()),
+            link_kind: Some(kind.to_string()),
+            link_confidence: Some(confidence.to_string()),
+            link_spawn_turn: Some(3),
+            link_spawn_tool_call_id: Some("call_1".to_string()),
+            ..LinkColumns::default()
+        }
+    }
+
+    /// One case per stored kind and confidence, and the values no writer
+    /// stores: an unknown kind is no link, an unknown confidence an expert's
+    /// medium, as the expert's own parser reads it.
+    #[test]
+    fn every_stored_link_is_stated_in_the_api_vocabulary() {
+        for (kind, expect) in [
+            ("linkage", Some(SessionLinkKind::SubAgent)),
+            ("continuation", Some(SessionLinkKind::Continuation)),
+            ("auxiliary", None),
+            ("issue", None),
+        ] {
+            assert_eq!(columns(kind, "content").link().map(|l| l.kind), expect, "{kind}");
+        }
+        for (confidence, expect) in [
+            ("content", SessionLinkEvidence::Quote),
+            ("high", SessionLinkEvidence::AgentHigh),
+            ("medium", SessionLinkEvidence::AgentMedium),
+            ("certain", SessionLinkEvidence::AgentMedium),
+        ] {
+            assert_eq!(columns("linkage", confidence).link().map(|l| l.evidence), Some(expect), "{confidence}");
+        }
+    }
+
+    /// A spawn point is a sub-agent's alone, and needs its turn; the call is
+    /// stated only when stored.
+    #[test]
+    fn only_a_sub_agent_names_where_it_was_spawned() {
+        let anchor = SpawnAnchor { turn_number: 3, tool_call_id: Some("call_1".to_string()) };
+        assert_eq!(columns("linkage", "content").link().and_then(|l| l.spawned_at), Some(anchor));
+        assert_eq!(columns("continuation", "content").link().and_then(|l| l.spawned_at), None);
+        let turn_only = LinkColumns { link_spawn_tool_call_id: None, ..columns("linkage", "high") };
+        assert_eq!(
+            turn_only.link().and_then(|l| l.spawned_at),
+            Some(SpawnAnchor { turn_number: 3, tool_call_id: None })
+        );
+        let no_turn = LinkColumns { link_spawn_turn: None, ..columns("linkage", "high") };
+        assert_eq!(no_turn.link().and_then(|l| l.spawned_at), None);
+        let unnamed = LinkColumns { link_session_id: None, ..columns("linkage", "high") };
+        assert!(unnamed.link().is_none());
+    }
+
+    /// Counts are stated when anything is linked, a continuation alone included.
+    #[test]
+    fn linked_counts_are_absent_only_when_nothing_is_linked() {
+        assert_eq!(LinkColumns::default().links(), None);
+        let zero = LinkColumns { links_sub_agents: Some(0), ..LinkColumns::default() };
+        assert_eq!(zero.links(), None);
+        let continued = LinkColumns { links_continued_in: Some(Uuid::nil()), ..zero };
+        assert_eq!(
+            continued.links(),
+            Some(LinkedCounts { sub_agents: 0, continued_in: Some(Uuid::nil()) })
+        );
+        let sub = LinkColumns { links_sub_agents: Some(2), ..LinkColumns::default() };
+        assert_eq!(sub.links().map(|c| c.sub_agents), Some(2));
     }
 }

@@ -23,7 +23,7 @@
   import Copyable from '#lib/components/Copyable.svelte';
   import Icon from '#lib/components/Icon.svelte';
   import { tagClasses } from '#lib/components/TagBadge.svelte';
-  import { linkageTag } from '#lib/colormaps/linkage.js';
+  import { linkageTag, linkBackLabel, linkEvidenceLabel, linkedSessionLabel } from '#lib/colormaps/linkage.js';
   import ConversationView from '#lib/components/ConversationView.svelte';
   import SessionAlertBanner from '#lib/components/SessionAlertBanner.svelte';
   import SessionLinkList from '#lib/components/SessionLinkList.svelte';
@@ -307,26 +307,37 @@
   <!-- The session-level expert signal, stated once. -->
   <SessionAlertBanner level={conversation?.alert_level} note={conversation?.alert_note} />
 
-  {#if conversation?.parent_session_id}
-    {@const parentId = conversation.parent_session_id}
-    {@const spawnTurn = conversation.linkage_spawn_turn}
+  {#if conversation?.link}
+    {@const link = conversation.link}
     <button
-      onclick={() => navigateToSession(parentId, spawnTurn)}
+      onclick={() => navigateToSession(link.session_id, link.spawned_at?.turn_number)}
       class="mb-4 w-full rounded-xl border border-(--accent) bg-(--accent)/5 hover:bg-(--accent)/10 px-4 py-3 flex items-center gap-3 cursor-pointer transition-colors text-left"
     >
       <Icon name="arrowLeft" size="sm" color="var(--accent)" />
       <span class="text-sm text-(--text-primary)">
-        {m.browse_session_parent()}
-        <span class="text-(--accent) font-mono text-xs ml-1">{parentId.substring(0, 8)}...</span>
+        {linkBackLabel(link.kind)}
+        <span class="text-(--accent) font-mono text-xs ml-1">{link.session_id.substring(0, 8)}...</span>
       </span>
-      {#if conversation.linkage_confidence}
-        <span class="px-2 py-0.5 text-[10px] font-semibold rounded-full border border-current/30 {tagClasses(linkageTag(conversation.linkage_confidence))}">
-          {conversation.linkage_confidence}
-        </span>
+      <span class="px-2 py-0.5 text-[10px] font-semibold rounded-full border border-current/30 {tagClasses(linkageTag(link.evidence))}">
+        {linkEvidenceLabel(link.evidence)}
+      </span>
+      {#if link.spawned_at}
+        <span class="text-xs text-(--text-secondary)">{m.browse_session_spawned_at({ turn: link.spawned_at.turn_number + 1 })}</span>
       {/if}
-      {#if spawnTurn != null}
-        <span class="text-xs text-(--text-secondary)">{m.browse_session_spawned_at({ turn: spawnTurn + 1 })}</span>
-      {/if}
+    </button>
+  {/if}
+
+  {#if conversation?.links?.continued_in}
+    {@const next = conversation.links.continued_in}
+    <button
+      onclick={() => navigateToSession(next)}
+      class="mb-4 w-full rounded-xl border border-(--accent) bg-(--accent)/5 hover:bg-(--accent)/10 px-4 py-3 flex items-center gap-3 cursor-pointer transition-colors text-left"
+    >
+      <Icon name="arrowRight" size="sm" color="var(--accent)" />
+      <span class="text-sm text-(--text-primary)">
+        {m.browse_session_continued_in()}
+        <span class="text-(--accent) font-mono text-xs ml-1">{next.substring(0, 8)}...</span>
+      </span>
     </button>
   {/if}
 
@@ -374,7 +385,6 @@
       events={conversation.events}
       turnParams={conversation.turn_params}
       linkedChildren={linkedData?.children}
-      detectedSpawnPoints={conversation.detected_spawn_points}
       bind:placedChildIds={placedInline}
       {renderMode}
       {viewMode}
@@ -439,9 +449,11 @@
                     <span class="text-[10px] text-(--text-secondary)">&middot;</span>
                     <span class="text-[10px] text-(--text-secondary) font-mono">{formatTokens(child.total_tokens)}</span>
                   {/if}
-                  {#if child.linkage_confidence}
-                    <span class="px-1.5 py-0.5 text-[9px] font-semibold rounded-full border border-current/30 {tagClasses(linkageTag(child.linkage_confidence))}">
-                      {child.linkage_confidence}
+                  {#if child.link}
+                    <span class="text-[10px] text-(--text-secondary)">&middot;</span>
+                    <span class="text-[10px] text-(--text-secondary)">{linkedSessionLabel(child.link.kind)}</span>
+                    <span class="px-1.5 py-0.5 text-[9px] font-semibold rounded-full border border-current/30 {tagClasses(linkageTag(child.link.evidence))}">
+                      {linkEvidenceLabel(child.link.evidence)}
                     </span>
                   {/if}
                 </div>

@@ -1052,6 +1052,13 @@ struct SessionMeta {
     app_id: Option<String>,
     #[serde(default)]
     first_user_prompt: Option<String>,
+    /// The session's own stored link (a child, a continuation): a linkage judge
+    /// leaves a linked session as it is.
+    #[serde(skip)]
+    link: Option<crate::routes::audit::SessionLink>,
+    /// The stored links to this session: its sub-agents, its continuation.
+    #[serde(skip)]
+    links: Option<crate::routes::audit::LinkedCounts>,
     /// Where the session stands in landing order, and its last activity.
     #[serde(skip)]
     pos: Option<Pos>,
@@ -2046,7 +2053,7 @@ async fn analyze_session_cluster(
     let response = agent_analysis_call(client, config, body, routing.call_timeout()).await?;
     let parsed = parse_analysis_response(&response, &expert.axis)?;
 
-    let fields = parse_axis_fields(&parsed, &ewp.output_types, &cidx.s_index, &cidx.spawn_points);
+    let fields = parse_axis_fields(&parsed, &ewp.output_types, &cidx.s_index);
 
     // Alert / issue targets are named by S-index and resolved against `s_index`
     // (the cluster's ordered id map) — an out-of-range index is dropped, so a
@@ -2083,16 +2090,12 @@ async fn analyze_session_cluster(
     })
 }
 
-/// The cluster's `S{i}` → session map plus, parallel to it, the spawn points
-/// detected in each session's own stream (labelled `[P{j}]` in the prompt). Built
-/// once in [`render_cluster`] — the only place the printed labels and these
-/// vectors stay in lockstep — and consumed by extraction to resolve the judge's
-/// `session_index` / `parent_spawn_point_index` refs back to ids and anchors.
+/// The cluster's `S{i}` → session map. Built once in [`render_cluster`] — the
+/// only place the printed labels and this vector stay in lockstep — and consumed
+/// by extraction to resolve the judge's `session_index` refs back to ids.
 struct ClusterIndex {
     /// `s_index[i]` is the session printed as `S{i}`.
     s_index: Vec<uuid::Uuid>,
-    /// `spawn_points[i]` are the spawn points printed as `[P0]…` under `S{i}`.
-    spawn_points: Vec<Vec<crate::conversation::DetectedSpawnPoint>>,
 }
 
 /// Render a cluster — the timeline overview plus each session's budget-capped
@@ -2153,42 +2156,90 @@ async fn render_cluster(
         // one into an output field (it references sessions by index; our code maps
         // the index back via `s_index`).
         cluster_text.push_str(&format!(
-            "  S{i}: {first}–{last} | {turns} turns | {model} | {cost} | \"{topic}\"\n"
+            "  S{i}: {first}–{last} | {turns} turns | {model} | {cost} | \"{topic}\"{linked}\n",
+            linked = if session.link.is_some() { " | already linked" } else { "" },
         ));
     }
     cluster_text.push('\n');
 
-    // Fetch key conversations (budget-aware). Alongside each, capture the spawn
-    // points detected deterministically in that session's stream and print them as
-    // `[P{j}]` so the judge CONFIRMS a child→spawn link by index instead of
-    // hunting the raw text (kept in lockstep with `s_index` by the shared order).
+    // Fetch key conversations (budget-aware). Under each, its stored links, so
+    // the judge sees what the ingest already linked by quote.
     cluster_text.push_str("### Session Details\n");
-    let mut spawn_points: Vec<Vec<crate::conversation::DetectedSpawnPoint>> =
-        Vec::with_capacity(sorted.len());
     for (i, session) in sorted.iter().enumerate() {
         let conversation =
             fetch_conversation_via_db(pool, tenant_id, session.session_id).await?;
         let rendered = render_session(session, &conversation, per_session_budget);
         cluster_text.push_str(&format!("#### S{i}\n"));
         cluster_text.push_str(&rendered);
-        let points: Vec<crate::conversation::DetectedSpawnPoint> = conversation
-            .get("detected_spawn_points")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
-        if !points.is_empty() {
-            cluster_text.push_str("##### Detected spawn points\n");
-            for (j, p) in points.iter().enumerate() {
-                cluster_text.push_str(&format!(
-                    "  [P{j}] turn {} · {} · \"{}\"\n",
-                    p.turn_number, p.tool_name, p.prompt_preview
-                ));
-            }
-        }
-        spawn_points.push(points);
+        cluster_text.push_str(&render_session_links(i, &sorted, &s_index));
         cluster_text.push('\n');
     }
 
-    Ok((cluster_text, ClusterIndex { s_index, spawn_points }))
+    Ok((cluster_text, ClusterIndex { s_index }))
+}
+
+/// The stored links of the cluster's `S{i}` (`sorted[i]`), as a `##### Links`
+/// block naming every other session by its S-index when it is in the cluster:
+/// its own link (kind, the other session, where a sub-agent was spawned, the
+/// evidence), the sub-agents linked to it and its continuation. Empty when the
+/// session has no link either way.
+fn render_session_links(i: usize, sorted: &[&&SessionMeta], s_index: &[uuid::Uuid]) -> String {
+    use crate::routes::audit::{SessionLinkEvidence, SessionLinkKind};
+    let name = |id: uuid::Uuid| match s_index.iter().position(|s| *s == id) {
+        Some(j) => format!("S{j}"),
+        None => "a session outside this cluster".to_string(),
+    };
+    let session = sorted[i];
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(link) = &session.link {
+        let kind = match link.kind {
+            SessionLinkKind::SubAgent => "sub-agent of",
+            SessionLinkKind::Continuation => "continues",
+        };
+        let mut line = format!("  already linked: {kind} {}", name(link.session_id));
+        if let Some(at) = &link.spawned_at {
+            line.push_str(&format!(", spawned at its turn {}", at.turn_number));
+            if let Some(call) = &at.tool_call_id {
+                // A client's id: only the characters an id is made of reach the prompt.
+                let call: String =
+                    call.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')).take(64).collect();
+                line.push_str(&format!(" by tool call `{call}`"));
+            }
+        }
+        let evidence = match link.evidence {
+            SessionLinkEvidence::Quote => "its opening quotes the other session",
+            SessionLinkEvidence::AgentHigh => "an expert's judgement, high confidence",
+            SessionLinkEvidence::AgentMedium => "an expert's judgement, medium confidence",
+        };
+        line.push_str(&format!(" ({evidence})"));
+        lines.push(line);
+    }
+    if let Some(links) = &session.links {
+        if links.sub_agents > 0 {
+            let in_cluster: Vec<String> = sorted
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| {
+                    s.link.as_ref().is_some_and(|l| {
+                        l.kind == SessionLinkKind::SubAgent && l.session_id == session.session_id
+                    })
+                })
+                .map(|(j, _)| format!("S{j}"))
+                .collect();
+            let mut line = format!("  linked sub-agents: {}", links.sub_agents);
+            if !in_cluster.is_empty() {
+                line.push_str(&format!(" (in this cluster: {})", in_cluster.join(", ")));
+            }
+            lines.push(line);
+        }
+        if let Some(next) = links.continued_in {
+            lines.push(format!("  continued in: {}", name(next)));
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!("##### Links\n{}\n", lines.join("\n"))
 }
 
 /// Bound and de-degenerate an agent-supplied alert note before it is persisted
@@ -2392,7 +2443,7 @@ async fn analyze_single_session(
     let parsed: serde_json::Value =
         parse_analysis_response(&response, &expert.axis).map_err(deterministic)?;
 
-    let mut result = parse_axis_fields(&parsed, &ewp.output_types, &[], &[]);
+    let mut result = parse_axis_fields(&parsed, &ewp.output_types, &[]);
     result.alert = parse_and_write_session_alert(
         pool,
         tenant_id,
@@ -3195,6 +3246,8 @@ async fn fetch_sessions_via_db(
         }
         sessions.push(SessionMeta {
             session_id: s.session_id,
+            link: s.link,
+            links: s.links,
             user_id: s.user_id,
             key_id: s.key_id,
             turn_count: s.turn_count,
@@ -4501,8 +4554,7 @@ fn axis_payload_schema(
                     "parent_session_index": { "type": "integer", "description": "S-index of the PARENT session — the integer N from `S<N>`. NEVER a UUID." },
                     "confidence": { "type": "string", "enum": ["high", "medium"] },
                     "note": { "type": "string", "description": "Brief explanation" },
-                    "spawn_turn": { "type": ["integer", "null"], "description": "Turn in parent where child was spawned, or null" },
-                    "parent_spawn_point_index": { "type": ["integer", "null"], "description": "Index P from the parent's `Detected spawn points` list ([P0], [P1]…) whose prompt preview matches this child's first message. Set it ONLY to confirm a listed spawn call; null if none matches." }
+                    "spawn_turn": { "type": ["integer", "null"], "description": "Turn in parent where child was spawned, or null" }
                 },
                 "required": ["session_index", "label_type", "parent_session_index", "confidence", "note"]
             }
@@ -4765,15 +4817,12 @@ fn parse_analysis_response(response: &serde_json::Value, axis: &str) -> anyhow::
 /// `extract_session_alerts`), so `alert` is returned as `None`.
 /// Parse the fields common to session- and cluster-path axes. `s_index` is the
 /// cluster's ordered id map (`render_cluster`); it resolves the S-index refs on
-/// `session_labels` to real session UUIDs. `spawn_points[i]` (parallel to
-/// `s_index`) is the detected spawn points printed under `S{i}` — used to resolve
-/// a confirmed `parent_spawn_point_index` to an exact anchor. On the session path
-/// there are no labels, so callers pass `&[]` for both.
+/// `session_labels` to real session UUIDs. On the session path there are no
+/// labels, so callers pass `&[]`.
 fn parse_axis_fields(
     parsed: &serde_json::Value,
     output_types: &[String],
     s_index: &[uuid::Uuid],
-    spawn_points: &[Vec<crate::conversation::DetectedSpawnPoint>],
 ) -> SessionAnalysisResult {
     let findings: Vec<Finding> = parsed
         .get("findings")
@@ -4854,26 +4903,9 @@ fn parse_axis_fields(
                     let session_id = resolve(l, "session_index")?;
                     let label_type = l.get("label_type")?.as_str()?.to_string();
                     let label_value = resolve(l, "parent_session_index")?;
-                    // Resolve an optional CONFIRMED spawn point against the PARENT
-                    // session's detected list. On a match the code-detected turn
-                    // OVERRIDES the model's spawn_turn estimate (the off-by-one this
-                    // fixes) and the exact tool-call id anchors the child card; with
-                    // no match, keep the model's estimate and no id.
-                    let parent_pts = l
-                        .get("parent_session_index")
-                        .and_then(|v| v.as_u64())
-                        .and_then(|pi| spawn_points.get(pi as usize));
-                    let matched = l
-                        .get("parent_spawn_point_index")
-                        .and_then(|v| v.as_u64())
-                        .and_then(|sp| parent_pts.and_then(|pts| pts.get(sp as usize)));
-                    let (spawn_turn, spawn_tool_call_id) = match matched {
-                        Some(p) => (Some(p.turn_number), Some(p.tool_call_id.clone())),
-                        None => (
-                            l.get("spawn_turn").and_then(|t| t.as_i64()).map(|t| t as i32),
-                            None,
-                        ),
-                    };
+                    // An expert's link carries its own turn estimate and never a
+                    // tool-call id: only a quote names the spawning call.
+                    let spawn_turn = l.get("spawn_turn").and_then(|t| t.as_i64()).and_then(|t| i32::try_from(t).ok()).filter(|t| *t >= 1);
                     Some(super::suggestion::SessionLabel {
                         session_id,
                         label_type,
@@ -4881,7 +4913,7 @@ fn parse_axis_fields(
                         confidence: l.get("confidence").and_then(|c| c.as_str()).unwrap_or("medium").to_string(),
                         note: l.get("note").and_then(|n| n.as_str()).unwrap_or("").to_string(),
                         spawn_turn,
-                        spawn_tool_call_id,
+                        spawn_tool_call_id: None,
                     })
                 })
                 .collect()
@@ -5214,7 +5246,7 @@ async fn analyze_session_merged(
             continue;
         };
 
-        let mut result = parse_axis_fields(axis_payload, &m.output_types, &[], &[]);
+        let mut result = parse_axis_fields(axis_payload, &m.output_types, &[]);
         result.alert = parse_and_write_session_alert(
             pool,
             tenant_id,
@@ -5324,7 +5356,7 @@ async fn analyze_cluster_merged(
             continue;
         };
 
-        let fields = parse_axis_fields(axis_payload, &m.output_types, &cidx.s_index, &cidx.spawn_points);
+        let fields = parse_axis_fields(axis_payload, &m.output_types, &cidx.s_index);
         let (alerts, cross_session_issues) = if m.output_types.iter().any(|t| t == "alert") {
             (
                 extract_session_alerts(axis_payload, axis, &cidx.s_index),
@@ -5707,6 +5739,8 @@ mod tests {
     fn test_render_session_with_events() {
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 3,
@@ -5759,6 +5793,8 @@ mod tests {
         let conv = serde_json::json!({"events": events});
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 1,
@@ -5802,6 +5838,8 @@ mod tests {
         }
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 20,
@@ -5851,6 +5889,8 @@ mod tests {
         }
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 3,
@@ -5879,6 +5919,8 @@ mod tests {
     fn a_rendered_session_names_its_spend_currency() {
         let meta = |spend| SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 1,
@@ -5923,6 +5965,8 @@ mod tests {
     fn test_render_window_derived_caps_and_finish_marker() {
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 2,
@@ -6099,6 +6143,8 @@ mod tests {
     fn test_render_session_small_budget() {
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 5,
@@ -6124,6 +6170,8 @@ mod tests {
     fn test_render_session_with_media_api_call() {
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 4,
@@ -6190,6 +6238,8 @@ mod tests {
     fn test_render_session_with_chat_media_attachments() {
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 2,
@@ -6250,6 +6300,8 @@ mod tests {
     fn test_render_session_mixed_chat_and_media_api() {
         let meta = SessionMeta {
             session_id: uuid::Uuid::nil(),
+            link: None,
+            links: None,
             user_id: None,
             key_id: None,
             turn_count: 4,
@@ -6516,13 +6568,12 @@ mod tests {
             &payload,
             &["transform_suggestion".to_string(), "memory".to_string()],
             &[],
-            &[],
         );
         assert_eq!(with_memory.findings.len(), 1);
         assert_eq!(with_memory.memory_update, "remember this");
 
         let without_memory =
-            parse_axis_fields(&payload, &["transform_suggestion".to_string()], &[], &[]);
+            parse_axis_fields(&payload, &["transform_suggestion".to_string()], &[]);
         assert!(without_memory.memory_update.is_empty());
     }
 
@@ -6565,70 +6616,93 @@ mod tests {
     }
 
     #[test]
-    fn parse_axis_fields_confirms_spawn_anchor_and_overrides_turn() {
-        use crate::conversation::DetectedSpawnPoint;
+    fn parse_axis_fields_keeps_the_model_turn_and_names_no_call() {
         let s0 = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let s1 = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
         let s_index = vec![s0, s1];
-        // Parent S0 has two detected spawn points; the child S1 confirms P1.
-        let spawn_points = vec![
-            vec![
-                DetectedSpawnPoint {
-                    turn_number: 2,
-                    tool_call_id: "toolu_a".into(),
-                    tool_name: "Task".into(),
-                    prompt_preview: "first".into(),
-                },
-                DetectedSpawnPoint {
-                    turn_number: 6,
-                    tool_call_id: "toolu_b".into(),
-                    tool_name: "Task".into(),
-                    prompt_preview: "second".into(),
-                },
-            ],
-            vec![],
-        ];
         let payload = serde_json::json!({
             "session_labels": [
-                // Confirms P1 → anchor id toolu_b, turn overridden to 6 (not the
-                // model's 99 estimate).
                 {"session_index": 1, "label_type": "parent_session_id", "parent_session_index": 0,
-                 "confidence": "high", "note": "spawned", "spawn_turn": 99, "parent_spawn_point_index": 1},
+                 "confidence": "high", "note": "spawned", "spawn_turn": 4},
             ]
         });
-        let fields = parse_axis_fields(&payload, &["session_label".to_string()], &s_index, &spawn_points);
+        let fields = parse_axis_fields(&payload, &["session_label".to_string()], &s_index);
         assert_eq!(fields.session_labels.len(), 1);
         let label = &fields.session_labels[0];
         assert_eq!(label.session_id, s1.to_string());
         assert_eq!(label.label_value, s0.to_string());
-        assert_eq!(label.spawn_tool_call_id.as_deref(), Some("toolu_b"));
-        assert_eq!(label.spawn_turn, Some(6), "code-detected turn overrides the model estimate");
+        assert_eq!(label.spawn_turn, Some(4), "the model's estimate is kept");
+        assert_eq!(label.spawn_tool_call_id, None, "an expert's link names no call");
+        // A turn that cannot be one is dropped, the link kept.
+        let bad = serde_json::json!({"session_labels": [
+            {"session_index": 1, "label_type": "parent_session_id", "parent_session_index": 0,
+             "confidence": "medium", "note": "n", "spawn_turn": -1},
+        ]});
+        let fields = parse_axis_fields(&bad, &["session_label".to_string()], &s_index);
+        assert_eq!(fields.session_labels[0].spawn_turn, None);
     }
 
     #[test]
-    fn parse_axis_fields_out_of_range_spawn_index_keeps_model_turn() {
-        let s0 = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-        let s1 = uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-        let s_index = vec![s0, s1];
-        let spawn_points = vec![
-            vec![crate::conversation::DetectedSpawnPoint {
-                turn_number: 2,
-                tool_call_id: "toolu_a".into(),
-                tool_name: "Task".into(),
-                prompt_preview: "only one".into(),
-            }],
-            vec![],
-        ];
-        let payload = serde_json::json!({
-            "session_labels": [
-                {"session_index": 1, "label_type": "parent_session_id", "parent_session_index": 0,
-                 "confidence": "medium", "note": "temporal", "spawn_turn": 4, "parent_spawn_point_index": 9},
-            ]
-        });
-        let fields = parse_axis_fields(&payload, &["session_label".to_string()], &s_index, &spawn_points);
-        let label = &fields.session_labels[0];
-        assert_eq!(label.spawn_tool_call_id, None, "out-of-range P-index → no anchor");
-        assert_eq!(label.spawn_turn, Some(4), "falls back to the model's estimate");
+    fn render_session_links_names_each_stored_link_by_s_index() {
+        use crate::routes::audit::{LinkedCounts, SessionLink, SessionLinkEvidence, SessionLinkKind, SpawnAnchor};
+        let meta = |n: u128, link: Option<SessionLink>, links: Option<LinkedCounts>| SessionMeta {
+            session_id: uuid::Uuid::from_u128(n),
+            link,
+            links,
+            user_id: None,
+            key_id: None,
+            turn_count: 1,
+            total_tokens: None,
+            spend: None,
+            first_timestamp: None,
+            last_timestamp: None,
+            last_latency_ms: None,
+            model_requested: None,
+            model_used: None,
+            user_email: None,
+            app_id: None,
+            first_user_prompt: None,
+            pos: None,
+        };
+        let parent = meta(1, None, Some(LinkedCounts { sub_agents: 2, continued_in: Some(uuid::Uuid::from_u128(9)) }));
+        let child = meta(
+            2,
+            Some(SessionLink {
+                session_id: uuid::Uuid::from_u128(1),
+                kind: SessionLinkKind::SubAgent,
+                evidence: SessionLinkEvidence::Quote,
+                spawned_at: Some(SpawnAnchor { turn_number: 3, tool_call_id: Some("toolu_1".into()) }),
+            }),
+            None,
+        );
+        let agent_child = meta(
+            3,
+            Some(SessionLink {
+                session_id: uuid::Uuid::from_u128(1),
+                kind: SessionLinkKind::SubAgent,
+                evidence: SessionLinkEvidence::AgentMedium,
+                spawned_at: Some(SpawnAnchor { turn_number: 5, tool_call_id: None }),
+            }),
+            None,
+        );
+        let unlinked = meta(4, None, None);
+        let (p, c, a, u) = (&parent, &child, &agent_child, &unlinked);
+        let sorted: Vec<&&SessionMeta> = vec![&p, &c, &a, &u];
+        let s_index: Vec<uuid::Uuid> = sorted.iter().map(|s| s.session_id).collect();
+
+        assert_eq!(
+            render_session_links(0, &sorted, &s_index),
+            "##### Links\n  linked sub-agents: 2 (in this cluster: S1, S2)\n  continued in: a session outside this cluster\n"
+        );
+        assert_eq!(
+            render_session_links(1, &sorted, &s_index),
+            "##### Links\n  already linked: sub-agent of S0, spawned at its turn 3 by tool call `toolu_1` (its opening quotes the other session)\n"
+        );
+        assert_eq!(
+            render_session_links(2, &sorted, &s_index),
+            "##### Links\n  already linked: sub-agent of S0, spawned at its turn 5 (an expert's judgement, medium confidence)\n"
+        );
+        assert_eq!(render_session_links(3, &sorted, &s_index), "", "an unlinked session prints no block");
     }
 
     #[test]

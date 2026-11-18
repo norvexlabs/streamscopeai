@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.63]
+
+### Changed
+
+- **BREAKING (API):** The conversation API no longer returns `detected_spawn_points`; a subagent's
+  spawning call is named by its session link (`link.spawned_at`).
+
+### Fixed
+
+- Gemini CLI's built-in subagents use the model the client was set up with, instead of a Google
+  model the gateway does not serve (which made them retry without pause for up to ten minutes).
+  Provision Gemini CLI again to get the new settings.
+- A session is titled by the user's own prompt, not by the context a client puts before or after
+  it: Gemini CLI's session context, Crush's todo reminder, Qwen Code's memory catalog, Goose's
+  turn context.
+
+## [2026.11.62]
+
+- **Each conversation an agent runs is its own session, and sessions are linked by what they
+  quote.** A session is now one conversation, decided by its messages: a client that sends one
+  session id for several conversations side by side (OpenCode names its parent's session from
+  every subagent) gets one session per conversation, so session counts rise and each reads as the
+  agent ran it; a client that keeps only the latest part of a long conversation stays one
+  session, and a client's instructions or environment sent as the first message never make two
+  conversations one. A new conversation is linked to a recent one of the same user when its
+  opening quotes it: a subagent opening with the prompt its parent's tool call gave it moments
+  before is the parent's **child**, placed at that call; a conversation opening with the summary of
+  an earlier answer (a compaction) **continues** it. A single line two conversations share links
+  nothing, nor does a client's `X-Parent-Session-Id` header, and the instructions and reminders a
+  client adds to every conversation are never read as a quote. Links are found for conversations
+  up to a day apart, from the upgrade on. The MCP, web and A2A calls made under a session id still
+  show in the conversations that carry it, while each was under way, and so does a media call (an
+  image, an embedding, speech) made under the session id; a Responses turn chained to an earlier
+  answer joins the conversation its session id is having. A session row
+  counts its sub-agents, and a compacted conversation links forward to the one that continues it.
+  **BREAKING (API):** on a session summary and a session's conversation, `parent_session_id`, the
+  `linkage_*` fields and `child_count` are replaced by `link` (the session it is linked to, the
+  kind of link, what it was read from, and a sub-agent's spawn point) and `links` (its sub-agents
+  and the session that continues it).
+
+## [2026.11.61]
+
+- **The gateway's session tracking holds long agent sessions in a fraction of the memory, and its
+  ceiling is set in megabytes.** The turns of one conversation now share the messages they have in
+  common instead of each repeating every earlier one, so a gateway remembers far more sessions in
+  the same memory, and turns are numbered in the order they arrive. The ceiling is a memory size,
+  `SESSION_DETECTOR_MAX_MB` (by default a tenth of the gateway's memory limit), replacing the entry
+  count `SESSION_DETECTOR_MAX_ENTRIES`, which is no longer read. The record saved for restarts is
+  written in a new form: at the upgrade, a conversation in progress that names no session of its
+  own continues as a new session, and one that does (`X-Session-Id`) numbers its next turns from 0
+  again.
+
 ## [2026.11.60]
 
 - **The gateway's session tracking uses less memory.** The record of recent turns the gateway links

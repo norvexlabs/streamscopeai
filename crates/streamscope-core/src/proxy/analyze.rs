@@ -470,7 +470,7 @@ fn passthrough_meta_base(
         session_id: client.session_id.as_deref().map(|sid| {
             content::session_id_from_client(sid, ctx.user.tenant_id, ctx.user.user_id)
         }),
-        parent_session_id: None,
+        conversation_session_id: None,
         user_agent: client.user_agent.clone(),
         detection_method: app.detection_method,
         // The gateway-resolved end client, relayed by the trusted inline key.
@@ -581,7 +581,7 @@ async fn analyze_request(
     let pre_content = content::extract_request_content(&api_request, wire.len());
     // The proxied path's identity fields, over the body as analyzed: a re-sent
     // analysis is the same turn, as a re-sent proxied request is.
-    let request_key = content::request_key(
+    let request_key = super::session_detector::request_key(
         ctx.user.user_id,
         key_id,
         envelope.client.session_id.as_deref(),
@@ -599,6 +599,7 @@ async fn analyze_request(
         key_id,
         ctx.user.tenant_id,
         &pre_content.session_hashes,
+        pre_content.thread_root,
         envelope.client.session_id.as_deref(),
         request_key,
     );
@@ -706,7 +707,7 @@ async fn analyze_request(
     // the conversation session stable — always, regardless of content logging,
     // exactly as the proxied handler does.
     let is_baseline = session_info.is_baseline || flags.compression_applied;
-    let final_info = content::SessionInfo {
+    let final_info = super::session_detector::SessionInfo {
         session_id: session_info.session_id,
         parent_request_id: session_info.parent_request_id,
         turn_number: session_info.turn_number,
@@ -717,8 +718,8 @@ async fn analyze_request(
         key_id,
         request_id,
         &final_info,
-        pre_content.session_hashes.clone(),
-        envelope.client.session_id.clone(),
+        &pre_content.session_hashes,
+        envelope.client.session_id.as_deref(),
     );
 
     // Build the content payload the audit row renders from — only when content
@@ -768,6 +769,7 @@ async fn analyze_request(
             transform_diff: serde_json::to_value(&transform_diff).ok(),
             link_hashes: pre_content.link_hashes,
             session_info: final_info,
+            opening: pre_content.opening,
             request_size_bytes: pre_content.request_size_bytes,
             first_user_prompt: pre_content.first_user_prompt,
         })

@@ -10,11 +10,11 @@ You receive CLUSTERS of sessions — sessions from the same user key and applica
 Each cluster is sorted chronologically. You see:
 - **Timeline**: Start/end times, turn counts, costs, first user prompt for each session
 - **Session details**: Full conversation data (within budget) for each session in the cluster
-- **Detected spawn points**: under a session, a `[P0]`/`[P1]`… list of the subagent-spawning tool calls found deterministically in its own stream (turn · tool · prompt preview). Match a child's first message to one of these and confirm the link with `parent_spawn_point_index` — you don't have to hunt the raw text for the call.
+- **Links**: under a session, the links already stored for it — the session it is a sub-agent of or continues (by S-index when it is in the cluster, with the turn and tool call it was spawned at when known), its linked sub-agents and its continuation. A session marked `already linked` keeps its link; propose links only for the others.
 
 A cluster may contain a SINGLE session — cross-session baselining still applies to it, while linkage does not (there is nothing to link).
 
-Look for cross-session patterns: temporal overlap (child starts during parent), turn gaps (parent pauses while child runs), content echo (child references parent context), and spawn-point tool calls (`Task`, `Agent`, `task`, `new_task`, `use_subagents`, `runSubagent`, `spawn_agent`, `delegate_to_agent`, `delegate_task`, `dispatch`, `dispatch_agent`, `subagent`).
+Look for cross-session patterns: temporal overlap (child starts during parent), turn gaps (parent pauses while child runs), content echo (child references parent context), and the links already shown — never a tool's name alone, since clients name their delegation tool differently.
 
 ### Agentic system prompts are normal
 

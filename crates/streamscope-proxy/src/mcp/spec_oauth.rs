@@ -631,10 +631,10 @@ mod tests {
                 tenant_registry: registry,
                 audit_tx,
                 session_detector:
-                    streamscope_core::proxy::content::SessionDetector::with_capacity(
+                    streamscope_core::proxy::session_detector::SessionDetector::with_capacity(
                         8,
                         Duration::from_secs(60),
-                        8,
+                        1 << 20,
                     ),
                 inline_exchanges:
                     streamscope_core::proxy::inline_exchange::InlineExchangeStore::default(),

@@ -26,7 +26,8 @@ use super::response_blocks::{self, BlockAccumulator};
 use super::translate;
 
 // Re-use proxy-level types.
-use crate::proxy::{AppState, ForwardAuthContext, RequestMeta, send_audit};
+use crate::proxy::{AppState, ContentMeta, ForwardAuthContext, RequestMeta, send_audit};
+use crate::proxy::fingerprint::TurnFingerprints;
 use crate::proxy::client::UpstreamClient;
 
 /// Per-substitution-cycle audit labels — one entry per unique
@@ -445,13 +446,13 @@ struct MixedPendingParkOutcome {
 
 /// Park each successfully-or-failed-dispatched intercepted call from a
 /// mixed-pending round into the cross-request
-/// [`crate::web::MixedPendingCache`], keyed on the gateway-side session UUID
-/// so the next request in the same logical session can drain and splice them.
+/// [`crate::web::MixedPendingCache`], keyed on the request's conversation
+/// session so the conversation's next turn can drain and splice them.
 ///
-/// `gateway_session_id` is the already-hashed gateway session UUID
-/// (`RequestMeta.session_id`) — the same value
-/// `apply_inbound_mixed_pending_splice` derives from the raw `X-Session-Id`
-/// on the next request, so park and drain key identically.
+/// `conversation_session_id` is the session the detector gave this request
+/// (`RequestMeta.conversation_session_id`) — the session of the next turn,
+/// which continues this one, and what `apply_inbound_mixed_pending_splice`
+/// drains by, so park and drain key identically.
 ///
 /// The parked `result_text` is the **model-facing** text: it is guardrail-
 /// screened and spotlight-wrapped *here, at park time*, exactly as the
@@ -464,8 +465,8 @@ struct MixedPendingParkOutcome {
 /// the user's own message, not this third-party web content.
 ///
 /// Skips entries when:
-/// - `gateway_session_id` is `None` (client didn't send `X-Session-Id`,
-///   no cross-request continuity possible).
+/// - `conversation_session_id` is `None` (`/v1/analyze`: nothing continues
+///   it here).
 /// - `pending.tool_use_id` is `None` (Gemini's positional matching means we
 ///   can't synthesise a stable `tool_use(id=...)` block on the next request).
 /// - The pending entry has no client-tool projection — i.e. it's a server-tool
@@ -475,13 +476,13 @@ struct MixedPendingParkOutcome {
 async fn record_mixed_pending_into_cache(
     cache: &std::sync::Arc<crate::web::MixedPendingCache>,
     tenant_id: uuid::Uuid,
-    gateway_session_id: Option<uuid::Uuid>,
+    conversation_session_id: Option<uuid::Uuid>,
     guardrail: &crate::guardrail::GuardrailSettings,
     pending: &[crate::pipeline::response_blocks::PendingInterceptedCall],
     dispatch_outcomes: &[Result<crate::web::DispatchOutcome, crate::web::WebError>],
 ) -> MixedPendingParkOutcome {
     let mut park_outcome = MixedPendingParkOutcome::default();
-    let Some(session_uuid) = gateway_session_id else {
+    let Some(session_uuid) = conversation_session_id else {
         return park_outcome;
     };
     if cache.ttl().is_zero() {
@@ -1237,6 +1238,7 @@ impl ResponsePipeline {
         let ws_key_id = self.meta.key_id;
         let ws_app_id = self.meta.app_id.clone();
         let ws_session_id = self.meta.session_id;
+        let ws_conversation_id = self.meta.conversation_session_id;
         let ws_user_agent = self.meta.user_agent.clone();
         let ws_detection_method = Some(crate::middleware::attribution::DETECTION_REQUEST.to_string());
         let ws_parent_request_id = self.meta.request_id;
@@ -1805,14 +1807,9 @@ impl ResponsePipeline {
                 // its own `web_audit` row through the audit channel
                 // (`surface="substitution"` + `parent_request_id`); the
                 // returned result is parked in the cross-request
-                // `MixedPendingCache` keyed by the gateway-side session UUID
-                // so the next request in the same session can splice it
-                // into the conversation as a synthesised
-                // `assistant tool_use → user tool_result` pair (strict
-                // Decision #4). When the request has no `X-Session-Id`
-                // (`ws_session_id == None`), there is no cross-request
-                // continuity and the result is dropped after audit, same as
-                // step-1 behaviour.
+                // `MixedPendingCache` keyed by the conversation session so
+                // the conversation's next turn can splice it in as a
+                // synthesised `assistant tool_use → user tool_result` pair.
                 let dispatch_outcomes: Vec<Result<crate::web::DispatchOutcome, crate::web::WebError>> =
                     futures::future::join_all(pending.iter().map(|p| {
                         let sem = dispatch_semaphore.clone();
@@ -1851,7 +1848,7 @@ impl ResponsePipeline {
                 let park_outcome = record_mixed_pending_into_cache(
                     &mixed_pending_cache,
                     ws_tenant_id,
-                    ws_session_id,
+                    ws_conversation_id,
                     &ws_guardrail_owned,
                     &pending,
                     &dispatch_outcomes,
@@ -3242,7 +3239,7 @@ impl ResponsePipeline {
                     let park_outcome = record_mixed_pending_into_cache(
                         &mixed_pending_cache,
                         self.meta.tenant_id,
-                        self.meta.session_id,
+                        self.meta.conversation_session_id,
                         &ws_guardrail_owned,
                         &pending,
                         &dispatch_outcomes,
@@ -9014,6 +9011,43 @@ fn capture_image_generation_outputs(
     }
 }
 
+/// What a later conversation may quote of this turn — its answer's text and
+/// its client tool calls' string arguments — and, when it continues no earlier
+/// turn here, the segments of the message it opens with. That last is this
+/// replica's view: a turn of a session under way served where its history is
+/// not held offers its opening too, and the ingest ignores an opening whose
+/// session already had a turn before it. Nothing without content capture: no
+/// session is detected then either.
+fn turn_fingerprints(state: &TransformState, content: Option<&ContentMeta>) -> TurnFingerprints {
+    use crate::proxy::fingerprint;
+    let Some(content) = content else {
+        return TurnFingerprints::default();
+    };
+    let opening = content
+        .opening
+        .filter(|_| content.session_info.parent_request_id.is_none())
+        .and_then(|i| content.request_messages_json.get(i))
+        .map(|message| fingerprint::json_segments(message, fingerprint::OPENING_MAX))
+        .unwrap_or_default();
+    let mut budget = fingerprint::ARGUMENT_SEGMENTS_MAX;
+    let arguments = state
+        .accumulated_tool_calls
+        .iter()
+        .filter(|call| !call.server_tool)
+        .flat_map(|call| fingerprint::call_arguments(&call.id, &call.arguments))
+        .take_while(|argument| {
+            let fits = argument.segments.len() <= budget;
+            budget = budget.saturating_sub(argument.segments.len());
+            fits
+        })
+        .collect();
+    TurnFingerprints {
+        opening,
+        answer: fingerprint::segments(&state.accumulated_text, fingerprint::ANSWER_MAX),
+        arguments,
+    }
+}
+
 /// Assemble an audit record from transform state and request metadata.
 pub fn assemble_audit_record(
     state: &TransformState,
@@ -9137,6 +9171,8 @@ pub fn assemble_audit_record(
         });
         Some(hash)
     });
+
+    let fingerprints = turn_fingerprints(state, meta.content.as_ref());
 
     AuditRecord {
         request_id: meta.request_id,
@@ -9364,7 +9400,7 @@ pub fn assemble_audit_record(
             .content
             .as_mut()
             .and_then(|c| c.first_user_prompt.take()),
-        parent_session_id: meta.parent_session_id,
+        fingerprints,
         upstream_server_id: meta
             .upstream_server_id
             .as_deref()
@@ -9444,6 +9480,42 @@ pub fn assemble_audit_record(
 
 #[cfg(test)]
 mod tests {
+    mod turn_fingerprint_tests {
+        use super::super::{TransformState, turn_fingerprints};
+        use crate::proxy::ContentMeta;
+        use crate::proxy::session_detector::SessionInfo;
+
+        const OPENING: &str = r#"{"role":"user","content":"Investigate the failing build and report back"}"#;
+
+        fn meta(parent: Option<uuid::Uuid>) -> ContentMeta {
+            ContentMeta {
+                request_messages_json: vec![OPENING.to_string()],
+                media_scan_needed: false,
+                request_tools: None,
+                effective_tools: None,
+                request_params: None,
+                system_prompt: None,
+                transform_diff: None,
+                link_hashes: Vec::new(),
+                session_info: SessionInfo { session_id: uuid::Uuid::nil(), parent_request_id: parent, turn_number: 4, is_baseline: true },
+                opening: Some(0),
+                request_size_bytes: 0,
+                first_user_prompt: None,
+            }
+        }
+
+        /// A turn offers its opening when it continues no earlier turn here —
+        /// whatever its number, which only this replica's counter gave it —
+        /// and a continued turn never does.
+        #[test]
+        fn a_turn_continuing_nothing_offers_its_opening() {
+            let state = TransformState::new(crate::api::sse::ApiVersion::ChatCompletions);
+            assert_eq!(turn_fingerprints(&state, Some(&meta(None))).opening.len(), 1);
+            assert!(turn_fingerprints(&state, Some(&meta(Some(uuid::Uuid::nil())))).opening.is_empty());
+        }
+    }
+
+
     mod call_stream_properties;
 
     #[test]

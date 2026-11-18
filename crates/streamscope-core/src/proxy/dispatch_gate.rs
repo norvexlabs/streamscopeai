@@ -108,7 +108,7 @@ pub struct GateRequest {
     /// How long this request may be held.
     pub ttl: Duration,
     /// What makes another request the same one sent again
-    /// ([`super::content::request_key`]). A request with the same key waiting
+    /// ([`super::session_detector::request_key`]). A request with the same key waiting
     /// in this request's own pool for at least
     /// [`GateSettings::resend_min_age`] is a copy its client gave up on: the
     /// arrival takes its place in the queue and the copy is refused

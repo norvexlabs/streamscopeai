@@ -2,6 +2,7 @@
   import { portalWorkspace, sessionHref } from '#lib/selfScoped.js';
   import { formatTimeAgo, formatTokens, formatSpend, parseAlertLines } from '#lib/formatters.js';
   import { m } from '#lib/paraglide/messages.js';
+  import { linkChipLabel } from '#lib/colormaps/linkage.js';
   import Icon from '#lib/components/Icon.svelte';
   import type { SessionSummary } from '#lib/api-types.js';
   import { page } from '$app/state';
@@ -107,20 +108,33 @@
       {#each alertLines as line}
         <span class="text-[10px] px-1 py-0.5 rounded-sm {line.level === 'major' ? 'bg-(--error-bg) text-(--error)/80' : line.level === 'minor' ? 'bg-(--warning-bg) text-(--warning)/80' : 'bg-(--tag-neutral-bg) text-(--tag-neutral-text)'}">{line.axis}</span>
       {/each}
-      {#if (session.child_count ?? 0) > 0}
+      {#if session.links && session.links.sub_agents > 0}
         <span class="text-[10px] px-1.5 py-0.5 rounded-sm bg-(--accent)/15 text-(--accent) border border-(--accent)">
-          {session.child_count} {session.child_count === 1 ? m.session_row_child() : m.session_row_children()}
+          {session.links.sub_agents} {session.links.sub_agents === 1 ? m.session_row_child() : m.session_row_children()}
         </span>
       {/if}
-      {#if session.parent_session_id}
+      {#if session.links?.continued_in}
+        {@const next = session.links.continued_in}
         <span
           role="link"
           tabindex="0"
-          onclick={(e) => { e.preventDefault(); e.stopPropagation(); goto(sessionHref(slug, page.url.pathname, session.parent_session_id ?? '', viewedWorkspace())); }}
-          onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); goto(sessionHref(slug, page.url.pathname, session.parent_session_id ?? '', viewedWorkspace())); } }}
+          onclick={(e) => { e.preventDefault(); e.stopPropagation(); goto(sessionHref(slug, page.url.pathname, next, viewedWorkspace())); }}
+          onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); goto(sessionHref(slug, page.url.pathname, next, viewedWorkspace())); } }}
           class="text-[10px] px-1.5 py-0.5 rounded-sm bg-(--accent)/10 text-(--accent) border border-(--accent) hover:bg-(--accent)/20 transition-colors cursor-pointer"
         >
-          &rarr; {m.session_row_parent()}
+          {m.session_row_continued_in()} &rarr;
+        </span>
+      {/if}
+      {#if session.link}
+        {@const link = session.link}
+        <span
+          role="link"
+          tabindex="0"
+          onclick={(e) => { e.preventDefault(); e.stopPropagation(); goto(sessionHref(slug, page.url.pathname, link.session_id, viewedWorkspace())); }}
+          onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); goto(sessionHref(slug, page.url.pathname, link.session_id, viewedWorkspace())); } }}
+          class="text-[10px] px-1.5 py-0.5 rounded-sm bg-(--accent)/10 text-(--accent) border border-(--accent) hover:bg-(--accent)/20 transition-colors cursor-pointer"
+        >
+          &rarr; {linkChipLabel(link.kind)}
         </span>
       {/if}
     </div>

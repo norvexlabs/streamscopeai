@@ -9728,32 +9728,15 @@ export interface components {
              *     authenticated here (distinct from `user_email`, the internal account).
              */
             client_ip?: string | null;
-            /**
-             * @description Subagent spawn points detected in THIS session's own stream (the parent
-             *     side): each `Agent`/`Task`-style tool call, with the turn, id and a prompt
-             *     preview. Computed on read from the built events. The cluster judge confirms
-             *     a child↔spawn link from it, and the UI anchors child cards + content-matches
-             *     header-linked children that carry no stored anchor.
-             */
-            detected_spawn_points?: components["schemas"]["DetectedSpawnPoint"][];
             end_user?: string | null;
             end_user_groups?: string[];
             events?: components["schemas"]["ConversationEvent"][] | null;
             format: string;
             key_name?: string | null;
             key_prefix?: string | null;
-            linkage_confidence?: string | null;
-            /**
-             * @description This session's own spawn anchor as a CHILD — the tool-call id in its parent.
-             *     Present only when a spawn call was confirmed; the parent's stream anchors the
-             *     child card on `(linkage_spawn_turn, linkage_spawn_tool_call_id)`.
-             */
-            linkage_spawn_tool_call_id?: string | null;
-            /** Format: int32 */
-            linkage_spawn_turn?: number | null;
+            link?: components["schemas"]["SessionLink"] | null;
+            links?: components["schemas"]["LinkedCounts"] | null;
             model: string;
-            /** Format: uuid */
-            parent_session_id?: string | null;
             raw_turns?: components["schemas"]["RawTurn"][] | null;
             /** Format: uuid */
             session_id: string;
@@ -10663,29 +10646,6 @@ export interface components {
          * @enum {string}
          */
         DestinationMode: "allow" | "block";
-        /**
-         * @description A subagent-spawning tool call detected in a parent conversation. The judge
-         *     references it by its position in the per-session list (`[P0]`, `[P1]`, …); the
-         *     UI anchors a child card to the composite `(turn_number, tool_call_id)` because
-         *     `tool_call_id` alone is only turn-unique (Gemini/legacy shapes synthesize a
-         *     per-turn `call_0`).
-         */
-        DetectedSpawnPoint: {
-            /**
-             * @description First ~200 chars of the child prompt/description the call carried, so the
-             *     judge can match it to a child session's first user message.
-             */
-            prompt_preview: string;
-            /** @description Tool-call id of the spawn call (turn-unique, not session-unique). */
-            tool_call_id: string;
-            /** @description Spawn tool name (`Task`, `Agent`, …). */
-            tool_name: string;
-            /**
-             * Format: int32
-             * @description Parent turn the spawn call was made in.
-             */
-            turn_number: number;
-        };
         DeviceAuthorizationRequest: {
             /** @description Must be [`CLI_CLIENT_ID`]. */
             client_id: string;
@@ -13127,6 +13087,19 @@ export interface components {
              *     another person's spend (the viewer rules are `StackViewer`'s).
              */
             used?: number | null;
+        };
+        /** @description The sessions linked to a session, by kind. */
+        LinkedCounts: {
+            /**
+             * Format: uuid
+             * @description The session that continues it after a compaction.
+             */
+            continued_in?: string | null;
+            /**
+             * Format: int64
+             * @description Sub-agents it spawned.
+             */
+            sub_agents: number;
         };
         /** @description Response for GET /sessions/{id}/linked — returns parent + children. */
         LinkedSessions: {
@@ -16155,8 +16128,6 @@ export interface components {
                 alert_level?: string | null;
                 alert_note?: string | null;
                 app_id?: string | null;
-                /** Format: int64 */
-                child_count?: number | null;
                 /** Format: date-time */
                 first_timestamp: string;
                 first_user_prompt?: string | null;
@@ -16168,19 +16139,10 @@ export interface components {
                 last_latency_ms?: number | null;
                 /** Format: date-time */
                 last_timestamp: string;
-                linkage_confidence?: string | null;
-                /**
-                 * @description Tool-call id of the spawn call in the parent this session was spawned from
-                 *     (a CHILD only). The UI anchors the child card to the composite
-                 *     `(linkage_spawn_turn, linkage_spawn_tool_call_id)` on the parent's stream.
-                 */
-                linkage_spawn_tool_call_id?: string | null;
-                /** Format: int32 */
-                linkage_spawn_turn?: number | null;
+                link?: components["schemas"]["SessionLink"] | null;
+                links?: components["schemas"]["LinkedCounts"] | null;
                 model_requested?: string | null;
                 model_used?: string | null;
-                /** Format: uuid */
-                parent_session_id?: string | null;
                 provider?: string | null;
                 /** Format: uuid */
                 session_id: string;
@@ -19960,6 +19922,28 @@ export interface components {
             id: string;
             name: string;
         };
+        /** @description The session a session is linked to, and how. */
+        SessionLink: {
+            evidence: components["schemas"]["SessionLinkEvidence"];
+            kind: components["schemas"]["SessionLinkKind"];
+            /**
+             * Format: uuid
+             * @description The session it is linked to: the parent of a sub-agent, the
+             *     conversation a continuation continues.
+             */
+            session_id: string;
+            spawned_at?: components["schemas"]["SpawnAnchor"] | null;
+        };
+        /**
+         * @description What a session link was read from.
+         * @enum {string}
+         */
+        SessionLinkEvidence: "quote" | "agent_high" | "agent_medium";
+        /**
+         * @description What a session is to the session it is linked to.
+         * @enum {string}
+         */
+        SessionLinkKind: "sub_agent" | "continuation";
         /**
          * @description How a session sits in a cross-session relation.
          * @enum {string}
@@ -19977,8 +19961,6 @@ export interface components {
             alert_level?: string | null;
             alert_note?: string | null;
             app_id?: string | null;
-            /** Format: int64 */
-            child_count?: number | null;
             /** Format: date-time */
             first_timestamp: string;
             first_user_prompt?: string | null;
@@ -19990,19 +19972,10 @@ export interface components {
             last_latency_ms?: number | null;
             /** Format: date-time */
             last_timestamp: string;
-            linkage_confidence?: string | null;
-            /**
-             * @description Tool-call id of the spawn call in the parent this session was spawned from
-             *     (a CHILD only). The UI anchors the child card to the composite
-             *     `(linkage_spawn_turn, linkage_spawn_tool_call_id)` on the parent's stream.
-             */
-            linkage_spawn_tool_call_id?: string | null;
-            /** Format: int32 */
-            linkage_spawn_turn?: number | null;
+            link?: components["schemas"]["SessionLink"] | null;
+            links?: components["schemas"]["LinkedCounts"] | null;
             model_requested?: string | null;
             model_used?: string | null;
-            /** Format: uuid */
-            parent_session_id?: string | null;
             provider?: string | null;
             /** Format: uuid */
             session_id: string;
@@ -20148,6 +20121,19 @@ export interface components {
          * @enum {string}
          */
         SourceFilter: "builtin" | "custom";
+        /** @description Where in its parent's conversation a sub-agent was spawned. */
+        SpawnAnchor: {
+            /**
+             * @description The spawning tool call in that turn; absent when only the turn is
+             *     known (an expert's estimate).
+             */
+            tool_call_id?: string | null;
+            /**
+             * Format: int32
+             * @description The parent's turn, as the conversation's events number it.
+             */
+            turn_number: number;
+        };
         /**
          * @description A spend total decomposed per pricing unit.
          *

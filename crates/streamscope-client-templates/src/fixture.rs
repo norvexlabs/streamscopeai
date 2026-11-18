@@ -2172,6 +2172,47 @@ mod tests {
         );
     }
 
+    /// Gemini CLI's built-in subagents ignore `model.name`: `codebase_investigator`,
+    /// `cli_help` and `browser_agent` each name a Google model of their own,
+    /// which the gateway does not serve. Every one of them is pinned to the
+    /// provisioned model through `agents.overrides.<name>.modelConfig.model`;
+    /// `generalist` inherits the session model, so it is left to follow
+    /// `--model`. Under BYOK the user's own models pass through, so neither
+    /// the model nor the pins are written.
+    #[test]
+    fn gemini_pins_every_builtin_subagent_that_names_its_own_model() {
+        // The built-in agents of Gemini CLI 0.68 whose `modelConfig.model` is not `inherit`.
+        const PINNED: [&str; 3] = ["browser_agent", "cli_help", "codebase_investigator"];
+        let gemini = seed("gemini-cli");
+        let t = &gemini.templates[0];
+        assert!(t.kind.needs_llm());
+        let render = |forward_auth: bool| {
+            let mut phs = validation_placeholders();
+            phs.insert("forward_auth".into(), Value::Bool(forward_auth));
+            phs.insert("model_alias".into(), Value::String("gw-provisioned-alias".into()));
+            let body = crate::render::render(&t.body, t.format, &phs).expect("renders");
+            serde_json::from_str::<serde_json::Value>(&body).expect("json")
+        };
+
+        let doc = render(false);
+        assert_eq!(doc["model"]["name"], "gw-provisioned-alias");
+        let overrides = doc["agents"]["overrides"].as_object().expect("agents.overrides");
+        let mut ids: Vec<&str> = overrides.keys().map(String::as_str).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, PINNED);
+        for (id, o) in overrides {
+            assert_eq!(
+                o,
+                &serde_json::json!({ "modelConfig": { "model": "gw-provisioned-alias" } }),
+                "agent {id}"
+            );
+        }
+
+        let byok = render(true);
+        assert!(byok.get("model").is_none(), "{byok}");
+        assert!(byok.get("agents").is_none(), "{byok}");
+    }
+
     /// The MCP-only leg of a dual-template client declares no credential
     /// companion — the property that replaced the old `kind.needs_llm()` gate
     /// inside `companion_files`.

@@ -1853,25 +1853,17 @@ async fn media_handler_inner(
         .map(|sid| super::content::session_id_from_client(sid, ctx.user.tenant_id, ctx.user.user_id));
 
     // --- Session detection ---
-    // Media requests have no message content, so pass empty hashes.
-    // With a client X-Session-Id, detect() will link to an existing session.
-    // Without one, detect() with empty hashes creates a new session.
+    // A media request has no conversation to continue: under a client
+    // X-Session-Id it is a turn of the session that id names, else a session
+    // of its own. Nothing to record — no request continues it.
     let key_id = ctx.user.key_id.unwrap_or(uuid::Uuid::nil());
-    let empty_hashes: Vec<String> = Vec::new();
     let session_info = state.session_detector.detect(
         ctx.user.user_id,
         key_id,
         ctx.user.tenant_id,
-        &empty_hashes,
+        &[],
+        None,
         attr.session_id.as_deref(),
-    );
-    state.session_detector.record(
-        ctx.user.user_id,
-        key_id,
-        request_id,
-        &session_info,
-        empty_hashes,
-        attr.session_id.clone(),
     );
     record.conversation_session_id = Some(session_info.session_id);
     record.turn_number = Some(session_info.turn_number);

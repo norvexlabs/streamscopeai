@@ -258,15 +258,15 @@ pub async fn run_purge_tenant_with_override(
     .await?;
 
     // Cross-session relations reference sessions BY VALUE (no FK), so purging a
-    // member session above would otherwise leave stale members — drifting
-    // `child_count` / `has_children` and growing the tables unbounded.
+    // member session above would otherwise leave stale members — drifting the
+    // linked counts and growing the tables unbounded.
     // Reference-driven cleanup (RLS-scoped), run after the session delete:
-    //  - a linkage is a pair, so drop the whole relation if EITHER endpoint is
-    //    gone (its members cascade);
+    //  - a linkage or a continuation is a pair, so drop
+    //    the whole relation if EITHER endpoint is gone (its members cascade);
     //  - an issue spans a set, so drop only the purged `subject` members, then
     //    any relation left with none.
     let linkage_gone = sqlx::query(
-        "DELETE FROM cross_session_relations r WHERE r.kind = 'linkage' \
+        "DELETE FROM cross_session_relations r WHERE r.kind IN ('linkage', 'continuation') \
          AND EXISTS (SELECT 1 FROM cross_session_relation_members m \
            WHERE m.relation_id = r.id \
            AND NOT EXISTS (SELECT 1 FROM sessions s WHERE s.session_id = m.session_id))",
@@ -308,6 +308,38 @@ pub async fn run_purge_tenant_with_override(
     summary.system_prompts_deleted = content.system_prompts;
     summary.history_chunks_deleted = content.history_chunks;
     summary.media_blobs_deleted = content.media_blobs;
+
+    // What a new conversation may quote: looked for only within the content
+    // links' window, so kept no longer, whatever the tenant's retention.
+    let fingerprint_cutoff = std::cmp::max(
+        cutoff,
+        chrono::Utc::now() - chrono::Duration::hours(i64::from(crate::edge_v2::content_links::WINDOW_HOURS)),
+    );
+    batch_delete_conn(
+        &mut *conn,
+        "DELETE FROM turn_fingerprints WHERE timestamp < $1 \
+           AND (tenant_id, user_id, kind, fp, request_id, tool_call_id, part) IN \
+         (SELECT tenant_id, user_id, kind, fp, request_id, tool_call_id, part \
+            FROM turn_fingerprints WHERE timestamp < $1 LIMIT $2)",
+        &fingerprint_cutoff,
+        crate::settings::admin_settings().retention_batch_size,
+    )
+    .await?;
+    // A tool-call argument is quoted only within minutes (a subagent opens
+    // right after its call), and its rows are most of the table: each pass
+    // drops those past that window.
+    let argument_cutoff = chrono::Utc::now()
+        - chrono::Duration::minutes(i64::from(crate::edge_v2::content_links::ARGUMENT_WINDOW_MINUTES));
+    batch_delete_conn(
+        &mut *conn,
+        "DELETE FROM turn_fingerprints WHERE kind = 'argument' AND timestamp < $1 \
+           AND (tenant_id, user_id, kind, fp, request_id, tool_call_id, part) IN \
+         (SELECT tenant_id, user_id, kind, fp, request_id, tool_call_id, part \
+            FROM turn_fingerprints WHERE kind = 'argument' AND timestamp < $1 LIMIT $2)",
+        &argument_cutoff,
+        crate::settings::admin_settings().retention_batch_size,
+    )
+    .await?;
 
     // Agent-generated suggestions — accumulate per analysis cycle, purge by age
     let prog_result = sqlx::query("DELETE FROM program_suggestions WHERE created_at < $1")

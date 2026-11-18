@@ -12,6 +12,9 @@
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use super::fingerprint;
+use super::session_detector::LinkHash;
+
 use crate::api::domain::{Message, MessageContent, ResponseInput};
 use crate::api::messages::{AnthropicContent, AnthropicMessage, ContentBlock, ToolResultBlock, ToolResultContent};
 use crate::api::sse::ApiVersion;
@@ -49,7 +52,19 @@ pub struct RequestContent {
     pub hash_exact: Vec<bool>,
     /// Filtered hashes for session detection — `link_hashes` without the
     /// messages that are volatile whole (e.g. `<available-deferred-tools>`).
-    pub session_hashes: Vec<String>,
+    pub session_hashes: Vec<LinkHash>,
+    /// The session hash of the message the conversation opens with
+    /// ([`fingerprint::opening_of`]: past the leading system/developer run,
+    /// the first of its first messages with prose of the user's own — a
+    /// client's injected context sent as a message of its own is the same in
+    /// every conversation). `None` when the request carries no such message,
+    /// or its history is held elsewhere (a Responses `previous_response_id`):
+    /// nothing in it can tell its thread.
+    pub thread_root: Option<LinkHash>,
+    /// Where that message is among the messages (`messages_json`): what the
+    /// ingest reads a new history's quote from
+    /// ([`crate::proxy::fingerprint`]). Set exactly when `thread_root` is.
+    pub opening: Option<usize>,
     pub request_size_bytes: usize,
     /// First meaningful user prompt text (max 200 chars), extracted protocol-aware.
     /// Skips system-injected content blocks (e.g., `<system-reminder>` tags).
@@ -763,26 +778,12 @@ fn extract_user_prompt_chat(messages: &[Message]) -> Option<String> {
         .iter()
         .filter(|m| m.role == "user")
         .find_map(|m| match &m.content {
-            Some(MessageContent::Text(text)) => {
-                let t = text.trim();
-                if is_injected_content(t) {
-                    None
-                } else {
-                    Some(truncate_prompt(t))
-                }
-            }
-            Some(MessageContent::Parts(parts)) => {
-                // Walk parts forward to find the first meaningful user text
-                for part in parts {
-                    if let crate::api::domain::ContentPart::Text { text, .. } = part {
-                        let t = text.trim();
-                        if !t.is_empty() && !is_injected_content(t) {
-                            return Some(truncate_prompt(t));
-                        }
-                    }
-                }
-                None
-            }
+            Some(MessageContent::Text(text)) => title_prompt(text),
+            // The first meaningful text part, forward.
+            Some(MessageContent::Parts(parts)) => parts.iter().find_map(|part| match part {
+                crate::api::domain::ContentPart::Text { text, .. } => title_prompt(text),
+                _ => None,
+            }),
             None => None,
         })
 }
@@ -793,17 +794,13 @@ fn extract_user_prompt_chat(messages: &[Message]) -> Option<String> {
 /// (`input_text` — how Codex sends every message); a message carrying only
 /// client-injected context is skipped.
 fn extract_user_prompt_responses(input: &ResponseInput) -> Option<String> {
-    let meaningful = |text: &str| {
-        let t = text.trim();
-        (!is_injected_content(t)).then(|| truncate_prompt(t))
-    };
     match input {
-        ResponseInput::Text(text) => meaningful(text),
+        ResponseInput::Text(text) => title_prompt(text),
         ResponseInput::Messages(msgs) => msgs
             .iter()
             .filter(|m| m.role == "user")
             .find_map(|m| match &m.content {
-                MessageContent::Text(text) => meaningful(text),
+                MessageContent::Text(text) => title_prompt(text),
                 // An `input_text` part is not a Chat part, so it parses as
                 // `Unknown`; its text is still the prompt.
                 MessageContent::Parts(parts) => parts
@@ -815,17 +812,17 @@ fn extract_user_prompt_responses(input: &ResponseInput) -> Option<String> {
                         }
                         _ => None,
                     })
-                    .find_map(meaningful),
+                    .find_map(title_prompt),
             }),
         ResponseInput::Raw(items) => items
             .iter()
             .filter(|v| v.get("role").and_then(|r| r.as_str()) == Some("user"))
             .find_map(|v| match v.get("content") {
-                Some(serde_json::Value::String(text)) => meaningful(text),
+                Some(serde_json::Value::String(text)) => title_prompt(text),
                 Some(serde_json::Value::Array(parts)) => parts
                     .iter()
                     .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-                    .find_map(meaningful),
+                    .find_map(title_prompt),
                 _ => None,
             }),
     }
@@ -839,25 +836,12 @@ fn extract_user_prompt_anthropic(messages: &[AnthropicMessage]) -> Option<String
         .iter()
         .filter(|m| m.role == "user")
         .find_map(|m| match &m.content {
-            AnthropicContent::Text(text) => {
-                let t = text.trim();
-                if is_injected_content(t) {
-                    None
-                } else {
-                    Some(truncate_prompt(t))
-                }
-            }
-            AnthropicContent::Blocks(blocks) => {
-                for block in blocks {
-                    if let ContentBlock::Text { text, .. } = block {
-                        let t = text.trim();
-                        if !t.is_empty() && !is_injected_content(t) {
-                            return Some(truncate_prompt(t));
-                        }
-                    }
-                }
-                None
-            }
+            AnthropicContent::Text(text) => title_prompt(text),
+            // The first meaningful text block, forward.
+            AnthropicContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                ContentBlock::Text { text, .. } => title_prompt(text),
+                _ => None,
+            }),
         })
 }
 
@@ -1085,6 +1069,27 @@ fn strip_volatile_inline(text: &str) -> String {
     out
 }
 
+/// The user's own prose in `text`, a string of a message as sent: `None` when
+/// the whole text is context a client injects (a volatile block or bracket
+/// prefix at its start, an [`INJECTED_CONTEXT_PREFIXES`] text, leading
+/// whitespace aside), else `text` without its volatile blocks and its
+/// [`CONTEXT_BLOCK_TAGS`] blocks. What an opening is fingerprinted by: the
+/// context a client repeats in every conversation (its instructions file, its
+/// reminders) is no quote of another conversation.
+pub fn own_prose(text: &str) -> Option<String> {
+    let lead = text.trim_start();
+    if INJECTED_CONTEXT_PREFIXES.iter().any(|p| lead.starts_with(p))
+        || BRACKET_PREFIXES.iter().any(|p| lead.starts_with(p))
+    {
+        return None;
+    }
+    let prose = strip_volatile_inline(text);
+    Some(match strip_context_blocks(&prose) {
+        std::borrow::Cow::Borrowed(_) => prose,
+        std::borrow::Cow::Owned(stripped) => stripped,
+    })
+}
+
 /// True iff `part` is a volatile text element. Accepts two shapes:
 ///   - Tagged text part: `{type:"text", text:"<volatile-tag>…"}` —
 ///     used by Chat Completions (`ContentPart::Text`), Anthropic
@@ -1208,11 +1213,74 @@ fn is_injected_content(text: &str) -> bool {
 /// Context a client injects as a user message that is not the user's prompt,
 /// yet is NOT volatile: it holds still within a session, so it stays in the
 /// session hashes (unlike [`VOLATILE_TAG_PREFIXES`]) and is only kept out of
-/// the prompt a session is titled by.
+/// the prompt a session is titled by and its opening ([`own_prose`]).
 const INJECTED_CONTEXT_PREFIXES: &[&str] = &[
     "<environment_context>",    // Codex: working directory, shell, date
     "# AGENTS.md instructions", // Codex: the repository's AGENTS.md, as a user message
+    // Qwen Code: its memory index, a part before the prompt (its header line, then the block).
+    "Current memory catalog (full snapshot; supersedes all earlier memory catalogs):\n<system-reminder>",
 ];
+
+/// Context a client puts before or after the user's own text, or sends as a
+/// text of its own, as a block that opens at the start of a line and closes
+/// with its tag. Like [`INJECTED_CONTEXT_PREFIXES`] it stays in the session
+/// hashes and is only kept out of the title and the opening
+/// ([`strip_context_blocks`]); the text around it is kept.
+const CONTEXT_BLOCK_TAGS: &[(&str, &str)] = &[
+    ("<turn-context>", "</turn-context>"), // Goose: the time and working directory, after every user message
+    ("<system_reminder>", "</system_reminder>"), // Crush: its todo-list reminder, a user message of its own
+];
+
+/// `text` without its [`CONTEXT_BLOCK_TAGS`] blocks: each from an opening tag
+/// at the start of a line of what is kept (spaces and tabs before it allowed)
+/// through its first close; an opening never closed is kept, as prose, with
+/// everything after it. One pass over the text per tag, borrowed when it holds
+/// no opening tag.
+fn strip_context_blocks(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut text = std::borrow::Cow::Borrowed(text);
+    for &(open, close) in CONTEXT_BLOCK_TAGS {
+        if !text.contains(open) {
+            continue;
+        }
+        let mut out = String::with_capacity(text.len());
+        let (mut cursor, mut from) = (0, 0);
+        while let Some(found) = text[from..].find(open) {
+            let at = from + found;
+            let before = text[cursor..at].trim_end_matches([' ', '\t']);
+            let line_start = if before.is_empty() {
+                let kept = out.trim_end_matches([' ', '\t']);
+                kept.is_empty() || kept.ends_with('\n')
+            } else {
+                before.ends_with('\n')
+            };
+            if !line_start {
+                from = at + open.len();
+                continue;
+            }
+            // No close after this opening: none after a later one either.
+            let Some(end) = text[at..].find(close) else { break };
+            out.push_str(&text[cursor..at]);
+            cursor = at + end + close.len();
+            from = cursor;
+        }
+        out.push_str(&text[cursor..]);
+        text = std::borrow::Cow::Owned(out);
+    }
+    text
+}
+
+/// The prompt a session is titled by, from one text of a user message: `None`
+/// when it is empty or context a client injects ([`is_injected_content`]),
+/// else the text without its context blocks, truncated.
+fn title_prompt(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() || is_injected_content(t) {
+        return None;
+    }
+    let own = strip_context_blocks(t);
+    let own = own.trim();
+    (!own.is_empty()).then(|| truncate_prompt(own))
+}
 
 /// Detect volatile metadata blocks that change between turns without
 /// representing actual conversation content. These are excluded from
@@ -1259,6 +1327,11 @@ fn extract_text_from_message_content(content: &crate::api::domain::MessageConten
 
 fn truncate_prompt(text: &str) -> String {
     crate::proxy::truncate_with_marker(text, MAX_PROMPT_PREVIEW_CHARS)
+}
+
+/// A role whose messages make up a history's leading system run.
+fn is_system_role(role: &str) -> bool {
+    role == "system" || role == "developer"
 }
 
 /// The Chat Completions system prompt: the leading run of `system`/`developer`
@@ -1446,13 +1519,23 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
             let system_prompt = chat_system_prompt(&req.messages);
 
             // Session hashes: non-volatile messages only — reuse already-computed hashes.
-            let session_hashes: Vec<String> = req
+            let session_hashes: Vec<LinkHash> = req
                 .messages
                 .iter()
                 .enumerate()
                 .filter(|(_, msg)| !is_volatile_for_hashing_chat(msg))
-                .map(|(i, _)| message_hashes[i].clone())
+                .map(|(i, _)| LinkHash::of(&message_hashes[i]))
                 .collect();
+            let opening = fingerprint::opening_of(
+                &messages_json,
+                req.messages
+                    .iter()
+                    .enumerate()
+                    .skip_while(|(_, msg)| is_system_role(&msg.role))
+                    .filter(|(_, msg)| !is_volatile_for_hashing_chat(msg))
+                    .map(|(i, _)| i),
+            );
+            let thread_root = opening.map(|i| LinkHash::of(&message_hashes[i]));
 
             // Extract ALL request parameters (100% raw capture)
             let params = {
@@ -1544,6 +1627,8 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
+                thread_root,
+                opening,
                 request_size_bytes,
                 first_user_prompt,
             }
@@ -1655,7 +1740,25 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
             let first_user_prompt = extract_user_prompt_responses(&req.input);
 
             // Session hashes: same as message_hashes for Responses (no volatile blocks)
-            let session_hashes = message_hashes.clone();
+            let session_hashes: Vec<LinkHash> = message_hashes.iter().map(|h| LinkHash::of(h)).collect();
+            let opening = if req.previous_response_id.is_some() {
+                None
+            } else {
+                let candidates: Vec<usize> = match &req.input {
+                    ResponseInput::Text(_) => vec![0],
+                    ResponseInput::Messages(msgs) => {
+                        msgs.iter().enumerate().filter(|(_, m)| !is_system_role(&m.role)).map(|(i, _)| i).collect()
+                    }
+                    ResponseInput::Raw(items) => items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| !item.get("role").and_then(|r| r.as_str()).is_some_and(is_system_role))
+                        .map(|(i, _)| i)
+                        .collect(),
+                };
+                fingerprint::opening_of(&messages_json, candidates.into_iter().filter(|&i| i < session_hashes.len()))
+            };
+            let thread_root = opening.map(|i| session_hashes[i]);
 
             RequestContent {
                 messages_json,
@@ -1666,6 +1769,8 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
+                thread_root,
+                opening,
                 request_size_bytes,
                 first_user_prompt,
             }
@@ -1680,13 +1785,19 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
             let system_prompt = req.system.as_ref().map(|s| s.to_text());
 
             // Session hashes: non-volatile messages only — reuse already-computed hashes.
-            let session_hashes: Vec<String> = req
+            let session_hashes: Vec<LinkHash> = req
                 .messages
                 .iter()
                 .enumerate()
                 .filter(|(_, msg)| !is_volatile_for_hashing(msg))
-                .map(|(i, _)| message_hashes[i].clone())
+                .map(|(i, _)| LinkHash::of(&message_hashes[i]))
                 .collect();
+            // The system prompt rides beside the messages.
+            let opening = fingerprint::opening_of(
+                &messages_json,
+                req.messages.iter().enumerate().filter(|(_, msg)| !is_volatile_for_hashing(msg)).map(|(i, _)| i),
+            );
+            let thread_root = opening.map(|i| LinkHash::of(&message_hashes[i]));
 
             let params = {
                 let mut p = serde_json::Map::new();
@@ -1741,6 +1852,8 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
+                thread_root,
+                opening,
                 request_size_bytes,
                 first_user_prompt,
             }
@@ -1755,7 +1868,10 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
             let system_prompt = req.system_instruction.as_ref().and_then(crate::api::gemini::GeminiContent::system_text);
 
             // All message hashes are stable (Gemini has no volatile fields like cache_control)
-            let session_hashes = message_hashes.clone();
+            let session_hashes: Vec<LinkHash> = message_hashes.iter().map(|h| LinkHash::of(h)).collect();
+            // The system instruction rides beside the contents.
+            let opening = fingerprint::opening_of(&messages_json, 0..session_hashes.len());
+            let thread_root = opening.map(|i| session_hashes[i]);
 
             let params = {
                 let mut p = serde_json::Map::new();
@@ -1797,16 +1913,15 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 .as_ref()
                 .and_then(|t| serde_json::to_value(t).ok());
 
-            // Extract first user prompt text
+            // The first meaningful text of a user content, forward, as on the
+            // other protocols.
             let first_user_prompt = req
                 .contents
                 .iter()
-                .find(|c| c.role.as_deref() == Some("user"))
-                .and_then(|c| {
+                .filter(|c| c.role.as_deref().is_none_or(|r| r == "user"))
+                .find_map(|c| {
                     c.parts.iter().find_map(|p| match p {
-                        crate::api::gemini::GeminiPart::Text { text } => {
-                            Some(crate::proxy::truncate_with_marker(text, MAX_PROMPT_PREVIEW_CHARS))
-                        }
+                        crate::api::gemini::GeminiPart::Text { text } => title_prompt(text),
                         _ => None,
                     })
                 });
@@ -1820,6 +1935,8 @@ pub fn extract_request_content(api_request: &ApiRequest, body_size: usize) -> Re
                 link_hashes: message_hashes,
                 hash_exact: exact,
                 session_hashes,
+                thread_root,
+                opening,
                 request_size_bytes,
                 first_user_prompt,
             }
@@ -2304,69 +2421,8 @@ pub fn extract_response_content(
 }
 
 // ---------------------------------------------------------------------------
-// Session Detection
+// Client session ids
 // ---------------------------------------------------------------------------
-
-/// A message's link hash in its 32 bytes, not its 64-character hex text: the
-/// detector keeps one per message of every recent turn, and a long session's
-/// turn repeats every hash before it. A lowercase hex hash (what the link
-/// hashes are) is its own bytes; any other text is held as a domain-separated
-/// SHA-256 of it, which no hex hash's bytes can equal short of a preimage.
-/// Written (the restart snapshot) as hex.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LinkHash([u8; 32]);
-
-impl LinkHash {
-    pub fn of(hash: &str) -> Self {
-        let mut bytes = [0u8; 32];
-        let canonical = hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-        if canonical && hex::decode_to_slice(hash, &mut bytes).is_ok() {
-            return Self(bytes);
-        }
-        let mut digest = Sha256::new();
-        digest.update(b"streamscope-link-hash\0");
-        digest.update(hash.as_bytes());
-        Self(digest.finalize().into())
-    }
-}
-
-impl serde::Serialize for LinkHash {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut text = [0u8; 64];
-        hex::encode_to_slice(self.0, &mut text).map_err(serde::ser::Error::custom)?;
-        serializer.serialize_str(std::str::from_utf8(&text).map_err(serde::ser::Error::custom)?)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for LinkHash {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Ok(Self::of(&text))
-    }
-}
-
-/// Entry tracking a recent turn for session detection.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TurnEntry {
-    pub request_id: Uuid,
-    pub session_id: Uuid,
-    pub turn_number: i32,
-    pub message_hashes: Vec<LinkHash>,
-    pub client_session_id: Option<String>,
-    /// When this entry was recorded. Not serialized — on deserialization,
-    /// defaults to `Instant::now()` so restored entries get a fresh TTL window.
-    #[serde(skip, default = "std::time::Instant::now")]
-    pub recorded_at: std::time::Instant,
-}
-
-/// Session detection result.
-#[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub session_id: Uuid,
-    pub parent_request_id: Option<Uuid>,
-    pub turn_number: i32,
-    pub is_baseline: bool,
-}
 
 /// Derive a deterministic UUID from a client-provided session ID string,
 /// scoped to a specific tenant and API key. Same (client_id, tenant_id, key_id)
@@ -2392,592 +2448,6 @@ pub fn session_id_from_client(client_id: &str, tenant_id: Uuid, user_id: Uuid) -
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 1
     Uuid::from_bytes(bytes)
-}
-
-/// What makes a request the same one sent again: its caller, the key it came
-/// on, its client session id, its protocol, model and streaming mode (a Gemini
-/// request names the last two in its URL), and its body exactly as sent. The
-/// session hashes are not enough — they leave out a Responses
-/// `previous_response_id`, an Anthropic `system`, tools and sampling
-/// parameters — so two different requests could share them. Read by the
-/// session detector ([`SessionDetector::detect_serving`]) and the dispatch gate
-/// (`GateRequest::resend_key`).
-pub fn request_key(
-    user_id: Uuid,
-    key_id: Uuid,
-    client_session_id: Option<&str>,
-    protocol: &str,
-    model: &str,
-    stream: bool,
-    body: &[u8],
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(user_id.as_bytes());
-    hasher.update(key_id.as_bytes());
-    // Length-prefixed, so no two field splits hash alike.
-    for field in [client_session_id.unwrap_or("").as_bytes(), protocol.as_bytes(), model.as_bytes()] {
-        hasher.update((field.len() as u64).to_le_bytes());
-        hasher.update(field);
-    }
-    hasher.update([u8::from(client_session_id.is_some()), u8::from(stream)]);
-    hasher.update(body);
-    hasher.finalize().into()
-}
-
-/// The requests this process is serving now, by [`request_key`], each with the
-/// turn its detection gave it and how many copies of it are being served.
-type InFlight = dashmap::DashMap<[u8; 32], (SessionInfo, usize)>;
-
-/// A request's place among those being served ([`SessionDetector::detect_serving`]).
-/// Dropped when the request is over by any path — answered, refused, failed or
-/// abandoned — which is when a copy of it stops being a re-send.
-pub struct ServingGuard {
-    in_flight: std::sync::Arc<InFlight>,
-    key: [u8; 32],
-    released: std::sync::atomic::AtomicBool,
-}
-
-impl ServingGuard {
-    /// The client has the whole answer: from now on the same request is the
-    /// conversation asking again, though the audit of this one may still be
-    /// running (it holds the guard until it ends). Idempotent, and the drop
-    /// releases whatever was not.
-    pub fn release(&self) {
-        if self.released.swap(true, std::sync::atomic::Ordering::AcqRel) {
-            return;
-        }
-        if let dashmap::mapref::entry::Entry::Occupied(mut e) = self.in_flight.entry(self.key) {
-            e.get_mut().1 -= 1;
-            if e.get().1 == 0 {
-                e.remove();
-            }
-        }
-    }
-}
-
-impl Drop for ServingGuard {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-impl std::fmt::Debug for ServingGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServingGuard").finish_non_exhaustive()
-    }
-}
-
-/// Snapshot data type: maps `(user_id, key_id)` to their recorded turns.
-/// Used for session detector persistence and snapshot import/export.
-pub type SessionSnapshot = std::collections::HashMap<(Uuid, Uuid), Vec<TurnEntry>>;
-
-/// Current time as epoch milliseconds (for atomic dirty-tracking).
-fn epoch_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// In-memory session detector using message prefix matching.
-///
-/// Sharded by `(user_id, key_id)` via DashMap — concurrent requests for
-/// different users or different API keys never contend. Each shard holds a
-/// Vec of recent turns with an LRU cap. Key scoping ensures that sessions
-/// from one API key cannot be matched or continued by a different key.
-///
-/// When the client provides an `X-Session-Id` header, it takes priority
-/// over prefix matching — this allows session continuity across context
-/// compaction (where the message array is replaced with a summary).
-///
-/// **Two-tier memory model**:
-/// - `recent_turns` — heavy (each entry keeps its turn's message hashes, 32 B a message).
-///   Evicted aggressively to cap memory.
-/// - `session_high_water` — lightweight map (session_id → max turn_number,
-///   ~20 bytes/entry). Survives LRU eviction so that X-Session-Id sessions
-///   continue turn numbering correctly after cache miss. Without this,
-///   LRU eviction causes turn_number to reset to 0, producing duplicates.
-///
-/// Persistence across restarts is provided by periodic snapshots to disk
-/// (managed by the proxy binary). Zero per-request I/O — the DashMap is
-/// the only hot-path data structure.
-pub struct SessionDetector {
-    recent_turns: dashmap::DashMap<(Uuid, Uuid), Vec<TurnEntry>>,
-    max_entries_per_user: usize,
-    /// Maximum total entries across all users (memory safety net). Past it,
-    /// [`Self::shrink_to_low_water`] drops the expired entries and then the
-    /// oldest across all users. Set to 0 for unlimited.
-    max_total_entries: usize,
-    /// A [`Self::shrink_to_low_water`] pass is running.
-    shrinking: std::sync::atomic::AtomicBool,
-    /// Approximate count of entries across all users. Updated atomically
-    /// on insert (+1) and eviction (-N). Used to check the global cap
-    /// without scanning the DashMap.
-    entry_count: std::sync::atomic::AtomicUsize,
-    entry_ttl: std::time::Duration,
-    /// Set to true by `record()`, cleared by `export_entries()`.
-    dirty: std::sync::atomic::AtomicBool,
-    /// Epoch millis of last `record()` call (for idle detection).
-    last_record_ms: std::sync::atomic::AtomicU64,
-    /// Epoch millis of last successful snapshot export.
-    last_snapshot_ms: std::sync::atomic::AtomicU64,
-    /// Tracks the highest turn_number ever recorded per session_id.
-    /// Survives LRU eviction so that re-detected sessions (via X-Session-Id)
-    /// continue from the correct turn instead of resetting to 0.
-    session_high_water: dashmap::DashMap<Uuid, i32>,
-    /// The requests this process is serving now ([`Self::detect_serving`]): an
-    /// identical one arriving meanwhile is a re-send. Never persisted — a
-    /// restart ends every request it was serving.
-    in_flight: std::sync::Arc<InFlight>,
-}
-
-impl SessionDetector {
-    pub fn new(max_entries_per_user: usize, entry_ttl: std::time::Duration) -> Self {
-        Self::with_capacity(max_entries_per_user, entry_ttl, 0)
-    }
-
-    /// Create a session detector with a global entry cap (`max_total_entries`,
-    /// 0 for none): past it, [`Self::shrink_to_low_water`].
-    pub fn with_capacity(max_entries_per_user: usize, entry_ttl: std::time::Duration, max_total_entries: usize) -> Self {
-        let now_ms = epoch_millis();
-        Self {
-            recent_turns: dashmap::DashMap::new(),
-            max_entries_per_user,
-            max_total_entries,
-            shrinking: std::sync::atomic::AtomicBool::new(false),
-            entry_count: std::sync::atomic::AtomicUsize::new(0),
-            entry_ttl,
-            dirty: std::sync::atomic::AtomicBool::new(false),
-            last_record_ms: std::sync::atomic::AtomicU64::new(now_ms),
-            last_snapshot_ms: std::sync::atomic::AtomicU64::new(now_ms),
-            session_high_water: dashmap::DashMap::new(),
-            in_flight: std::sync::Arc::default(),
-        }
-    }
-
-    /// [`Self::detect`], for a request this process then serves until the
-    /// returned guard drops. A request with the same [`request_key`] still
-    /// being served is a re-send: its client gave up waiting and sent it again.
-    /// It is that turn again — same session, turn number, parent and baseline
-    /// — never a new session (a first turn would otherwise open a second one,
-    /// which the conversation's next turn joins) nor, under a client session
-    /// id, the next turn. Once every copy is over, by any path, the same request
-    /// is the conversation asking again.
-    ///
-    /// Two copies arriving together get one turn between them: each detects
-    /// outside the entry's lock (a prefix scan, not to be held under it), and
-    /// the first to register wins — a later one takes its info.
-    pub fn detect_serving(
-        &self,
-        user_id: Uuid,
-        key_id: Uuid,
-        tenant_id: Uuid,
-        current_hashes: &[String],
-        client_session_id: Option<&str>,
-        request_key: [u8; 32],
-    ) -> (SessionInfo, ServingGuard) {
-        let original = self.in_flight.get_mut(&request_key).map(|mut entry| {
-            entry.1 += 1;
-            entry.0.clone()
-        });
-        let info = match original {
-            Some(info) => info,
-            None => {
-                let detected = self.detect(user_id, key_id, tenant_id, current_hashes, client_session_id);
-                match self.in_flight.entry(request_key) {
-                    dashmap::mapref::entry::Entry::Occupied(mut first) => {
-                        first.get_mut().1 += 1;
-                        first.get().0.clone()
-                    }
-                    dashmap::mapref::entry::Entry::Vacant(slot) => {
-                        slot.insert((detected.clone(), 1));
-                        detected
-                    }
-                }
-            }
-        };
-        (info, ServingGuard { in_flight: self.in_flight.clone(), key: request_key, released: Default::default() })
-    }
-
-    /// Remove user entries where all turn entries have expired.
-    /// Call periodically to prevent unbounded growth of the user key set.
-    /// Returns the number of entries removed (for entry_count bookkeeping).
-    pub fn prune_expired_users(&self) -> usize {
-        let now = std::time::Instant::now();
-        let mut removed = 0usize;
-        self.recent_turns.retain(|_key, entries| {
-            let before = entries.len();
-            entries.retain(|e| now.duration_since(e.recorded_at) < self.entry_ttl);
-            removed += before - entries.len();
-            !entries.is_empty()
-        });
-        self.uncount(removed);
-        removed
-    }
-
-    /// Bring the map back to [`Self::low_water`] entries: every expired entry
-    /// goes ([`Self::prune_expired_users`]), then the oldest ones across all
-    /// users — never one user's alone, so no user loses its newest turns to a
-    /// cap the others filled. Age is `recorded_at`, then depth: entries restored
-    /// from a snapshot share one stamp, and among them the deepest in their
-    /// user's list (the oldest) go first. One caller at a time: another one past the
-    /// cap meanwhile records and goes on, and a pass leaves room for a tenth of
-    /// the cap before the next one is needed.
-    ///
-    /// Each step reads or writes the map in its own statement, with no guard of
-    /// it alive across another call on it: a guard held there waits on its own
-    /// lock and parks the worker for good.
-    fn shrink_to_low_water(&self) {
-        use std::sync::atomic::Ordering;
-        if self.shrinking.swap(true, Ordering::Acquire) {
-            return;
-        }
-        // Cleared however the pass ends: a flag left set would turn the cap off.
-        struct Running<'a>(&'a std::sync::atomic::AtomicBool);
-        impl Drop for Running<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
-        let _running = Running(&self.shrinking);
-        self.prune_expired_users();
-        // (stamp, depth from the user's newest, user, request): the entries
-        // chosen are removed by request id AND stamp, so a record running beside
-        // the pass never loses an entry the pass did not choose.
-        type Age = (std::time::Instant, std::cmp::Reverse<usize>, (Uuid, Uuid), Uuid);
-        let mut ages: Vec<Age> = Vec::new();
-        for user in self.recent_turns.iter() {
-            let n = user.value().len();
-            ages.extend(
-                user.value().iter().enumerate().map(|(i, e)| (e.recorded_at, std::cmp::Reverse(n - 1 - i), *user.key(), e.request_id)),
-            );
-        }
-        let excess = ages.len().saturating_sub(self.low_water());
-        type Chosen = std::collections::HashSet<(Uuid, std::time::Instant)>;
-        let mut take: std::collections::HashMap<(Uuid, Uuid), Chosen> = std::collections::HashMap::new();
-        if excess > 0 {
-            ages.select_nth_unstable_by(excess - 1, |x, y| (x.0, x.1).cmp(&(y.0, y.1)));
-            for (stamp, _, key, request) in &ages[..excess] {
-                take.entry(*key).or_default().insert((*request, *stamp));
-            }
-        }
-        drop(ages);
-        let mut removed = 0usize;
-        for (key, requests) in take {
-            let emptied = match self.recent_turns.get_mut(&key) {
-                Some(mut turns) => {
-                    let before = turns.len();
-                    turns.retain(|e| !requests.contains(&(e.request_id, e.recorded_at)));
-                    removed += before - turns.len();
-                    turns.is_empty()
-                }
-                None => false,
-            };
-            if emptied {
-                // A concurrent record may have refilled it since: keep it then.
-                self.recent_turns.remove_if(&key, |_, turns| turns.is_empty());
-            }
-        }
-        self.uncount(removed);
-    }
-
-    /// What a pass past the global cap leaves: nine tenths of it, below it
-    /// for a small cap too, and never nothing (the turn just recorded stays).
-    fn low_water(&self) -> usize {
-        self.max_total_entries.saturating_sub((self.max_total_entries / 10).max(1)).max(1)
-    }
-
-    /// Take `n` entries off the approximate count, never below zero: a wrapped
-    /// count would read as past the cap on every record.
-    fn uncount(&self, n: usize) {
-        if n > 0 {
-            self.entry_count.update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |c| c.saturating_sub(n));
-        }
-    }
-
-    /// Export DashMap contents for periodic snapshot persistence.
-    /// Clears the dirty flag and records the snapshot time.
-    pub fn export_entries(&self) -> SessionSnapshot {
-        let result = self.recent_turns
-            .iter()
-            .map(|entry| (*entry.key(), entry.value().clone()))
-            .collect();
-        // Clear dirty AFTER collecting — any record() during iteration will
-        // re-set dirty, triggering another snapshot on the next cycle.
-        self.dirty.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.last_snapshot_ms.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
-        result
-    }
-
-    /// Import snapshot entries into the DashMap (startup recovery). Every
-    /// entry is stamped with ONE `recorded_at` (now: a fresh TTL window), which
-    /// the global cap relies on to age restored entries by their depth in their
-    /// user's list rather than by the order users were restored in.
-    pub fn import_entries(&self, entries: SessionSnapshot) {
-        let restored_at = std::time::Instant::now();
-        let mut total = 0usize;
-        for (key, mut turns) in entries {
-            for turn in &mut turns {
-                turn.recorded_at = restored_at;
-            }
-            total += turns.len();
-            for turn in &turns {
-                self.session_high_water
-                    .entry(turn.session_id)
-                    .and_modify(|hw| {
-                        if turn.turn_number > *hw {
-                            *hw = turn.turn_number;
-                        }
-                    })
-                    .or_insert(turn.turn_number);
-            }
-            self.recent_turns.insert(key, turns);
-        }
-        self.entry_count.store(total, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Check if a snapshot should be saved now.
-    ///
-    /// Uses idle-aware scheduling: saves during idle periods (1s after last
-    /// write) or forces a save when `max_interval_secs` has elapsed.
-    /// Returns `false` if nothing has changed since the last snapshot.
-    pub fn should_snapshot(&self, max_interval_secs: u64) -> bool {
-        if !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
-        }
-        let now = epoch_millis();
-        let last_record = self.last_record_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let last_snapshot = self.last_snapshot_ms.load(std::sync::atomic::Ordering::Relaxed);
-
-        // Save if idle for ≥1 second (quiet window)
-        let idle_ms = now.saturating_sub(last_record);
-        if idle_ms >= 1000 {
-            return true;
-        }
-        // Force save if max interval exceeded (sustained traffic)
-        let since_snapshot = now.saturating_sub(last_snapshot);
-        since_snapshot >= max_interval_secs * 1000
-    }
-
-    /// Detect whether current message hashes continue an existing session.
-    ///
-    /// Priority order (a re-send of a request still being served comes first:
-    /// [`Self::detect_serving`]):
-    /// 1. **Client-provided `X-Session-Id`** — if present, look for a recent turn with
-    ///    the same client session ID. This allows clients (like Claude Code) to maintain
-    ///    session continuity across context compaction where message prefixes change.
-    /// 2. **Message prefix matching** — if no client session ID (or no match), check if
-    ///    the current message hashes start with a previous turn's hashes.
-    /// 3. **New session** — no match found, start a new session.
-    pub fn detect(&self, user_id: Uuid, key_id: Uuid, tenant_id: Uuid, current_hashes: &[String], client_session_id: Option<&str>) -> SessionInfo {
-        let current_hashes: Vec<LinkHash> = current_hashes.iter().map(|h| LinkHash::of(h)).collect();
-        if current_hashes.is_empty() && client_session_id.is_none() {
-            return SessionInfo {
-                session_id: Uuid::new_v4(),
-                parent_request_id: None,
-                turn_number: 0,
-                is_baseline: true,
-            };
-        }
-
-        // Media requests have empty hashes but may have X-Session-Id.
-        // Fall through to the normal matching logic below.
-        if current_hashes.is_empty() {
-            // With a client session ID but no hashes, look up the session
-            // by X-Session-Id or create a deterministic one.
-            let csid = client_session_id.unwrap(); // safe: checked above
-            let map_key = (user_id, key_id);
-            let now = std::time::Instant::now();
-            if let Some(turns) = self.recent_turns.get(&map_key) {
-                for turn in turns.iter().rev() {
-                    if now.duration_since(turn.recorded_at) > self.entry_ttl {
-                        continue;
-                    }
-                    if turn.client_session_id.as_deref() == Some(csid) {
-                        return SessionInfo {
-                            session_id: turn.session_id,
-                            parent_request_id: Some(turn.request_id),
-                            turn_number: turn.turn_number + 1,
-                            is_baseline: false,
-                        };
-                    }
-                }
-            }
-            let session_id = session_id_from_client(csid, tenant_id, user_id);
-            let turn_number = self.session_high_water
-                .get(&session_id)
-                .map(|hw| *hw + 1)
-                .unwrap_or(0);
-            return SessionInfo {
-                session_id,
-                parent_request_id: None,
-                turn_number,
-                is_baseline: true,
-            };
-        }
-
-        let now = std::time::Instant::now();
-        let map_key = (user_id, key_id);
-
-        if let Some(turns) = self.recent_turns.get(&map_key) {
-            // Priority 1: Match by client-provided X-Session-Id header
-            if let Some(csid) = client_session_id {
-                for turn in turns.iter().rev() {
-                    if now.duration_since(turn.recorded_at) > self.entry_ttl {
-                        continue; // TTL expired
-                    }
-                    if turn.client_session_id.as_deref() == Some(csid) {
-                        let prefix_matches = !turn.message_hashes.is_empty()
-                            && current_hashes.len() > turn.message_hashes.len()
-                            && current_hashes[..turn.message_hashes.len()] == turn.message_hashes[..];
-                        return SessionInfo {
-                            session_id: turn.session_id,
-                            parent_request_id: Some(turn.request_id),
-                            turn_number: turn.turn_number + 1,
-                            is_baseline: !prefix_matches,
-                        };
-                    }
-                }
-                let session_id = session_id_from_client(csid, tenant_id, user_id);
-                // Check high-water mark — if this session was seen before but
-                // evicted from the LRU, continue from the last known turn.
-                let turn_number = self.session_high_water
-                    .get(&session_id)
-                    .map(|hw| *hw + 1)
-                    .unwrap_or(0);
-                return SessionInfo {
-                    session_id,
-                    parent_request_id: None,
-                    turn_number,
-                    is_baseline: true,
-                };
-            }
-
-            // Priority 2: Message prefix matching (auto-detection)
-            for turn in turns.iter().rev() {
-                if now.duration_since(turn.recorded_at) > self.entry_ttl {
-                    continue; // TTL expired
-                }
-                if !turn.message_hashes.is_empty()
-                    && current_hashes.len() > turn.message_hashes.len()
-                    && current_hashes[..turn.message_hashes.len()] == turn.message_hashes[..]
-                {
-                    return SessionInfo {
-                        session_id: turn.session_id,
-                        parent_request_id: Some(turn.request_id),
-                        turn_number: turn.turn_number + 1,
-                        is_baseline: false,
-                    };
-                }
-            }
-        } else if let Some(csid) = client_session_id {
-            let session_id = session_id_from_client(csid, tenant_id, user_id);
-            let turn_number = self.session_high_water
-                .get(&session_id)
-                .map(|hw| *hw + 1)
-                .unwrap_or(0);
-            return SessionInfo {
-                session_id,
-                parent_request_id: None,
-                turn_number,
-                is_baseline: true,
-            };
-        }
-
-        // Priority 3: No match — new session
-        SessionInfo {
-            session_id: Uuid::new_v4(),
-            parent_request_id: None,
-            turn_number: 0,
-            is_baseline: true,
-        }
-    }
-
-    /// Record a turn for future session detection.
-    pub fn record(
-        &self,
-        user_id: Uuid,
-        key_id: Uuid,
-        request_id: Uuid,
-        info: &SessionInfo,
-        message_hashes: Vec<String>,
-        client_session_id: Option<String>,
-    ) {
-        // Empty-hash entries without a client session ID cannot participate
-        // in prefix matching and would act as catch-all matches. Skip.
-        if message_hashes.is_empty() && client_session_id.is_none() {
-            return;
-        }
-
-        let now = std::time::Instant::now();
-        let ttl = self.entry_ttl;
-
-        // Mark dirty for snapshot persistence.
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-        self.last_record_ms.store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
-
-        // Update session high-water mark so turn numbering survives LRU eviction.
-        self.session_high_water
-            .entry(info.session_id)
-            .and_modify(|hw| {
-                if info.turn_number > *hw {
-                    *hw = info.turn_number;
-                }
-            })
-            .or_insert(info.turn_number);
-
-        let entry = TurnEntry {
-            request_id,
-            session_id: info.session_id,
-            turn_number: info.turn_number,
-            message_hashes: message_hashes.iter().map(|h| LinkHash::of(h)).collect(),
-            client_session_id,
-            recorded_at: now,
-        };
-
-        let mut turns = self.recent_turns.entry((user_id, key_id)).or_default();
-
-        // Prune expired entries before adding.
-        let before_prune = turns.len();
-        turns.retain(|e| now.duration_since(e.recorded_at) < ttl);
-        let ttl_pruned = before_prune - turns.len();
-
-        turns.push(entry);
-
-        // Evict oldest entries if over per-user limit.
-        let cap_evicted = if turns.len() > self.max_entries_per_user {
-            let excess = turns.len() - self.max_entries_per_user;
-            turns.drain(..excess);
-            excess
-        } else {
-            0
-        };
-
-        drop(turns);
-
-        // Update entry count: +1 (new) - ttl_pruned - cap_evicted.
-        // Single atomic op to avoid transient negative values.
-        let removed = ttl_pruned + cap_evicted;
-        if removed > 0 {
-            // Net change: +1 - removed. If removed >= 1, do sub then no add needed
-            // if removed == 1 (break-even). Otherwise handle carefully.
-            if removed > 1 {
-                self.uncount(removed - 1);
-            } else {
-                // removed == 1: new entry replaces one removed, net zero change
-            }
-        } else {
-            self.entry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Global memory cap: past it, one batch takes the whole map back to its
-        // low-water mark, oldest entries first.
-        if self.max_total_entries > 0
-            && self.entry_count.load(std::sync::atomic::Ordering::Relaxed) > self.max_total_entries
-        {
-            self.shrink_to_low_water();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3809,7 +3279,8 @@ mod tests {
             assert_eq!(h.len(), 64, "sha256 hex");
         }
         // Session hashes mirror message hashes for Responses (no volatile blocks).
-        assert_eq!(content.session_hashes, content.link_hashes);
+        let linked: Vec<LinkHash> = content.link_hashes.iter().map(|h| LinkHash::of(h)).collect();
+        assert_eq!(content.session_hashes, linked);
     }
 
     /// Regression: a `{role, content}` item must hash identically whether the
@@ -3942,399 +3413,6 @@ mod tests {
     }
 
     #[test]
-    fn session_detector_new_session_for_first_turn() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let hashes = vec!["hash1".to_string()];
-
-        let info = detector.detect(user_id, key_id, tenant_id, &hashes, None);
-        assert!(info.is_baseline);
-        assert_eq!(info.turn_number, 0);
-        assert!(info.parent_request_id.is_none());
-    }
-
-    #[test]
-    fn session_detector_continues_session_on_prefix_match() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let req1 = Uuid::new_v4();
-
-        // Turn 1: [hash1]
-        let hashes1 = vec!["hash1".to_string()];
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, None);
-        detector.record(user_id, key_id, req1, &info1, hashes1, None);
-
-        // Turn 2: [hash1, hash2, hash3] — prefix matches turn 1
-        let hashes2 = vec!["hash1".to_string(), "hash2".to_string(), "hash3".to_string()];
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, None);
-
-        assert_eq!(info2.session_id, info1.session_id);
-        assert_eq!(info2.parent_request_id, Some(req1));
-        assert_eq!(info2.turn_number, 1);
-        assert!(!info2.is_baseline);
-    }
-
-    #[test]
-    fn session_detector_new_session_when_no_prefix_match() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let req1 = Uuid::new_v4();
-
-        // Turn 1: [hash1]
-        let hashes1 = vec!["hash1".to_string()];
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, None);
-        detector.record(user_id, key_id, req1, &info1, hashes1, None);
-
-        // Turn 2: [hash_x] — completely different, new session
-        let hashes2 = vec!["hash_x".to_string()];
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, None);
-
-        assert_ne!(info2.session_id, info1.session_id);
-        assert!(info2.parent_request_id.is_none());
-        assert_eq!(info2.turn_number, 0);
-        assert!(info2.is_baseline);
-    }
-
-    #[test]
-    fn session_detector_evicts_old_entries() {
-        let detector = SessionDetector::new(2, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-
-        // Record 3 turns — only last 2 should remain
-        for i in 0..3 {
-            let req_id = Uuid::new_v4();
-            let hashes = vec![format!("hash_{i}")];
-            let info = SessionInfo {
-                session_id: Uuid::new_v4(),
-                parent_request_id: None,
-                turn_number: 0,
-                is_baseline: true,
-            };
-            detector.record(user_id, key_id, req_id, &info, hashes, None);
-        }
-
-        assert_eq!(detector.recent_turns.get(&(user_id, key_id)).unwrap().len(), 2);
-    }
-
-    /// Runs `f` on its own thread and fails if it has not returned within 10 s:
-    /// a self-deadlock parks that thread for good instead of failing.
-    fn returns_in_time<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
-            Ok(v) => v,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("the call did not return: it waits on a lock it holds"),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the call panicked (its own message is above)"),
-        }
-    }
-
-    fn baseline() -> SessionInfo {
-        SessionInfo { session_id: Uuid::new_v4(), parent_request_id: None, turn_number: 0, is_baseline: true }
-    }
-
-    #[test]
-    fn the_global_cap_evicts_a_whole_user_and_returns() {
-        // Two entries in all: the third user's record goes over the global cap,
-        // and the pass (down to one) empties the first two users' lists,
-        // removing them from the map.
-        let detector = std::sync::Arc::new(SessionDetector::with_capacity(1, std::time::Duration::from_secs(1800), 2));
-        let (first, middle, second, key_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        for (i, user_id) in [first, middle, second].into_iter().enumerate() {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            let d = detector.clone();
-            returns_in_time(move || d.record(user_id, key_id, Uuid::new_v4(), &baseline(), vec![format!("hash_{i}")], None));
-        }
-        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 1);
-        assert!(detector.recent_turns.get(&(first, key_id)).is_none());
-        assert!(detector.recent_turns.get(&(middle, key_id)).is_none());
-        assert_eq!(detector.recent_turns.get(&(second, key_id)).map(|t| t.len()), Some(1));
-    }
-
-    #[test]
-    fn past_the_global_cap_the_oldest_entries_of_all_users_go_first() {
-        // Five users, two rounds of one turn each: the cap of 10 is full. One
-        // more turn goes past it, and the pass leaves nine tenths of the cap,
-        // 9: the two oldest turns go (the first round's first two users'),
-        // whoever recorded last, and every user keeps its newest turn.
-        let detector = SessionDetector::with_capacity(50, std::time::Duration::from_secs(1800), 10);
-        let key_id = Uuid::new_v4();
-        let users: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-        let mut turn = 0;
-        let mut record = |user: Uuid| {
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            detector.record(user, key_id, Uuid::new_v4(), &baseline(), vec![format!("hash_{turn}")], None);
-            turn += 1;
-        };
-        for _round in 0..2 {
-            for &u in &users {
-                record(u);
-            }
-        }
-        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 10, "at the cap, nothing goes");
-        record(users[4]);
-        let held = |u: Uuid| detector.recent_turns.get(&(u, key_id)).map(|t| t.iter().map(|e| e.message_hashes[0]).collect::<Vec<_>>());
-        assert_eq!(held(users[0]), Some(vec![LinkHash::of("hash_5")]));
-        assert_eq!(held(users[1]), Some(vec![LinkHash::of("hash_6")]));
-        assert_eq!(held(users[2]), Some(vec![LinkHash::of("hash_2"), LinkHash::of("hash_7")]));
-        assert_eq!(held(users[4]), Some(vec![LinkHash::of("hash_4"), LinkHash::of("hash_9"), LinkHash::of("hash_10")]));
-        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 9);
-        assert_eq!(detector.recent_turns.iter().map(|e| e.value().len()).sum::<usize>(), 9);
-    }
-
-    /// A hex link hash is held as its 32 bytes and written back as the same
-    /// hex; any other text is held by a separate digest, and a snapshot's hex
-    /// reads back to the same value.
-    #[test]
-    fn a_link_hash_is_its_32_bytes_and_round_trips_as_hex() {
-        let hex_hash = "ab".repeat(32);
-        let held = LinkHash::of(&hex_hash);
-        assert_eq!(held.0, [0xab; 32]);
-        assert_eq!(serde_json::to_string(&held).unwrap(), format!("\"{hex_hash}\""));
-        assert_eq!(serde_json::from_str::<LinkHash>(&format!("\"{hex_hash}\"")).unwrap(), held);
-        // Not a hex hash (upper case, another length, a non-hex character): its
-        // digest, never its bytes.
-        assert_ne!(LinkHash::of(&"AB".repeat(32)), held);
-        assert_ne!(LinkHash::of(&"ab".repeat(33)).0[..], [0xab; 33][..32]);
-        assert_ne!(LinkHash::of(&format!("{}zz", "ab".repeat(31))).0[..31], [0xab; 31]);
-        // Never the bytes of the hex of a text's own digest.
-        let digest_hex = hex::encode(Sha256::digest(b"h1"));
-        assert_ne!(LinkHash::of("h1"), LinkHash::of(&digest_hex));
-        assert_eq!(LinkHash::of("h1"), LinkHash::of("h1"));
-        assert_ne!(LinkHash::of("h1"), LinkHash::of("h2"));
-        assert_eq!(std::mem::size_of::<LinkHash>(), 32);
-    }
-
-    #[test]
-    fn after_a_restore_the_global_cap_takes_each_users_oldest_turns_first() {
-        // Restored entries share one stamp: the pass ages them by depth, so of
-        // three equal lists each loses its oldest turn before any loses a
-        // second, and the turn just recorded stays.
-        let detector = SessionDetector::with_capacity(50, std::time::Duration::from_secs(1800), 11);
-        let key_id = Uuid::new_v4();
-        let users: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
-        let snapshot: SessionSnapshot = users
-            .iter()
-            .map(|&u| {
-                let turns = (0..4)
-                    .map(|i| TurnEntry {
-                        request_id: Uuid::new_v4(),
-                        session_id: Uuid::new_v4(),
-                        turn_number: i,
-                        message_hashes: vec![LinkHash::of(&format!("{u}-{i}"))],
-                        client_session_id: None,
-                        recorded_at: std::time::Instant::now(),
-                    })
-                    .collect();
-                ((u, key_id), turns)
-            })
-            .collect();
-        detector.import_entries(snapshot);
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let newcomer = Uuid::new_v4();
-        detector.record(newcomer, key_id, Uuid::new_v4(), &baseline(), vec!["new".into()], None);
-        // 13 entries past a cap of 11: down to 10, three go — each user's oldest.
-        for &u in &users {
-            let held: Vec<i32> = detector.recent_turns.get(&(u, key_id)).unwrap().iter().map(|e| e.turn_number).collect();
-            assert_eq!(held, vec![1, 2, 3], "{u}");
-        }
-        assert_eq!(detector.recent_turns.get(&(newcomer, key_id)).map(|t| t.len()), Some(1));
-        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 10);
-    }
-
-    #[test]
-    fn under_the_global_cap_every_user_keeps_its_entries() {
-        let detector = SessionDetector::with_capacity(2, std::time::Duration::from_secs(1800), 4);
-        let key_id = Uuid::new_v4();
-        for user_id in [Uuid::new_v4(), Uuid::new_v4()] {
-            for i in 0..2 {
-                detector.record(user_id, key_id, Uuid::new_v4(), &baseline(), vec![format!("hash_{i}")], None);
-            }
-        }
-        assert_eq!(detector.entry_count.load(std::sync::atomic::Ordering::Relaxed), 4);
-        assert_eq!(detector.recent_turns.len(), 2);
-    }
-
-    #[test]
-    fn session_detector_different_users_independent() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_a = Uuid::new_v4();
-        let user_b = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let req_a = Uuid::new_v4();
-
-        // User A: turn 1
-        let hashes_a = vec!["hash1".to_string()];
-        let info_a = detector.detect(user_a, key_id, tenant_id, &hashes_a, None);
-        detector.record(user_a, key_id, req_a, &info_a, hashes_a, None);
-
-        // User B: same hashes — should still be new session (different user)
-        let hashes_b = vec!["hash1".to_string(), "hash2".to_string()];
-        let info_b = detector.detect(user_b, key_id, tenant_id, &hashes_b, None);
-
-        assert_ne!(info_b.session_id, info_a.session_id);
-        assert!(info_b.is_baseline);
-    }
-
-    #[test]
-    fn session_detector_different_keys_independent() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_a = Uuid::new_v4();
-        let key_b = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let req_a = Uuid::new_v4();
-
-        // Key A: turn 1
-        let hashes = vec!["hash1".to_string()];
-        let info_a = detector.detect(user_id, key_a, tenant_id, &hashes, None);
-        detector.record(user_id, key_a, req_a, &info_a, hashes.clone(), None);
-
-        // Key B: same user, same hashes — should still be new session (different key)
-        let hashes2 = vec!["hash1".to_string(), "hash2".to_string()];
-        let info_b = detector.detect(user_id, key_b, tenant_id, &hashes2, None);
-
-        assert_ne!(info_b.session_id, info_a.session_id);
-        assert!(info_b.is_baseline);
-    }
-
-    fn hashes(names: &[&str]) -> Vec<String> {
-        names.iter().map(|n| n.to_string()).collect()
-    }
-
-    /// The request key of a test request whose body is its messages.
-    fn key_of(user: Uuid, key: Uuid, h: &[&str], csid: Option<&str>) -> [u8; 32] {
-        request_key(user, key, csid, "chat_completions", "m", false, h.join("|").as_bytes())
-    }
-
-    /// Detect and record one request, as the proxy does for every turn, and
-    /// keep it served until the returned guard drops.
-    fn arrive(d: &SessionDetector, user: Uuid, key: Uuid, h: &[&str], csid: Option<&str>) -> (SessionInfo, ServingGuard) {
-        let served = d.detect_serving(user, key, Uuid::nil(), &hashes(h), csid, key_of(user, key, h, csid));
-        d.record(user, key, Uuid::new_v4(), &served.0, hashes(h), csid.map(str::to_string));
-        served
-    }
-
-    #[test]
-    fn a_resent_first_turn_is_the_same_turn_and_the_next_turn_joins_it() {
-        let d = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-        let (first, held) = arrive(&d, user, key, &["a"], None);
-        let (again, resent) = arrive(&d, user, key, &["a"], None);
-        assert_eq!((again.session_id, again.turn_number, again.is_baseline), (first.session_id, 0, true));
-        assert_eq!(again.parent_request_id, None);
-        drop((held, resent));
-        // The next, longer turn joins the one session: nothing is left orphaned.
-        let (next, _g) = arrive(&d, user, key, &["a", "b", "c"], None);
-        assert_eq!((next.session_id, next.turn_number), (first.session_id, 1));
-    }
-
-    #[test]
-    fn a_resent_later_turn_keeps_its_number_and_parent() {
-        let d = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-        drop(arrive(&d, user, key, &["a"], None));
-        let (second, _held) = arrive(&d, user, key, &["a", "b", "c"], None);
-        let (again, _resent) = arrive(&d, user, key, &["a", "b", "c"], None);
-        assert_eq!((again.session_id, again.turn_number), (second.session_id, 1));
-        assert_eq!((again.parent_request_id, again.is_baseline), (second.parent_request_id, false));
-        // The positive control: a longer request still advances.
-        let (third, _g) = arrive(&d, user, key, &["a", "b", "c", "d", "e"], None);
-        assert_eq!((third.session_id, third.turn_number), (second.session_id, 2));
-    }
-
-    #[test]
-    fn a_resend_under_a_client_session_id_is_not_the_next_turn() {
-        let d = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-        drop(arrive(&d, user, key, &["a"], Some("cs")));
-        let (second, _held) = arrive(&d, user, key, &["a", "b", "c"], Some("cs"));
-        let (again, _resent) = arrive(&d, user, key, &["a", "b", "c"], Some("cs"));
-        assert_eq!((again.session_id, again.turn_number), (second.session_id, 1));
-        // An identical body under ANOTHER client session id is another request.
-        let (other, _o) = arrive(&d, user, key, &["a", "b", "c"], Some("other"));
-        assert_ne!(other.session_id, second.session_id);
-    }
-
-    #[test]
-    fn equal_session_hashes_of_a_different_request_are_not_a_resend() {
-        // A Responses turn chained by `previous_response_id`, an Anthropic
-        // `system` or another model: the session hashes match, the request
-        // does not.
-        let d = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-        drop(arrive(&d, user, key, &["a"], Some("cs")));
-        let (second, _held) = arrive(&d, user, key, &["a", "b", "c"], Some("cs"));
-        let other = request_key(user, key, Some("cs"), "responses", "m", false, b"previous_response_id=2");
-        let (next, _g) = d.detect_serving(user, key, Uuid::nil(), &hashes(&["a", "b", "c"]), Some("cs"), other);
-        assert_eq!((next.session_id, next.turn_number), (second.session_id, 2));
-    }
-
-    #[test]
-    fn the_same_body_from_another_user_or_key_is_not_a_resend() {
-        let d = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-        let (first, _held) = arrive(&d, user, key, &["a"], None);
-        assert_ne!(arrive(&d, user, Uuid::new_v4(), &["a"], None).0.session_id, first.session_id);
-        assert_ne!(arrive(&d, Uuid::new_v4(), key, &["a"], None).0.session_id, first.session_id);
-    }
-
-    #[test]
-    fn the_same_request_once_the_original_is_over_is_asked_again() {
-        // A test suite, a cron job, "regenerate" once the answer arrived — or
-        // a copy refused or failed: once nothing serves the original, the same
-        // request is the conversation asking again.
-        let d = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-        let (first, held) = arrive(&d, user, key, &["a"], None);
-        // The control: while it is served, the same request is a re-send.
-        let (again, resent) = arrive(&d, user, key, &["a"], None);
-        assert_eq!(again.session_id, first.session_id);
-        // Every copy must end: one still served keeps the turn open. A copy
-        // released early (its answer delivered, its audit still running) and
-        // then dropped counts once.
-        held.release();
-        drop(held);
-        assert_eq!(arrive(&d, user, key, &["a"], None).0.session_id, first.session_id);
-        drop(resent);
-        let (later, _g) = arrive(&d, user, key, &["a"], None);
-        assert_ne!(later.session_id, first.session_id);
-        assert_eq!(later.turn_number, 0);
-    }
-
-    #[test]
-    fn copies_arriving_together_get_one_turn() {
-        // Each copy detects outside the entry's lock; the first to register
-        // must win, or two simultaneous first turns open two sessions.
-        for _ in 0..50 {
-            let d = std::sync::Arc::new(SessionDetector::new(20, std::time::Duration::from_secs(1800)));
-            let (user, key) = (Uuid::new_v4(), Uuid::new_v4());
-            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
-            let copies: Vec<_> = (0..8)
-                .map(|_| {
-                    let (d, start) = (d.clone(), start.clone());
-                    std::thread::spawn(move || {
-                        start.wait();
-                        d.detect_serving(user, key, Uuid::nil(), &hashes(&["a"]), None, key_of(user, key, &["a"], None))
-                    })
-                })
-                .collect();
-            let served: Vec<_> = copies.into_iter().map(|c| c.join().expect("thread")).collect();
-            let sessions: std::collections::HashSet<_> = served.iter().map(|(info, _)| info.session_id).collect();
-            assert_eq!(sessions.len(), 1, "simultaneous copies split into {} sessions", sessions.len());
-        }
-    }
-
-    #[test]
     fn session_id_from_client_user_keyed() {
         // The hash is keyed by user_id (not key_id), so the same agent
         // stamping the same client session id under two different keys
@@ -4349,81 +3427,6 @@ mod tests {
         assert_eq!(id_a, id_b, "same user + same client id → same UUID");
         let id_other_user = session_id_from_client("same-session", tenant, other_user);
         assert_ne!(id_a, id_other_user, "different users → different UUIDs");
-    }
-
-    #[test]
-    fn session_detector_client_session_id_creates_deterministic_session() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let hashes = vec!["hash1".to_string()];
-
-        // Same client session ID → same session UUID
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes, Some("my-session-abc"));
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes, Some("my-session-abc"));
-        assert_eq!(info1.session_id, info2.session_id);
-
-        // Different client session ID → different session UUID
-        let info3 = detector.detect(user_id, key_id, tenant_id, &hashes, Some("other-session"));
-        assert_ne!(info1.session_id, info3.session_id);
-    }
-
-    #[test]
-    fn session_detector_client_session_id_continues_across_compaction() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let csid = "conv-42";
-
-        // Turn 1: [hash1, hash2] with client session ID
-        let req1 = Uuid::new_v4();
-        let hashes1 = vec!["hash1".to_string(), "hash2".to_string()];
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, Some(csid));
-        assert!(info1.is_baseline);
-        assert_eq!(info1.turn_number, 0);
-        detector.record(user_id, key_id, req1, &info1, hashes1, Some(csid.to_string()));
-
-        // Turn 2: [hash1, hash2, hash3] — prefix match + same session ID
-        let req2 = Uuid::new_v4();
-        let hashes2 = vec!["hash1".to_string(), "hash2".to_string(), "hash3".to_string()];
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, Some(csid));
-        assert_eq!(info2.session_id, info1.session_id);
-        assert_eq!(info2.turn_number, 1);
-        assert!(!info2.is_baseline); // prefix matches → not baseline
-        detector.record(user_id, key_id, req2, &info2, hashes2, Some(csid.to_string()));
-
-        // Turn 3: CLIENT COMPACTION — completely different messages, same session ID
-        let hashes3 = vec!["summary_hash".to_string(), "new_user_hash".to_string()];
-        let info3 = detector.detect(user_id, key_id, tenant_id, &hashes3, Some(csid));
-        assert_eq!(info3.session_id, info1.session_id); // SAME session!
-        assert_eq!(info3.parent_request_id, Some(req2)); // links to turn 2
-        assert_eq!(info3.turn_number, 2);
-        assert!(info3.is_baseline); // prefix doesn't match → baseline
-    }
-
-    #[test]
-    fn session_detector_no_client_id_falls_back_to_prefix() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-
-        // Turn 1 with client session ID
-        let req1 = Uuid::new_v4();
-        let hashes1 = vec!["hash1".to_string()];
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, Some("sess-1"));
-        detector.record(user_id, key_id, req1, &info1, hashes1, Some("sess-1".to_string()));
-
-        // Turn 2 WITHOUT client session ID but with prefix match
-        let hashes2 = vec!["hash1".to_string(), "hash2".to_string()];
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, None);
-
-        // Should still match via prefix
-        assert_eq!(info2.session_id, info1.session_id);
-        assert_eq!(info2.turn_number, 1);
-        assert!(!info2.is_baseline);
     }
 
     #[test]
@@ -4708,7 +3711,7 @@ mod tests {
     fn anthropic_session_detection_with_cache_control_changes() {
         use crate::api::messages::{AnthropicContent, AnthropicMessage, CacheControl, ContentBlock};
 
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
+        let detector = super::super::session_detector::SessionDetector::new(20, std::time::Duration::from_secs(1800));
         let user_id = Uuid::new_v4();
         let key_id = Uuid::new_v4();
         let tenant_id = Uuid::new_v4();
@@ -4722,10 +3725,10 @@ mod tests {
                 extra: Default::default(),
             }]),
         };
-        let hashes1 = vec![hash_anthropic_message(&msg1)];
+        let hashes1 = vec![LinkHash::of(&hash_anthropic_message(&msg1))];
         let req1 = Uuid::new_v4();
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, None);
-        detector.record(user_id, key_id, req1, &info1, hashes1, None);
+        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, hashes1.first().copied(), None);
+        detector.record(user_id, key_id, req1, &info1, &hashes1, None);
         assert_eq!(info1.turn_number, 0);
 
         // Turn 2: same user message but cache_control moved to assistant message
@@ -4750,144 +3753,15 @@ mod tests {
             content: AnthropicContent::Text("How are you?".to_string()),
         };
         let hashes2 = vec![
-            hash_anthropic_message(&msg1_no_cc),
-            hash_anthropic_message(&msg2_assistant),
-            hash_anthropic_message(&msg2_user),
+            LinkHash::of(&hash_anthropic_message(&msg1_no_cc)),
+            LinkHash::of(&hash_anthropic_message(&msg2_assistant)),
+            LinkHash::of(&hash_anthropic_message(&msg2_user)),
         ];
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, None);
+        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, hashes2.first().copied(), None);
 
         assert_eq!(info2.session_id, info1.session_id, "should continue same session");
         assert_eq!(info2.turn_number, 1, "should be turn 1");
         assert_eq!(info2.parent_request_id, Some(req1));
-    }
-
-    #[test]
-    fn session_detector_ttl_expires_entries() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_millis(50));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let req1 = Uuid::new_v4();
-
-        let hashes1 = vec!["hash1".to_string()];
-        let info1 = detector.detect(user_id, key_id, tenant_id, &hashes1, None);
-        detector.record(user_id, key_id, req1, &info1, hashes1, None);
-
-        // Immediately: prefix match should work
-        let hashes2 = vec!["hash1".to_string(), "hash2".to_string()];
-        let info2 = detector.detect(user_id, key_id, tenant_id, &hashes2, None);
-        assert_eq!(info2.session_id, info1.session_id, "should match before TTL");
-
-        // Wait for TTL to expire
-        std::thread::sleep(std::time::Duration::from_millis(60));
-
-        // After TTL: should NOT match (entry expired)
-        let hashes3 = vec!["hash1".to_string(), "hash2".to_string(), "hash3".to_string()];
-        let info3 = detector.detect(user_id, key_id, tenant_id, &hashes3, None);
-        assert_ne!(info3.session_id, info1.session_id, "should not match after TTL");
-    }
-
-    #[test]
-    fn session_detector_ttl_pruned_on_record() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_millis(50));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-
-        // Record 3 entries
-        for i in 0..3 {
-            let info = SessionInfo {
-                session_id: Uuid::new_v4(),
-                parent_request_id: None,
-                turn_number: 0,
-                is_baseline: true,
-            };
-            detector.record(user_id, key_id, Uuid::new_v4(), &info, vec![format!("h{i}")], None);
-        }
-        assert_eq!(detector.recent_turns.get(&(user_id, key_id)).unwrap().len(), 3);
-
-        // Wait for TTL
-        std::thread::sleep(std::time::Duration::from_millis(60));
-
-        // Recording a new entry should prune expired ones
-        let info = SessionInfo {
-            session_id: Uuid::new_v4(),
-            parent_request_id: None,
-            turn_number: 0,
-            is_baseline: true,
-        };
-        detector.record(user_id, key_id, Uuid::new_v4(), &info, vec!["fresh".to_string()], None);
-        assert_eq!(detector.recent_turns.get(&(user_id, key_id)).unwrap().len(), 1, "expired entries pruned");
-    }
-
-    #[test]
-    fn session_detector_empty_hashes_no_false_prefix_match() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-
-        // Record a turn with empty hashes (simulates ResponseInput::Raw)
-        let empty_info = SessionInfo {
-            session_id: Uuid::new_v4(),
-            parent_request_id: None,
-            turn_number: 0,
-            is_baseline: true,
-        };
-        // record() should skip this (empty hashes + no csid)
-        detector.record(user_id, key_id, Uuid::new_v4(), &empty_info, vec![], None);
-
-        // Detect with non-empty hashes — must NOT match the empty-hash entry
-        let hashes = vec!["hash1".to_string(), "hash2".to_string()];
-        let info = detector.detect(user_id, key_id, tenant_id, &hashes, None);
-
-        assert_ne!(info.session_id, empty_info.session_id, "must not match empty-hash entry");
-        assert!(info.is_baseline);
-        assert_eq!(info.turn_number, 0);
-    }
-
-    #[test]
-    fn session_detector_empty_hashes_client_session_id_baseline() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-        let tenant_id = Uuid::new_v4();
-        let csid = "media-session-1";
-
-        // Record a turn with empty hashes + client session ID (media request)
-        let media_info = SessionInfo {
-            session_id: session_id_from_client(csid, tenant_id, user_id),
-            parent_request_id: None,
-            turn_number: 0,
-            is_baseline: true,
-        };
-        detector.record(user_id, key_id, Uuid::new_v4(), &media_info, vec![], Some(csid.to_string()));
-
-        // Detect with non-empty hashes + same client session ID
-        let hashes = vec!["hash1".to_string(), "hash2".to_string()];
-        let info = detector.detect(user_id, key_id, tenant_id, &hashes, Some(csid));
-
-        assert_eq!(info.session_id, media_info.session_id, "same session via csid");
-        assert!(info.is_baseline, "empty stored hashes means prefix cannot match — must be baseline");
-        assert_eq!(info.turn_number, 1);
-    }
-
-    #[test]
-    fn session_detector_record_skips_empty_no_csid() {
-        let detector = SessionDetector::new(20, std::time::Duration::from_secs(1800));
-        let user_id = Uuid::new_v4();
-        let key_id = Uuid::new_v4();
-
-        let info = SessionInfo {
-            session_id: Uuid::new_v4(),
-            parent_request_id: None,
-            turn_number: 0,
-            is_baseline: true,
-        };
-        detector.record(user_id, key_id, Uuid::new_v4(), &info, vec![], None);
-
-        // Nothing should be stored
-        assert!(detector.recent_turns.get(&(user_id, key_id)).is_none(),
-            "empty hashes + no csid should not be recorded");
     }
 
     #[test]
@@ -4921,6 +3795,110 @@ mod tests {
             extract_text_from_message_content(&content),
             "Part 1 Part 2"
         );
+    }
+
+    /// What each client puts before or after the user's prompt is kept out of
+    /// the title: Gemini CLI's `<session_context>` part, Crush's
+    /// `<system_reminder>` message, Qwen Code's memory catalog part, Goose's
+    /// trailing `<turn-context>` block — and the prompt is what remains.
+    #[test]
+    fn a_title_is_the_prompt_without_the_context_a_client_injects() {
+        assert_eq!(title_prompt("<session_context>\nThis is the Gemini CLI.\n</session_context>"), None);
+        assert_eq!(title_prompt("<system_reminder>Your todo list is empty.</system_reminder>"), None);
+        assert_eq!(
+            title_prompt(
+                "Current memory catalog (full snapshot; supersedes all earlier memory catalogs):\n<system-reminder>\n- none\n</system-reminder>"
+            ),
+            None
+        );
+        // The user's own words are never taken for a client's context.
+        assert_eq!(
+            title_prompt("Current memory catalog looks wrong, rebuild it").as_deref(),
+            Some("Current memory catalog looks wrong, rebuild it")
+        );
+        assert_eq!(
+            title_prompt("<system_reminder>Your todo list is empty.</system_reminder>\nFix the login bug").as_deref(),
+            Some("Fix the login bug")
+        );
+        assert_eq!(
+            title_prompt("Remember OSPREY.\n<turn-context>\n<current-time>now</current-time>\n</turn-context>").as_deref(),
+            Some("Remember OSPREY.")
+        );
+        // A block only of context is no title; a tag named mid-line, or never
+        // closed, is the user's own prose.
+        assert_eq!(title_prompt("<turn-context>\nnow\n</turn-context>"), None);
+        assert_eq!(title_prompt("see <turn-context> here").as_deref(), Some("see <turn-context> here"));
+        assert_eq!(title_prompt("a\n<turn-context>\nnever closed").as_deref(), Some("a\n<turn-context>\nnever closed"));
+        assert_eq!(title_prompt("  \n ").as_deref(), None);
+    }
+
+    /// Gemini's first user content carries the session context and the prompt
+    /// as two parts: the title is the prompt, as on every other protocol.
+    #[test]
+    fn a_gemini_title_skips_the_session_context_part() {
+        let body = serde_json::json!({"contents": [
+            {"role": "user", "parts": [
+                {"text": "<session_context>\nThis is the Gemini CLI.\n</session_context>"},
+                {"text": "Remember the codeword OSPREY."},
+            ]},
+        ]});
+        let api = ApiRequest::parse(ApiVersion::GoogleGemini, &bytes::Bytes::from(body.to_string())).unwrap();
+        let content = extract_request_content(&api, 128);
+        assert_eq!(content.first_user_prompt.as_deref(), Some("Remember the codeword OSPREY."));
+    }
+
+    use proptest::strategy::Strategy as _;
+
+    proptest::proptest! {
+        /// A text holding no opening tag is returned as it is, borrowed.
+        #[test]
+        fn a_text_without_a_context_block_is_kept_whole(
+            text in proptest::collection::vec(proptest::prop_oneof![
+                "[a-z _<>/\n-]{0,6}",
+                proptest::strategy::Just("</turn-context>".to_string()),
+                proptest::strategy::Just("</system_reminder>".to_string()),
+                proptest::strategy::Just("<turn-context".to_string()),
+            ], 0..12).prop_map(|parts| parts.concat()),
+        ) {
+            proptest::prop_assume!(CONTEXT_BLOCK_TAGS.iter().all(|(open, _)| !text.contains(open)));
+            proptest::prop_assert!(matches!(strip_context_blocks(&text), std::borrow::Cow::Borrowed(s) if s == text));
+        }
+
+        /// A block opening on a line of its own, after the user's prose, is
+        /// removed through its close and nothing else is; what follows the
+        /// close is kept. Not claimed: that a second pass removes nothing — a
+        /// removal can bring a later opening to the start of a line.
+        #[test]
+        fn a_context_block_after_the_prose_is_removed_whole(
+            prose in "[a-zA-Z .,]{0,40}",
+            inside in proptest::collection::vec(proptest::prop_oneof![
+                "[a-z _<>/\n-]{0,6}",
+                proptest::strategy::Just("<turn-context>".to_string()),
+                proptest::strategy::Just("<system_reminder>".to_string()),
+                proptest::strategy::Just("</turn-context>".to_string()),
+                proptest::strategy::Just("</system_reminder>".to_string()),
+            ], 0..8).prop_map(|parts| parts.concat()),
+            after in "[a-zA-Z .,]{0,20}",
+            (open, close) in proptest::sample::select(CONTEXT_BLOCK_TAGS),
+        ) {
+            let inside = inside.replace(close, "");
+            let text = format!("{prose}\n{open}{inside}{close}{after}");
+            proptest::prop_assert_eq!(strip_context_blocks(&text).into_owned(), format!("{prose}\n{after}"));
+        }
+
+        /// Repeated openings never closed are kept, and the pass ends.
+        #[test]
+        fn an_opening_never_closed_is_kept(n in 0usize..2000) {
+            let text = format!("x{}", "\n<turn-context>".repeat(n));
+            proptest::prop_assert_eq!(strip_context_blocks(&text).into_owned(), text);
+        }
+    }
+
+    /// The opening a quote is matched on leaves out a trailing context block,
+    /// like the title.
+    #[test]
+    fn own_prose_leaves_out_a_context_block() {
+        assert_eq!(own_prose("Do it.\n<turn-context>\nnow\n</turn-context>").as_deref(), Some("Do it.\n"));
     }
 
     #[test]
@@ -5232,6 +4210,107 @@ mod tests {
             hash_message(&empty_assistant),
             "role must still distinguish otherwise-identical empty content",
         );
+    }
+
+    /// The thread root is the first message after the leading system run:
+    /// two threads of one agent (a subagent keeps its parent's system message)
+    /// open differently, and one thread whose system message changes opens
+    /// alike. A history held elsewhere has none.
+    #[test]
+    fn the_thread_root_is_the_first_message_after_the_system_run() {
+        let content = |version: ApiVersion, body: serde_json::Value| {
+            let api = ApiRequest::parse(version, &bytes::Bytes::from(body.to_string())).unwrap();
+            extract_request_content(&api, 0)
+        };
+        let chat = |system: &str, first: &str| {
+            content(
+                ApiVersion::ChatCompletions,
+                serde_json::json!({"model": "m", "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "developer", "content": "rules"},
+                    {"role": "user", "content": first},
+                    {"role": "assistant", "content": "ok"},
+                ]}),
+            )
+        };
+        let main = chat("agent", "fix the bug");
+        assert_eq!(main.thread_root, Some(main.session_hashes[2]));
+        assert_eq!(main.opening, Some(2));
+        assert_eq!(chat("agent, another day", "fix the bug").thread_root, main.thread_root);
+        assert_ne!(chat("agent", "explore the tests").thread_root, main.thread_root);
+        let only_system = content(
+            ApiVersion::ChatCompletions,
+            serde_json::json!({"model": "m", "messages": [{"role": "system", "content": "agent"}]}),
+        );
+        assert_eq!((only_system.thread_root, only_system.opening), (None, None));
+
+        let anthropic = content(
+            ApiVersion::AnthropicMessages,
+            serde_json::json!({"model": "m", "max_tokens": 1, "system": "agent", "messages": [{"role": "user", "content": "fix the bug"}]}),
+        );
+        assert_eq!(anthropic.thread_root, Some(anthropic.session_hashes[0]));
+        assert_eq!(anthropic.opening, Some(0));
+
+        let responses = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({"model": "m", "input": [
+                {"role": "developer", "content": "rules"},
+                {"role": "user", "content": "fix the bug"},
+            ]});
+            body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            content(ApiVersion::Responses, body)
+        };
+        let opened = responses(serde_json::json!({}));
+        assert_eq!(opened.thread_root, Some(opened.session_hashes[1]));
+        assert_eq!(opened.opening, Some(1));
+        let held = responses(serde_json::json!({"previous_response_id": "resp_1"}));
+        assert_eq!((held.thread_root, held.opening), (None, None));
+        let text = content(ApiVersion::Responses, serde_json::json!({"model": "m", "input": "fix the bug"}));
+        assert_eq!(text.thread_root, Some(text.session_hashes[0]));
+        assert_eq!(text.opening, Some(0));
+        // The opening's message is the one the ingest reads its quote from.
+        assert!(text.messages_json[0].contains("fix the bug"));
+    }
+
+    /// A client's instructions or environment sent as a message of its own
+    /// is the same in every conversation, so the thread opens with the first
+    /// message of the user's own prose after it — on every protocol — and two
+    /// conversations sharing that first message stay two threads.
+    #[test]
+    fn a_client_context_message_never_names_the_thread() {
+        let content = |version: ApiVersion, body: serde_json::Value| {
+            let api = ApiRequest::parse(version, &bytes::Bytes::from(body.to_string())).unwrap();
+            extract_request_content(&api, 0)
+        };
+        let codex = |prompt: &str| {
+            content(
+                ApiVersion::ChatCompletions,
+                serde_json::json!({"model": "m", "messages": [
+                    {"role": "system", "content": "agent"},
+                    {"role": "user", "content": "# AGENTS.md instructions\nAlways run the whole test suite before you answer"},
+                    {"role": "user", "content": prompt},
+                ]}),
+            )
+        };
+        let one = codex("Rename the parser module and update every caller");
+        let two = codex("Explain why the integration tests are flaky today");
+        assert_eq!(one.opening, Some(2));
+        assert_ne!(one.thread_root, two.thread_root);
+        let gemini = |prompt: &str| {
+            content(
+                ApiVersion::GoogleGemini,
+                serde_json::json!({"contents": [
+                    {"role": "user", "parts": [{"text": "<session_context>\nThe working directory is /work and the date is today\n</session_context>"}]},
+                    {"role": "user", "parts": [{"text": prompt}]},
+                ]}),
+            )
+        };
+        let one = gemini("Rename the parser module and update every caller");
+        assert_eq!(one.opening, Some(1));
+        assert_ne!(one.thread_root, gemini("Explain why the integration tests are flaky today").thread_root);
+        // A short first message of the user's own opens the thread, never the
+        // injected one before it.
+        assert_eq!(codex("ok").opening, Some(2));
+        assert_ne!(codex("ok").thread_root, codex("hi").thread_root);
     }
 
     /// Whole-message volatility filter for session_hashes continues to

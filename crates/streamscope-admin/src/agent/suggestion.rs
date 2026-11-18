@@ -291,13 +291,11 @@ pub async fn store_session_labels(
 /// Insert a `kind='linkage'` cross-session relation (parent→child) with
 /// FIRST-WRITE-WINS semantics: the one-parent-per-child partial unique index
 /// (`role='child'`) turns a second link on an already-linked child into a no-op
-/// via `ON CONFLICT DO NOTHING`, preserving the old "don't override an existing
-/// (e.g. header-derived) link" guarantee across concurrent writers. Returns
+/// via `ON CONFLICT DO NOTHING`, so a link already written — the ingest's
+/// content link (`origin='content'`) among them — is never overridden. Returns
 /// `Ok(true)` when a new link landed, `Ok(false)` when the child was already
-/// linked. The agent's (`origin='agent'`) writer; edge ingestion's header
-/// linkage (`origin='header'`) runs the same statements — the `LINKAGE_*_SQL`
-/// constants — on its own connection, so both produce the identical relation.
-#[allow(clippy::too_many_arguments)] // one relation row's columns, kept flat over the two call sites
+/// linked. The agent's (`origin='agent'`) writer.
+#[allow(clippy::too_many_arguments)] // one relation row's columns, kept flat
 pub async fn write_linkage_relation(
     conn: &mut Scoped,
     tenant_id: uuid::Uuid,
@@ -308,9 +306,8 @@ pub async fn write_linkage_relation(
     spawn_turn: Option<i32>,
     spawn_tool_call_id: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    // A session is never its own parent — reject a self-link (a duplicated index
-    // from the agent, or an `X-Parent-Session-Id` equal to the session's own id)
-    // so it can't inflate the session's child_count.
+    // A session is never its own parent — reject a self-link (a duplicated
+    // index from the agent) so it can't count itself among its sub-agents.
     if child_id == parent_id {
         return Ok(false);
     }
@@ -346,20 +343,20 @@ pub async fn write_linkage_relation(
 }
 
 /// The linkage relation row: `$1` tenant, `$2` confidence, `$3` spawn turn,
-/// `$4` spawn tool-call id, `$5` origin. Shared with the edge ingest writer's
-/// header linkage, so both produce the identical relation shape.
-pub(crate) const LINKAGE_RELATION_SQL: &str =
+/// `$4` spawn tool-call id, `$5` origin.
+const LINKAGE_RELATION_SQL: &str =
     "INSERT INTO cross_session_relations (tenant_id, kind, confidence, spawn_turn, spawn_tool_call_id, origin) \
      VALUES ($1, 'linkage', $2, $3, $4, $5) RETURNING id";
 
 /// The child member (`$1` relation, `$2` tenant, `$3` session): no row when the
-/// child already has a parent (the one-parent-per-child guard).
-pub(crate) const LINKAGE_CHILD_SQL: &str =
+/// session is already linked — as a child, or by the ingest as a continuation
+/// (the one-link index: a session is linked to at most one other).
+const LINKAGE_CHILD_SQL: &str =
     "INSERT INTO cross_session_relation_members (relation_id, tenant_id, session_id, role, seq) \
      VALUES ($1, $2, $3, 'child', 0) ON CONFLICT DO NOTHING RETURNING relation_id";
 
 /// The parent member (`$1` relation, `$2` tenant, `$3` session).
-pub(crate) const LINKAGE_PARENT_SQL: &str =
+const LINKAGE_PARENT_SQL: &str =
     "INSERT INTO cross_session_relation_members (relation_id, tenant_id, session_id, role, seq) \
      VALUES ($1, $2, $3, 'parent', 0)";
 

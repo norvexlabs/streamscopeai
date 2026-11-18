@@ -2652,7 +2652,7 @@ admin-console only (read-only accounts see them too).
   and a file or an image the detail it was sent with. An answer that is the model's refusal shows the refusal after
   any text it wrote and carries the **Refusal** badge. A program the model ran (OpenAI programmatic tool calling) shows as a tool
   call with its code, its output as the call's result, and a client's request to compact the
-  conversation as **Compaction requested by the client**, apart from a compaction that happened. A session shows each message once: a turn that starts afresh — a compaction, a rewritten history, agents running side by side under one session id — shows a marker with its message count, and the messages the session has not shown yet; its full request is in the turn's trace. Each system prompt shows the first time it appears, and a turn's **Request Params** panel loads that turn's tools when you open it. Parent/child **linkage** surfaces sub-agents (Claude Code, Cursor, …). Severity
+  conversation as **Compaction requested by the client**, apart from a compaction that happened. A session shows each message once: a turn that starts afresh — a compaction requested by the client, a rewritten or cut history — shows a marker with its message count, and the messages the session has not shown yet; its full request is in the turn's trace. Each system prompt shows the first time it appears, and a turn's **Request Params** panel loads that turn's tools when you open it. Each conversation an agent runs is a session of its own, even when the client sends one session id for several. Sessions are **linked** when a new conversation opens by quoting a recent one of the same user: a sub-agent that starts with the prompt its parent's tool call gave it is shown as a **child**, its card placed at that call; a conversation that starts from the summary of an earlier answer (a compaction) **continues** it. A single line two conversations share links nothing, and a side call such as a title stays a session of its own. A session list row counts a session's sub-agents, and a compacted conversation shows **Continued in** with a link to the session that continues it. Each link shows what it was read from: **quoted** for a link the gateway read from the conversation itself, **expert** with the expert's confidence for one the **session_linkage** expert made. A client's parent session header never links two sessions, and the **session_linkage** expert links what no quote did. Severity
   **badges** flag sessions the experts found noteworthy.
 - **Tool Calls** (`/tool-calls`) — every tool invocation (LLM and MCP) with the policy rule that
   classified, blocked, or rewrote it shown inline — the fastest way to audit what agents are doing.
@@ -3076,7 +3076,9 @@ One caveat: Aider's, Continue's, and Goose's YAML config files keep all your set
 your comments — the other formats preserve comments too, including a JSON config with comments or
 trailing commas (VS Code's `settings.json` for Cline, Gemini CLI's and Qwen Code's), which is edited in
 place around your text. Zed reads the API key from a `STREAMSCOPE_API_KEY`
-environment variable (or the Agent Panel) rather than its `settings.json`, so export the minted key in your shell. Qwen Code
+environment variable (or the Agent Panel) rather than its `settings.json`, so export the minted key in your shell. Gemini CLI
+gets the model in its `settings.json` both as its own and for each built-in subagent that would otherwise call a Google model
+by name (`codebase_investigator`, `cli_help`, `browser_agent`); `generalist` follows the session's model. Qwen Code
 gets the gateway in `~/.qwen/.env` with an output cap (the model alias's, else the model's, else 8 192 or its window if smaller), plus two keys merged into
 `~/.qwen/settings.json`: the OpenAI sign-in type (so a Qwen account you signed in with earlier does not
 take over) and, when the gateway knows the model, its context window. Aider gets

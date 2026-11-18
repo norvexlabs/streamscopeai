@@ -19,9 +19,7 @@ use uuid::Uuid;
 use crate::routes::audit::McpTransformDiff;
 
 pub mod build;
-pub mod spawn;
 pub use build::{build_events, stored_protocol, TurnRow};
-pub use spawn::{detect_spawn_points, DetectedSpawnPoint};
 
 /// The stored blobs one request carried, read from its `chat_media_summary`:
 /// the gateway writes that column from the bytes the request actually carried,

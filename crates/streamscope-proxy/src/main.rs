@@ -250,7 +250,7 @@ async fn run() -> anyhow::Result<()> {
     let proxy_stats = Arc::new(stats::ProxyStats::new());
 
     let session_capacity = s.session_detector_capacity;
-    let session_max_entries = s.session_detector_max_entries;
+    let session_max_bytes = usize::try_from(s.session_detector_max_bytes()).unwrap_or(usize::MAX);
     let session_ttl = s.session_detector_ttl;
 
     // SSRF-guarded clients for web search backend calls (the substitution
@@ -310,10 +310,10 @@ async fn run() -> anyhow::Result<()> {
         http_client,
         tenant_registry: tenant_registry.clone(),
         audit_tx,
-        session_detector: streamscope_core::proxy::content::SessionDetector::with_capacity(
+        session_detector: streamscope_core::proxy::session_detector::SessionDetector::with_capacity(
             session_capacity,
             session_ttl,
-            session_max_entries,
+            session_max_bytes,
         ),
         inline_exchanges: streamscope_core::proxy::inline_exchange::InlineExchangeStore::default(),
         script_engine: script_engine.clone(),
@@ -410,12 +410,13 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Load session state snapshot from disk (startup recovery).
-    match session_snapshot::load_snapshot(&snapshot_data_dir) {
-        Ok(Some(entries)) => {
-            let count: usize = entries.values().map(|v| v.len()).sum();
-            tracing::info!(users = entries.len(), entries = count, "loaded session snapshot from disk");
-            state.session_detector.import_entries(entries);
-        }
+    match session_snapshot::load_snapshot(&snapshot_data_dir, &state.session_detector) {
+        Ok(Some(counts)) => tracing::info!(
+            users = counts.users,
+            turns = counts.turns,
+            held_bytes = state.session_detector.held_bytes(),
+            "loaded session snapshot from disk"
+        ),
         Ok(None) => tracing::debug!("no session snapshot found, starting with empty state"),
         Err(e) => tracing::warn!(error = %e, "failed to load session snapshot, starting with empty state"),
     }
@@ -452,12 +453,13 @@ async fn run() -> anyhow::Result<()> {
                     _ = token.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
                         if snap_state.session_detector.should_snapshot(max_interval) {
-                            let entries = snap_state.session_detector.export_entries();
+                            let export = snap_state.session_detector.export();
                             let dir = snap_dir.clone();
                             if let Err(e) = tokio::task::spawn_blocking(move || {
-                                session_snapshot::save_snapshot(&dir, &entries)
+                                session_snapshot::save_snapshot(&dir, export)
                             }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {e}"))) {
                                 tracing::warn!(error = %e, "failed to save session snapshot");
+                                snap_state.session_detector.mark_dirty();
                             }
                         }
                     }
@@ -700,11 +702,14 @@ async fn run() -> anyhow::Result<()> {
     // Graceful shutdown: save final session snapshot before exit. The snapshot
     // task is now stopped (joined above), so there is no double-write race.
     {
-        let entries = state.session_detector.export_entries();
-        match session_snapshot::save_snapshot(&snapshot_data_dir, &entries) {
-            Ok(()) => {
-                let count: usize = entries.values().map(|v| v.len()).sum();
-                tracing::info!(users = entries.len(), entries = count, "saved session snapshot on shutdown");
+        let export = state.session_detector.export();
+        let dir = snapshot_data_dir.clone();
+        let saved = tokio::task::spawn_blocking(move || session_snapshot::save_snapshot(&dir, export))
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn_blocking panicked: {e}")));
+        match saved {
+            Ok(counts) => {
+                tracing::info!(users = counts.users, turns = counts.turns, "saved session snapshot on shutdown");
             }
             Err(e) => tracing::warn!(error = %e, "failed to save session snapshot on shutdown"),
         }

@@ -14,9 +14,10 @@
 //! full pipeline. Until that exists, the loopback gets us coverage of every
 //! surface (audit, budget, Rhai, tool policy) for free.
 //!
-//! Tight-loop marker (NOT an enforcer yet): the loopback request carries
-//! `X-Mcp-Sampling-Depth: 1`. The LLM proxy doesn't yet read this header on
-//! inbound, so today the loop is bounded only by the structural fact that
+//! The loopback request carries `X-Mcp-Sampling-Depth: 1`. The LLM proxy
+//! reads it for the request's session only — its conversation is the MCP
+//! session its `X-Session-Id` names, never a thread of its own. As a
+//! tight-loop marker it is NOT an enforcer yet: the loop is bounded only by the structural fact that
 //! the LLM pipeline doesn't recursively call MCP. Inbound enforcement
 //! requires a depth-incrementing intercept (read incoming, stamp `+1`)
 //! plus a threshold-≥2 inbound check; the simpler "stamp 1, reject ≥1"

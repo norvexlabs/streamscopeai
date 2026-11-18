@@ -1117,6 +1117,16 @@ restart — a fresh replica simply recomputes. Whether caching is used at all is
 a memory-rich host serving heavily repeated traffic; when the ceiling is reached, responses are
 still served normally and simply not stored, which the audit trail records.
 
+**Session-tracking capacity** (`SESSION_DETECTOR_MAX_MB`, unset by default: 10% of the gateway
+replica's memory limit, at least 32 MB, or 256 MB when it has none; `0` sets no ceiling). Each
+gateway replica remembers the recent turns of every conversation it serves, so that the next turn of
+a conversation that names no session of its own is recognised and joins it. The turns of one
+conversation share what they have in common, so a long session costs little more than its newest
+turn. Past the ceiling the conversations of the users least recently active are forgotten first; a
+forgotten conversation that names no session of its own continues as a new session. The record survives a restart. Left unset, the
+ceiling grows with the replica's memory limit; raise it on a replica serving many users with long
+agent sessions.
+
 ### Monitoring — Prometheus metrics
 
 Both services expose a Prometheus scrape endpoint at `/metrics` on a **dedicated internal port**,

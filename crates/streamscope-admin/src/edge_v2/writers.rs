@@ -539,6 +539,28 @@ pub(crate) async fn ingest_llm_audit(
         upsert_session_for_turn(conn, record, session_id).await?;
     }
     insert_session_messages(conn, &added, &fresh).await?;
+    // What each new turn quotes of an earlier conversation, and what it can be
+    // quoted by: the links between conversations (`content_links`).
+    let mut linked: HashSet<(uuid::Uuid, uuid::Uuid)> = HashSet::new();
+    let mut landed: Vec<super::content_links::LandedTurn<'_>> = records
+        .iter()
+        .filter(|r| !r.fingerprints.is_empty() && fresh.contains(&(r.tenant_id, r.request_id)))
+        .filter(|r| linked.insert((r.tenant_id, r.request_id)))
+        .filter_map(|r| {
+            Some(super::content_links::LandedTurn {
+                tenant: r.tenant_id,
+                user: r.user_id,
+                request: r.request_id,
+                session: r.conversation_session_id?,
+                turn_number: r.turn_number,
+                started: r.timestamp - chrono::Duration::milliseconds(r.latency_total_ms as i64),
+                ended: r.timestamp,
+                fingerprints: &r.fingerprints,
+            })
+        })
+        .collect();
+    landed.sort_by_key(|t| (t.tenant, t.user, t.started, t.request));
+    super::content_links::link_turns(conn, &landed).await;
     Ok(())
 }
 
@@ -2029,17 +2051,6 @@ async fn upsert_session_for_turn(
     .bind(record.cost_currency.as_str())
     .execute(&mut *conn)
     .await?;
-
-    // Header-derived parent→child linkage (X-Parent-Session-Id) is a first-class
-    // cross_session_relations row, not a sessions column. First-write-wins via the
-    // one-parent-per-child guard, so a later agent-inferred link can't override it;
-    // the parent session row may not exist yet (members reference ids by value).
-    // Best-effort: a linkage write must never fail the turn's session upsert.
-    if let Some(parent_id) = record.parent_session_id
-        && let Err(e) = write_header_linkage(conn, record.tenant_id, session_id, parent_id).await
-    {
-        tracing::warn!(child = %session_id, parent = %parent_id, "header linkage relation write failed: {e}");
-    }
     Ok(())
 }
 
@@ -2116,50 +2127,6 @@ const SESSION_TURN_UPSERT: &str = concat!(
                                           OR EXCLUDED.first_prompt_at < sessions.first_prompt_at) \
                                THEN EXCLUDED.first_prompt_at ELSE sessions.first_prompt_at END",
 );
-
-/// The header-derived parent→child linkage of `child_id` (X-Parent-Session-Id):
-/// the relation [`crate::agent::suggestion::write_linkage_relation`] writes,
-/// with origin and confidence `header` and no spawn call — the child card
-/// content-matches the parent's detected spawn points on read instead —
-/// first-write-wins through the one-parent-per-child guard. Under a savepoint,
-/// so a refused relation leaves the request's transaction healthy.
-async fn write_header_linkage(
-    conn: &mut IngestConn,
-    tenant_id: uuid::Uuid,
-    child_id: uuid::Uuid,
-    parent_id: uuid::Uuid,
-) -> Result<(), sqlx::Error> {
-    use crate::agent::suggestion::{LINKAGE_CHILD_SQL, LINKAGE_PARENT_SQL, LINKAGE_RELATION_SQL};
-    if child_id == parent_id {
-        return Ok(());
-    }
-    let mut sp = conn.savepoint().await?;
-    let relation_id: uuid::Uuid = sqlx::query_scalar(LINKAGE_RELATION_SQL)
-        .bind(tenant_id)
-        .bind("header")
-        .bind(None::<i32>)
-        .bind(None::<&str>)
-        .bind("header")
-        .fetch_one(sp.conn())
-        .await?;
-    let landed: Option<uuid::Uuid> = sqlx::query_scalar(LINKAGE_CHILD_SQL)
-        .bind(relation_id)
-        .bind(tenant_id)
-        .bind(child_id)
-        .fetch_optional(sp.conn())
-        .await?;
-    if landed.is_none() {
-        // The child already has a parent: dropping the savepoint undoes the relation.
-        return Ok(());
-    }
-    sqlx::query(LINKAGE_PARENT_SQL)
-        .bind(relation_id)
-        .bind(tenant_id)
-        .bind(parent_id)
-        .execute(sp.conn())
-        .await?;
-    sp.commit().await
-}
 
 #[cfg(test)]
 mod session_spend_currency_tests {

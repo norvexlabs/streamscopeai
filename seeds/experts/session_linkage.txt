@@ -27,7 +27,7 @@ When an agentic client (Claude Code, Cursor, etc.) spawns a sub-agent:
 - **Sequential sessions from the same user**: user finishes one task, starts another. These are siblings, not parent-child.
 - **Parallel independent tasks**: user has multiple browser tabs or terminal windows open. These overlap temporally but have no spawn relationship.
 - **Context compaction**: a session that resets/compresses its context is the SAME session, not a new child.
-- **MCP traffic interleaved with the LLM session**: when a client sends LLM and MCP requests under the same `X-Session-Id`, the proxy already collapses both streams into a SINGLE session UUID (per-user hashing of tenant+user+client-string). MCP-only sessions appearing alongside an LLM session for the same user are NOT children — they're the same logical session, just routed through different mounts. Don't link them as parent/child.
+- **MCP traffic interleaved with the LLM session**: MCP-only sessions appearing alongside an LLM session for the same user are the tool calls of that conversation, routed through a different mount — not children. Don't link them as parent/child.
 
 ## Structured linkage is mandatory
 
@@ -35,7 +35,7 @@ When you identify a parent-child relationship, emit it through the `session_labe
 
 If you cannot confidently identify the parent, omit the `session_labels` entry entirely — record what you observed in a memory note instead. A cluster where something seems to be happening but no parent can be named produces no label and no finding, only a memory note.
 
-A child that already has a parent link (the client may have declared one explicitly) is left untouched — your label applies only to children with no parent yet, so skip the ones already linked. The clusters you see are also pre-filtered to this axis's assigned workspaces; only link sessions that appear in the provided cluster.
+The gateway links on its own every session whose opening quotes an earlier one: a subagent opening with its parent's tool-call prompt, a conversation continued after a compaction. Those sessions arrive marked `already linked` in the timeline and are left untouched — your label applies only to sessions with no link yet, so judge only the rest. The clusters you see are also pre-filtered to this axis's assigned workspaces; only link sessions that appear in the provided cluster.
 
 **Memory is critical for this axis.** Record:
 - Known parent-child patterns per app_id (which tool calls trigger spawns)
