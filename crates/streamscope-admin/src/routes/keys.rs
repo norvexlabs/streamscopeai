@@ -606,6 +606,23 @@ pub async fn update_key(
         }
     };
 
+    let failed = |what: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!("update key ({what}): {e}");
+            ApiError::internal("failed to update key")
+        }
+    };
+    // A budget that newly caps the key counts the spend it already made
+    // (crate::budget_seed). Only a write setting a cap can: it locks the key
+    // row and reads its budget as it stands, so two such writes take turns.
+    let could_cap = budget_provided && crate::budget_seed::sets_a_cap(daily_budget, monthly_budget);
+    let tenant_id = db.tenant_uuid();
+    let mut tx = db.conn().begin().await.map_err(failed("begin"))?;
+    let before = if could_cap {
+        crate::budget_seed::lock_key_budget(&mut tx, id).await.map_err(failed("lock"))?
+    } else {
+        None
+    };
     let result = sqlx::query(
         r#"UPDATE api_keys SET
             name = CASE WHEN $12 THEN $2 ELSE name END,
@@ -629,14 +646,12 @@ pub async fn update_key(
     .bind(qos_class_id)
     .bind(qos_class_elevated)
     .bind(req.name.is_some()) // $12
-    .execute(db.conn())
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("update key: {e}");
-        ApiError::internal("failed to update key")
-    })?;
+    .map_err(failed("write"))?;
 
     if result.rows_affected() == 0 {
+        drop(tx);
         // Automation keys appear in the same inventory but are immutable here —
         // say so instead of a misleading 404.
         let is_automation: bool =
@@ -653,7 +668,11 @@ pub async fn update_key(
         }
         return Err(ApiError::not_found("key not found", ApiErrorCode::KeyNotFound));
     }
-
+    if let Some(before) = before {
+        let after = crate::budget_seed::Caps::of(daily_budget, monthly_budget);
+        crate::budget_seed::seed_key(&mut tx, tenant_id, id, before, after).await;
+    }
+    tx.commit().await.map_err(failed("commit"))?;
 
     let sql = format!("{} WHERE k.id = $1", gateway_select_base("$2"));
     let row = sqlx::query_as::<_, KeyListItem>(sqlx::AssertSqlSafe(&*sql))

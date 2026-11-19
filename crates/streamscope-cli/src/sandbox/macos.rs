@@ -171,7 +171,11 @@ fn profile_with_ttys(
         scratch.to_string_lossy().into_owned(),
         per_user_folders_root().to_string_lossy().into_owned(),
     ];
-    if let Some(agent) = profiles::agent_for(&spec.command) {
+    // The launched client's state, and that of each client it may run as a
+    // tool (a review tool writes its sessions there). A secret under either
+    // stays unreadable: every `SECRET_DENY` path is denied above.
+    let tools = spec.tool_clients.iter().map(|t| t.profile);
+    for agent in profiles::agent_for(&spec.command).into_iter().chain(tools) {
         writes.extend(agent.state_dirs.iter().filter_map(|d| {
             expand_tilde(d).ok().map(|p| p.to_string_lossy().into_owned())
         }));
@@ -415,6 +419,26 @@ mod tests {
         );
     }
 
+    /// A client the agent may run as a tool may write its state directory, as
+    /// the launched client may its own; without it in the run, it may not.
+    #[test]
+    fn profile_lets_a_tool_client_write_its_state_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized via ENV_LOCK.
+        unsafe { std::env::set_var("HOME", "/private/tmp/fake-home"); }
+        let rule = "(allow file-write* (subpath \"/private/tmp/fake-home/.opencodereview\"))";
+        let prof = profile_with_ttys(&sample_spec(), &[12345], Path::new(SCRATCH), &ProjectGrants::default(), &[]).unwrap();
+        assert!(!prof.lines().any(|l| l == rule), "{prof}");
+        let mut spec = sample_spec();
+        spec.tool_clients.push(crate::sandbox::ToolClient {
+            client_id: "open-code-review".into(),
+            profile: profiles::agent_for("open-code-review").unwrap(),
+            files: vec![],
+        });
+        let prof = profile_with_ttys(&spec, &[12345], Path::new(SCRATCH), &ProjectGrants::default(), &[]).unwrap();
+        assert!(prof.lines().any(|l| l == rule), "{prof}");
+    }
+
     fn sample_spec() -> LaunchSpec {
         LaunchSpec {
             command: "claude".into(),
@@ -432,6 +456,7 @@ mod tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         }
     }
 

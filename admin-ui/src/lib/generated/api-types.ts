@@ -7248,6 +7248,7 @@ export interface components {
         } | {
             /** @enum {string} */
             code: "web_substituted_server";
+            not_honoured?: string[];
             server_type: string;
         } | {
             client_label: string;
@@ -9270,6 +9271,14 @@ export interface components {
              */
             route_tag?: string | null;
             title: string;
+            /**
+             * @description The config this template provisions is reachable from the sandboxed
+             *     runs (`ssai run`) of the workspace's other clients, so their agents
+             *     can run this client as a tool: its files, and the gateway key they
+             *     hold, are readable by those agents. Off unless set; omitted from the
+             *     wire when off.
+             */
+            usable_as_tool?: boolean;
         };
         /**
          * @description A client model slot besides the default: `fast` for a client's
@@ -13056,7 +13065,12 @@ export interface components {
             key_name?: string | null;
             key_prefix?: string | null;
             monthly_budget: components["schemas"]["LimitMeter"];
+            /** @description LLM requests per minute (chat, media, `/v1/analyze`). */
             requests_per_minute: components["schemas"]["LimitMeter"];
+            /** @description A2A requests per minute. */
+            requests_per_minute_a2a: components["schemas"]["LimitMeter"];
+            /** @description MCP requests per minute, the built-in Web server included. */
+            requests_per_minute_mcp: components["schemas"]["LimitMeter"];
             /**
              * @description Where this layer's limits come from: `own` (set on this scope),
              *     `tenant_default` (a workspace whose every cap is the tenant default
@@ -13989,8 +14003,21 @@ export interface components {
             daily_budget?: number | null;
             /** Format: double */
             monthly_budget?: number | null;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description LLM requests per minute (chat, media, `/v1/analyze`).
+             */
             requests_per_minute?: number | null;
+            /**
+             * Format: int32
+             * @description A2A requests per minute.
+             */
+            requests_per_minute_a2a?: number | null;
+            /**
+             * Format: int32
+             * @description MCP requests per minute, the built-in Web server included.
+             */
+            requests_per_minute_mcp?: number | null;
             /** Format: int32 */
             tokens_per_minute?: number | null;
         };
@@ -16710,8 +16737,21 @@ export interface components {
                 monthly_budget?: number | null;
                 /** Format: double */
                 monthly_spent?: number;
-                /** Format: int32 */
+                /**
+                 * Format: int32
+                 * @description LLM requests per minute (chat, media, `/v1/analyze`).
+                 */
                 requests_per_minute?: number | null;
+                /**
+                 * Format: int32
+                 * @description A2A requests per minute.
+                 */
+                requests_per_minute_a2a?: number | null;
+                /**
+                 * Format: int32
+                 * @description MCP requests per minute, the built-in Web server included.
+                 */
+                requests_per_minute_mcp?: number | null;
                 /**
                  * @description The email of whoever last set it — withheld from the portal when that
                  *     was an administrator.
@@ -18480,8 +18520,21 @@ export interface components {
             daily_budget?: number | null;
             /** Format: double */
             monthly_budget?: number | null;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description LLM requests per minute (chat, media, `/v1/analyze`).
+             */
             requests_per_minute?: number | null;
+            /**
+             * Format: int32
+             * @description A2A requests per minute.
+             */
+            requests_per_minute_a2a?: number | null;
+            /**
+             * Format: int32
+             * @description MCP requests per minute, the built-in Web server included.
+             */
+            requests_per_minute_mcp?: number | null;
             /** Format: int32 */
             tokens_per_minute?: number | null;
         };
@@ -24049,8 +24102,21 @@ export interface components {
             monthly_budget?: number | null;
             /** Format: double */
             monthly_spent?: number;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description LLM requests per minute (chat, media, `/v1/analyze`).
+             */
             requests_per_minute?: number | null;
+            /**
+             * Format: int32
+             * @description A2A requests per minute.
+             */
+            requests_per_minute_a2a?: number | null;
+            /**
+             * Format: int32
+             * @description MCP requests per minute, the built-in Web server included.
+             */
+            requests_per_minute_mcp?: number | null;
             /**
              * @description The email of whoever last set it — withheld from the portal when that
              *     was an administrator.
@@ -24580,8 +24646,21 @@ export interface components {
                 daily_budget?: number | null;
                 /** Format: double */
                 monthly_budget?: number | null;
-                /** Format: int32 */
+                /**
+                 * Format: int32
+                 * @description LLM requests per minute (chat, media, `/v1/analyze`).
+                 */
                 requests_per_minute?: number | null;
+                /**
+                 * Format: int32
+                 * @description A2A requests per minute.
+                 */
+                requests_per_minute_a2a?: number | null;
+                /**
+                 * Format: int32
+                 * @description MCP requests per minute, the built-in Web server included.
+                 */
+                requests_per_minute_mcp?: number | null;
                 /** Format: int32 */
                 tokens_per_minute?: number | null;
             };
@@ -24707,8 +24786,21 @@ export interface components {
             daily_budget?: number | null;
             /** Format: double */
             monthly_budget?: number | null;
-            /** Format: int32 */
+            /**
+             * Format: int32
+             * @description LLM requests per minute (chat, media, `/v1/analyze`).
+             */
             requests_per_minute?: number | null;
+            /**
+             * Format: int32
+             * @description A2A requests per minute.
+             */
+            requests_per_minute_a2a?: number | null;
+            /**
+             * Format: int32
+             * @description MCP requests per minute, the built-in Web server included.
+             */
+            requests_per_minute_mcp?: number | null;
             /** Format: int32 */
             tokens_per_minute?: number | null;
         };

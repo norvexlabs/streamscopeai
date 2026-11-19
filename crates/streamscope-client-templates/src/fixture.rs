@@ -778,6 +778,7 @@ mod tests {
             companions: Vec::new(),
             keyed_arrays: BTreeMap::new(),
             local_mcp: Default::default(),
+            usable_as_tool: false,
             body: body.into(),
         }
     }
@@ -1493,6 +1494,42 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 8, "expected >= 8 seed profiles, found {checked}");
+    }
+
+    /// A tool's key is readable by the agents of the workspace's other
+    /// clients only where the seed says so: every Open Code Review template
+    /// that writes its gateway endpoint (an agent calls it as a review
+    /// skill), and no other — not its MCP-only one, merged by hand beside the
+    /// developer's own provider settings, whose key is not the gateway's.
+    #[test]
+    fn only_open_code_review_is_seeded_usable_as_a_tool() {
+        let profiles = seed_profiles();
+        assert!(profiles.len() >= 8, "expected >= 8 seed profiles, found {}", profiles.len());
+        for (path, profile) in profiles {
+            let ocr = profile.id == "open-code-review";
+            assert!(!profile.templates.is_empty(), "{}", path.display());
+            for t in &profile.templates {
+                let gateway_endpoint = t.protocol.is_some();
+                assert_eq!(t.usable_as_tool, ocr && gateway_endpoint, "{}: {}", path.display(), t.title);
+            }
+        }
+    }
+
+    /// The flag is off unless a template states it, and a template that does
+    /// not carry it serializes without it — so its bundle etag is unchanged.
+    #[test]
+    fn usable_as_tool_defaults_off_and_is_omitted_when_off() {
+        let off: ClientProfileTemplate =
+            serde_json::from_value(serde_json::json!({ "kind": "llm", "format": "json", "title": "t", "body": "{}" }))
+                .unwrap();
+        assert!(!off.usable_as_tool);
+        assert!(serde_json::to_value(&off).unwrap().get("usable_as_tool").is_none());
+        let on: ClientProfileTemplate = serde_json::from_value(serde_json::json!({
+            "kind": "llm", "format": "json", "title": "t", "body": "{}", "usable_as_tool": true
+        }))
+        .unwrap();
+        assert!(on.usable_as_tool);
+        assert_eq!(serde_json::to_value(&on).unwrap()["usable_as_tool"], serde_json::json!(true));
     }
 
     // -----------------------------------------------------------------------

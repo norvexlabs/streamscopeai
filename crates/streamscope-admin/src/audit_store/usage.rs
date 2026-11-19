@@ -332,3 +332,65 @@ pub(crate) async fn agent_usage(
     .fetch_one(&mut *conn)
     .await
 }
+
+/// Whose spend [`budget_window_spend`] sums: the members of one workspace
+/// (narrowed to one user when set), or one key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BudgetSpendOf {
+    Members { workspace_id: Uuid, user_id: Option<Uuid> },
+    Key(Uuid),
+}
+
+/// The budget windows of one instant, each `[start, end)`: the UTC day and the
+/// 30-day block containing it. The block always contains the day (a block
+/// boundary is a day boundary).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BudgetWindows {
+    pub daily: Window,
+    pub monthly: Window,
+}
+
+/// Priced spend in `currency` per scope id — the user (members) or the key —
+/// as `(scope_id, daily, monthly)` in whole units of the currency. A scope
+/// with no priced row is absent.
+///
+/// The figure a budget counter is seeded from: the `cost` the gateway accrues
+/// to a budget per request. Rows in another currency predate the tenant's
+/// current one, whose change resets every budget counter, so they are not
+/// summed. One aggregate over the monthly block, the day's share filtered from
+/// it; the window is stated on both tables of the join. Cost: the read walks
+/// that scope's rows of the block on its `(tenant_id, workspace_id | key_id,
+/// timestamp)` index.
+pub(crate) async fn budget_window_spend(
+    conn: &mut Scoped,
+    of: BudgetSpendOf,
+    currency: &str,
+    windows: BudgetWindows,
+) -> sqlx::Result<Vec<(Uuid, f64, f64)>> {
+    let (scope_col, filter): (&'static str, &'static str) = match of {
+        BudgetSpendOf::Members { .. } => {
+            ("g.user_id", " AND g.workspace_id = $6 AND ($7::uuid IS NULL OR g.user_id = $7)")
+        }
+        BudgetSpendOf::Key(_) => ("g.key_id", " AND g.key_id = $6"),
+    };
+    let sql = format!(
+        "SELECT {scope_col} AS scope_id, \
+                COALESCE(SUM(a.cost) FILTER (WHERE g.timestamp >= $3 AND g.timestamp < $4), 0.0)::float8 AS daily, \
+                COALESCE(SUM(a.cost), 0.0)::float8 AS monthly \
+           FROM {AUDIT_LOG_JOIN} \
+          WHERE a.cost > 0 AND a.cost_currency = $5{window}{filter} \
+          GROUP BY {scope_col}",
+        window = window_sql(AUDIT_LOG_WINDOW, 1, 2),
+    );
+    let q = sqlx::query_as::<_, (Uuid, f64, f64)>(sqlx::AssertSqlSafe(sql))
+        .bind(windows.monthly.0)
+        .bind(windows.monthly.1)
+        .bind(windows.daily.0)
+        .bind(windows.daily.1)
+        .bind(currency);
+    let q = match of {
+        BudgetSpendOf::Members { workspace_id, user_id } => q.bind(workspace_id).bind(user_id),
+        BudgetSpendOf::Key(key_id) => q.bind(key_id),
+    };
+    q.fetch_all(&mut *conn).await
+}

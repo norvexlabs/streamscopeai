@@ -233,20 +233,40 @@ pub(crate) fn jsonrpc_required_capabilities(bytes: &[u8]) -> Option<serde_json::
 /// every such character of the body.
 const SECRET_REDACTED_ANYWHERE_CHARS: usize = 8;
 
+/// The bytes of its input [`redact_upstream_body`] reads: nothing past them
+/// changes its output, so a caller assembling that input may stop there.
+pub(crate) const REDACT_INPUT_BOUND: usize = 16 * 1024;
+
 /// An upstream body made fit for a log line and an error message: truncated,
 /// every secret the request carried ([`UpstreamAuth::secrets`]) replaced by
 /// `<REDACTED>` (by [`redact_secret`]'s rule), and any `Bearer <token>`
 /// stripped.
 pub(crate) fn redact_upstream_body(raw: &str, upstream_auth: &UpstreamAuth) -> String {
+    redact_with(raw, upstream_auth.secrets())
+}
+
+/// Upstream text recorded where the request's own credentials are not in
+/// hand (the dispatch arms: `resources/read`, `completion/complete`,
+/// `resources/subscribe`, `logging/setLevel` and the rest): truncated, and
+/// any `Bearer <token>` stripped — the generic patterns only. Unlike
+/// [`redact_upstream_body`] it strips no upstream credential: it takes none,
+/// so recording an upstream's error never resolves one.
+pub(crate) fn redact_upstream_text(raw: &str) -> String {
+    redact_with(raw, std::iter::empty())
+}
+
+/// The one redaction both entry points share: bounded, each of `secrets`
+/// replaced by [`redact_secret`]'s rule, any `Bearer <token>` stripped.
+fn redact_with<'a>(raw: &str, secrets: impl Iterator<Item = &'a str>) -> String {
     // Pre-truncate the input to a generous bound BEFORE we allocate. Operator
     // logs don't need a 5 MB upstream HTML page, and `String::replace` would
     // otherwise copy the full body once per redaction pass.
-    const PRE_TRUNCATE: usize = 16 * 1024;
+    const PRE_TRUNCATE: usize = REDACT_INPUT_BOUND;
     let pre_cut = raw
         .floor_char_boundary(raw.len().min(PRE_TRUNCATE))
         .min(raw.len());
     let mut s = raw[..pre_cut].to_string();
-    for secret in upstream_auth.secrets() {
+    for secret in secrets {
         s = redact_secret(&s, secret);
     }
     // Strip `Bearer <opaque>` (and the case-flipped sibling). The pattern is

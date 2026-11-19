@@ -355,7 +355,7 @@ pub async fn transform_request(
 
         // First pass: SUBSTITUTE. Wholesale-replace the tool def via the wire
         // mutation primitive on `ApiRequest`.
-        let substitutions = request.substitute_tools(|name| {
+        let substituted = request.substitute_tools_noting(|name| {
             name_to_rule
                 .get(name)
                 .and_then(|(_, action)| match action {
@@ -363,8 +363,10 @@ pub async fn transform_request(
                     _ => None,
                 })
         });
+        let substitutions: Vec<(String, String)> =
+            substituted.iter().map(|s| (s.original.clone(), s.replaced.clone())).collect();
         rename_steps.push(substitutions.clone());
-        for (original, replaced) in &substitutions {
+        for crate::api::ToolSubstitution { original, replaced, not_honoured } in &substituted {
             // `name_to_rule` was built from the same `tool_defs` walk that
             // `substitute_tools` mutated, so a hit must exist — but guard
             // defensively (e.g. if the closure logic above ever drifts) and
@@ -388,6 +390,10 @@ pub async fn transform_request(
                 .get(original)
                 .cloned()
                 .unwrap_or(None);
+            let declares = match action {
+                RuleAction::Substitute { with, .. } => crate::web::DeclaredArgs::of_schema(&with.parameters),
+                _ => crate::web::DeclaredArgs::default(),
+            };
             intercept_bindings.push(crate::proxy::content::InterceptBinding {
                 original_name: original.clone(),
                 replaced_name: replaced.clone(),
@@ -395,6 +401,8 @@ pub async fn transform_request(
                 intercept,
                 action: "substitute".to_string(),
                 original_server_type,
+                declares,
+                not_honoured: not_honoured.clone(),
             });
             injection_blocks.push(crate::proxy::content::InjectionBlock {
                 transform: "tool_policy".to_string(),
@@ -431,6 +439,11 @@ pub async fn transform_request(
                     intercept: handler.clone(),
                     action: "intercept_only".to_string(),
                     original_server_type: server_type.clone(),
+                    // The client's own definition went out, and its schema
+                    // is not read here: a cut page says only that it was
+                    // cut, and a failed call names no optional argument.
+                    declares: crate::web::DeclaredArgs::default(),
+                    not_honoured: Vec::new(),
                 });
             }
         }
@@ -474,6 +487,8 @@ pub async fn transform_request(
                     intercept: intercept.clone(),
                     action: "substitute".to_string(),
                     original_server_type: None,
+                    declares: crate::web::DeclaredArgs::of_schema(&with.parameters),
+                    not_honoured: Vec::new(),
                 });
                 injection_blocks.push(crate::proxy::content::InjectionBlock {
                     transform: "tool_policy".to_string(),
@@ -2862,6 +2877,9 @@ mod tests {
             result.intercept_bindings[0].original_server_type.as_deref(),
             Some("web_search_20250305"),
         );
+        // The client's `max_uses` was cleared with the definition: the binding
+        // carries its key to the badge a search emits.
+        assert_eq!(result.intercept_bindings[0].not_honoured, vec!["max_uses".to_string()]);
     }
 
     #[tokio::test]

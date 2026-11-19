@@ -235,6 +235,30 @@ pub struct InterceptBinding {
     /// client; `None` ⇒ fully invisible (Decision #1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_server_type: Option<String>,
+    /// The optional arguments the definition the model calls declares: what
+    /// a failed call may tell it to pass, and whether a fetch cut short may
+    /// tell it where to resume (`web::DeclaredArgs`). Decided where the
+    /// binding is made, from the definition that went out; never sent
+    /// anywhere.
+    #[serde(skip)]
+    pub declares: crate::web::DeclaredArgs,
+    /// The members of the client's own definition a `substitute` binding does
+    /// not honour, keys only and sorted (`api::ToolSubstitution`), read
+    /// where the binding is made, before the members are cleared. Carried to
+    /// the `WebSubstitutedServer` badge a search under this binding emits;
+    /// empty for `intercept_only` (the client's definition goes out as sent).
+    /// Never sent anywhere.
+    #[serde(skip)]
+    pub not_honoured: Vec<String>,
+}
+
+impl InterceptBinding {
+    /// The web call this binding runs.
+    pub fn web_op(&self) -> crate::config::tool_rules::WebInterceptKind {
+        match &self.intercept {
+            crate::config::tool_rules::InterceptKind::WebExecutor { kind } => *kind,
+        }
+    }
 }
 
 /// One model tool call the gateway intercepted and ran server-side (a

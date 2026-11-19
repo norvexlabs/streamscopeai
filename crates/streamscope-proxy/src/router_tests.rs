@@ -31,6 +31,7 @@ use crate::{a2a, build_app, mcp};
 struct TestRig {
     app: axum::Router,
     state: Arc<AppState>,
+    mcp: Arc<mcp::McpAppState>,
     _keepalive: Keepalive,
 }
 
@@ -118,6 +119,7 @@ fn rig_with_metadata_cap(metadata_cap: u32) -> TestRig {
         app: state.clone(),
         a2a_audit_tx,
     };
+    let mcp = mcp_state.mcp.clone();
 
     TestRig {
         app: build_app(
@@ -131,6 +133,7 @@ fn rig_with_metadata_cap(metadata_cap: u32) -> TestRig {
             )),
         ),
         state,
+        mcp,
         _keepalive: Keepalive { audit_rx, mcp_audit_rx, a2a_audit_rx, web_audit_rx, mcp_sse_event_rx },
     }
 }
@@ -851,4 +854,65 @@ async fn metrics_are_not_exposed_on_the_main_port() {
         .await
         .expect("router responds");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The `METRICS_PORT` router serves every series an operator or the bench
+/// reads, the per-user state gauges included — each named here, so a series
+/// dropped from the exposition fails this test.
+#[tokio::test]
+async fn the_metrics_listener_serves_every_series() {
+    let rig = rig();
+    let dir = std::env::temp_dir().join(format!("streamscope_metrics_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let outbox = Arc::new(
+        crate::outbox_v2::OutboxV2::open(dir.to_str().expect("utf-8 path")).await.expect("outbox opens"),
+    );
+    let router = crate::metrics_router(crate::MetricsState {
+        stats: Arc::new(crate::stats::ProxyStats::new()),
+        outbox,
+        app: rig.state.clone(),
+        mcp: rig.mcp.clone(),
+    });
+    let resp = router
+        .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+        .await
+        .expect("router responds");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 1 << 20).await.expect("body").to_vec(),
+    )
+    .expect("utf-8 exposition");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for series in [
+        "streamscope_proxy_requests_total ",
+        "streamscope_proxy_pending_audit_records ",
+        "streamscope_proxy_cache_entries ",
+        "streamscope_proxy_dispatch_in_flight ",
+        "streamscope_proxy_outbox_shipped_records_total ",
+        "streamscope_proxy_session_detector_held_bytes ",
+        "streamscope_proxy_session_detector_turns ",
+        "streamscope_proxy_session_detector_users ",
+        "streamscope_proxy_usage_counters{map=\"cumulative\"} ",
+        "streamscope_proxy_usage_counters{map=\"reported\"} ",
+        "streamscope_proxy_usage_counters{map=\"authoritative\"} ",
+        "streamscope_proxy_mcp_sessions ",
+        "streamscope_proxy_mcp_upstream_sessions ",
+        "streamscope_proxy_mcp_upstream_handshakes ",
+        "streamscope_proxy_mcp_upstream_eras ",
+        "streamscope_proxy_mcp_upstream_listeners ",
+        "streamscope_proxy_mcp_session_cap_drops_total{map=\"sessions\"} ",
+        "streamscope_proxy_mcp_session_cap_drops_total{map=\"log_levels\"} ",
+        "streamscope_proxy_mcp_session_cap_drops_total{map=\"upstream_eras\"} ",
+        "streamscope_proxy_mcp_session_cap_drops_total{map=\"upstream_handshakes\"} ",
+    ] {
+        assert!(text.lines().any(|l| l.starts_with(series)), "{series}missing from:\n{text}");
+    }
+    #[cfg(feature = "alloc-stats")]
+    for series in [
+        "streamscope_proxy_process_rss_bytes ",
+        "streamscope_proxy_process_peak_rss_bytes ",
+    ] {
+        assert!(text.lines().any(|l| l.starts_with(series)), "{series}missing from:\n{text}");
+    }
 }

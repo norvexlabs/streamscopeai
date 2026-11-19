@@ -387,10 +387,11 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
       // — keep this map in sync with the constants there.
       const codeMap: Record<number, string> = {
         [-32001]: 'route not found',
-        [-32002]: 'auth mode unsupported',
+        [-32002]: 'resource not found',
         [-32003]: 'upstream error',
         [-32004]: 'tool not found',
         [-32401]: 'auth required',
+        [-32403]: 'insufficient scope',
         [-32429]: 'rate limited',
         [-32500]: 'upstream credential unavailable',
         [-32501]: 'user credential missing',
@@ -400,12 +401,17 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
         [-32505]: 'ssrf refused',
         [-32506]: 'blocked by policy',
         [-32507]: 'upstream session lost',
+        [-32508]: 'upstream configuration unsupported',
+        [-32509]: 'upstream input unsupported',
         [-32600]: 'invalid request',
         [-32601]: 'method not found',
         [-32602]: 'invalid params',
         [-32603]: 'internal error',
         [-32700]: 'parse error',
       };
+      // Recorded only: the tool ran and its result said it failed
+      // (`isError`), which the client received as a result, not an error.
+      if (b.rpc_code === -32510) return 'The tool reported an error in its result (isError)';
       const label = codeMap[b.rpc_code] ?? `code ${b.rpc_code}`;
       return `JSON-RPC error ${b.rpc_code} — ${label}`;
     },
@@ -508,7 +514,12 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
     label: 'Server Tool Substituted',
     tooltip: (b) => {
       if (b.code !== 'web_substituted_server') return '';
-      return `Native server-tool ${b.server_type} replaced with the gateway's filtered web executor`;
+      const base = `Native server-tool ${b.server_type} replaced with the gateway's filtered web executor`;
+      // Absent on a row with none, and on rows written before it was recorded.
+      const notApplied = b.not_honoured ?? [];
+      return notApplied.length > 0
+        ? `${base}. The client's own settings on that tool were not applied: ${notApplied.join(', ')}`
+        : base;
     },
     classes: 'bg-(--accent)/15 text-(--accent) border border-(--accent)',
     iconName: 'arrowsLR',

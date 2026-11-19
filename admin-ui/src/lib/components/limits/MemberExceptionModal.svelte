@@ -41,7 +41,7 @@
     exceptions: Exception[];
     defaults: Defaults;
     /** The pool's effective caps (null = unlimited), for the above-pool note. */
-    pool: { rpm: number | null; tpm: number | null; daily: number | null; monthly: number | null };
+    pool: { rpm: number | null; rpmMcp: number | null; rpmA2a: number | null; tpm: number | null; daily: number | null; monthly: number | null };
     currency: string;
     saving?: boolean;
     error?: string | null;
@@ -53,6 +53,8 @@
 
   let picked = $state('');
   let rpm = $state<LimitState>({ kind: 'inherit' });
+  let rpmMcp = $state<LimitState>({ kind: 'inherit' });
+  let rpmA2a = $state<LimitState>({ kind: 'inherit' });
   let tpm = $state<LimitState>({ kind: 'inherit' });
   let daily = $state<LimitState>({ kind: 'inherit' });
   let monthly = $state<LimitState>({ kind: 'inherit' });
@@ -62,11 +64,13 @@
   function seed(forUser: string) {
     const e = exceptions.find((x) => x.user_id === forUser);
     rpm = decodeLimit(e?.requests_per_minute, 'exception');
+    rpmMcp = decodeLimit(e?.requests_per_minute_mcp, 'exception');
+    rpmA2a = decodeLimit(e?.requests_per_minute_a2a, 'exception');
     tpm = decodeLimit(e?.tokens_per_minute, 'exception');
     daily = decodeLimit(e?.daily_budget, 'exception');
     monthly = decodeLimit(e?.monthly_budget, 'exception');
     mode = e?.budget_mode === 'alert_only' ? 'alert_only' : 'enforce';
-    seeded = JSON.stringify([rpm, tpm, daily, monthly, mode]);
+    seeded = JSON.stringify([rpm, rpmMcp, rpmA2a, tpm, daily, monthly, mode]);
     form.markClean();
   }
 
@@ -97,7 +101,7 @@
   $effect(() => {
     if (!open || !seeded) return;
     // Back to what was loaded is clean again — Cancel then asks nothing.
-    if (JSON.stringify([rpm, tpm, daily, monthly, mode]) !== seeded) form.markDirty();
+    if (JSON.stringify([rpm, rpmMcp, rpmA2a, tpm, daily, monthly, mode]) !== seeded) form.markDirty();
     else form.markClean();
   });
 
@@ -110,6 +114,8 @@
   const abovePool = $derived.by(() => {
     const parts: string[] = [];
     if (pool.rpm != null && exceedsPool(rpm, pool.rpm)) parts.push(`${count(pool.rpm)} ${m.limits_rpm_short()}`);
+    if (pool.rpmMcp != null && exceedsPool(rpmMcp, pool.rpmMcp)) parts.push(`${count(pool.rpmMcp)} ${m.limits_rpm_mcp_short()}`);
+    if (pool.rpmA2a != null && exceedsPool(rpmA2a, pool.rpmA2a)) parts.push(`${count(pool.rpmA2a)} ${m.limits_rpm_a2a_short()}`);
     if (pool.tpm != null && exceedsPool(tpm, pool.tpm)) parts.push(`${formatTokens(pool.tpm)} ${m.limits_tpm_short()}`);
     if (pool.daily != null && exceedsPool(daily, pool.daily)) parts.push(`${money(pool.daily)} ${m.limits_daily_short()}`);
     if (pool.monthly != null && exceedsPool(monthly, pool.monthly)) parts.push(`${money(pool.monthly)} ${m.limits_monthly_short()}`);
@@ -120,9 +126,11 @@
 
   async function save() {
     const target = userId ?? picked;
-    if (!target || ![rpm, tpm, daily, monthly].every(isValidLimit)) return;
+    if (!target || ![rpm, rpmMcp, rpmA2a, tpm, daily, monthly].every(isValidLimit)) return;
     await onsave(target, {
       requests_per_minute: encodeLimit(rpm, 'exception'),
+      requests_per_minute_mcp: encodeLimit(rpmMcp, 'exception'),
+      requests_per_minute_a2a: encodeLimit(rpmA2a, 'exception'),
       tokens_per_minute: encodeLimit(tpm, 'exception'),
       daily_budget: encodeLimit(daily, 'exception'),
       monthly_budget: encodeLimit(monthly, 'exception'),
@@ -138,7 +146,7 @@
   {error}
   title={userId ? m.limits_exception_title_edit({ email }) : m.limits_exception_title_new()}
   saveLabel={m.limits_save()}
-  saveDisabled={!(userId ?? picked) || ![rpm, tpm, daily, monthly].every(isValidLimit)}
+  saveDisabled={!(userId ?? picked) || ![rpm, rpmMcp, rpmA2a, tpm, daily, monthly].every(isValidLimit)}
   maxWidth="max-w-lg"
   {onclose}
   onsave={save}
@@ -153,6 +161,8 @@
   {/if}
   <p class="text-xs text-(--text-secondary)">{m.limits_exception_replaces()}</p>
   <LimitField label={m.limits_rpm()} bind:limit={rpm} encoding="exception" inheritedLabel={inheritLabel(defaults.requests_per_minute, count)} />
+  <LimitField label={m.limits_rpm_mcp()} bind:limit={rpmMcp} encoding="exception" inheritedLabel={inheritLabel(defaults.requests_per_minute_mcp, count)} />
+  <LimitField label={m.limits_rpm_a2a()} bind:limit={rpmA2a} encoding="exception" inheritedLabel={inheritLabel(defaults.requests_per_minute_a2a, count)} />
   <LimitField label={m.limits_tpm()} bind:limit={tpm} encoding="exception" inheritedLabel={inheritLabel(defaults.tokens_per_minute, formatTokens)} />
   <LimitField label={m.limits_daily({ currency })} bind:limit={daily} encoding="exception" step={0.01} inheritedLabel={inheritLabel(defaults.daily_budget, money)} />
   <LimitField label={m.limits_monthly({ currency })} bind:limit={monthly} encoding="exception" step={0.01} inheritedLabel={inheritLabel(defaults.monthly_budget, money)} />

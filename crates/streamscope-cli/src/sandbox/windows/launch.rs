@@ -12,7 +12,8 @@
 //!   console): the console is put in raw VT mode and UTF-8 for the run and
 //!   restored after it, keystrokes travel as `Data`, size changes as
 //!   `Resize`, and the host's output — the client's screen — is copied to
-//!   the console as bytes.
+//!   the console as bytes; the terminal modes it leaves on are switched
+//!   off at the end ([`super::vt_modes`]).
 //! - **Pipes mode** (anything else): each stream is relayed, captured, a
 //!   file or `NUL`; a console on standard input is read line by line, as
 //!   the console edits them, Ctrl-Z ending the input; Ctrl-C on this
@@ -46,6 +47,7 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
 use windows_sys::Win32::System::Console::{
     CONSOLE_MODE, CONSOLE_READCONSOLE_CONTROL, CONSOLE_SCREEN_BUFFER_INFO, CTRL_C_EVENT, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT,
+    FlushConsoleInputBuffer,
     ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleCP, GetConsoleMode, GetConsoleOutputCP, GetConsoleScreenBufferInfo,
     GetStdHandle, ReadConsoleW, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP,
@@ -68,6 +70,7 @@ use super::cmdline;
 use super::frame::{self, Frame};
 use super::launch_env;
 use super::setup::Sid;
+use super::vt_modes;
 
 /// The sandbox account a launch signs in as (from `setup::Ready`).
 pub struct Account {
@@ -285,7 +288,7 @@ impl Command {
                     }
                     Sink::Capture(buf)
                 }
-                RelayKind::Relay => Sink::developer(which, console),
+                RelayKind::Relay => Sink::developer(which, modes.as_ref().map(|m| &m.screen)),
             };
             let done_tx = done_tx.clone();
             spawn_named("ssai-relay", move || {
@@ -504,8 +507,11 @@ enum RelayKind {
 
 /// Where a relay writes.
 enum Sink {
-    /// Bytes, unchanged: a file or pipe, or the console in raw VT mode.
+    /// Bytes, unchanged: a file or pipe.
     Raw(STD_HANDLE),
+    /// The client's screen, to the console in raw VT mode (a console-mode
+    /// run's output): bytes, unchanged, while the run's [`Screen`] is open.
+    Screen(Arc<Mutex<Screen>>),
     /// Text, to a console in its own mode: decoded from UTF-8 and written
     /// through std, which converts it for the console.
     Text(Stream, launch_env::Utf8Stream),
@@ -513,22 +519,26 @@ enum Sink {
 }
 
 impl Sink {
-    fn developer(which: Stream, console_mode: bool) -> Sink {
+    /// Where the developer's stream `which` is written: in a console-mode
+    /// run (`screen` set), standard output is the run's screen and standard
+    /// error bytes as they are.
+    fn developer(which: Stream, screen: Option<&Arc<Mutex<Screen>>>) -> Sink {
         let std = match which {
             Stream::Out => STD_OUTPUT_HANDLE,
             Stream::Err => STD_ERROR_HANDLE,
         };
-        if console_mode || !is_console(std) { Sink::Raw(std) } else { Sink::Text(which, Default::default()) }
+        match (which, screen) {
+            (Stream::Out, Some(screen)) => Sink::Screen(screen.clone()),
+            (_, Some(_)) => Sink::Raw(std),
+            (_, None) if !is_console(std) => Sink::Raw(std),
+            (_, None) => Sink::Text(which, Default::default()),
+        }
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
-            Sink::Raw(std) => {
-                // SAFETY: plain call; the standard handle stays open for the
-                // process's life and is never closed through this file.
-                let mut to = ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(GetStdHandle(*std)) });
-                to.write_all(bytes).and_then(|()| to.flush())
-            }
+            Sink::Raw(std) => write_std(*std, bytes),
+            Sink::Screen(screen) => screen.lock().unwrap_or_else(|p| p.into_inner()).write(bytes),
             Sink::Text(which, decoder) => {
                 let text = decoder.push(bytes);
                 match which {
@@ -544,6 +554,47 @@ impl Sink {
                 Ok(())
             }
         }
+    }
+}
+
+/// Bytes, unchanged, to one of this process's standard handles.
+fn write_std(std: STD_HANDLE, bytes: &[u8]) -> io::Result<()> {
+    // SAFETY: plain call; the standard handle stays open for the process's
+    // life and is never closed through this file.
+    let mut to = ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(GetStdHandle(std)) });
+    to.write_all(bytes).and_then(|()| to.flush())
+}
+
+/// A console-mode run's screen on the developer's console: the client's
+/// output, written as it comes while open and read for the terminal modes
+/// it switches on ([`vt_modes`]). Closing it stops every later write — a
+/// relay still copying cannot switch a mode back on — and writes the
+/// inverse of what is still on. It is closed while the console is still in
+/// VT mode ([`ConsoleModes`] closes it before restoring the console).
+struct Screen {
+    modes: vt_modes::Modes,
+    open: bool,
+}
+
+impl Screen {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if !self.open {
+            return Err(io::Error::other("the run's screen is closed"));
+        }
+        self.modes.feed(bytes);
+        write_std(STD_OUTPUT_HANDLE, bytes)
+    }
+
+    /// Close it; whether a mode was left on (and so switched off).
+    fn close(&mut self) -> bool {
+        if !std::mem::replace(&mut self.open, false) {
+            return false;
+        }
+        let reset = self.modes.restore();
+        if !reset.is_empty() {
+            let _ = write_std(STD_OUTPUT_HANDLE, &reset);
+        }
+        !reset.is_empty()
     }
 }
 
@@ -704,13 +755,16 @@ fn is_console(std: STD_HANDLE) -> bool {
     unsafe { GetConsoleMode(GetStdHandle(std), &mut mode) != 0 }
 }
 
-/// The developer's console as it was before a console-mode run, put back
-/// when this drops.
+/// The developer's console as it was before a console-mode run, and the
+/// run's screen on it: when this drops, the screen is closed (its modes
+/// switched off while the console still reads VT), then the console is put
+/// back.
 struct ConsoleModes {
     input: CONSOLE_MODE,
     output: CONSOLE_MODE,
     input_cp: u32,
     output_cp: u32,
+    screen: Arc<Mutex<Screen>>,
 }
 
 impl ConsoleModes {
@@ -727,7 +781,13 @@ impl ConsoleModes {
             return Err(io::Error::other(format!("read the console's mode: {}", io::Error::last_os_error())));
         }
         // SAFETY: plain calls.
-        let modes = ConsoleModes { input, output, input_cp: unsafe { GetConsoleCP() }, output_cp: unsafe { GetConsoleOutputCP() } };
+        let modes = ConsoleModes {
+            input,
+            output,
+            input_cp: unsafe { GetConsoleCP() },
+            output_cp: unsafe { GetConsoleOutputCP() },
+            screen: Arc::new(Mutex::new(Screen { modes: vt_modes::Modes::default(), open: true })),
+        };
         let raw_in = (input & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)) | ENABLE_VIRTUAL_TERMINAL_INPUT;
         let raw_out = output | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN;
         // SAFETY: plain calls. A failure leaves `modes` to put back what
@@ -754,8 +814,15 @@ impl ConsoleModes {
 
 impl Drop for ConsoleModes {
     fn drop(&mut self) {
+        let reset = self.screen.lock().unwrap_or_else(|p| p.into_inner()).close();
         // SAFETY: plain calls putting back what `enter` read.
         unsafe {
+            // What the modes left on reported after the input readers
+            // stopped (mouse moves, focus changes) is the client's, never
+            // the developer's next keystrokes.
+            if reset {
+                FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+            }
             SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), self.input);
             SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), self.output);
             SetConsoleCP(self.input_cp);

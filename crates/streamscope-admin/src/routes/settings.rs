@@ -647,6 +647,26 @@ pub async fn update_settings(
         tracing::error!("begin settings tx: {e}");
         ApiError::internal("failed to update settings")
     })?;
+    // An organisation ceiling that newly caps a window counts the spend already
+    // made in it (crate::budget_seed). EVERY save writing a ceiling field takes
+    // the tenant's ceiling lock — one that clears it as much as one that sets
+    // it — so ceiling saves take turns and a save setting a cap reads the
+    // committed ceiling of any save before it as its before: none can miss a
+    // window another left uncapped. The lock orders the save, so failing to
+    // take it fails the save. Only a save setting a positive cap can newly cap
+    // a window: it alone reads the before (best-effort) and seeds.
+    let writes_ceiling = payload.tenant_daily_budget.is_some() || payload.tenant_monthly_budget.is_some();
+    if writes_ceiling {
+        crate::budget_seed::lock_ceiling(&mut tx, tenant_id).await.map_err(|e| {
+            tracing::error!("settings (ceiling lock): {e}");
+            ApiError::internal("failed to update settings")
+        })?;
+    }
+    let ceiling_before = if crate::budget_seed::sets_a_cap(payload.tenant_daily_budget, payload.tenant_monthly_budget) {
+        crate::budget_seed::read_ceiling(&mut tx, tenant_id).await
+    } else {
+        None
+    };
 
     // Route the app registry to the `apps` table, then drop it from the generic
     // key loop below so no stale `system_settings` blob row is written.
@@ -693,6 +713,12 @@ pub async fn update_settings(
             tracing::error!("failed to update setting {key}: {e}");
             ApiError::internal("failed to update settings")
         })?;
+    }
+
+    // An unchanged ceiling newly caps nothing: the seed reads the ceiling after
+    // the write and stops there, before any spend is read.
+    if let Some(before) = ceiling_before {
+        crate::budget_seed::seed_organisation(&mut tx, tenant_id, before).await;
     }
 
     tx.commit().await.map_err(|e| {

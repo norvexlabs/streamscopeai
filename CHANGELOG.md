@@ -5,6 +5,146 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.66]
+
+### Changed
+
+- **BREAKING (MCP) — a `completion/complete` whose `ref` names a prompt or resource the virtual
+  server does not serve answers `-32602` (Invalid params)**, in every protocol revision, as the MCP
+  completion specification answers an invalid prompt name. It was `-32001` for a prompt no route
+  serves (and for an unknown resource on an older revision); a prompt a route filters out already
+  answered `-32602`, and the two now answer alike. A resource ref names its `uri` in the error's
+  `data`.
+- **The installer moves to a newer Stowage.** The VM is no longer created by the installer:
+  `vm create` writes the disk and the seed and prints the steps, and an OpenTofu root of your own
+  creates the VM from `vm seed --json`; `vm destroy` and `vm create --create opentofu` are gone. A
+  VM created that way by an earlier installer keeps running and upgrading; remove it with that
+  installer's `vm destroy`, or adopt it into a root of your own. On TrueNAS, `vm truenas
+  import-image`, `seed` and `stop` are documented.
+- **The first start after the upgrade recreates every service once** (each container is now told
+  the deploy shape it runs on). On the VM appliance the console's memory tile then shows the whole
+  VM's memory.
+- **A restore loads only this install's own backups** unless `--unrecorded` is given (a backup
+  another VM took — a rebuild's, a restore drill's source).
+- **VM disk images are published weekly** (and on request), not with every release; a release
+  without disks boots the newest disk set of its channel and writes its own OS at first boot.
+
+### Added
+
+- **New installer options:** `--registry-login-file` and `registry-login` (a pull login per
+  install), `--acme-ca` / `--acme-ca-root` (another ACME CA than Let's Encrypt), `--known-hosts-line`
+  for the VM's SSH host key, `upgrade --dry-run` / `rollback --dry-run` on the VM, and on Kubernetes
+  `k8s secrets export` / `k8s install --secrets` (disaster recovery across shapes).
+- **The gateway's metrics show what it holds per user and per session**: the turns it keeps to
+  recognise a conversation's next turn, the budget and rate counters it tracks, its MCP sessions,
+  the upstream connections and notification streams behind them, and how many audit records the
+  console has answered for — so a gateway's memory can be sized from what it serves before it runs
+  short (Operator Guide § Monitoring — Prometheus metrics).
+- **The Server Tool Substituted badge names the client's settings the gateway did not apply.**
+  When the gateway runs a provider's server-side web search itself, the limits the client set on
+  that tool (`max_uses`, a domain list, `user_location`, a code-execution caller, …) are listed on
+  the request's badge by name only, never their values.
+
+### Fixed
+
+- **The audit trail keeps up with a few hundred active users.** The console merged each gateway's
+  budget and rate counters one at a time; with a few hundred users that took several seconds per
+  report and the gateway's audit records queued behind it without end. Counters now merge in
+  batches.
+- **The images carry OpenSSL's latest security fixes** (OpenSSL 3.5.9-r1 in every image the
+  release ships but the database's, whose official image has no such build yet), and the console's
+  Node.js its latest patch release.
+- **The guardrail's record of what it already screened is held to its size in real memory.** It
+  counted only part of what each entry costs, so it could grow to about three times its limit.
+- **MCP — a modern client asked for input it did not declare is told what it is missing.** The
+  `-32021` the gateway answers in that case now carries `data.requiredCapabilities`, listing every
+  capability missing, not only the first; an upstream asking for an input kind the gateway does
+  not know is answered as the upstream's failure instead.
+- **Past a few thousand MCP users, the gateway no longer forgets a live MCP session or opens a new
+  upstream connection on every call.** Each MCP session store holds up to 65,536 entries (was
+  4,096, `MCP_SESSION_MAX_ENTRIES`), and the upstream connections the gateway opens itself, larger
+  each, up to a quarter of that; a session already held is always kept current at the limit,
+  where before its activity stopped being recorded and it could be dropped while in use. A new
+  entry past the limit is counted in a metric and logged once per sweep rather than on every
+  request. The upstream session behind a client session the gateway no longer holds is now
+  released once idle, where before it was kept for the gateway's lifetime.
+
+## [2026.11.65]
+
+### Changed
+
+- **BREAKING — requests per minute are limited per surface.** The workspace pool, the default
+  member limit and member exceptions now each take three request rates: LLM (chat, media and
+  analysis), MCP (the built-in Web tools included) and A2A. Before, one rate counted all three
+  together. On upgrade every rate you had set is copied to all three surfaces, so no surface you
+  capped becomes unlimited — but the three together can now reach up to three times the old
+  figure; lower a surface's own field to tighten it. A refused request's 429 (and an MCP call's
+  error data) names the `surface` beside the `bucket`. A script that writes a workspace's or a
+  member's limits must send the new fields: a field left out of a full update is cleared, as for
+  the existing ones.
+- **BREAKING (MCP) — an unknown tool or prompt answers `-32602` (Invalid params)**, including a
+  name a route filters out and a built-in Web tool the server does not offer (`web_search` with no
+  search backend), in every protocol revision, as the MCP specification's own example does; it was
+  `-32004`.
+- **BREAKING (MCP) — a tool call a tool-call rule blocks now answers as a tool error** (a result with
+  `isError`) naming the rule, so the model can adapt, instead of the JSON-RPC error `-32506`; the
+  audit records it as blocked, as before. A blocked resource read or prompt still answers `-32506`.
+- **New workspaces start with a default member limit** of 120 LLM, 300 MCP and 60 A2A requests a
+  minute, so one member's runaway client cannot use up the team's pool. Existing workspaces keep
+  what they have; the Agent and Inline AI workspaces take no default.
+- **A workspace's default member limit no longer applies to service accounts**, in every
+  workspace: a service account is held by the workspace pool, the organisation ceiling and its own
+  member exception, if you give it one.
+- **A new budget counts the spend already made in its window.** Setting a member, key or
+  organisation budget where there was none now counts the spend the audit trail already holds for
+  the current day and 30-day period, so a $50 monthly limit set after $40 of spend stops at $50
+  instead of letting $90 through.
+- **BREAKING — the built-in Web tools speak the interface models know.** A failed `web_search` or
+  `web_fetch` call on the Web MCP server now comes back as a tool error the model can read and act
+  on (a result with `isError`: a short code such as `invalid_tool_input` or `url_not_allowed`, then
+  what to fix), instead of a JSON-RPC error (`-32505`, `-32506`, `-32500`, …) many clients never show
+  the model. `web_fetch` reads a long page in slices: `max_length` (characters, at least 1) and
+  `start_index` replace `max_bytes`, which is no longer read — a call still sending it gets the whole
+  page — and a cut page says where to continue. The tools carry clearer descriptions, a title and read-only hints, and `web_search`
+  returns structured results. A substitution rule's fetch tool gains the same optional paging
+  arguments; a rule you edited keeps working as it is.
+
+### Fixed
+
+- A web search the gateway runs in place of Anthropic's own now reports a failure with one of the
+  error codes Anthropic defines, instead of an internal one a strict client could not read.
+- An MCP server's tool that reports a failure (`isError`), and a streamed JSON-RPC error, now
+  show as errors on the request's audit entry (a tool's own failure under its own category), with
+  the message bounded and stripped of credentials; both read as successes before.
+- A web call with malformed arguments is audited as invalid arguments rather than as a
+  configuration error.
+- A web search the gateway runs for a Responses client names its query in `action.queries` as well
+  as `action.query`, as the current specification defines both.
+- In the CLI, a run's end always releases its hold on the sandbox's run lock, so a cleanup that
+  needs the lock alone is no longer skipped when another process was starting at that instant.
+
+## [2026.11.64]
+
+### Added
+
+- **Open Code Review works as a tool of another sandboxed client.** An agent run under `ssai run
+  --sandbox` (OpenCode, Claude Code, …) can now run Open Code Review, for example as a skill, with
+  the Open Code Review setup provisioned for the same workspace. Before, it failed with "no valid
+  LLM endpoint configured". A new client-profile setting, **usable as a tool**, decides which
+  clients this applies to: it is on for Open Code Review only, and turning it on lets the agents
+  of the workspace's other clients read that client's key. It applies to clients provisioned
+  globally; run `ssai sync` to pick it up.
+
+### Fixed
+
+- After a client run in a terminal under the Windows sandbox, copy and paste work again in that
+  terminal: the terminal modes the client left on (mouse tracking, bracketed paste and the like)
+  are switched off when the run ends.
+- Leaving a client run under the Windows sandbox is faster: the cleanup of what the sandbox
+  account left scheduled no longer starts PowerShell, so it takes a fraction of a second at the
+  start and the end of each run instead of several seconds, and the files the agent wrote are
+  handed back in parallel.
+
 ## [2026.11.63]
 
 ### Changed

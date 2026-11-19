@@ -69,7 +69,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // to confine read-write. Looks in the project manifest first, then the
     // global one — so a home-scoped client provisioned globally (the CLI tells
     // you to "provision it globally instead") is runnable from any project.
-    let resolved = resolve_client(&args.client, args.host.as_deref())?;
+    let mut resolved = resolve_client(&args.client, args.host.as_deref())?;
 
     // What the administrator offers this workspace: the client must be one of
     // its clients, `--sandbox off` may be refused, and the sandbox reaches
@@ -167,8 +167,22 @@ pub async fn run(args: RunArgs) -> Result<()> {
     }
     ca_files.extend(args.ca_file.iter().cloned());
 
-    // Per-agent env quirks (keyring/warning toggles).
-    if let Some(agent) = sandbox::profiles::agent_for(&command) {
+    // The clients the agent may run as tools, among those the workspace is
+    // still offered; a flagged one this ssai has no profile row for is named.
+    let offered = |id: &str| access.as_ref().is_none_or(|a| a.clients.iter().any(|c| c == id));
+    for id in resolved.unknown_tools.iter().filter(|id| offered(id)) {
+        crate::ui::warn("", format_args!(
+            "{id} may be run as a tool, but this ssai does not know where it keeps its state — the \
+             sandbox does not give it its config (ssai update may)"
+        ));
+    }
+    let tool_clients: Vec<sandbox::ToolClient> =
+        std::mem::take(&mut resolved.tool_clients).into_iter().filter(|t| offered(&t.client_id)).collect();
+
+    // Per-agent env quirks (keyring/warning toggles): the launched client's,
+    // then each tool's, which the agent's child process inherits.
+    let agents = sandbox::profiles::agent_for(&command).into_iter().chain(tool_clients.iter().map(|t| t.profile));
+    for agent in agents {
         for (k, v) in agent.env {
             env.push((k.to_string(), v.to_string()));
         }
@@ -207,6 +221,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         client_files: resolved.client_files,
         private_project: args.private_project,
         opencode: resolved.opencode,
+        tool_clients,
     };
 
     let tier = sandbox::select_tier(choice)?;
@@ -254,6 +269,10 @@ struct ResolvedClient {
     home_files: Vec<PathBuf>,
     /// Every file the client was provisioned with, either scope.
     client_files: Vec<PathBuf>,
+    /// The clients of the same global manifest and workspace it may run as tools.
+    tool_clients: Vec<sandbox::ToolClient>,
+    /// Those of them this ssai has no profile row for, by client id.
+    unknown_tools: Vec<String>,
 }
 
 /// Resolve `client` against the project manifest first, then the GLOBAL manifest.
@@ -318,6 +337,7 @@ fn resolve_client(client: &str, host: Option<&str>) -> Result<ResolvedClient> {
             None
         };
         let files = provisioned_files(managed, is_project.then_some(confine_root.as_path()));
+        let (tool_clients, unknown_tools) = tool_clients_of(ws, managed, *is_project);
         return Ok(ResolvedClient {
             client_id: managed.client_id.clone(),
             command,
@@ -337,6 +357,8 @@ fn resolve_client(client: &str, host: Option<&str>) -> Result<ResolvedClient> {
             // docker tier does not mount: it mounts these files instead.
             home_files: if *is_project { Vec::new() } else { files.clone() },
             client_files: files,
+            tool_clients,
+            unknown_tools,
         });
     }
     // A `--host` naming no provisioned gateway at all is the thing to fix.
@@ -457,6 +479,33 @@ fn provisioned_files(managed: &ManagedClient, project_root: Option<&Path>) -> Ve
             (real != root && real.starts_with(root)).then_some(real)
         })
         .collect()
+}
+
+/// The clients of `ws` — the launched client's own manifest and workspace,
+/// never the other manifest, which may name another gateway or workspace —
+/// other than `launched` whose template is `usable_as_tool`, each with the
+/// files it was provisioned with; and, by client id, those flagged that the
+/// sandbox has no profile row for (the run names them; nothing reaches
+/// them). None from a project's record (`in_project`): it can come with the
+/// project's sources, and a tool's grant is its profile row's state
+/// folders, wherever its files are.
+fn tool_clients_of(ws: &WorkspaceManifest, launched: &ManagedClient, in_project: bool) -> (Vec<sandbox::ToolClient>, Vec<String>) {
+    let (mut tools, mut unknown) = (Vec::new(), Vec::new());
+    if in_project {
+        return (tools, unknown);
+    }
+    for c in ws.clients.iter().filter(|c| c.usable_as_tool && c.client_id != launched.client_id) {
+        let profile = c
+            .launch_command
+            .as_deref()
+            .and_then(sandbox::profiles::agent_for)
+            .or_else(|| sandbox::profiles::agent_for(&c.client_id));
+        match profile {
+            Some(profile) => tools.push(sandbox::ToolClient { client_id: c.client_id.clone(), profile, files: provisioned_files(c, None) }),
+            None => unknown.push(c.client_id.clone()),
+        }
+    }
+    (tools, unknown)
 }
 
 /// The user config dir `run` hands `managed` in the project at `project_root`
@@ -655,6 +704,66 @@ mod tests {
         let named = [own.to_str().unwrap(), outside.to_str().unwrap(), "~/.ssh/id_ed25519", root.to_str().unwrap()];
         assert_eq!(provisioned_files(&with_files(&named), Some(&root)), vec![own]);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A client recorded with its template's `usable_as_tool`.
+    fn tool(id: &str, launch: &str, usable: bool) -> serde_json::Value {
+        let mut c = client(id);
+        c["launch_command"] = launch.into();
+        c["usable_as_tool"] = usable.into();
+        c["files"] = serde_json::json!([{ "path": "~/.opencodereview/config.json", "format": "json", "owned": [], "file_hash": "" }]);
+        c
+    }
+
+    fn ids(tools: &[sandbox::ToolClient]) -> Vec<&str> {
+        tools.iter().map(|t| t.client_id.as_str()).collect()
+    }
+
+    /// The tools a run reaches are the flagged clients of the launched
+    /// client's own gateway and workspace, with their profile row and files:
+    /// not one of another gateway's, not an unflagged one, not the launched
+    /// client itself, not one this ssai has no profile row for.
+    #[test]
+    fn a_run_reaches_only_the_flagged_clients_of_its_own_workspace() {
+        let m = manifest(serde_json::json!({ "hosts": {
+            "https://a.example#t1": ws(vec![
+                client("opencode"),
+                tool("open-code-review", "ocr", true),
+                tool("unknown-tool", "unknown-tool", true),
+                tool("codex", "codex", false),
+            ]),
+            "https://b.example#t2": ws(vec![client("claude"), tool("open-code-review", "ocr", true)]),
+            "https://c.example#t3": ws(vec![client("claude"), tool("open-code-review", "ocr", false)]),
+        }}));
+        let (_, ws_a, opencode) = select_client(&m, Some("https://a.example#t1"), "opencode").unwrap().unwrap();
+        let (tools, unknown) = tool_clients_of(ws_a, opencode, false);
+        // Flagged, with no profile row: named, never reached.
+        assert_eq!(unknown, ["unknown-tool"]);
+        assert_eq!(ids(&tools), ["open-code-review"]);
+        assert!(std::ptr::eq(tools[0].profile, sandbox::profiles::agent_for("ocr").unwrap()));
+        let home = crate::state::home_dir().unwrap();
+        let config = home.join(".opencodereview").join("config.json");
+        assert_eq!(tools[0].files, vec![dunce::canonicalize(&config).unwrap_or(config)]);
+        // A project's record, which can come with its sources, names no tool.
+        let (tools, unknown) = tool_clients_of(ws_a, opencode, true);
+        assert!(tools.is_empty() && unknown.is_empty());
+        // The launched client itself is never its own tool.
+        let (_, _, ocr) = select_client(&m, Some("https://a.example#t1"), "ocr").unwrap().unwrap();
+        assert!(tool_clients_of(ws_a, ocr, false).0.is_empty());
+        // Another gateway's flagged client reaches only its own gateway's run.
+        let (_, ws_b, claude) = select_client(&m, Some("https://b.example#t2"), "claude").unwrap().unwrap();
+        assert_eq!(ids(&tool_clients_of(ws_b, claude, false).0), ["open-code-review"]);
+        let (_, ws_c, claude) = select_client(&m, Some("https://c.example#t3"), "claude").unwrap().unwrap();
+        assert!(tool_clients_of(ws_c, claude, false).0.is_empty());
+    }
+
+    /// A record written before the flag existed reads it off.
+    #[test]
+    fn a_record_without_the_flag_is_not_a_tool() {
+        let old: ManagedClient = serde_json::from_value(client("open-code-review")).unwrap();
+        assert!(!old.usable_as_tool);
+        let new: ManagedClient = serde_json::from_value(tool("open-code-review", "ocr", true)).unwrap();
+        assert!(new.usable_as_tool);
     }
 
     fn two_gateways() -> crate::state::Manifest {

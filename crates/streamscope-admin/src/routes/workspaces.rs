@@ -25,6 +25,15 @@ use crate::db::tenant::{Scoped, TenantConn};
 use crate::middleware::AuditDiffSink;
 use crate::AdminState;
 
+/// The exception columns every read and `RETURNING` of an exception names, in
+/// [`UserRateLimitOverride`]'s order.
+macro_rules! exception_columns {
+    () => {
+        "user_id, requests_per_minute, requests_per_minute_mcp, requests_per_minute_a2a, tokens_per_minute, \
+         daily_budget, monthly_budget, budget_mode, set_via, set_by_email"
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -381,7 +390,12 @@ pub(crate) fn norm_budget_mode(s: &str) -> String {
 
 #[derive(Serialize, Deserialize, ToSchema, sqlx::FromRow)]
 pub struct WorkspaceRateLimits {
+    /// LLM requests per minute (chat, media, `/v1/analyze`).
     pub requests_per_minute: Option<i32>,
+    /// MCP requests per minute, the built-in Web server included.
+    pub requests_per_minute_mcp: Option<i32>,
+    /// A2A requests per minute.
+    pub requests_per_minute_a2a: Option<i32>,
     pub tokens_per_minute: Option<i32>,
     pub daily_budget: Option<f64>,
     pub monthly_budget: Option<f64>,
@@ -393,7 +407,12 @@ pub struct WorkspaceRateLimits {
 #[derive(Serialize, ToSchema, sqlx::FromRow)]
 pub struct UserRateLimitOverride {
     pub user_id: Uuid,
+    /// LLM requests per minute (chat, media, `/v1/analyze`).
     pub requests_per_minute: Option<i32>,
+    /// MCP requests per minute, the built-in Web server included.
+    pub requests_per_minute_mcp: Option<i32>,
+    /// A2A requests per minute.
+    pub requests_per_minute_a2a: Option<i32>,
     pub tokens_per_minute: Option<i32>,
     pub daily_budget: Option<f64>,
     pub monthly_budget: Option<f64>,
@@ -421,8 +440,15 @@ pub struct UserRateLimitOverride {
 
 #[derive(Deserialize, ToSchema)]
 pub struct PutRateLimitOverrideRequest {
+    /// LLM requests per minute (chat, media, `/v1/analyze`).
     #[serde(default)]
     pub requests_per_minute: Option<i32>,
+    /// MCP requests per minute, the built-in Web server included.
+    #[serde(default)]
+    pub requests_per_minute_mcp: Option<i32>,
+    /// A2A requests per minute.
+    #[serde(default)]
+    pub requests_per_minute_a2a: Option<i32>,
     #[serde(default)]
     pub tokens_per_minute: Option<i32>,
     #[serde(default)]
@@ -441,8 +467,15 @@ pub struct PutRateLimitOverrideRequest {
 /// member exception replaces it per metric.
 #[derive(Serialize, Deserialize, ToSchema, Default, Clone, PartialEq, sqlx::FromRow)]
 pub struct MemberLimitDefaults {
+    /// LLM requests per minute (chat, media, `/v1/analyze`).
     #[serde(default)]
     pub requests_per_minute: Option<i32>,
+    /// MCP requests per minute, the built-in Web server included.
+    #[serde(default)]
+    pub requests_per_minute_mcp: Option<i32>,
+    /// A2A requests per minute.
+    #[serde(default)]
+    pub requests_per_minute_a2a: Option<i32>,
     #[serde(default)]
     pub tokens_per_minute: Option<i32>,
     #[serde(default)]
@@ -477,12 +510,11 @@ pub struct WorkspaceLimitsOverview {
 /// budget that is not a finite number. `0` is allowed where the field allows
 /// it (explicitly unlimited).
 pub(crate) fn validate_limit_values(
-    rpm: Option<i32>,
-    tpm: Option<i32>,
+    rates: &[Option<i32>],
     daily: Option<f64>,
     monthly: Option<f64>,
 ) -> Result<(), ApiError> {
-    if rpm.is_some_and(|v| v < 0) || tpm.is_some_and(|v| v < 0) {
+    if rates.iter().flatten().any(|v| *v < 0) {
         return Err(ApiError::bad_request("a rate limit cannot be negative").code(ApiErrorCode::ValidationFailed));
     }
     if [daily, monthly].into_iter().flatten().any(|v| !v.is_finite() || v < 0.0) {
@@ -733,6 +765,14 @@ pub async fn create_workspace(
     }
 
     let tenant_id = db.tenant_uuid();
+    let failed = |what: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!("create workspace ({what}): {e}");
+            ApiError::internal("failed to create workspace")
+        }
+    };
+    // The workspace and its starting member limit land together.
+    let mut tx = db.conn().begin().await.map_err(failed("begin"))?;
     let ws = sqlx::query_as::<_, Workspace>(
         "INSERT INTO workspaces (tenant_id, name, description, oidc_claim_name, oidc_claim_pattern, role) \
          VALUES ($1, $2, $3, $4, $5, 'standard') \
@@ -745,12 +785,13 @@ pub async fn create_workspace(
     .bind(&req.description)
     .bind(oidc_claim_name)
     .bind(oidc_claim_pattern)
-    .fetch_one(db.conn())
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("create workspace: {e}");
-        ApiError::internal("failed to create workspace")
-    })?;
+    .map_err(failed("insert"))?;
+    write_member_defaults(&mut tx, tenant_id, ws.id, &new_workspace_member_defaults())
+        .await
+        .map_err(failed("member defaults"))?;
+    tx.commit().await.map_err(failed("commit"))?;
 
     Ok((axum::http::StatusCode::CREATED, Json(ws)))
 }
@@ -1367,8 +1408,10 @@ pub(crate) async fn remove_membership(
         .map_err(failed("keys"))?
         .rows_affected();
     let exception = sqlx::query_as::<_, UserRateLimitOverride>(
-        "DELETE FROM workspace_user_rate_limit_overrides WHERE workspace_id = $1 AND user_id = $2 \
-         RETURNING user_id, requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode, set_via, set_by_email",
+        concat!(
+            "DELETE FROM workspace_user_rate_limit_overrides WHERE workspace_id = $1 AND user_id = $2 RETURNING ",
+            exception_columns!()
+        ),
     )
     .bind(workspace_id)
     .bind(user_id)
@@ -2012,7 +2055,8 @@ pub async fn remove_a2a_agent(
 
 async fn fetch_rate_limits(db: &mut TenantConn, id: Uuid) -> Result<WorkspaceRateLimits, ApiError> {
     let row = sqlx::query_as::<_, WorkspaceRateLimits>(
-        "SELECT requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode \
+        "SELECT requests_per_minute, requests_per_minute_mcp, requests_per_minute_a2a, tokens_per_minute, \
+                daily_budget, monthly_budget, budget_mode \
          FROM workspace_rate_limits WHERE workspace_id = $1",
     )
     .bind(id)
@@ -2024,6 +2068,8 @@ async fn fetch_rate_limits(db: &mut TenantConn, id: Uuid) -> Result<WorkspaceRat
     })?;
     Ok(row.unwrap_or(WorkspaceRateLimits {
         requests_per_minute: None,
+        requests_per_minute_mcp: None,
+        requests_per_minute_a2a: None,
         tokens_per_minute: None,
         daily_budget: None,
         monthly_budget: None,
@@ -2071,14 +2117,21 @@ pub async fn put_rate_limits(
     Json(req): Json<WorkspaceRateLimits>,
 ) -> Result<Json<WorkspaceRateLimits>, ApiError> {
     workspace_role(&mut db, id).await?;
-    validate_limit_values(req.requests_per_minute, req.tokens_per_minute, req.daily_budget, req.monthly_budget)?;
+    validate_limit_values(
+        &[req.requests_per_minute, req.requests_per_minute_mcp, req.requests_per_minute_a2a, req.tokens_per_minute],
+        req.daily_budget,
+        req.monthly_budget,
+    )?;
     let tenant_id = db.tenant_uuid();
     let before = fetch_rate_limits(&mut db, id).await?;
     sqlx::query(
-        "INSERT INTO workspace_rate_limits (workspace_id, tenant_id, requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+        "INSERT INTO workspace_rate_limits (workspace_id, tenant_id, requests_per_minute, requests_per_minute_mcp, \
+            requests_per_minute_a2a, tokens_per_minute, daily_budget, monthly_budget, budget_mode) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (tenant_id, workspace_id) DO UPDATE SET \
             requests_per_minute = EXCLUDED.requests_per_minute, \
+            requests_per_minute_mcp = EXCLUDED.requests_per_minute_mcp, \
+            requests_per_minute_a2a = EXCLUDED.requests_per_minute_a2a, \
             tokens_per_minute = EXCLUDED.tokens_per_minute, \
             daily_budget = EXCLUDED.daily_budget, \
             monthly_budget = EXCLUDED.monthly_budget, \
@@ -2088,6 +2141,8 @@ pub async fn put_rate_limits(
     .bind(id)
     .bind(tenant_id)
     .bind(req.requests_per_minute)
+    .bind(req.requests_per_minute_mcp)
+    .bind(req.requests_per_minute_a2a)
     .bind(req.tokens_per_minute)
     .bind(req.daily_budget)
     .bind(req.monthly_budget)
@@ -2138,8 +2193,8 @@ pub(crate) async fn list_member_exceptions(
 ) -> Result<OffsetPage<UserRateLimitOverride>, ApiError> {
     let (limit, offset) = page.resolve();
     let mut rows = sqlx::query_as::<_, UserRateLimitOverride>(
-        "SELECT o.user_id, o.requests_per_minute, o.tokens_per_minute, o.daily_budget, o.monthly_budget, o.budget_mode, \
-                o.set_via, o.set_by_email \
+        "SELECT o.user_id, o.requests_per_minute, o.requests_per_minute_mcp, o.requests_per_minute_a2a, \
+                o.tokens_per_minute, o.daily_budget, o.monthly_budget, o.budget_mode, o.set_via, o.set_by_email \
          FROM workspace_user_rate_limit_overrides o \
          JOIN workspace_members m ON m.workspace_id = o.workspace_id AND m.user_id = o.user_id \
          WHERE o.workspace_id = $1 \
@@ -2230,40 +2285,60 @@ pub(crate) async fn upsert_member_exception(
     req: &PutRateLimitOverrideRequest,
     setter: ExceptionSetter,
 ) -> Result<(Option<UserRateLimitOverride>, UserRateLimitOverride), ApiError> {
-    validate_limit_values(req.requests_per_minute, req.tokens_per_minute, req.daily_budget, req.monthly_budget)?;
+    validate_limit_values(
+        &[req.requests_per_minute, req.requests_per_minute_mcp, req.requests_per_minute_a2a, req.tokens_per_minute],
+        req.daily_budget,
+        req.monthly_budget,
+    )?;
     let tenant_id = db.tenant_uuid();
-    let before = sqlx::query_as::<_, UserRateLimitOverride>(
-        "SELECT user_id, requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode, set_via, set_by_email \
-         FROM workspace_user_rate_limit_overrides WHERE workspace_id = $1 AND user_id = $2",
-    )
+    let failed = |what: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!("put override ({what}): {e}");
+            ApiError::internal("failed to set override")
+        }
+    };
+    let mut tx = db.conn().begin().await.map_err(failed("begin"))?;
+    lock_member_limits(&mut tx, id).await.map_err(failed("lock"))?;
+    // Only an exception that leaves the member a budget — its own, or the
+    // default's it inherits — can newly cap one; the default is read under the
+    // lock, so a concurrent default write is either seen or seeds the member
+    // itself (crate::budget_seed).
+    let members_before = match crate::budget_seed::read_member_default_budget(&mut tx, tenant_id, id).await {
+        Some(default) if crate::budget_seed::could_cap_a_member(default, Some((req.daily_budget, req.monthly_budget))) => {
+            crate::budget_seed::read_member_buckets(&mut tx, tenant_id, id, Some(user_id)).await
+        }
+        _ => None,
+    };
+    let before = sqlx::query_as::<_, UserRateLimitOverride>(concat!(
+        "SELECT ", exception_columns!(), " FROM workspace_user_rate_limit_overrides \
+          WHERE workspace_id = $1 AND user_id = $2"
+    ))
     .bind(id)
     .bind(user_id)
-    .fetch_optional(db.conn())
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("put override load before: {e}");
-        ApiError::internal("failed to set override")
-    })?;
+    .map_err(failed("load before"))?;
     // An override only makes sense for a member of this workspace; the
     // membership check is RLS-scoped, so it also rejects cross-tenant user ids.
     let is_member: Option<Uuid> =
         sqlx::query_scalar("SELECT user_id FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
             .bind(id)
             .bind(user_id)
-            .fetch_optional(db.conn())
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| {
-                tracing::error!("check membership: {e}");
-                ApiError::internal("failed to set override")
-            })?;
+            .map_err(failed("check membership"))?;
     if is_member.is_none() {
         return Err(ApiError::not_found("user is not a member of this workspace", ApiErrorCode::WorkspaceMembershipRequired));
     }
-    let row = sqlx::query_as::<_, UserRateLimitOverride>(
-        "INSERT INTO workspace_user_rate_limit_overrides (workspace_id, user_id, tenant_id, requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode, set_via, set_by_email) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+    let row = sqlx::query_as::<_, UserRateLimitOverride>(concat!(
+        "INSERT INTO workspace_user_rate_limit_overrides (workspace_id, user_id, tenant_id, requests_per_minute, \
+            requests_per_minute_mcp, requests_per_minute_a2a, tokens_per_minute, daily_budget, monthly_budget, \
+            budget_mode, set_via, set_by_email) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (tenant_id, workspace_id, user_id) DO UPDATE SET \
             requests_per_minute = EXCLUDED.requests_per_minute, \
+            requests_per_minute_mcp = EXCLUDED.requests_per_minute_mcp, \
+            requests_per_minute_a2a = EXCLUDED.requests_per_minute_a2a, \
             tokens_per_minute = EXCLUDED.tokens_per_minute, \
             daily_budget = EXCLUDED.daily_budget, \
             monthly_budget = EXCLUDED.monthly_budget, \
@@ -2271,25 +2346,43 @@ pub(crate) async fn upsert_member_exception(
             set_via = EXCLUDED.set_via, \
             set_by_email = EXCLUDED.set_by_email, \
             updated_at = now() \
-         RETURNING user_id, requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode, set_via, set_by_email",
-    )
+         RETURNING ", exception_columns!()
+    ))
     .bind(id)
     .bind(user_id)
     .bind(tenant_id)
     .bind(req.requests_per_minute)
+    .bind(req.requests_per_minute_mcp)
+    .bind(req.requests_per_minute_a2a)
     .bind(req.tokens_per_minute)
     .bind(req.daily_budget)
     .bind(req.monthly_budget)
     .bind(norm_budget_mode(&req.budget_mode))
     .bind(setter.via)
     .bind(setter.email)
-    .fetch_one(db.conn())
+    .fetch_one(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("put override: {e}");
-        ApiError::internal("failed to set override")
-    })?;
+    .map_err(failed("write"))?;
+    if let Some(members_before) = &members_before {
+        crate::budget_seed::seed_members(&mut tx, tenant_id, id, Some(user_id), members_before).await;
+    }
+    tx.commit().await.map_err(failed("commit"))?;
     Ok((before, row))
+}
+
+/// Lock a workspace's member limits for a write: the workspace row, `FOR NO
+/// KEY UPDATE` (which no insert's foreign-key check waits on). It serialises
+/// the writes to one workspace's default and exceptions, so each one's
+/// before-read sees the other's commit: two writes that each newly cap nobody
+/// cannot together newly cap a member without either seeding them. It orders
+/// the write itself, so unlike the seed's reads it is not best-effort: if it
+/// cannot be taken, the write fails.
+async fn lock_member_limits(tx: &mut Scoped, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM workspaces WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
 }
 
 #[utoipa::path(
@@ -2319,37 +2412,59 @@ pub async fn delete_rate_limit_override(
 }
 
 /// Remove one member's exception, returning the removed row so the audit
-/// records the values that stopped applying — not only whose they were.
+/// records the values that stopped applying — not only whose they were. The
+/// member falls back to the workspace default: a budget that appears that way
+/// counts the spend already made (`crate::budget_seed`).
 pub(crate) async fn delete_member_exception(
     db: &mut TenantConn,
     id: Uuid,
     user_id: Uuid,
 ) -> Result<Option<UserRateLimitOverride>, ApiError> {
-    sqlx::query_as::<_, UserRateLimitOverride>(
-        "DELETE FROM workspace_user_rate_limit_overrides WHERE workspace_id = $1 AND user_id = $2 \
-         RETURNING user_id, requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode, set_via, set_by_email",
-    )
+    let tenant_id = db.tenant_uuid();
+    let failed = |what: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!("delete override ({what}): {e}");
+            ApiError::internal("failed to remove override")
+        }
+    };
+    let mut tx = db.conn().begin().await.map_err(failed("begin"))?;
+    lock_member_limits(&mut tx, id).await.map_err(failed("lock"))?;
+    // The member falls back to the default: only a default with a budget can
+    // newly cap them (read under the lock, as for an exception write).
+    let members_before = match crate::budget_seed::read_member_default_budget(&mut tx, tenant_id, id).await {
+        Some(default) if crate::budget_seed::could_cap_a_member(default, None) => {
+            crate::budget_seed::read_member_buckets(&mut tx, tenant_id, id, Some(user_id)).await
+        }
+        _ => None,
+    };
+    let removed = sqlx::query_as::<_, UserRateLimitOverride>(concat!(
+        "DELETE FROM workspace_user_rate_limit_overrides WHERE workspace_id = $1 AND user_id = $2 RETURNING ",
+        exception_columns!()
+    ))
     .bind(id)
     .bind(user_id)
-    .fetch_optional(db.conn())
+    .fetch_optional(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("delete override: {e}");
-        ApiError::internal("failed to remove override")
-    })
+    .map_err(failed("delete"))?;
+    if let Some(members_before) = &members_before {
+        crate::budget_seed::seed_members(&mut tx, tenant_id, id, Some(user_id), members_before).await;
+    }
+    tx.commit().await.map_err(failed("commit"))?;
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
 // Member limit defaults + effective limits
 // ---------------------------------------------------------------------------
 
-/// `(rpm, tpm, daily, monthly, budget_mode)` of the member-default columns.
-type MemberDefaultsRow = (Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<String>);
+/// `(rpm, rpm_mcp, rpm_a2a, tpm, daily, monthly, budget_mode)` of the
+/// member-default columns.
+type MemberDefaultsRow = (Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<String>);
 
 async fn fetch_member_defaults(db: &mut TenantConn, id: Uuid) -> Result<MemberLimitDefaults, ApiError> {
     let row: Option<MemberDefaultsRow> = sqlx::query_as(
-        "SELECT member_requests_per_minute, member_tokens_per_minute, member_daily_budget, \
-                member_monthly_budget, member_budget_mode \
+        "SELECT member_requests_per_minute, member_requests_per_minute_mcp, member_requests_per_minute_a2a, \
+                member_tokens_per_minute, member_daily_budget, member_monthly_budget, member_budget_mode \
            FROM workspace_rate_limits WHERE workspace_id = $1",
     )
     .bind(id)
@@ -2360,8 +2475,10 @@ async fn fetch_member_defaults(db: &mut TenantConn, id: Uuid) -> Result<MemberLi
         ApiError::internal("failed to load member defaults")
     })?;
     Ok(match row {
-        Some((rpm, tpm, daily, monthly, mode)) => MemberLimitDefaults {
+        Some((rpm, rpm_mcp, rpm_a2a, tpm, daily, monthly, mode)) => MemberLimitDefaults {
             requests_per_minute: rpm,
+            requests_per_minute_mcp: rpm_mcp,
+            requests_per_minute_a2a: rpm_a2a,
             tokens_per_minute: tpm,
             daily_budget: daily,
             monthly_budget: monthly,
@@ -2414,18 +2531,30 @@ pub async fn put_member_defaults(
     Json(req): Json<MemberLimitDefaults>,
 ) -> Result<Json<MemberLimitDefaults>, ApiError> {
     let role = workspace_role(&mut db, id).await?;
-    validate_limit_values(req.requests_per_minute, req.tokens_per_minute, req.daily_budget, req.monthly_budget)?;
+    validate_limit_values(
+        &[req.requests_per_minute, req.requests_per_minute_mcp, req.requests_per_minute_a2a, req.tokens_per_minute],
+        req.daily_budget,
+        req.monthly_budget,
+    )?;
     // `0` and unset mean the same thing on a default — no default for that
     // metric — so they are stored one way.
     let none_if_zero_i = |v: Option<i32>| v.filter(|n| *n > 0);
     let none_if_zero_f = |v: Option<f64>| v.filter(|n| *n > 0.0);
-    let (rpm, tpm, daily, monthly) = (
-        none_if_zero_i(req.requests_per_minute),
-        none_if_zero_i(req.tokens_per_minute),
-        none_if_zero_f(req.daily_budget),
-        none_if_zero_f(req.monthly_budget),
-    );
-    let sets_any = rpm.is_some() || tpm.is_some() || daily.is_some() || monthly.is_some();
+    let defaults = MemberLimitDefaults {
+        requests_per_minute: none_if_zero_i(req.requests_per_minute),
+        requests_per_minute_mcp: none_if_zero_i(req.requests_per_minute_mcp),
+        requests_per_minute_a2a: none_if_zero_i(req.requests_per_minute_a2a),
+        tokens_per_minute: none_if_zero_i(req.tokens_per_minute),
+        daily_budget: none_if_zero_f(req.daily_budget),
+        monthly_budget: none_if_zero_f(req.monthly_budget),
+        budget_mode: norm_budget_mode(&req.budget_mode),
+    };
+    let sets_any = defaults.requests_per_minute.is_some()
+        || defaults.requests_per_minute_mcp.is_some()
+        || defaults.requests_per_minute_a2a.is_some()
+        || defaults.tokens_per_minute.is_some()
+        || defaults.daily_budget.is_some()
+        || defaults.monthly_budget.is_some();
     if sets_any && matches!(role, WorkspaceRole::Agent | WorkspaceRole::Inline) {
         return Err(ApiError::bad_request(
             "The Agent and Inline AI workspaces take no default member limit — one service member \
@@ -2434,13 +2563,45 @@ pub async fn put_member_defaults(
         .code(ApiErrorCode::MemberDefaultsNotAllowed));
     }
     let tenant_id = db.tenant_uuid();
+    let failed = |what: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!("put member defaults ({what}): {e}");
+            ApiError::internal("failed to update member defaults")
+        }
+    };
+    // Only a default carrying a budget can newly cap a member's budget — a
+    // member it newly caps inherits it (crate::budget_seed).
+    let could_cap = crate::budget_seed::could_cap_a_member((defaults.daily_budget, defaults.monthly_budget), None);
     let before = fetch_member_defaults(&mut db, id).await?;
+    let mut tx = db.conn().begin().await.map_err(failed("begin"))?;
+    lock_member_limits(&mut tx, id).await.map_err(failed("lock"))?;
+    let members_before = if could_cap { crate::budget_seed::read_member_buckets(&mut tx, tenant_id, id, None).await } else { None };
+    write_member_defaults(&mut tx, tenant_id, id, &defaults).await.map_err(failed("write"))?;
+    if let Some(members_before) = &members_before {
+        crate::budget_seed::seed_members(&mut tx, tenant_id, id, None, members_before).await;
+    }
+    tx.commit().await.map_err(failed("commit"))?;
+    let after = fetch_member_defaults(&mut db, id).await?;
+    audit_sink.record(Some(&before), Some(&after));
+    Ok(Json(after))
+}
+
+/// Store a workspace's default member limit (`0` already folded into unset).
+async fn write_member_defaults(
+    tx: &mut Scoped,
+    tenant_id: Uuid,
+    id: Uuid,
+    d: &MemberLimitDefaults,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO workspace_rate_limits (workspace_id, tenant_id, member_requests_per_minute, \
-            member_tokens_per_minute, member_daily_budget, member_monthly_budget, member_budget_mode) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+            member_requests_per_minute_mcp, member_requests_per_minute_a2a, member_tokens_per_minute, \
+            member_daily_budget, member_monthly_budget, member_budget_mode) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT (tenant_id, workspace_id) DO UPDATE SET \
             member_requests_per_minute = EXCLUDED.member_requests_per_minute, \
+            member_requests_per_minute_mcp = EXCLUDED.member_requests_per_minute_mcp, \
+            member_requests_per_minute_a2a = EXCLUDED.member_requests_per_minute_a2a, \
             member_tokens_per_minute = EXCLUDED.member_tokens_per_minute, \
             member_daily_budget = EXCLUDED.member_daily_budget, \
             member_monthly_budget = EXCLUDED.member_monthly_budget, \
@@ -2449,20 +2610,33 @@ pub async fn put_member_defaults(
     )
     .bind(id)
     .bind(tenant_id)
-    .bind(rpm)
-    .bind(tpm)
-    .bind(daily)
-    .bind(monthly)
-    .bind(norm_budget_mode(&req.budget_mode))
-    .execute(db.conn())
-    .await
-    .map_err(|e| {
-        tracing::error!("put member defaults: {e}");
-        ApiError::internal("failed to update member defaults")
-    })?;
-    let after = fetch_member_defaults(&mut db, id).await?;
-    audit_sink.record(Some(&before), Some(&after));
-    Ok(Json(after))
+    .bind(d.requests_per_minute)
+    .bind(d.requests_per_minute_mcp)
+    .bind(d.requests_per_minute_a2a)
+    .bind(d.tokens_per_minute)
+    .bind(d.daily_budget)
+    .bind(d.monthly_budget)
+    .bind(&d.budget_mode)
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}
+
+/// The default member limit a newly created workspace starts with, per
+/// surface: LLM, MCP and A2A requests per minute; no token rate, no budget.
+/// Only `create_workspace` applies it, to the standard workspaces it creates —
+/// the Default, Agent and Inline AI workspaces come from the tenant seed and
+/// take none, and a workspace that existed before keeps what it has.
+fn new_workspace_member_defaults() -> MemberLimitDefaults {
+    MemberLimitDefaults {
+        requests_per_minute: Some(120),
+        requests_per_minute_mcp: Some(300),
+        requests_per_minute_a2a: Some(60),
+        tokens_per_minute: None,
+        daily_budget: None,
+        monthly_budget: None,
+        budget_mode: default_budget_mode(),
+    }
 }
 
 #[utoipa::path(
@@ -2658,16 +2832,19 @@ mod limit_value_tests {
     /// must be a finite number.
     #[test]
     fn zero_is_a_limit_value_and_a_negative_or_non_finite_one_is_refused() {
-        assert!(validate_limit_values(Some(0), Some(0), Some(0.0), Some(0.0)).is_ok());
-        assert!(validate_limit_values(Some(60), None, Some(5.0), None).is_ok());
-        assert!(validate_limit_values(None, None, None, None).is_ok());
-        assert!(validate_limit_values(Some(-1), None, None, None).is_err());
-        assert!(validate_limit_values(None, Some(-1), None, None).is_err());
-        assert!(validate_limit_values(None, None, Some(-0.01), None).is_err());
-        assert!(validate_limit_values(None, None, None, Some(-0.01)).is_err());
+        assert!(validate_limit_values(&[Some(0), Some(0), Some(0), Some(0)], Some(0.0), Some(0.0)).is_ok());
+        assert!(validate_limit_values(&[Some(60), None, Some(1), None], Some(5.0), None).is_ok());
+        assert!(validate_limit_values(&[None, None, None, None], None, None).is_ok());
+        for i in 0..4 {
+            let mut rates = [None; 4];
+            rates[i] = Some(-1);
+            assert!(validate_limit_values(&rates, None, None).is_err(), "rate #{i}");
+        }
+        assert!(validate_limit_values(&[], Some(-0.01), None).is_err());
+        assert!(validate_limit_values(&[], None, Some(-0.01)).is_err());
         for bad in [f64::NAN, f64::INFINITY] {
-            assert!(validate_limit_values(None, None, Some(bad), None).is_err(), "{bad}");
-            assert!(validate_limit_values(None, None, None, Some(bad)).is_err(), "{bad}");
+            assert!(validate_limit_values(&[], Some(bad), None).is_err(), "{bad}");
+            assert!(validate_limit_values(&[], None, Some(bad)).is_err(), "{bad}");
         }
     }
 }

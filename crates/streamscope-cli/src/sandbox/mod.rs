@@ -146,6 +146,25 @@ pub struct LaunchSpec {
     /// `ssai run` itself, or under the docker tier by the agent in the
     /// container, since the host cannot read the container's home.
     pub opencode: Option<OpencodeLaunch>,
+    /// The other clients of the launched client's global record (manifest and
+    /// workspace) whose template is `usable_as_tool`: the agent may run each
+    /// as a tool, so the run reaches its config as it reaches the launched
+    /// client's.
+    pub tool_clients: Vec<ToolClient>,
+}
+
+/// A client the launched agent may run as a tool ([`LaunchSpec::tool_clients`]).
+pub struct ToolClient {
+    /// Its client id (`open-code-review`).
+    pub client_id: String,
+    /// Its profile row: the state directories granted beside the launched
+    /// client's, and its Windows column.
+    pub profile: &'static profiles::AgentProfile,
+    /// Every file it was provisioned with (a global record's: under the
+    /// home), granted on Windows as `LaunchSpec::client_files` are and
+    /// mounted by the docker tier as `LaunchSpec::home_files` are.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    pub files: Vec<PathBuf>,
 }
 
 /// What an OpenCode client was provisioned with, for its launch to be judged.
@@ -1605,6 +1624,7 @@ mod tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         }
     }
 
@@ -1630,6 +1650,7 @@ mod tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         };
         point_at_ca_bundle(&mut spec, Path::new("/root/run.pem"));
         // `Command::env` keeps the last value of a key.

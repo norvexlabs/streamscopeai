@@ -47,8 +47,15 @@ pub fn member_scope_id(workspace_id: Uuid, user_id: Uuid) -> Uuid {
 /// own limit.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemberLimits {
+    /// LLM requests per minute.
     #[serde(default)]
     pub requests_per_minute: Option<u32>,
+    /// MCP requests per minute.
+    #[serde(default)]
+    pub requests_per_minute_mcp: Option<u32>,
+    /// A2A requests per minute.
+    #[serde(default)]
+    pub requests_per_minute_a2a: Option<u32>,
     #[serde(default)]
     pub tokens_per_minute: Option<u32>,
     #[serde(default)]
@@ -70,26 +77,46 @@ impl MemberLimits {
     }
 }
 
+/// Who a member is, for the member bucket: a person, or a service account (a
+/// non-human principal automation keys hang off). A workspace's DEFAULT member
+/// limit is sized for people; it never applies to a service account, which is
+/// held by the workspace pool, the organisation ceiling and its own exception.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberKind {
+    Person,
+    ServiceAccount,
+}
+
 /// The member bucket for one membership, or `None` when nothing limits the
 /// member (no default and no exception, or every metric resolves unlimited) —
-/// no counter is created for a scope that is never enforced.
+/// no counter is created for a scope that is never enforced. A service
+/// account takes no default: only its own exception limits it here.
 pub fn resolve_member_limit(
     default: Option<&MemberLimits>,
     exception: Option<&MemberLimits>,
+    member: MemberKind,
 ) -> Option<RateLimitConfig> {
+    let default = match member {
+        MemberKind::Person => default,
+        MemberKind::ServiceAccount => None,
+    };
     let none = MemberLimits::default();
     let d = default.unwrap_or(&none);
     let e = exception.unwrap_or(&none);
     let rpm = e.requests_per_minute.or(d.requests_per_minute).unwrap_or(0);
+    let rpm_mcp = e.requests_per_minute_mcp.or(d.requests_per_minute_mcp).unwrap_or(0);
+    let rpm_a2a = e.requests_per_minute_a2a.or(d.requests_per_minute_a2a).unwrap_or(0);
     let tpm = e.tokens_per_minute.or(d.tokens_per_minute).unwrap_or(0);
     let daily = e.daily_budget.or(d.daily_budget).unwrap_or(0.0).max(0.0);
     let monthly = e.monthly_budget.or(d.monthly_budget).unwrap_or(0.0).max(0.0);
-    if rpm == 0 && tpm == 0 && daily <= 0.0 && monthly <= 0.0 {
+    if rpm == 0 && rpm_mcp == 0 && rpm_a2a == 0 && tpm == 0 && daily <= 0.0 && monthly <= 0.0 {
         return None;
     }
     let budget_alert_only = if e.sets_a_budget_cap() { e.budget_alert_only } else { d.budget_alert_only };
     Some(RateLimitConfig {
         requests_per_minute: rpm,
+        requests_per_minute_mcp: rpm_mcp,
+        requests_per_minute_a2a: rpm_a2a,
         tokens_per_minute: tpm,
         daily_budget: daily,
         monthly_budget: monthly,
@@ -122,7 +149,7 @@ mod tests {
         let rpm = |d: Option<u32>, e: Option<Option<u32>>| {
             let default = lim(d, None);
             let exception = e.map(|v| lim(v, None));
-            resolve_member_limit(Some(&default), exception.as_ref()).map(|c| c.requests_per_minute)
+            resolve_member_limit(Some(&default), exception.as_ref(), MemberKind::Person).map(|c| c.requests_per_minute)
         };
         // No exception row at all.
         assert_eq!(rpm(None, None), None);
@@ -144,7 +171,7 @@ mod tests {
     fn an_exception_replaces_only_the_metrics_it_sets() {
         let default = MemberLimits { requests_per_minute: Some(60), daily_budget: Some(5.0), ..Default::default() };
         let exception = lim(Some(120), None);
-        let c = resolve_member_limit(Some(&default), Some(&exception)).unwrap();
+        let c = resolve_member_limit(Some(&default), Some(&exception), MemberKind::Person).unwrap();
         assert_eq!(c.requests_per_minute, 120);
         assert_eq!(c.daily_budget, 5.0);
     }
@@ -155,7 +182,7 @@ mod tests {
     fn unlimited_on_one_metric_keeps_the_bucket_for_the_others() {
         let default = MemberLimits { requests_per_minute: Some(60), daily_budget: Some(5.0), ..Default::default() };
         let exception = lim(None, Some(0.0));
-        let c = resolve_member_limit(Some(&default), Some(&exception)).unwrap();
+        let c = resolve_member_limit(Some(&default), Some(&exception), MemberKind::Person).unwrap();
         assert_eq!(c.requests_per_minute, 60);
         assert_eq!(c.daily_budget, 0.0);
     }
@@ -165,10 +192,10 @@ mod tests {
         let default = MemberLimits { daily_budget: Some(5.0), budget_alert_only: true, ..Default::default() };
         // An exception that touches only the rate keeps the default's mode.
         let rate_only = MemberLimits { requests_per_minute: Some(10), budget_alert_only: false, ..Default::default() };
-        assert!(resolve_member_limit(Some(&default), Some(&rate_only)).unwrap().budget_alert_only);
+        assert!(resolve_member_limit(Some(&default), Some(&rate_only), MemberKind::Person).unwrap().budget_alert_only);
         // One that sets its own budget brings its own mode.
         let own_budget = MemberLimits { daily_budget: Some(9.0), budget_alert_only: false, ..Default::default() };
-        assert!(!resolve_member_limit(Some(&default), Some(&own_budget)).unwrap().budget_alert_only);
+        assert!(!resolve_member_limit(Some(&default), Some(&own_budget), MemberKind::Person).unwrap().budget_alert_only);
     }
 
     /// Making one budget unlimited sets no cap, so the inherited budget keeps
@@ -183,23 +210,73 @@ mod tests {
             ..Default::default()
         };
         let lifted = MemberLimits { daily_budget: Some(0.0), budget_alert_only: false, ..Default::default() };
-        let c = resolve_member_limit(Some(&default), Some(&lifted)).unwrap();
+        let c = resolve_member_limit(Some(&default), Some(&lifted), MemberKind::Person).unwrap();
         assert_eq!(c.daily_budget, 0.0);
         assert_eq!(c.monthly_budget, 50.0);
         assert!(c.budget_alert_only, "the inherited monthly budget lost its alert-only mode");
     }
 
+    /// Each surface's rate resolves on its own, in every (exception ×
+    /// default) state, and a cap on one surface alone is a member bucket.
+    #[test]
+    fn each_surface_rate_resolves_on_its_own() {
+        let default = MemberLimits {
+            requests_per_minute: Some(120),
+            requests_per_minute_mcp: Some(300),
+            requests_per_minute_a2a: Some(60),
+            ..Default::default()
+        };
+        let exception = MemberLimits {
+            requests_per_minute_mcp: Some(0),
+            requests_per_minute_a2a: Some(5),
+            ..Default::default()
+        };
+        let c = resolve_member_limit(Some(&default), Some(&exception), MemberKind::Person).unwrap();
+        assert_eq!((c.requests_per_minute, c.requests_per_minute_mcp, c.requests_per_minute_a2a), (120, 0, 5));
+        let c = resolve_member_limit(Some(&default), None, MemberKind::Person).unwrap();
+        assert_eq!((c.requests_per_minute, c.requests_per_minute_mcp, c.requests_per_minute_a2a), (120, 300, 60));
+        for only in [
+            MemberLimits { requests_per_minute_mcp: Some(1), ..Default::default() },
+            MemberLimits { requests_per_minute_a2a: Some(1), ..Default::default() },
+        ] {
+            assert!(resolve_member_limit(Some(&only), None, MemberKind::Person).is_some(), "{only:?}");
+        }
+    }
+
+    /// A service account takes no workspace default — on any metric — while
+    /// its own exception still limits it; a person beside it under the same
+    /// default is limited (the positive control).
+    #[test]
+    fn a_service_account_takes_no_default_but_its_exception_applies() {
+        let default = MemberLimits {
+            requests_per_minute: Some(120),
+            requests_per_minute_mcp: Some(300),
+            requests_per_minute_a2a: Some(60),
+            daily_budget: Some(5.0),
+            ..Default::default()
+        };
+        assert!(resolve_member_limit(Some(&default), None, MemberKind::ServiceAccount).is_none());
+        let person = resolve_member_limit(Some(&default), None, MemberKind::Person).unwrap();
+        assert_eq!(person.requests_per_minute, 120);
+        let exception = MemberLimits { requests_per_minute: Some(10), ..Default::default() };
+        let sa = resolve_member_limit(Some(&default), Some(&exception), MemberKind::ServiceAccount).unwrap();
+        // The exception's own metric only: nothing is inherited from the default.
+        assert_eq!((sa.requests_per_minute, sa.requests_per_minute_mcp, sa.daily_budget), (10, 0, 0.0));
+    }
+
     #[test]
     fn nothing_set_means_no_member_bucket() {
-        assert!(resolve_member_limit(None, None).is_none());
+        assert!(resolve_member_limit(None, None, MemberKind::Person).is_none());
         let zeros = MemberLimits {
             requests_per_minute: Some(0),
+            requests_per_minute_mcp: Some(0),
+            requests_per_minute_a2a: Some(0),
             tokens_per_minute: Some(0),
             daily_budget: Some(0.0),
             monthly_budget: Some(0.0),
             budget_alert_only: false,
         };
-        assert!(resolve_member_limit(Some(&zeros), None).is_none());
+        assert!(resolve_member_limit(Some(&zeros), None, MemberKind::Person).is_none());
     }
 
     #[test]

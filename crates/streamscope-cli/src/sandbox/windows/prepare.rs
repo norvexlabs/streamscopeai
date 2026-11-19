@@ -41,6 +41,8 @@ pub struct Host<'a> {
 /// - the seed: each `(file, key)` in the first of those folders gets `key`
 ///   set to `true` when absent;
 /// - the column's arguments go before the client's own;
+/// - each client the agent may run as a tool gets its folder and files, or
+///   its endpoint in its variables ([`reach_tools`]);
 /// - git trusts the project root and a linked worktree's common git folder
 ///   and every repository under the root, a submodule's checkout included
 ///   (`safe.directory`, appended after any `GIT_CONFIG_COUNT` the run sets);
@@ -91,6 +93,7 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
         }
         spec.args.splice(0..0, agent.windows_args.iter().map(|a| a.to_string()));
     }
+    let tool_files = reach_tools(spec, host, &mut dirs)?;
     trust_in_git(spec)?;
     carry_node_ca(spec, host);
     let found = host
@@ -113,6 +116,7 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
     let provisioned = spec
         .client_files
         .iter()
+        .chain(&tool_files)
         .filter_map(|f| real(f).filter(|r| r == f))
         .filter(|f| under(f, host.profile) || under(f, &spec.project_root));
     for file in ca.chain(provisioned) {
@@ -121,6 +125,161 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
         }
     }
     Ok(dirs)
+}
+
+/// The client id whose endpoint [`ocr_env`] carries.
+const OCR_CLIENT_ID: &str = "open-code-review";
+
+/// The variables Open Code Review reads its endpoint from when it finds no
+/// config file; a run that sets any of them is left to its own.
+const OCR_ENDPOINT_VARS: [&str; 4] = ["OCR_LLM_URL", "OCR_LLM_TOKEN", "OCR_LLM_MODEL", "OCR_LLM_PROTOCOL"];
+
+/// Reach each client the agent may run as a tool (`spec.tool_clients`), and
+/// return its provisioned files for the grant to give the account to read.
+/// Where the run points every variable of the tool's Windows column where the
+/// tool's own run would (the launched client's column sets `USERPROFILE` to
+/// the developer's profile, as the tool's does), the tool reads its own
+/// config there: its folder is granted as a state folder, its files as files.
+/// Elsewhere the tool would read the sandbox account's profile, and Open Code
+/// Review is handed its endpoint in its variables instead ([`ocr_env`]),
+/// unless the run sets one; any other tool is named in a warning.
+fn reach_tools(spec: &mut LaunchSpec, host: &Host, dirs: &mut RunDirs) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut carried: Vec<(String, String)> = Vec::new();
+    for tool in &spec.tool_clients {
+        let column = tool.profile.windows_config;
+        let shared: Option<Vec<PathBuf>> = (!column.is_empty())
+            .then(|| {
+                column
+                    .iter()
+                    .map(|c| {
+                        let own = anchored(c.value, host)?;
+                        let run = PathBuf::from(last(&spec.env, c.var)?);
+                        same_folder(&run, &own).then(|| in_folder(&own, c.granted))
+                    })
+                    .collect()
+            })
+            .flatten();
+        if let Some(folders) = shared {
+            // A tool the grant would refuse is left out, never the run.
+            let profile = host.profile.to_string_lossy();
+            if let Some((folder, why)) =
+                folders.iter().find_map(|f| refused_root(&f.to_string_lossy(), &profile).map(|why| (f, why)))
+            {
+                crate::ui::warn(
+                    "",
+                    format_args!("{} is not given its folder {}: {why}", tool.client_id, folder.display()),
+                );
+                continue;
+            }
+            if let Some((folder, e)) = folders.iter().find_map(|f| std::fs::create_dir_all(f).err().map(|e| (f, e))) {
+                crate::ui::warn("", format_args!("{} is not given its folder {}: {e}", tool.client_id, folder.display()));
+                continue;
+            }
+            for folder in folders {
+                if !dirs.state.contains(&folder) {
+                    dirs.state.push(folder);
+                }
+            }
+            files.extend(tool.files.iter().cloned());
+            continue;
+        }
+        if tool.client_id != OCR_CLIENT_ID {
+            crate::ui::warn(
+                "",
+                format_args!("{} is not given its config under the Windows sandbox for this client", tool.client_id),
+            );
+            continue;
+        }
+        if OCR_ENDPOINT_VARS.iter().any(|v| last(&spec.env, v).is_some()) {
+            continue;
+        }
+        let Some(config) = tool.files.first() else { continue };
+        match std::fs::read(config).map_err(|e| e.to_string()).and_then(|bytes| ocr_env(&bytes)) {
+            Ok(env) => carried.extend(env.into_iter().filter(|(k, _)| last(&spec.env, k).is_none())),
+            Err(why) => crate::ui::warn(
+                "",
+                format_args!(
+                    "{}: {} is not the config ssai provisioned ({why}) — Open Code Review is not handed its \
+                     endpoint under the Windows sandbox",
+                    tool.client_id,
+                    config.display()
+                ),
+            ),
+        }
+    }
+    // Ahead of the run's own variables, as a column's defaults are.
+    spec.env.splice(0..0, carried);
+    Ok(files)
+}
+
+/// Open Code Review's endpoint as the variables it reads when it finds no
+/// config file, from the config its template writes: the literal `provider`
+/// naming an entry of `custom_providers` that holds a string `url`,
+/// `api_key`, `model` and `protocol` (and its `models` list) and nothing
+/// else; plus `OCR_NO_UPDATE`. Any other provider shape — a command producing
+/// the key, a preset provider, the legacy `llm` section, a provider setting
+/// the variables cannot carry — is refused with why: carried half, the run
+/// would use another endpoint than the file names. The file's other
+/// top-level settings (its gateway `mcp_servers`) have no variable form and
+/// are not carried: the tool reaches the model, not its MCP servers.
+fn ocr_env(config: &[u8]) -> std::result::Result<Vec<(String, String)>, String> {
+    use serde_json::Value;
+    let doc: Value = serde_json::from_slice(config).map_err(|e| format!("not JSON: {e}"))?;
+    let provider = doc.get("provider").and_then(Value::as_str).ok_or("no `provider` names the endpoint")?;
+    let Some(entry) = doc.get("custom_providers").and_then(|p| p.get(provider)).and_then(Value::as_object) else {
+        return Err(format!("`{provider}` is not one of its `custom_providers`"));
+    };
+    if let Some(other) = entry.keys().find(|k| !["url", "api_key", "model", "protocol", "models"].contains(&k.as_str())) {
+        return Err(format!("its provider sets `{other}`"));
+    }
+    let field = |name: &str| {
+        entry
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("its provider has no `{name}`"))
+    };
+    let (url, token, model, protocol) = (field("url")?, field("api_key")?, field("model")?, field("protocol")?);
+    if !["anthropic", "openai", "openai-responses"].contains(&protocol) {
+        return Err(format!("its provider speaks `{protocol}`"));
+    }
+    // Its file names a base its reader completes, its variable the address it
+    // posts to (unless it already ends with the messages path): carried as
+    // the file would resolve it.
+    let url = if protocol == "anthropic" { anthropic_messages_url(url) } else { url.to_string() };
+    Ok([
+        ("OCR_LLM_URL", url.as_str()),
+        ("OCR_LLM_TOKEN", token),
+        ("OCR_LLM_MODEL", model),
+        ("OCR_LLM_PROTOCOL", protocol),
+        ("OCR_NO_UPDATE", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect())
+}
+
+/// An Anthropic endpoint as Open Code Review completes the one its config
+/// file names: a URL ending with the messages path is kept, one ending with
+/// `/v1` gets `/messages`, one with `/v1/` inside it is kept, and any other
+/// gets `/v1/messages`.
+fn anthropic_messages_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    if trimmed.ends_with("/v1/messages") || (trimmed.contains("/v1/") && !trimmed.ends_with("/v1")) {
+        url.to_string()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/messages")
+    } else {
+        format!("{trimmed}/v1/messages")
+    }
+}
+
+/// `a` and `b` name the same folder, compared without case and either slash,
+/// as Windows compares paths.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    norm(a) == norm(b)
 }
 
 /// The developer's `NODE_EXTRA_CA_CERTS` (the Windows advice for a private
@@ -255,7 +414,6 @@ fn tool_environments(program: &Path, host: &Host) -> Vec<PathBuf> {
     // elsewhere (`python`, a tool's own `Scripts`) names no one environment.
     let launchers = host.profile.join(".local").join("bin");
     let in_launchers = program.parent().is_some_and(|dir| {
-        let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
         norm(dir) == norm(&launchers)
     });
     let Some(name) = program.file_name().filter(|_| in_launchers) else { return Vec::new() };
@@ -292,8 +450,12 @@ fn tool_environments(program: &Path, host: &Host) -> Vec<PathBuf> {
 
 /// `path` is inside the folder `profile`, compared without case and either
 /// slash, as Windows compares paths.
+/// A path as Windows compares paths: either slash, no trailing one, no case.
+fn norm(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
 fn under(path: &Path, profile: &Path) -> bool {
-    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_lowercase();
     let profile = norm(profile);
     !profile.is_empty() && norm(path).starts_with(&format!("{profile}/"))
 }
@@ -331,6 +493,7 @@ mod tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         };
         (profile, spec)
     }
@@ -549,6 +712,140 @@ mod tests {
         assert_eq!(spec.env[0], ("USERPROFILE".to_string(), profile.to_string_lossy().into_owned()));
         assert_eq!(dirs.state, vec![profile.join(".opencodereview")]);
         let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// Open Code Review's config as its template writes it, for `protocol`.
+    fn ocr_config(protocol: &str) -> String {
+        serde_json::json!({
+            "provider": "streamscope",
+            "custom_providers": { "streamscope": {
+                "protocol": protocol, "url": "https://gw.example/v1", "api_key": "sk-ocr",
+                "model": "review", "models": ["review"],
+            }},
+            "mcp_servers": { "web": { "type": "remote", "url": "https://gw.example/mcp/web" } },
+        })
+        .to_string()
+    }
+
+    /// A profile holding a project and Open Code Review's provisioned config,
+    /// and a spec for `command` that may run it as a tool.
+    fn with_ocr(name: &str, command: &str, env: &[(&str, &str)]) -> (PathBuf, LaunchSpec, PathBuf) {
+        let (profile, mut spec) = setup(name, command, env);
+        let config = profile.join(".opencodereview").join("config.json");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, ocr_config("anthropic")).unwrap();
+        spec.tool_clients.push(crate::sandbox::ToolClient {
+            client_id: OCR_CLIENT_ID.into(),
+            profile: agent_for(OCR_CLIENT_ID).unwrap(),
+            files: vec![config.clone()],
+        });
+        (profile, spec, config)
+    }
+
+    /// Under a client whose run already reads the developer's profile as its
+    /// home (Aider), the tool reads its own config there: its folder and file
+    /// are granted, no variable is carried.
+    #[test]
+    fn a_tool_sharing_the_launched_clients_home_is_granted_its_folder_and_files() {
+        let (profile, mut spec, config) = with_ocr("tool-aider", "aider", &[]);
+        let dirs = run(&mut spec, &profile);
+        assert!(dirs.state.contains(&profile.join(".opencodereview")), "{:?}", dirs.state);
+        assert!(dirs.files.contains(&config), "{:?}", dirs.files);
+        assert!(last(&spec.env, "OCR_LLM_TOKEN").is_none(), "{:?}", spec.env);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// Under a client whose run keeps the account's own home (Claude Code),
+    /// Open Code Review is handed its endpoint in its variables, and given
+    /// none of its files; a run without the tool carries none (the control),
+    /// and a run naming one of the endpoint variables itself is left alone.
+    #[test]
+    fn a_tool_outside_the_launched_clients_home_is_handed_its_endpoint() {
+        let (profile, mut spec, config) = with_ocr("tool-claude", "claude", &[]);
+        let dirs = run(&mut spec, &profile);
+        for (k, v) in [
+            ("OCR_LLM_URL", "https://gw.example/v1/messages"),
+            ("OCR_LLM_TOKEN", "sk-ocr"),
+            ("OCR_LLM_MODEL", "review"),
+            ("OCR_LLM_PROTOCOL", "anthropic"),
+            ("OCR_NO_UPDATE", "1"),
+        ] {
+            assert_eq!(last(&spec.env, k), Some(v), "{k}: {:?}", spec.env);
+        }
+        assert!(!dirs.files.contains(&config) && !dirs.state.contains(&profile.join(".opencodereview")));
+        let _ = std::fs::remove_dir_all(&profile);
+
+        let (profile, mut spec) = setup("tool-none", "claude", &[]);
+        run(&mut spec, &profile);
+        assert!(OCR_ENDPOINT_VARS.iter().all(|v| last(&spec.env, v).is_none()), "{:?}", spec.env);
+        let _ = std::fs::remove_dir_all(&profile);
+
+        let (profile, mut spec, _) = with_ocr("tool-own", "claude", &[("OCR_LLM_URL", "https://mine.example")]);
+        run(&mut spec, &profile);
+        assert_eq!(last(&spec.env, "OCR_LLM_URL"), Some("https://mine.example"));
+        assert!(last(&spec.env, "OCR_LLM_TOKEN").is_none(), "{:?}", spec.env);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// The endpoint is read only from the shape the template writes, each of
+    /// its protocols as Open Code Review names it; any other shape carries
+    /// nothing.
+    #[test]
+    fn only_the_provisioned_config_shape_becomes_the_endpoint_variables() {
+        for protocol in ["anthropic", "openai", "openai-responses"] {
+            let env = ocr_env(ocr_config(protocol).as_bytes()).unwrap();
+            assert!(env.contains(&("OCR_LLM_PROTOCOL".to_string(), protocol.to_string())), "{env:?}");
+            assert!(env.contains(&("OCR_LLM_TOKEN".to_string(), "sk-ocr".to_string())), "{env:?}");
+        }
+        let edited = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut doc: serde_json::Value = serde_json::from_str(&ocr_config("openai")).unwrap();
+            edit(&mut doc);
+            ocr_env(doc.to_string().as_bytes())
+        };
+        let entry = |doc: &mut serde_json::Value| doc["custom_providers"]["streamscope"].as_object_mut().unwrap().clone();
+        type Edit<'a> = &'a dyn Fn(&mut serde_json::Value);
+        let refused: [(&str, Edit); 6] = [
+            ("api_key_cmd", &|d| {
+                let mut e = entry(d);
+                e.remove("api_key");
+                e.insert("api_key_cmd".into(), "pass show gw".into());
+                d["custom_providers"]["streamscope"] = e.into();
+            }),
+            ("a preset provider", &|d| d["provider"] = "anthropic".into()),
+            ("the legacy llm section", &|d| {
+                d.as_object_mut().unwrap().remove("provider");
+                d["llm"] = serde_json::json!({ "url": "https://x", "auth_token": "t", "model": "m" });
+            }),
+            ("bedrock", &|d| d["custom_providers"]["streamscope"]["protocol"] = "anthropic-bedrock".into()),
+            ("a timeout", &|d| d["custom_providers"]["streamscope"]["timeout_sec"] = 30.into()),
+            ("an empty key", &|d| d["custom_providers"]["streamscope"]["api_key"] = "".into()),
+        ];
+        for (what, edit) in refused {
+            assert!(edited(edit).is_err(), "{what} was accepted");
+        }
+        assert!(ocr_env(b"not json").is_err());
+    }
+
+    /// The variable carries the address Open Code Review would post to from
+    /// its file: an Anthropic base is completed as its file reader completes
+    /// it (its variable reader would append the messages path to `/v1`
+    /// again); an OpenAI one travels as written.
+    #[test]
+    fn an_anthropic_endpoint_is_carried_as_the_file_would_resolve_it() {
+        for (base, posted) in [
+            ("https://gw.example", "https://gw.example/v1/messages"),
+            ("https://gw.example/", "https://gw.example/v1/messages"),
+            ("https://gw.example/v1", "https://gw.example/v1/messages"),
+            ("https://gw.example/v1/", "https://gw.example/v1/messages"),
+            ("https://gw.example/v1/messages", "https://gw.example/v1/messages"),
+            ("https://gw.example/api/v1", "https://gw.example/api/v1/messages"),
+            ("https://gw.example/v1/anthropic", "https://gw.example/v1/anthropic"),
+            ("https://gw.example/v2", "https://gw.example/v2/v1/messages"),
+        ] {
+            assert_eq!(anthropic_messages_url(base), posted, "{base}");
+        }
+        let env = ocr_env(ocr_config("openai").as_bytes()).unwrap();
+        assert!(env.contains(&("OCR_LLM_URL".to_string(), "https://gw.example/v1".to_string())), "{env:?}");
     }
 
     /// A uv or pipx launcher: its environment and the Python it was made

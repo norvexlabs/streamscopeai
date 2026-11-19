@@ -143,7 +143,7 @@ pub(crate) async fn ingest_handler(
             }
             if let Some(report) = req.usage {
                 let merge = merge_usage_reports(&state, instance, report.counters, epoch).await;
-                // After every counter's own transaction, and only when each
+                // After every chunk's transaction, and only when each counter
                 // merged or settled: a stamp names a merge that is already visible.
                 if merge.complete
                     && let Err(e) = stamp_usage_merged(&state.db, instance, epoch).await

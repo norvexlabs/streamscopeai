@@ -231,6 +231,13 @@ pub struct ClientProfileTemplate {
     /// [`LocalMcpForm`]. Omitted from the wire when it has no form.
     #[serde(default, skip_serializing_if = "LocalMcpForm::is_none")]
     pub local_mcp: LocalMcpForm,
+    /// The config this template provisions is reachable from the sandboxed
+    /// runs (`ssai run`) of the workspace's other clients, so their agents
+    /// can run this client as a tool: its files, and the gateway key they
+    /// hold, are readable by those agents. Off unless set; omitted from the
+    /// wire when off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub usable_as_tool: bool,
     pub body: String,
 }
 

@@ -43,6 +43,9 @@ pub struct ClientError {
     pub message: String,
     /// On a limit refusal: which limit refused it.
     pub bucket: Option<&'static str>,
+    /// On a requests-per-minute refusal: whose requests it counted (`llm`,
+    /// `mcp`, `a2a`).
+    pub surface: Option<&'static str>,
 }
 
 impl ClientError {
@@ -54,6 +57,7 @@ impl ClientError {
             kind: "upstream_error",
             message: message.to_string(),
             bucket: None,
+            surface: None,
         }
     }
 
@@ -70,6 +74,9 @@ impl ClientError {
                 if let Some(bucket) = self.bucket {
                     error["bucket"] = bucket.into();
                 }
+                if let Some(surface) = self.surface {
+                    error["surface"] = surface.into();
+                }
                 json!({ "error": error })
             }
             ApiVersion::AnthropicMessages => {
@@ -81,6 +88,9 @@ impl ClientError {
                 // gateway's own and no Anthropic client reads it.
                 if let Some(bucket) = self.bucket {
                     error["bucket"] = bucket.into();
+                }
+                if let Some(surface) = self.surface {
+                    error["surface"] = surface.into();
                 }
                 json!({ "type": "error", "error": error })
             }
@@ -411,6 +421,7 @@ mod tests {
             kind: "upstream_error",
             message: "boom".into(),
             bucket: None,
+            surface: None,
         }
     }
 
@@ -451,6 +462,18 @@ mod tests {
         assert_eq!(e.body(ApiVersion::AnthropicMessages)["error"]["bucket"], "workspace");
         // AIP-193 defines no free-form member; the bucket is not invented into it.
         assert!(e.body(ApiVersion::GoogleGemini)["error"].get("bucket").is_none());
+    }
+
+    #[test]
+    fn a_limit_surface_rides_beside_the_bucket_and_only_when_set() {
+        let mut e = err(429);
+        e.bucket = Some("member");
+        assert!(e.body(ApiVersion::ChatCompletions)["error"].get("surface").is_none());
+        e.surface = Some("mcp");
+        assert_eq!(e.body(ApiVersion::ChatCompletions)["error"]["surface"], "mcp");
+        assert_eq!(e.body(ApiVersion::Responses)["error"]["surface"], "mcp");
+        assert_eq!(e.body(ApiVersion::AnthropicMessages)["error"]["surface"], "mcp");
+        assert!(e.body(ApiVersion::GoogleGemini)["error"].get("surface").is_none());
     }
 
     #[test]

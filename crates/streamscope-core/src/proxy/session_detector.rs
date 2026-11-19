@@ -417,6 +417,11 @@ impl SessionDetector {
         self.recent_turns.iter().map(|user| user.value().len()).sum()
     }
 
+    /// The user-and-key pairs holding a list now.
+    pub fn users(&self) -> usize {
+        self.recent_turns.len()
+    }
+
     /// [`Self::detect`], for a request this process then serves until the
     /// returned guard drops. A request with the same [`request_key`] still
     /// being served is a re-send: its client gave up waiting and sent it again.

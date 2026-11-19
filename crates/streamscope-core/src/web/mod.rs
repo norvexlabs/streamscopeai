@@ -48,8 +48,8 @@ pub use mixed_pending::{MixedPendingCache, MixedPendingEntry};
 pub use service::{dispatch_intercept, DispatchOutcome, WebContext, WebSurface};
 pub use settings::{FetchProvider, WebDestinationLists, WebDestinations, WebSettings};
 pub use types::{
-    FetchRequest, FetchResult, SearchHit, SearchRequest, SearchResult, WebError,
-    WebProvider,
+    DeclaredArgs, FetchRequest, FetchResult, ModelErrorCode, Paging, SearchHit, SearchRequest, SearchResult,
+    WebError, WebProvider,
 };
 pub use url_filter::{FilterChain, FilterContext, FilterVerdict, UrlFilter};
 
@@ -111,6 +111,9 @@ pub const TOOL_WEB_FETCH: &str = "web_fetch";
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinTool {
     pub name: &'static str,
+    /// The display name (MCP `title`).
+    pub title: &'static str,
+    /// What the model reads to decide when to call it and what comes back.
     pub description: &'static str,
     /// Served only with a search backend configured ([`served_web_tools`]).
     pub needs_search_backend: bool,
@@ -121,12 +124,14 @@ pub struct BuiltinTool {
 const BUILTIN_WEB_TOOLS: [BuiltinTool; 2] = [
     BuiltinTool {
         name: TOOL_WEB_SEARCH,
-        description: "Search the public web using the gateway-configured backend. Returns ranked results with title, URL, and snippet.",
+        title: "Web search",
+        description: "Search the public web. Use it to find pages about a topic, or current information you do not know; then read a page with web_fetch. Returns ranked results, each with its title, URL, a snippet and, when known, a published date. Results whose address is not allowed are left out (counted in total_filtered).",
         needs_search_backend: true,
     },
     BuiltinTool {
         name: TOOL_WEB_FETCH,
-        description: "Fetch a single URL and return the extracted text. http/https only; private and link-local addresses are refused.",
+        title: "Fetch a web page",
+        description: "Read one web page: pass its absolute http or https URL, such as one from a web_search result. Returns the page's readable text (HTML is reduced to text; other text types come as they are; any other type is named with its size, not returned), with its final URL after redirects, its content type and the HTTP status the site answered. Long pages: set max_length to receive at most that many characters; a cut result says so and gives next_start_index, to pass as start_index for the rest. Private-network addresses are refused.",
         needs_search_backend: false,
     },
 ];

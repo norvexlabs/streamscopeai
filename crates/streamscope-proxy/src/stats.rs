@@ -78,6 +78,9 @@ pub struct ProxyStats {
     /// itself): every attempt counts, a resend included.
     content_bodies_shipped: AtomicU64,
     content_bytes_shipped: AtomicU64,
+    /// Audit records admin-api answered for (stored, or refused for their
+    /// data) and so removed from the outbox.
+    outbox_records_shipped: AtomicU64,
     /// Unix seconds of the last config sync answer that left this process
     /// nothing more to receive; 0 until the first.
     config_synced_at: AtomicU64,
@@ -124,6 +127,7 @@ impl ProxyStats {
             duration_sum_ms: AtomicU64::new(0),
             content_bodies_shipped: AtomicU64::new(0),
             content_bytes_shipped: AtomicU64::new(0),
+            outbox_records_shipped: AtomicU64::new(0),
             config_synced_at: AtomicU64::new(0),
         }
     }
@@ -142,6 +146,11 @@ impl ProxyStats {
     pub fn record_content_shipped(&self, (bodies, bytes): (u64, u64)) {
         self.content_bodies_shipped.fetch_add(bodies, Ordering::Relaxed);
         self.content_bytes_shipped.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Count audit records admin-api answered for and the outbox let go.
+    pub fn record_outbox_shipped(&self, records: u64) {
+        self.outbox_records_shipped.fetch_add(records, Ordering::Relaxed);
     }
 
     /// Record proxy overhead in microseconds (auth + transforms + routing).
@@ -316,6 +325,17 @@ impl ProxyStats {
         );
 
         buf.family(
+            "streamscope_proxy_outbox_shipped_records_total",
+            "counter",
+            "Audit records admin-api answered for (stored, or refused for their data) and removed from the outbox.",
+        );
+        buf.sample_u64(
+            "streamscope_proxy_outbox_shipped_records_total",
+            &[],
+            self.outbox_records_shipped.load(Ordering::Relaxed),
+        );
+
+        buf.family(
             "streamscope_proxy_config_synced_timestamp_seconds",
             "gauge",
             "Unix time of the last config sync answer that left this gateway nothing more to receive; 0 from its start until the first.",
@@ -478,6 +498,92 @@ pub fn render_gate_prometheus(
         "Requests this replica currently has in flight at capacity-limited endpoints.",
     );
     buf.sample_u64("streamscope_proxy_dispatch_in_flight", &[], gate.in_flight);
+}
+
+/// What the gateway holds per user and per session, read at scrape time.
+pub struct StateGauges {
+    pub detector_held_bytes: u64,
+    pub detector_turns: u64,
+    pub detector_users: u64,
+    /// The fleet usage counters held: `(cumulative, reported, authoritative)`.
+    pub usage_counters: (u64, u64, u64),
+    pub mcp_sessions: u64,
+    pub mcp_upstream_sessions: u64,
+    pub mcp_upstream_handshakes: u64,
+    pub mcp_upstream_eras: u64,
+    pub mcp_upstream_listeners: u64,
+    /// CUMULATIVE new entries each MCP session map refused at its cap, by map.
+    pub mcp_cap_drops: Vec<(&'static str, u64)>,
+}
+
+/// Append the per-user state series: gauges of what each bounded map holds
+/// now, and the MCP session maps' cumulative cap refusals.
+pub fn render_state_prometheus(buf: &mut PromBuf, g: &StateGauges) {
+    let gauges: [(&str, &str, u64); 8] = [
+        (
+            "streamscope_proxy_session_detector_held_bytes",
+            "Bytes the session detector's recorded turns hold (capped by SESSION_DETECTOR_MAX_MB, or a share of the memory limit).",
+            g.detector_held_bytes,
+        ),
+        (
+            "streamscope_proxy_session_detector_turns",
+            "Turns the session detector holds, across every user.",
+            g.detector_turns,
+        ),
+        (
+            "streamscope_proxy_session_detector_users",
+            "User-and-key pairs the session detector holds turns for.",
+            g.detector_users,
+        ),
+        (
+            "streamscope_proxy_mcp_sessions",
+            "MCP client sessions this gateway holds.",
+            g.mcp_sessions,
+        ),
+        (
+            "streamscope_proxy_mcp_upstream_sessions",
+            "Upstream MCP session ids held for client sessions, one per upstream a session reached.",
+            g.mcp_upstream_sessions,
+        ),
+        (
+            "streamscope_proxy_mcp_upstream_handshakes",
+            "Upstream MCP connections the gateway opened on its own behalf, one per user, upstream and protocol era.",
+            g.mcp_upstream_handshakes,
+        ),
+        (
+            "streamscope_proxy_mcp_upstream_eras",
+            "MCP upstreams whose protocol era is known, per tenant.",
+            g.mcp_upstream_eras,
+        ),
+        (
+            "streamscope_proxy_mcp_upstream_listeners",
+            "Long-lived upstream MCP notification streams this gateway holds open.",
+            g.mcp_upstream_listeners,
+        ),
+    ];
+    for (name, help, value) in gauges {
+        buf.family(name, "gauge", help);
+        buf.sample_u64(name, &[], value);
+    }
+
+    buf.family(
+        "streamscope_proxy_usage_counters",
+        "gauge",
+        "Fleet usage counters this gateway holds, by map: its own cumulatives, what admin-api last answered for them, and the fleet totals it received.",
+    );
+    let (cumulative, reported, authoritative) = g.usage_counters;
+    for (map, value) in [("cumulative", cumulative), ("reported", reported), ("authoritative", authoritative)] {
+        buf.sample_u64("streamscope_proxy_usage_counters", &[("map", map)], value);
+    }
+
+    buf.family(
+        "streamscope_proxy_mcp_session_cap_drops_total",
+        "counter",
+        "New entries an MCP session map refused at its cap (MCP_SESSION_MAX_ENTRIES), by map.",
+    );
+    for &(map, value) in &g.mcp_cap_drops {
+        buf.sample_u64("streamscope_proxy_mcp_session_cap_drops_total", &[("map", map)], value);
+    }
 }
 
 /// Append the response-cache series. Separate from
@@ -740,6 +846,18 @@ mod tests {
         assert!(text.contains("# TYPE streamscope_proxy_content_bodies_shipped_total counter"), "{text}");
         assert!(text.lines().any(|l| l == "streamscope_proxy_content_bodies_shipped_total 3"), "{text}");
         assert!(text.lines().any(|l| l == "streamscope_proxy_content_bytes_shipped_total 350"), "{text}");
+    }
+
+    #[test]
+    fn the_outbox_shipped_counter_is_cumulative() {
+        let stats = ProxyStats::new();
+        stats.record_outbox_shipped(3);
+        stats.record_outbox_shipped(2);
+        let mut buf = PromBuf::new();
+        stats.render_prometheus(&mut buf);
+        let text = buf.finish();
+        assert!(text.contains("# TYPE streamscope_proxy_outbox_shipped_records_total counter"), "{text}");
+        assert!(text.lines().any(|l| l == "streamscope_proxy_outbox_shipped_records_total 5"), "{text}");
     }
 
     #[test]

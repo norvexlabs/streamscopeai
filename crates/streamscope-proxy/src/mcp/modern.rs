@@ -141,6 +141,17 @@ pub struct ModernError {
     pub data: Option<Value>,
 }
 
+/// The JSON-RPC error a modern refusal is rendered as — code, message and
+/// `data`. The one conversion every site uses, so a typed payload (a
+/// `-32021`'s `requiredCapabilities`) cannot be dropped by a site building the
+/// error from its code and message alone. The HTTP status is not part of it:
+/// the site sending the error decides that.
+impl From<ModernError> for super::jsonrpc::JsonRpcError {
+    fn from(err: ModernError) -> Self {
+        Self { code: err.code, message: err.message, data: err.data }
+    }
+}
+
 impl ModernError {
     /// `-32020`. Every header-validation failure is a 400 per
     /// § Server Validation.
@@ -363,15 +374,62 @@ impl RequestMeta {
 }
 
 /// The `ClientCapabilities` object naming the capability an input request of
-/// `method` consumes — the `data.requiredCapabilities` payload of a
-/// `-32021`.
-pub fn required_capability_for(method: &str) -> Value {
+/// `method` consumes — one member of the `data.requiredCapabilities` payload
+/// of a `-32021`. `None` for a method this gateway does not know: it names no
+/// capability, so it is never answered with a `-32021`.
+pub fn required_capability_for(method: &str) -> Option<Value> {
     match method {
-        "elicitation/create" => json!({ "elicitation": {} }),
-        "sampling/createMessage" => json!({ "sampling": {} }),
-        "roots/list" => json!({ "roots": {} }),
-        _ => json!({}),
+        "elicitation/create" => Some(json!({ "elicitation": {} })),
+        "sampling/createMessage" => Some(json!({ "sampling": {} })),
+        "roots/list" => Some(json!({ "roots": {} })),
+        _ => None,
     }
+}
+
+/// Whether the client can be asked every input request an upstream asked.
+#[derive(Debug, Clone)]
+pub enum InputCapabilityCheck {
+    /// Every method asked names a capability the client declared.
+    Declared,
+    /// A method this gateway does not know. Checked before any capability:
+    /// it is no capability refusal, and a `-32021` naming nothing would tell
+    /// the client nothing it could add.
+    Unknown(String),
+    /// The `-32021` to answer: every KNOWN method asked whose capability the
+    /// client did not declare, their capabilities merged into ONE
+    /// `requiredCapabilities` (§ `_meta`: the data "lists the missing
+    /// capabilities").
+    Missing(ModernError),
+}
+
+/// Check the input requests an upstream asked against what the client
+/// declared in `meta` (§ MRTR server requirement 7: never ask for input the
+/// client cannot produce).
+pub fn check_input_capabilities(meta: &RequestMeta, methods: &[String]) -> InputCapabilityCheck {
+    if let Some(unknown) = methods.iter().find(|m| required_capability_for(m).is_none()) {
+        return InputCapabilityCheck::Unknown(unknown.clone());
+    }
+    let missing: Vec<&str> = methods
+        .iter()
+        .map(String::as_str)
+        .filter(|m| !meta.supports_input_request(m))
+        .collect();
+    if missing.is_empty() {
+        return InputCapabilityCheck::Declared;
+    }
+    let mut required = Map::new();
+    for method in &missing {
+        if let Some(Value::Object(cap)) = required_capability_for(method) {
+            required.extend(cap);
+        }
+    }
+    InputCapabilityCheck::Missing(ModernError::missing_client_capability(
+        Value::Object(required),
+        format!(
+            "the upstream requires {}, which this request did not declare support for",
+            missing.join(", ")
+        ),
+    ))
 }
 
 /// Extract and validate the modern `_meta` envelope from a request's params.
@@ -720,7 +778,7 @@ pub fn stamp_result(
 /// - `-32002` MUST NOT be emitted at all in this revision; the spec moved
 ///   resource-not-found onto `-32602`.
 /// - `-32000`..=`-32019` is frozen, and a receiver "MUST NOT assume any
-///   specific meaning" for a code in it. Our three gateway codes live there,
+///   specific meaning" for a code in it. Our two gateway codes live there,
 ///   so to a modern client they are indistinguishable noise. Mapping them
 ///   onto the standard JSON-RPC code that carries the same meaning is
 ///   strictly more informative than passing them through.
@@ -731,7 +789,6 @@ pub fn modernize_error_code(code: i32) -> Option<i32> {
     match code {
         LEGACY_RESOURCE_NOT_FOUND => Some(INVALID_PARAMS),
         super::jsonrpc::ROUTE_NOT_FOUND => Some(METHOD_NOT_FOUND),
-        super::jsonrpc::TOOL_NOT_FOUND => Some(INVALID_PARAMS),
         super::jsonrpc::UPSTREAM_ERROR => Some(super::jsonrpc::INTERNAL_ERROR),
         _ => None,
     }
@@ -748,8 +805,9 @@ pub fn modernize_error_code(code: i32) -> Option<i32> {
 /// code necessarily breaks the other era's wire.
 ///
 /// `data.uri` is the discriminator. It works because it keys on the GATEWAY'S
-/// OWN emissions: `resource_not_found` is the only site that attaches a `uri`,
-/// and it attaches one every time, so within our own errors the field is
+/// OWN emissions: `resource_not_found` attaches a `uri` every time, and the
+/// only other site that does, an unknown completion reference, already
+/// answers `-32602` in both eras; so within our own `ROUTE_NOT_FOUND`s the field is
 /// present exactly when the error is about a resource rather than a route.
 /// (SEP-2164 only says the `data` SHOULD carry the uri — it is not a guarantee
 /// about anyone else's errors, so do not extend this discriminator to
@@ -2238,13 +2296,13 @@ mod tests {
     #[test]
     fn frozen_range_gateway_codes_become_standard_ones_but_keep_the_original() {
         let mut e = super::super::jsonrpc::JsonRpcError {
-            code: super::super::jsonrpc::TOOL_NOT_FOUND,
-            message: "no such tool".into(),
+            code: super::super::jsonrpc::UPSTREAM_ERROR,
+            message: "upstream failed".into(),
             data: None,
         };
         modernize_error(&mut e);
-        assert_eq!(e.code, INVALID_PARAMS);
-        assert_eq!(e.data.as_ref().unwrap()["streamscopeCode"], -32004);
+        assert_eq!(e.code, super::super::jsonrpc::INTERNAL_ERROR);
+        assert_eq!(e.data.as_ref().unwrap()["streamscopeCode"], -32003);
     }
 
     #[test]
@@ -2281,7 +2339,6 @@ mod tests {
             codes::INTERNAL_ERROR,
             codes::ROUTE_NOT_FOUND,
             codes::UPSTREAM_ERROR,
-            codes::TOOL_NOT_FOUND,
             codes::AUTH_REQUIRED,
             codes::INSUFFICIENT_SCOPE,
             codes::RATE_LIMITED,
@@ -2295,6 +2352,7 @@ mod tests {
             codes::MCP_UPSTREAM_SESSION_LOST,
             codes::MCP_UPSTREAM_CONFIG_UNSUPPORTED,
             codes::MCP_UPSTREAM_INPUT_UNSUPPORTED,
+            codes::MCP_TOOL_EXECUTION_ERROR,
         ];
         for code in ours {
             assert!(
@@ -3152,15 +3210,72 @@ mod tests {
 
     #[test]
     fn required_capability_data_names_exactly_the_missing_one() {
-        assert_eq!(required_capability_for("elicitation/create"), json!({"elicitation": {}}));
-        assert_eq!(required_capability_for("sampling/createMessage"), json!({"sampling": {}}));
-        assert_eq!(required_capability_for("roots/list"), json!({"roots": {}}));
+        assert_eq!(required_capability_for("elicitation/create"), Some(json!({"elicitation": {}})));
+        assert_eq!(required_capability_for("sampling/createMessage"), Some(json!({"sampling": {}})));
+        assert_eq!(required_capability_for("roots/list"), Some(json!({"roots": {}})));
+        assert_eq!(required_capability_for("something/new"), None);
+    }
+
+    /// 2026-07-28 § `_meta`: a `-32021`'s `data.requiredCapabilities` "lists
+    /// the missing capabilities" — every one of them, as one
+    /// `ClientCapabilities` object (schema: `requiredCapabilities:
+    /// ClientCapabilities`), never only the first. A declared capability is
+    /// not listed; an unknown method is no capability refusal at all.
+    #[test]
+    fn the_capability_check_lists_every_missing_capability_and_only_those() {
+        use std::assert_matches;
+        let meta = |caps: Value| RequestMeta {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_string(),
+            client_info: None,
+            client_capabilities: caps,
+            log_level: None,
+        };
+        let asked = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let InputCapabilityCheck::Missing(err) =
+            check_input_capabilities(&meta(json!({})), &asked(&["elicitation/create", "sampling/createMessage"]))
+        else {
+            panic!("two undeclared inputs are a -32021");
+        };
+        assert_eq!(err.code, MISSING_REQUIRED_CLIENT_CAPABILITY);
+        assert_eq!(err.data, Some(json!({"requiredCapabilities": {"elicitation": {}, "sampling": {}}})));
+
+        let InputCapabilityCheck::Missing(err) =
+            check_input_capabilities(&meta(json!({"elicitation": {}})), &asked(&["elicitation/create", "roots/list"]))
+        else {
+            panic!("an undeclared input beside a declared one is a -32021");
+        };
+        assert_eq!(err.data, Some(json!({"requiredCapabilities": {"roots": {}}})));
+
+        assert_matches!(
+            check_input_capabilities(&meta(json!({"elicitation": {}})), &asked(&["elicitation/create"])),
+            InputCapabilityCheck::Declared
+        );
+        assert_matches!(
+            check_input_capabilities(&meta(json!({})), &asked(&["elicitation/create", "x/new"])),
+            InputCapabilityCheck::Unknown(m) if m == "x/new"
+        );
+    }
+
+    /// The one conversion every site renders a modern refusal through keeps
+    /// its `data` (a `-32021`'s `requiredCapabilities` is required by the
+    /// 2026-07-28 schema).
+    #[test]
+    fn a_modern_error_becomes_a_json_rpc_error_with_its_data() {
+        let err: super::super::jsonrpc::JsonRpcError =
+            ModernError::missing_client_capability(json!({"roots": {}}), "needs roots").into();
+        assert_eq!(
+            serde_json::to_value(&err).unwrap(),
+            json!({"code": -32021, "message": "needs roots", "data": {"requiredCapabilities": {"roots": {}}}})
+        );
+        let bare: super::super::jsonrpc::JsonRpcError = ModernError::invalid_params("bad").into();
+        assert_eq!(serde_json::to_value(&bare).unwrap(), json!({"code": -32602, "message": "bad"}));
     }
 
     #[test]
     fn a_missing_capability_error_carries_the_http_status_the_spec_mandates() {
         let e = ModernError::missing_client_capability(
-            required_capability_for("elicitation/create"),
+            json!({"elicitation": {}}),
             "needs elicitation",
         );
         assert_eq!(e.code, MISSING_REQUIRED_CLIENT_CAPABILITY);
@@ -3372,10 +3487,6 @@ mod tests {
         assert_eq!(
             modernize_error_code(super::super::jsonrpc::UPSTREAM_ERROR),
             Some(super::super::jsonrpc::INTERNAL_ERROR)
-        );
-        assert_eq!(
-            modernize_error_code(super::super::jsonrpc::TOOL_NOT_FOUND),
-            Some(INVALID_PARAMS)
         );
         assert_eq!(modernize_error_code(LEGACY_RESOURCE_NOT_FOUND), Some(INVALID_PARAMS));
         // Anything else passes through untouched.

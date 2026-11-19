@@ -3572,11 +3572,12 @@ pub enum VisibleModeOutcome {
     /// (`SearchResult`/`FetchResult`/opaque) returned by
     /// `WebService::dispatch_intercept`.
     Success(serde_json::Value),
-    /// Dispatch failed; carries the typed `WebError::category()`
-    /// string. Renderers project to protocol-native error blocks
-    /// (Anthropic `web_search_tool_result_error`, Responses
-    /// `web_search_call.status = "failed"`).
-    Error(String),
+    /// Dispatch failed; carries the failure as a model is told it
+    /// (`WebError::model_code`). Renderers project to protocol-native error
+    /// blocks, each in its own vocabulary (Anthropic
+    /// `web_search_tool_result_error`, Responses `web_search_call.status =
+    /// "failed"`).
+    Error(crate::web::ModelErrorCode),
 }
 
 /// Whether a frame names a source a text cites: an Anthropic
@@ -3847,12 +3848,12 @@ pub fn inject_visible_mode_blocks_into_response_json(
                                 "content": result_content,
                             })
                         }
-                        VisibleModeOutcome::Error(error_kind) => serde_json::json!({
+                        VisibleModeOutcome::Error(code) => serde_json::json!({
                             "type": "web_search_tool_result",
                             "tool_use_id": call.tool_use_id,
                             "content": {
                                 "type": "web_search_tool_result_error",
-                                "error_code": error_kind,
+                                "error_code": crate::pipeline::translate::anthropic_web_search_error_code(*code),
                             },
                         }),
                     };
@@ -3950,10 +3951,7 @@ pub fn inject_visible_mode_blocks_into_response_json(
                         VisibleModeOutcome::Success(_) => "completed",
                         VisibleModeOutcome::Error(_) => "failed",
                     };
-                    let mut action = serde_json::json!({"type": "search"});
-                    if let Some(q) = call.input.get("query").and_then(|v| v.as_str()) {
-                        action["query"] = serde_json::Value::String(q.to_string());
-                    }
+                    let action = crate::pipeline::translate::responses_web_search_action_of(&call.input);
                     prepend.push(serde_json::json!({
                         "type": "web_search_call",
                         "id": call.tool_use_id,
@@ -8215,6 +8213,8 @@ mod tests {
                 },
                 action: "substitute".to_string(),
                 original_server_type: None,
+                declares: Default::default(),
+                not_honoured: Vec::new(),
             },
             InterceptBinding {
                 original_name: "WebSearch".to_string(),
@@ -8225,6 +8225,8 @@ mod tests {
                 },
                 action: "substitute".to_string(),
                 original_server_type: None,
+                declares: Default::default(),
+                not_honoured: Vec::new(),
             },
         ];
         let interests = BlockInterests {
@@ -8271,6 +8273,8 @@ mod tests {
             },
             action: "substitute".to_string(),
             original_server_type: None,
+            declares: Default::default(),
+            not_honoured: Vec::new(),
         }];
         let interests = BlockInterests {
             buffer_tool_blocks: true,
@@ -8330,6 +8334,8 @@ mod tests {
                 },
                 action: "substitute".to_string(),
                 original_server_type: None,
+                declares: Default::default(),
+                not_honoured: Vec::new(),
             },
             InterceptBinding {
                 original_name: "second_original".to_string(),
@@ -8340,6 +8346,8 @@ mod tests {
                 },
                 action: "substitute".to_string(),
                 original_server_type: None,
+                declares: Default::default(),
+                not_honoured: Vec::new(),
             },
         ];
         let acc = BlockAccumulator::new(
@@ -8412,6 +8420,8 @@ mod tests {
             },
             action: "substitute".to_string(),
             original_server_type: original_server_type.map(str::to_string),
+            declares: Default::default(),
+            not_honoured: Vec::new(),
         }
     }
 
@@ -9113,6 +9123,8 @@ mod tests {
             },
             action: "substitute".to_string(),
             original_server_type: None,
+            declares: Default::default(),
+            not_honoured: Vec::new(),
         }];
         let response = json!({
             "type": "message",
@@ -9457,7 +9469,7 @@ mod tests {
                 server_type: "web_search_20250305".to_string(),
                 name: "web_search".to_string(),
                 input: json!({"query": "q"}),
-                outcome: VisibleModeOutcome::Error("no_backend".to_string()),
+                outcome: VisibleModeOutcome::Error(crate::web::ModelErrorCode::Unavailable),
             }],
         }];
         inject_visible_mode_blocks_into_response_json(
@@ -9472,7 +9484,114 @@ mod tests {
             content[1]["content"]["type"],
             "web_search_tool_result_error"
         );
-        assert_eq!(content[1]["content"]["error_code"], "no_backend");
+        assert_eq!(content[1]["content"]["error_code"], "unavailable");
+    }
+
+    /// Written from Anthropic's web search tool page: a failed search is a
+    /// 200 whose `web_search_tool_result.content` is ONE object
+    /// `{type: "web_search_tool_result_error", error_code}`, the code one of
+    /// `too_many_requests`, `invalid_tool_input`, `max_uses_exceeded`,
+    /// `query_too_long`, `request_too_large`, `unavailable`. Every failure the
+    /// gateway can report lands in that set, on both the non-streamed and the
+    /// streamed answer.
+    #[test]
+    fn every_failed_server_side_search_names_an_anthropic_error_code() {
+        use crate::web::ModelErrorCode::*;
+        const SPEC: [&str; 6] = [
+            "too_many_requests",
+            "invalid_tool_input",
+            "max_uses_exceeded",
+            "query_too_long",
+            "request_too_large",
+            "unavailable",
+        ];
+        let expected = [
+            (InvalidToolInput, "invalid_tool_input"),
+            (UrlNotAllowed, "invalid_tool_input"),
+            (UrlNotAccessible, "unavailable"),
+            (ContentTooLarge, "unavailable"),
+            (TooManyRequests, "too_many_requests"),
+            (Unavailable, "unavailable"),
+        ];
+        for (code, want) in expected {
+            let mut response = json!({"content": [{"type": "text", "text": "No luck."}]});
+            let rounds = vec![VisibleModeRound {
+                preamble: String::new(),
+                calls: vec![VisibleModeCall {
+                    tool_use_id: "srvtoolu_x".to_string(),
+                    server_type: "web_search_20250305".to_string(),
+                    name: "web_search".to_string(),
+                    input: json!({"query": "q"}),
+                    outcome: VisibleModeOutcome::Error(code),
+                }],
+            }];
+            inject_visible_mode_blocks_into_response_json(
+                &mut response,
+                crate::api::sse::ApiVersion::AnthropicMessages,
+                &rounds,
+            );
+            let result = &response["content"][1];
+            assert_eq!(result["type"], "web_search_tool_result");
+            assert_eq!(result["tool_use_id"], "srvtoolu_x");
+            assert_eq!(
+                result["content"],
+                json!({"type": "web_search_tool_result_error", "error_code": want}),
+                "{code:?}"
+            );
+            assert!(SPEC.contains(&want));
+            // The streamed answer names the same code.
+            assert_eq!(crate::pipeline::translate::anthropic_web_search_error_code(code), want, "{code:?}");
+        }
+    }
+
+    /// Written from OpenAI's Responses reference: a `web_search_call` item is
+    /// `{type, id, status, action}` with `status` one of `in_progress`,
+    /// `searching`, `completed`, `failed`, `incomplete`, and carries no error
+    /// field — a failed search is `status: "failed"` and nothing else.
+    #[test]
+    fn a_failed_server_side_search_is_a_failed_responses_web_search_call() {
+        let mut response = json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "No luck."}]}]});
+        let rounds = vec![VisibleModeRound {
+            preamble: String::new(),
+            calls: vec![VisibleModeCall {
+                tool_use_id: "ws_1".to_string(),
+                server_type: "web_search_preview".to_string(),
+                name: "web_search".to_string(),
+                input: json!({"query": "q"}),
+                outcome: VisibleModeOutcome::Error(crate::web::ModelErrorCode::UrlNotAllowed),
+            }],
+        }];
+        inject_visible_mode_blocks_into_response_json(&mut response, crate::api::sse::ApiVersion::Responses, &rounds);
+        let call = &response["output"][0];
+        let keys: std::collections::BTreeSet<&str> = call.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["action", "id", "status", "type"].into_iter().collect());
+        assert_eq!((call["type"].as_str(), call["status"].as_str()), (Some("web_search_call"), Some("failed")));
+        assert_eq!(call["action"]["type"], "search");
+    }
+
+    /// Written from Gemini's generateContent reference: `groundingMetadata`
+    /// has no per-search error field. A failed search still names its query in
+    /// `webSearchQueries` and contributes no `groundingChunks`; a positive
+    /// control shows a successful one does.
+    #[test]
+    fn a_failed_server_side_search_grounds_nothing_on_gemini() {
+        let call = |outcome| VisibleModeCall {
+            tool_use_id: "g_1".to_string(),
+            server_type: "google_search".to_string(),
+            name: "web_search".to_string(),
+            input: json!({"query": "q"}),
+            outcome,
+        };
+        let render = |outcome| {
+            let mut response = json!({"candidates": [{"content": {"parts": [{"text": "x"}]}}]});
+            let rounds = vec![VisibleModeRound { preamble: String::new(), calls: vec![call(outcome)] }];
+            inject_visible_mode_blocks_into_response_json(&mut response, crate::api::sse::ApiVersion::GoogleGemini, &rounds);
+            response["candidates"][0]["groundingMetadata"].clone()
+        };
+        let failed = render(VisibleModeOutcome::Error(crate::web::ModelErrorCode::Unavailable));
+        assert_eq!(failed, json!({"groundingChunks": [], "webSearchQueries": ["q"]}));
+        let found = render(VisibleModeOutcome::Success(json!({"hits": [{"url": "https://a.test/", "title": "A"}]})));
+        assert_eq!(found["groundingChunks"], json!([{"web": {"uri": "https://a.test/", "title": "A"}}]));
     }
 
     #[test]
@@ -9602,8 +9721,9 @@ mod tests {
         assert_eq!(output[0]["type"], "web_search_call");
         assert_eq!(output[0]["id"], "tu_sub_test_0");
         assert_eq!(output[0]["status"], "completed");
-        assert_eq!(output[0]["action"]["type"], "search");
-        assert_eq!(output[0]["action"]["query"], "find X");
+        // The Responses search action: its query as `queries` and as
+        // `query`, both members the specification defines.
+        assert_eq!(output[0]["action"], json!({"type": "search", "queries": ["find X"], "query": "find X"}));
         assert_eq!(output[1]["type"], "message");
     }
 
@@ -9617,7 +9737,7 @@ mod tests {
                 server_type: "web_search_preview".to_string(),
                 name: "web_search".to_string(),
                 input: json!({"query": "q"}),
-                outcome: VisibleModeOutcome::Error("filter_blocked".to_string()),
+                outcome: VisibleModeOutcome::Error(crate::web::ModelErrorCode::InvalidToolInput),
             }],
         }];
         inject_visible_mode_blocks_into_response_json(
@@ -9714,7 +9834,7 @@ mod tests {
                 server_type: "web_search_preview".to_string(),
                 name: "web_search".to_string(),
                 input: json!({"query": "q"}),
-                outcome: VisibleModeOutcome::Error("no_backend".to_string()),
+                outcome: VisibleModeOutcome::Error(crate::web::ModelErrorCode::Unavailable),
             }],
         }];
         inject_visible_mode_blocks_into_response_json(
@@ -9901,7 +10021,7 @@ mod tests {
                 server_type: "google_search".to_string(),
                 name: "web_search".to_string(),
                 input: json!({"query": "Q"}),
-                outcome: VisibleModeOutcome::Error("filter_blocked".to_string()),
+                outcome: VisibleModeOutcome::Error(crate::web::ModelErrorCode::InvalidToolInput),
             }],
         }];
         inject_visible_mode_blocks_into_response_json(

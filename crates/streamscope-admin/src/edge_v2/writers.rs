@@ -55,8 +55,6 @@ pub(crate) async fn merge_usage_reports(
     reports: Vec<streamscope_core::usage::UsageCounterReport>,
     epoch: i64,
 ) -> UsageMerge {
-    use streamscope_core::usage::UsageCounterAuthoritative;
-
     let mut by_tenant: HashMap<uuid::Uuid, Vec<streamscope_core::usage::UsageCounterReport>> =
         HashMap::new();
     for r in reports {
@@ -84,53 +82,343 @@ pub(crate) async fn merge_usage_reports(
                 continue;
             }
         };
-        for r in items {
-            // The database's clock, the one the janitor deletes watermarks by
-            // (a replica's own may run behind it): read once per report, and
-            // again every `CLOCK_REREAD`, so a long report stays well inside
-            // the settle margin.
-            let now_ms = match clock {
-                Some((ms, read)) if read.elapsed() < CLOCK_REREAD => ms,
-                _ => {
-                    let Some(ms) = db_clock_ms(db.conn(), edge_instance_id, tenant_id).await else {
-                        merge.complete = false;
-                        break;
-                    };
-                    clock = Some((ms, std::time::Instant::now()));
-                    ms
-                }
+        // Chunk by chunk, one transaction each: what can never merge is
+        // settled first, against a clock read at most `CLOCK_REREAD` ago.
+        'chunks: for chunk in highest_cumulatives(items).chunks(MERGE_CHUNK) {
+            // No clock: the rest of this tenant waits for the next report.
+            let Some(ready) = mergeable(db.conn(), edge_instance_id, tenant_id, chunk, &mut clock, &mut merge).await else {
+                break 'chunks;
             };
-            let window_start = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(r.key.window_start_ms as i64);
-            let Some(window_start) = window_start else {
-                tracing::error!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge: window start out of range — counter dropped");
-                merge.settled.push(r.key);
-                continue;
-            };
-            if r.key.window_start_ms.saturating_add(r.key.window_kind.kept_for_ms()) <= now_ms.saturating_add(SETTLE_BEFORE_EXPIRY_MS) {
-                // Its watermark may already be gone: merging would add the
-                // whole cumulative again to a window nothing reads.
-                tracing::warn!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge: window past retention — counter dropped");
-                merge.settled.push(r.key);
+            if ready.is_empty() {
                 continue;
             }
-            match merge_one_counter(db.conn(), edge_instance_id, &r, window_start, epoch).await {
-                Ok(Some(total)) => merge.totals.push(UsageCounterAuthoritative {
-                    key: r.key,
-                    total: total.max(0) as u64,
-                }),
-                Ok(None) => merge.complete = false,
+            match merge_counter_batch(db.conn(), edge_instance_id, tenant_id, &ready, epoch).await {
+                Ok(Some(totals)) => merge.totals.extend(totals),
+                Ok(None) => {
+                    // The epoch moved on: no later chunk of this report merges.
+                    merge.complete = false;
+                    break 'chunks;
+                }
                 Err(e) if is_permanent_row_rejection(&e) => {
-                    tracing::error!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge refused for its data — counter dropped: {e}");
-                    merge.settled.push(r.key);
+                    // A value the database refuses fails the whole chunk: merge
+                    // it again counter by counter, so only that counter is
+                    // settled and the rest merge.
+                    tracing::warn!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge: a chunk was refused for its data — merging it counter by counter: {e}");
+                    for (r, _) in ready {
+                        let one = std::slice::from_ref(&r);
+                        let Some(again) = mergeable(db.conn(), edge_instance_id, tenant_id, one, &mut clock, &mut merge).await else {
+                            break 'chunks;
+                        };
+                        for (r, window_start) in again {
+                            merge_counter_alone(db.conn(), edge_instance_id, tenant_id, r, window_start, epoch, &mut merge).await;
+                        }
+                    }
                 }
                 Err(e) => {
+                    // Transient (a lock, a lost connection): the edge restates
+                    // the chunk with its next report.
                     merge.complete = false;
-                    tracing::warn!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge failed: {e}")
+                    tracing::warn!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge failed: {e}");
                 }
             }
         }
     }
     merge
+}
+
+/// How many counters one merge transaction carries.
+const MERGE_CHUNK: usize = 500;
+
+/// A tenant's reports with each key once, at the highest cumulative reported
+/// for it.
+fn highest_cumulatives(
+    items: Vec<streamscope_core::usage::UsageCounterReport>,
+) -> Vec<streamscope_core::usage::UsageCounterReport> {
+    let mut highest: HashMap<streamscope_core::usage::UsageCounterKey, u64> = HashMap::new();
+    for r in items {
+        let slot = highest.entry(r.key).or_insert(0);
+        *slot = (*slot).max(r.cumulative);
+    }
+    highest
+        .into_iter()
+        .map(|(key, cumulative)| streamscope_core::usage::UsageCounterReport { key, cumulative })
+        .collect()
+}
+
+/// The counters of `items` that may merge now, each with its window start —
+/// `None` when the database clock cannot be read (the report is then
+/// incomplete). A counter that can never merge (a window out of range, or
+/// within [`SETTLE_BEFORE_EXPIRY_MS`] of its retention) is settled into
+/// `merge`.
+async fn mergeable(
+    conn: &mut Scoped,
+    edge_instance_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    items: &[streamscope_core::usage::UsageCounterReport],
+    clock: &mut Option<(u64, std::time::Instant)>,
+    merge: &mut UsageMerge,
+) -> Option<Vec<(streamscope_core::usage::UsageCounterReport, chrono::DateTime<chrono::Utc>)>> {
+    // The database's clock, the one the janitor deletes watermarks by (a
+    // replica's own may run behind it): read again once it is `CLOCK_REREAD`
+    // old, and the caller asks before every transaction, so no merge starts
+    // on a clock older than that.
+    let now_ms = match *clock {
+        Some((ms, read)) if read.elapsed() < CLOCK_REREAD => ms,
+        _ => {
+            let Some(ms) = db_clock_ms(conn, edge_instance_id, tenant_id).await else {
+                merge.complete = false;
+                return None;
+            };
+            *clock = Some((ms, std::time::Instant::now()));
+            ms
+        }
+    };
+    let mut ready = Vec::with_capacity(items.len());
+    for r in items {
+        let window_start = i64::try_from(r.key.window_start_ms)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis);
+        let Some(window_start) = window_start else {
+            tracing::error!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge: window start out of range — counter dropped");
+            merge.settled.push(r.key.clone());
+            continue;
+        };
+        if r.key.window_start_ms.saturating_add(r.key.window_kind.kept_for_ms()) <= now_ms.saturating_add(SETTLE_BEFORE_EXPIRY_MS) {
+            // Its watermark may already be gone: merging would add the whole
+            // cumulative again to a window nothing reads.
+            tracing::warn!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge: window past retention — counter dropped");
+            merge.settled.push(r.key.clone());
+            continue;
+        }
+        ready.push((r.clone(), window_start));
+    }
+    Some(ready)
+}
+
+/// One counter merged in its own transaction, its verdict recorded in `merge`.
+async fn merge_counter_alone(
+    conn: &mut Scoped,
+    edge_instance_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    r: streamscope_core::usage::UsageCounterReport,
+    window_start: chrono::DateTime<chrono::Utc>,
+    epoch: i64,
+    merge: &mut UsageMerge,
+) {
+    match merge_one_counter(conn, edge_instance_id, &r, window_start, epoch).await {
+        Ok(Some(total)) => merge.totals.push(streamscope_core::usage::UsageCounterAuthoritative {
+            key: r.key,
+            total: total.max(0) as u64,
+        }),
+        Ok(None) => merge.complete = false,
+        Err(e) if is_permanent_row_rejection(&e) => {
+            tracing::error!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge refused for its data — counter dropped: {e}");
+            merge.settled.push(r.key);
+        }
+        Err(e) => {
+            merge.complete = false;
+            tracing::warn!(edge_instance_id = %edge_instance_id, %tenant_id, "usage merge failed: {e}")
+        }
+    }
+}
+
+/// The rows of one chunk as the parallel arrays `unnest` reads, in the
+/// chunk's order: scope kinds, scope ids, metrics, window kinds, window starts.
+type ChunkArrays = (Vec<&'static str>, Vec<uuid::Uuid>, Vec<&'static str>, Vec<&'static str>, Vec<chrono::DateTime<chrono::Utc>>);
+
+fn chunk_arrays(rows: &[&(streamscope_core::usage::UsageCounterReport, chrono::DateTime<chrono::Utc>)]) -> ChunkArrays {
+    let mut a: ChunkArrays = Default::default();
+    for (r, window_start) in rows {
+        a.0.push(r.key.scope_kind.as_str());
+        a.1.push(r.key.scope_id);
+        a.2.push(r.key.metric.as_str());
+        a.3.push(r.key.window_kind.as_str());
+        a.4.push(*window_start);
+    }
+    a
+}
+
+/// The chunk index (0-based) of a row the merge reads back: `unnest … WITH
+/// ORDINALITY` numbers the chunk's rows from 1.
+fn chunk_index(ord: i64, len: usize) -> Result<usize, sqlx::Error> {
+    usize::try_from(ord - 1)
+        .ok()
+        .filter(|i| *i < len)
+        .ok_or_else(|| sqlx::Error::Protocol(format!("usage merge: row {ord} outside a chunk of {len}")))
+}
+
+/// The counters of one chunk (one tenant, keys distinct) merged in ONE
+/// transaction, with the same watermark/delta rule as [`merge_one_counter`]:
+/// the fleet totals of every counter — `None` when the report's epoch is no
+/// longer the instance's current one (nothing merged).
+///
+/// Every statement visits the rows in key order (`ORDER BY` the key columns,
+/// in the database's collation): two replicas merging one restated report, or
+/// two instances' chunks meeting on a fleet counter, lock rows in the same
+/// order and take turns. Rows read back are matched to the chunk by their
+/// ordinal. Every key of the chunk ends in the answer, or the call fails: a
+/// key whose watermark the locking read does not find makes it an error,
+/// never a silent omission (which would stamp the report as merged).
+async fn merge_counter_batch(
+    conn: &mut Scoped,
+    edge_instance_id: uuid::Uuid,
+    tenant_id: uuid::Uuid,
+    chunk: &[(streamscope_core::usage::UsageCounterReport, chrono::DateTime<chrono::Utc>)],
+    epoch: i64,
+) -> Result<Option<Vec<streamscope_core::usage::UsageCounterAuthoritative>>, sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    // The instance row is share-locked for the merge, so an epoch change waits
+    // for it and a merge that started under an older epoch cannot rebase over
+    // the newer process's watermark.
+    let current: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT process_epoch FROM edge_instances WHERE id = $1 FOR SHARE")
+            .bind(edge_instance_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if current.flatten() != Some(epoch) {
+        return Ok(None);
+    }
+    let all: Vec<_> = chunk.iter().collect();
+    let (kinds, ids, metrics, windows, starts) = chunk_arrays(&all);
+    // A new watermark starts at 0 under this epoch: the whole cumulative is
+    // the delta, as for a counter never seen.
+    sqlx::query(
+        "INSERT INTO usage_counter_watermarks \
+           (edge_instance_id, tenant_id, scope_kind, scope_id, metric, window_kind, window_start, last_seen, process_epoch) \
+         SELECT $1::uuid, $2::uuid, u.scope_kind, u.scope_id, u.metric, u.window_kind, u.window_start, 0::bigint, $8::bigint \
+           FROM unnest($3::text[], $4::uuid[], $5::text[], $6::text[], $7::timestamptz[]) \
+                AS u(scope_kind, scope_id, metric, window_kind, window_start) \
+          ORDER BY u.scope_kind, u.scope_id, u.metric, u.window_kind, u.window_start \
+         ON CONFLICT (edge_instance_id, tenant_id, scope_kind, scope_id, metric, window_kind, window_start) DO NOTHING",
+    )
+    .bind(edge_instance_id)
+    .bind(tenant_id)
+    .bind(&kinds)
+    .bind(&ids)
+    .bind(&metrics)
+    .bind(&windows)
+    .bind(&starts)
+    .bind(epoch)
+    .execute(&mut *tx)
+    .await?;
+    let seen: Vec<(i64, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT u.ord, w.last_seen, w.process_epoch \
+           FROM usage_counter_watermarks w \
+           JOIN unnest($3::text[], $4::uuid[], $5::text[], $6::text[], $7::timestamptz[]) WITH ORDINALITY \
+                AS u(scope_kind, scope_id, metric, window_kind, window_start, ord) \
+             ON w.scope_kind = u.scope_kind AND w.scope_id = u.scope_id AND w.metric = u.metric \
+            AND w.window_kind = u.window_kind AND w.window_start = u.window_start \
+          WHERE w.edge_instance_id = $1 AND w.tenant_id = $2 \
+          ORDER BY w.scope_kind, w.scope_id, w.metric, w.window_kind, w.window_start \
+            FOR UPDATE OF w",
+    )
+    .bind(edge_instance_id)
+    .bind(tenant_id)
+    .bind(&kinds)
+    .bind(&ids)
+    .bind(&metrics)
+    .bind(&windows)
+    .bind(&starts)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut watermarks: Vec<Option<(i64, Option<i64>)>> = vec![None; chunk.len()];
+    for (ord, last, ep) in seen {
+        watermarks[chunk_index(ord, chunk.len())?] = Some((last, ep));
+    }
+    // What each counter adds and where its watermark moves: within one epoch
+    // the cumulative only grows, so a lower value is a late duplicate and adds
+    // nothing; a watermark of another epoch is a previous process's, so the
+    // whole value is the delta. A restatement (nothing added, same epoch)
+    // writes nothing.
+    let mut changed = Vec::new();
+    let mut deltas = Vec::new();
+    let mut last_seens = Vec::new();
+    for (item, watermark) in chunk.iter().zip(&watermarks) {
+        let Some((old, old_epoch)) = *watermark else {
+            return Err(sqlx::Error::Protocol("usage merge: a counter's watermark was not found".into()));
+        };
+        let reported = i64::try_from(item.0.cumulative).unwrap_or(i64::MAX);
+        let (delta, last_seen) =
+            if old_epoch == Some(epoch) { ((reported - old).max(0), reported.max(old)) } else { (reported, reported) };
+        if delta == 0 && old_epoch == Some(epoch) {
+            continue;
+        }
+        changed.push(item);
+        deltas.push(delta);
+        last_seens.push(last_seen);
+    }
+    if !changed.is_empty() {
+        let (kinds, ids, metrics, windows, starts) = chunk_arrays(&changed);
+        sqlx::query(
+            "UPDATE usage_counter_watermarks w SET last_seen = u.last_seen, process_epoch = $9::bigint \
+               FROM unnest($3::text[], $4::uuid[], $5::text[], $6::text[], $7::timestamptz[], $8::bigint[]) \
+                    AS u(scope_kind, scope_id, metric, window_kind, window_start, last_seen) \
+              WHERE w.edge_instance_id = $1 AND w.tenant_id = $2 \
+                AND w.scope_kind = u.scope_kind AND w.scope_id = u.scope_id AND w.metric = u.metric \
+                AND w.window_kind = u.window_kind AND w.window_start = u.window_start",
+        )
+        .bind(edge_instance_id)
+        .bind(tenant_id)
+        .bind(&kinds)
+        .bind(&ids)
+        .bind(&metrics)
+        .bind(&windows)
+        .bind(&starts)
+        .bind(&last_seens)
+        .bind(epoch)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO usage_counters \
+               (tenant_id, scope_kind, scope_id, metric, window_kind, window_start, total, updated_at) \
+             SELECT $1::uuid, u.scope_kind, u.scope_id, u.metric, u.window_kind, u.window_start, u.delta, now() \
+               FROM unnest($2::text[], $3::uuid[], $4::text[], $5::text[], $6::timestamptz[], $7::bigint[]) \
+                    AS u(scope_kind, scope_id, metric, window_kind, window_start, delta) \
+              ORDER BY u.scope_kind, u.scope_id, u.metric, u.window_kind, u.window_start \
+             ON CONFLICT (tenant_id, scope_kind, scope_id, metric, window_kind, window_start) \
+             DO UPDATE SET total = usage_counters.total + EXCLUDED.total, updated_at = now()",
+        )
+        .bind(tenant_id)
+        .bind(&kinds)
+        .bind(&ids)
+        .bind(&metrics)
+        .bind(&windows)
+        .bind(&starts)
+        .bind(&deltas)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // The fleet total of every counter of the chunk, this merge's writes
+    // included; a counter with no row yet totals 0.
+    let read: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT u.ord, c.total \
+           FROM usage_counters c \
+           JOIN unnest($2::text[], $3::uuid[], $4::text[], $5::text[], $6::timestamptz[]) WITH ORDINALITY \
+                AS u(scope_kind, scope_id, metric, window_kind, window_start, ord) \
+             ON c.scope_kind = u.scope_kind AND c.scope_id = u.scope_id AND c.metric = u.metric \
+            AND c.window_kind = u.window_kind AND c.window_start = u.window_start \
+          WHERE c.tenant_id = $1",
+    )
+    .bind(tenant_id)
+    .bind(&kinds)
+    .bind(&ids)
+    .bind(&metrics)
+    .bind(&windows)
+    .bind(&starts)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut totals = vec![0i64; chunk.len()];
+    for (ord, total) in read {
+        totals[chunk_index(ord, chunk.len())?] = total;
+    }
+    tx.commit().await?;
+    Ok(Some(
+        chunk
+            .iter()
+            .zip(totals)
+            .map(|((r, _), total)| streamscope_core::usage::UsageCounterAuthoritative { key: r.key.clone(), total: total.max(0) as u64 })
+            .collect(),
+    ))
 }
 
 /// How often a merge reads the database clock again: far inside
@@ -151,7 +439,8 @@ async fn db_clock_ms(conn: &mut Scoped, edge_instance_id: uuid::Uuid, tenant_id:
     }
 }
 
-/// Single-counter watermark/delta merge inside one transaction. Returns the new
+/// One counter's watermark/delta merge in its own transaction — the fallback
+/// for a chunk the database refused for its data. Returns the new
 /// global total for the counter, in that counter's own unit — `None` when the
 /// report's epoch is no longer the instance's current one (nothing merged).
 ///

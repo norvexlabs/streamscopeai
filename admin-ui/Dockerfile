@@ -1,4 +1,4 @@
-FROM node:24-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
+FROM node:24-alpine3.24@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS builder
 
 WORKDIR /app
 
@@ -51,7 +51,7 @@ RUN APP_VERSION=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | head -1) \
 # own licence (with the notices of what it bundles), from the release of the
 # binary the image copies; the node image ships none. The checksum is that
 # release's file: a node bump changes it, and the build says so.
-FROM node:24-alpine3.24@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS deps
+FROM node:24-alpine3.24@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5 AS deps
 WORKDIR /app
 COPY admin-ui/package.json admin-ui/package-lock.json ./
 RUN npm ci --omit=dev
@@ -64,9 +64,10 @@ RUN wget -qO /NODEJS_LICENSE "https://raw.githubusercontent.com/nodejs/node/$(no
 # builder's own image (built for this musl) and the two libraries it links.
 FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
 
-# zlib 1.4: the pinned base carries 1.3.2, whose critical CVE-2026-4738 the release audit
-# refuses. A base digest carrying 1.4 makes this requirement a no-op.
-RUN apk add --no-cache libstdc++ libgcc 'zlib>=1.4'
+# zlib 1.4 and OpenSSL 3.5.9-r1: the pinned base carries zlib 1.3.2 (critical CVE-2026-4738)
+# and OpenSSL 3.5.9-r0 (high CVE-2026-107496, -88823, -95691), which the release audit refuses.
+# A base digest carrying both makes these requirements a no-op.
+RUN apk add --no-cache libstdc++ libgcc 'zlib>=1.4' 'libssl3>=3.5.9-r1' 'libcrypto3>=3.5.9-r1'
 COPY --from=deps /usr/local/bin/node /usr/local/bin/node
 
 # Fixed uid/gid 65532 so the runtime user is identical and numeric across every

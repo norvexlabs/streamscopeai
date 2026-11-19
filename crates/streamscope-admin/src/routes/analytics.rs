@@ -3831,7 +3831,7 @@ pub(crate) async fn evaluate_budget_scopes(
             caps.push(("workspace", ws, ws, ws, pool.daily_budget, pool.monthly_budget));
         }
     }
-    for ((ws, user), bucket) in crate::limits::load_member_buckets(&mut *conn, workspace_filter).await? {
+    for ((ws, user), bucket) in crate::limits::load_member_buckets(&mut *conn, workspace_filter, None).await? {
         caps.push(("user", user, member_scope_id(ws, user), ws, bucket.daily_budget, bucket.monthly_budget));
     }
     let key_caps: Vec<(Uuid, Uuid, Option<f64>, Option<f64>)> = sqlx::query_as(

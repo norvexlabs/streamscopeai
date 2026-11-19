@@ -276,7 +276,11 @@ pub async fn a2a_handler(
     // the honest HTTP 429 rather than a JSON-RPC error (the JSON-RPC error
     // space has no rate-limit code, and 429 is what a client can act on).
     for check in [
-        streamscope_core::middleware::rate_limit::check_rate_limit(&identity.user, &state.app.usage),
+        streamscope_core::middleware::rate_limit::check_rate_limit(
+            &identity.user,
+            &state.app.usage,
+            streamscope_core::middleware::rate_limit::RateSurface::A2a,
+        ),
         streamscope_core::middleware::rate_limit::check_budget(
             &identity.user,
             &state.app.usage,

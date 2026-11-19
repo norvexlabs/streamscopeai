@@ -481,6 +481,7 @@ pub async fn test_web(
                 WebError::NoBackend
                 | WebError::MissingCredential { .. }
                 | WebError::InvalidConfig(_)
+                | WebError::InvalidArguments(_)
                 | WebError::InvalidUrl(_)
                 | WebError::SchemeRefused(_)
                 | WebError::UrlFilterDenied { .. }

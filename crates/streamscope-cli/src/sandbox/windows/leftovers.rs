@@ -45,24 +45,14 @@ pub fn to_end<'a>(procs: &'a [Proc], me: &str, own: u32) -> Vec<&'a Proc> {
     procs.iter().filter(|p| p.sid.as_deref() == Some(me) && !spared.contains(&p.pid)).collect()
 }
 
-/// The script that deletes the account's scheduled tasks: the tasks whose
-/// principal is this account, by SID or name, wherever they are. One line
-/// per task: `ended\ttask <path>` or `left\ttask <path>: <why>`.
-pub const TASKS_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-$me = [Security.Principal.WindowsIdentity]::GetCurrent()
-$names = @($me.User.Value, $me.Name, $me.Name.Split('\')[-1])
-foreach ($t in @(Get-ScheduledTask)) {
-  if ($names -contains $t.Principal.UserId) {
-    $path = "$($t.TaskPath)$($t.TaskName)"
-    try {
-      Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false
-      "ended`ttask $path"
-    } catch {
-      "left`ttask ${path}: $($_.Exception.Message -replace '\s+', ' ')"
-    }
-  }
-}"#;
+/// Whether a task's principal (`UserId`, as the Task Scheduler records it:
+/// a SID, `COMPUTER\name` or a bare name) is the account whose SID is `sid`
+/// and whose qualified name is `qualified`. Compared without case, as
+/// Windows compares account names.
+pub fn is_own_principal(user_id: &str, sid: &str, qualified: &str) -> bool {
+    let bare = qualified.rsplit('\\').next().unwrap_or(qualified);
+    [sid, qualified, bare].iter().any(|n| !n.is_empty() && n.eq_ignore_ascii_case(user_id))
+}
 
 /// What a cleanup reported: the items it ended, and those it left (with why).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -126,6 +116,16 @@ impl RunHold {
     }
 }
 
+/// A run lets go when it ends, explicitly: closing its handle releases the
+/// lock only once no other handle to the same open file remains, and a
+/// process another thread is starting holds a copy of every handle until it
+/// execs — the lock would outlive the run that held it.
+impl Drop for RunHold {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// The run's side: have the account end what it left, and warn about what
 /// it could not. `when` names the moment for the warning ("before the run",
 /// "after the run").
@@ -164,7 +164,7 @@ pub fn host_main(account_sid: &str) -> anyhow::Result<i32> {
         bail!("__sandbox-host cleanup runs only as the sandbox account it names");
     }
     let mut ok = true;
-    match tasks() {
+    match tasks(&me) {
         Ok(text) => print!("{text}"),
         Err(e) => {
             println!("left\ttasks: {e:#}");
@@ -188,29 +188,91 @@ pub fn host_main(account_sid: &str) -> anyhow::Result<i32> {
     Ok(if ok { 0 } else { 1 })
 }
 
-/// A script as `powershell -EncodedCommand` takes it: base64 of its UTF-16LE
-/// — no quoting of the script on the command line to get wrong.
-pub fn encoded(script: &str) -> String {
-    use base64::Engine;
-    let bytes: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-/// Run [`TASKS_SCRIPT`] in Windows PowerShell; its output, UTF-8.
+/// Delete the account's scheduled tasks — every task, in every folder it
+/// can read, whose principal [`is_own_principal`] — through the Task
+/// Scheduler's own interface, in this process. One report line per task:
+/// `ended\ttask <path>` or `left\ttask <path>: <why>`. A folder or task the
+/// account cannot read (a system folder, a task removed since it was
+/// listed) is not its own and is passed over; only failing to reach the
+/// scheduler or its root folder is an error.
 #[cfg(windows)]
-fn tasks() -> anyhow::Result<String> {
-    use anyhow::{Context, bail};
-    let root = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into()));
-    let ps = root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-    let out = std::process::Command::new(&ps)
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded(TASKS_SCRIPT)])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("start {}", ps.display()))?;
-    if !out.status.success() {
-        bail!("list them: {}", String::from_utf8_lossy(&out.stderr).split_whitespace().collect::<Vec<_>>().join(" "));
+fn tasks(account_sid: &str) -> anyhow::Result<String> {
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize};
+    use windows::Win32::System::TaskScheduler::{ITaskFolder, ITaskService, TASK_ENUM_HIDDEN, TaskScheduler};
+    use windows::Win32::System::Variant::{VARIANT, VT_I4};
+    use windows::core::BSTR;
+
+    /// The 32-bit integer variant a collection's `Item` is indexed by.
+    fn index(i: i32) -> VARIANT {
+        let mut v = VARIANT::default();
+        // SAFETY: a zeroed variant given its type tag and the matching member.
+        unsafe {
+            (*v.Anonymous.Anonymous).vt = VT_I4;
+            (*v.Anonymous.Anonymous).Anonymous.lVal = i;
+        }
+        v
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+
+    /// An error as one line of text, read while COM is still initialised
+    /// (it holds the call's error object).
+    fn text(e: &windows::core::Error) -> String {
+        e.message().split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn walk(folder: &ITaskFolder, sid: &str, qualified: &str, out: &mut String) {
+        // SAFETY: COM calls on interfaces this thread holds; collections are 1-based.
+        unsafe {
+            // Collected first, deleted after: a deletion renumbers the collection.
+            let mut own = Vec::new();
+            if let Ok(tasks) = folder.GetTasks(TASK_ENUM_HIDDEN.0) {
+                for i in 1..=tasks.Count().unwrap_or(0) {
+                    let Ok(task) = tasks.get_Item(&index(i)) else { continue };
+                    let mut user = BSTR::new();
+                    let read = task.Definition().and_then(|d| d.Principal()).and_then(|p| p.UserId(&mut user));
+                    if read.is_ok()
+                        && is_own_principal(&user.to_string(), sid, qualified)
+                        && let (Ok(name), Ok(path)) = (task.Name(), task.Path())
+                    {
+                        own.push((name, path));
+                    }
+                }
+            }
+            for (name, path) in own {
+                match folder.DeleteTask(&name, 0) {
+                    Ok(()) => out.push_str(&format!("ended\ttask {path}\n")),
+                    Err(e) => out.push_str(&format!("left\ttask {path}: {}\n", text(&e))),
+                }
+            }
+            if let Ok(folders) = folder.GetFolders(0) {
+                for i in 1..=folders.Count().unwrap_or(0) {
+                    if let Ok(sub) = folders.get_Item(&index(i)) {
+                        walk(&sub, sid, qualified, out);
+                    }
+                }
+            }
+        }
+    }
+
+    let qualified = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default());
+    // SAFETY: COM initialised for this thread and uninitialised once every
+    // interface and error object is released: the closure returns only text.
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().map_err(|e| anyhow::anyhow!("start COM: {}", text(&e)))?;
+    let result = (|| -> Result<String, String> {
+        // SAFETY: COM calls on this thread's apartment.
+        unsafe {
+            let service: ITaskService =
+                CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).map_err(|e| format!("reach the Task Scheduler: {}", text(&e)))?;
+            let none = VARIANT::default();
+            service.Connect(&none, &none, &none, &none).map_err(|e| format!("connect to the Task Scheduler: {}", text(&e)))?;
+            let root = service.GetFolder(&BSTR::from("\\")).map_err(|e| format!("open its root folder: {}", text(&e)))?;
+            let mut out = String::new();
+            walk(&root, account_sid, &qualified, &mut out);
+            Ok(out)
+        }
+    })();
+    // SAFETY: paired with the initialisation above.
+    unsafe { CoUninitialize() };
+    result.map_err(|e| anyhow::anyhow!("list them: {e}"))
 }
 
 #[cfg(windows)]
@@ -324,35 +386,28 @@ mod tests {
         // Holding it exclusively, another run is not alone.
         let (c, alone) = RunHold::open(&path).unwrap();
         assert!(!alone);
+        // A second handle to the first run's file (what a process another
+        // thread starts holds until it execs) outlives the run: the run's end
+        // still lets go.
+        let copy = a.0.try_clone().unwrap();
         drop((a, c));
         assert!(RunHold::open(&path).unwrap().1);
+        drop(copy);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn an_encoded_script_is_base64_of_its_utf16() {
-        assert_eq!(encoded("ab"), "YQBiAA==");
-        assert_eq!(encoded("é"), "6QA=");
-    }
-
-    /// Windows PowerShell parses the script, passed encoded as the cleanup
-    /// passes it (parsed only: running it would delete this user's tasks).
-    #[cfg(windows)]
-    #[test]
-    fn windows_powershell_parses_the_tasks_script() {
-        let check = format!(
-            "$errors = $null; $null = [System.Management.Automation.Language.Parser]::ParseInput([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')), [ref]$null, [ref]$errors); \"errors=$($errors.Count)\"",
-            {
-                use base64::Engine;
-                base64::engine::general_purpose::STANDARD.encode(TASKS_SCRIPT)
-            }
-        );
-        let out = std::process::Command::new("powershell.exe")
-            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded(&check)])
-            .output()
-            .unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && text.trim() == "errors=0", "{text} {}", String::from_utf8_lossy(&out.stderr));
+    fn a_task_is_the_accounts_by_its_sid_or_either_name_whatever_the_case() {
+        let (sid, qualified) = ("S-1-5-21-1-2-3-1005", "WIN-DEV\\ssai-sbx-e9a8bb");
+        for own in ["S-1-5-21-1-2-3-1005", "WIN-DEV\\ssai-sbx-e9a8bb", "win-dev\\SSAI-SBX-E9A8BB", "ssai-sbx-e9a8bb"] {
+            assert!(is_own_principal(own, sid, qualified), "{own}");
+        }
+        // Another account's, the developer's, a system principal, none.
+        for other in ["S-1-5-21-1-2-3-1000", "WIN-DEV\\lab", "lab", "SYSTEM", "S-1-5-18", "", "ssai-sbx-e9a8b"] {
+            assert!(!is_own_principal(other, sid, qualified), "{other}");
+        }
+        // An unknown name never matches an empty principal.
+        assert!(!is_own_principal("", sid, ""));
     }
 
     #[test]
@@ -363,13 +418,4 @@ mod tests {
         assert_eq!(Report::parse(""), Report::default());
     }
 
-    #[test]
-    fn the_tasks_script_matches_the_principal_and_reports_each_task() {
-        for needle in ["$me.User.Value", "$t.Principal.UserId", "Unregister-ScheduledTask", "\"ended`ttask", "\"left`ttask"] {
-            assert!(TASKS_SCRIPT.contains(needle), "{needle}");
-        }
-        // Passed as one argument to `-Command`: no double quote may need
-        // escaping beyond what the process API quotes.
-        assert!(!TASKS_SCRIPT.contains('\0'));
-    }
 }

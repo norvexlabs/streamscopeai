@@ -119,6 +119,12 @@ describe('exceptionDirections', () => {
     expect(exceptionDirections({ monthly_budget: 10 }, defaults)).toEqual({ raised: false, lowered: true });
     expect(exceptionDirections({ requests_per_minute: 10, monthly_budget: 0 }, defaults)).toEqual({ raised: true, lowered: true });
   });
+  it('sees a change on each surface rate, in each direction', () => {
+    const surfaces = { ...defaults, requests_per_minute_mcp: 300, requests_per_minute_a2a: 60 };
+    expect(exceptionDirections({ requests_per_minute_mcp: 600 }, surfaces)).toEqual({ raised: true, lowered: false });
+    expect(exceptionDirections({ requests_per_minute_a2a: 5 }, surfaces)).toEqual({ raised: false, lowered: true });
+    expect(exceptionDirections({ requests_per_minute_mcp: 300, requests_per_minute_a2a: 60 }, surfaces)).toEqual({ raised: false, lowered: false });
+  });
   it('an exception inheriting every field or matching the default shows neither', () => {
     expect(exceptionDirections({}, defaults)).toEqual({ raised: false, lowered: false });
     expect(exceptionDirections({ daily_budget: 5 }, defaults)).toEqual({ raised: false, lowered: false });

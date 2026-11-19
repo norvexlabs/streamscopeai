@@ -650,6 +650,23 @@ pub async fn set_member_key_budget(
         None => (None, None, crate::routes::workspaces::default_budget_mode()),
     };
 
+    let failed = |what: &'static str| {
+        move |e: sqlx::Error| {
+            tracing::error!("manager set member key budget ({what}): {e}");
+            ApiError::internal("internal error")
+        }
+    };
+    // A budget that newly caps the key counts the spend it already made
+    // (crate::budget_seed). Only a write setting a cap can: it locks the key
+    // row and reads its budget as it stands, so two such writes take turns.
+    let could_cap = crate::budget_seed::sets_a_cap(daily, monthly);
+    let tenant_id = db.tenant_uuid();
+    let mut tx = db.conn().begin().await.map_err(failed("begin"))?;
+    let before = if could_cap {
+        crate::budget_seed::lock_key_budget(&mut tx, key_id).await.map_err(failed("lock"))?
+    } else {
+        None
+    };
     // Scope the update to a key the member holds in THIS workspace — a manager
     // cannot touch keys outside the workspace they manage.
     let result = sqlx::query(
@@ -662,16 +679,20 @@ pub async fn set_member_key_budget(
     .bind(daily)
     .bind(monthly)
     .bind(mode)
-    .execute(db.conn())
+    .execute(&mut *tx)
     .await
-    .map_err(|e| {
-        tracing::error!("manager set member key budget: {e}");
-        ApiError::internal("internal error")
-    })?;
+    .map_err(failed("write"))?;
 
     if result.rows_affected() == 0 {
         return Err(ApiError::not_found("key not found", ApiErrorCode::KeyNotFound));
     }
+    // Only the row the update matched — the member's key in this workspace —
+    // is seeded.
+    if let Some(before) = before {
+        let after = crate::budget_seed::Caps::of(daily, monthly);
+        crate::budget_seed::seed_key(&mut tx, tenant_id, key_id, before, after).await;
+    }
+    tx.commit().await.map_err(failed("commit"))?;
 
     Ok(Json(ActionResponse::ok().with_message("Member key budget updated.")))
 }

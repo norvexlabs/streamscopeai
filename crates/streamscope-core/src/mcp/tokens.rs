@@ -13,7 +13,7 @@
 //!
 //! Resource URIs are wrapped in the gateway's own `stsmcp://` scheme rather
 //! than signed: a stale or forged URI fails the prefix→route resolution and
-//! returns `-32004 not found`, which is a stronger guarantee than HMAC for
+//! is answered as a resource that does not exist, a stronger guarantee than HMAC for
 //! this surface (the upstream can't be coaxed into reading something it
 //! doesn't own because the prefix is the only routing input).
 

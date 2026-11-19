@@ -1344,9 +1344,23 @@ impl ApiRequest {
     /// original, it would force a tool that is no longer declared.
     pub fn substitute_tools(
         &mut self,
-        mut lookup: impl FnMut(&str) -> Option<crate::config::tool_rules::ToolDefValue>,
+        lookup: impl FnMut(&str) -> Option<crate::config::tool_rules::ToolDefValue>,
     ) -> Vec<(String, String)> {
-        let mut substituted = Vec::new();
+        self.substitute_tools_noting(lookup)
+            .into_iter()
+            .map(|s| (s.original, s.replaced))
+            .collect()
+    }
+
+    /// [`Self::substitute_tools`], also naming, per substituted tool, the
+    /// members of the client's definition the substitute does not honour
+    /// ([`ToolSubstitution::not_honoured`]), read from the definition as the
+    /// client sent it, before its members are cleared.
+    pub fn substitute_tools_noting(
+        &mut self,
+        mut lookup: impl FnMut(&str) -> Option<crate::config::tool_rules::ToolDefValue>,
+    ) -> Vec<ToolSubstitution> {
+        let mut out: Vec<ToolSubstitution> = Vec::new();
         match self {
             Self::ChatCompletions(req) => {
                 if let Some(tools) = &mut req.tools {
@@ -1361,6 +1375,14 @@ impl ApiRequest {
                             None => continue,
                         };
                         if let Some(replacement) = lookup(&original) {
+                            let mut not_honoured = substitution_not_honoured(Some(&tool.r#type), &tool.extra);
+                            // Chat nests `strict` in the function block, outside
+                            // `extra`; the substitute's block drops it.
+                            if tool.function.as_ref().is_some_and(|f| f.strict.is_some()) {
+                                not_honoured.push("strict".to_string());
+                                not_honoured.sort();
+                                not_honoured.dedup();
+                            }
                             tool.function = Some(crate::api::domain::FunctionDef {
                                 name: replacement.name.clone(),
                                 description: replacement.description.clone(),
@@ -1369,7 +1391,7 @@ impl ApiRequest {
                             });
                             tool.r#type = "function".to_string();
                             tool.extra.clear();
-                            substituted.push((original, replacement.name));
+                            out.push(ToolSubstitution { original, replaced: replacement.name, not_honoured });
                         }
                     }
                 }
@@ -1385,6 +1407,14 @@ impl ApiRequest {
                             None => tool.r#type.clone(),
                         };
                         if let Some(replacement) = lookup(&original) {
+                            let mut not_honoured = substitution_not_honoured(Some(&tool.r#type), &tool.extra);
+                            // A nested function block's `strict` is outside
+                            // `extra`; the substitute clears the block.
+                            if tool.function.as_ref().is_some_and(|f| f.strict.is_some()) {
+                                not_honoured.push("strict".to_string());
+                                not_honoured.sort();
+                                not_honoured.dedup();
+                            }
                             // Written in Responses' own flat grammar: a
                             // same-protocol forward re-serializes this struct,
                             // and a nested `function` block is Chat's shape.
@@ -1396,7 +1426,7 @@ impl ApiRequest {
                                 tool.extra.insert("description".into(), Value::from(d.clone()));
                             }
                             tool.extra.insert("parameters".into(), replacement.parameters.clone());
-                            substituted.push((original, replacement.name));
+                            out.push(ToolSubstitution { original, replaced: replacement.name, not_honoured });
                         }
                     }
                 }
@@ -1406,11 +1436,12 @@ impl ApiRequest {
                     for tool in tools.iter_mut() {
                         let original = tool.name.clone();
                         if let Some(replacement) = lookup(&original) {
+                            let not_honoured = substitution_not_honoured(tool.server_type(), &tool.extra);
                             tool.name = replacement.name.clone();
                             tool.description = replacement.description.clone();
                             tool.input_schema = Some(replacement.parameters.clone());
                             tool.extra.clear();
-                            substituted.push((original, replacement.name));
+                            out.push(ToolSubstitution { original, replaced: replacement.name, not_honoured });
                         }
                     }
                 }
@@ -1424,18 +1455,22 @@ impl ApiRequest {
                         for decl in decls.iter_mut() {
                             let original = decl.name.clone();
                             if let Some(replacement) = lookup(&original) {
+                                // A declaration's own members are replaced,
+                                // none is dropped.
+                                let not_honoured = Vec::new();
                                 decl.name = replacement.name.clone();
                                 decl.description = replacement.description.clone();
                                 decl.parameters = Some(replacement.parameters.clone());
-                                substituted.push((original, replacement.name));
+                                out.push(ToolSubstitution { original, replaced: replacement.name, not_honoured });
                             }
                         }
                     }
                 }
             }
         }
-        self.follow_tool_renames(&substituted, Became::Function);
-        substituted
+        let renames: Vec<(String, String)> = out.iter().map(|s| (s.original.clone(), s.replaced.clone())).collect();
+        self.follow_tool_renames(&renames, Became::Function);
+        out
     }
 
     /// Rewrite tool_result content blocks across all protocols. For every
@@ -2110,6 +2145,98 @@ fn hosted_family(kind: &str) -> &str {
     undated.strip_suffix("_preview").unwrap_or(undated)
 }
 
+/// One tool definition [`ApiRequest::substitute_tools_noting`] replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSubstitution {
+    /// The name (or, for a hosted tool, the type) the client declared.
+    pub original: String,
+    /// The name of the definition that replaced it.
+    pub replaced: String,
+    /// The members of the client's definition the substitute does not honour,
+    /// as keys only, sorted — see [`SUBSTITUTION_MEMBERS`].
+    pub not_honoured: Vec<String>,
+}
+
+/// The members of a provider's own tool definition a substitution can drop
+/// that are recorded by name: the web search and web fetch tools' own members
+/// and the properties every tool definition accepts (Anthropic's tool
+/// reference), and the members OpenAI's hosted web search declares. Any other
+/// member is the client's own text and is recorded only as
+/// [`SUBSTITUTION_OTHER_MEMBER`], never by its name: a badge carries the
+/// gateway's vocabulary, and a member name is free text a client chose.
+pub const SUBSTITUTION_MEMBERS: &[&str] = &[
+    "allowed_callers",
+    "allowed_domains",
+    "blocked_domains",
+    "citations",
+    "defer_loading",
+    "filters",
+    "max_content_tokens",
+    "max_uses",
+    "response_inclusion",
+    "search_context_size",
+    "strict",
+    "url_sources",
+    "use_cache",
+    "user_location",
+];
+
+/// The one token any member outside [`SUBSTITUTION_MEMBERS`] is recorded as.
+pub const SUBSTITUTION_OTHER_MEMBER: &str = "other";
+
+/// The members of a substituted definition the substitute does not honour —
+/// keys only, never a value (`user_location` is personal data, a domain list
+/// can name a customer), sorted and without repeats.
+///
+/// `members` is the definition's own members as the client sent it, the ones
+/// the substitution clears; what the substitute replaces (`type`, `name`,
+/// `description`, the schema, `function`) or keeps (`cache_control`) is not a
+/// member it drops. `allowed_callers` is also recorded when the client did not
+/// send it on a web search or web fetch dated `20260209` or later, whose
+/// default caller is code execution — a caller the gateway never is; it is not
+/// recorded when the client's list names `direct`, the caller the gateway is.
+fn substitution_not_honoured(server_type: Option<&str>, members: &std::collections::BTreeMap<String, Value>) -> Vec<String> {
+    const REPLACED_OR_KEPT: &[&str] =
+        &["type", "name", "description", "parameters", "input_schema", "function", "cache_control"];
+    let mut out: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (key, value) in members {
+        if REPLACED_OR_KEPT.contains(&key.as_str()) {
+            continue;
+        }
+        if key == "allowed_callers"
+            && value.as_array().is_some_and(|callers| callers.iter().any(|c| c.as_str() == Some("direct")))
+        {
+            continue;
+        }
+        out.insert(
+            SUBSTITUTION_MEMBERS
+                .iter()
+                .find(|m| **m == key.as_str())
+                .copied()
+                .unwrap_or(SUBSTITUTION_OTHER_MEMBER),
+        );
+    }
+    if !members.contains_key("allowed_callers") && server_type.is_some_and(defaults_to_a_code_execution_caller) {
+        out.insert("allowed_callers");
+    }
+    out.into_iter().map(str::to_string).collect()
+}
+
+/// Whether an Anthropic web tool's `allowed_callers` defaults to the code
+/// execution caller: `web_search_` / `web_fetch_` dated `20260209` or later
+/// (Anthropic's server tools: "The `_20260209` versions of the web tools
+/// default to the code execution caller only; earlier versions default to
+/// `["direct"]`"). Reads only those two prefixes and an eight-digit date.
+fn defaults_to_a_code_execution_caller(server_type: &str) -> bool {
+    let Some(date) = server_type
+        .strip_prefix("web_search_")
+        .or_else(|| server_type.strip_prefix("web_fetch_"))
+    else {
+        return false;
+    };
+    date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && date >= "20260209"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2587,6 +2714,190 @@ mod tests {
                 {"type": "function", "name": "gw_lookup", "description": "d", "parameters": {"type": "object"}},
             ])
         );
+    }
+
+    /// Substitute every tool of `tools` on `version`, returning what each
+    /// substitution says it does not honour.
+    fn not_honoured_by_substitution(version: ApiVersion, body: serde_json::Value) -> Vec<Vec<String>> {
+        let mut req = ApiRequest::parse(version, &Bytes::from(body.to_string())).unwrap();
+        req.substitute_tools_noting(|name| {
+            Some(crate::config::tool_rules::ToolDefValue {
+                name: format!("gw_{name}"),
+                description: None,
+                parameters: serde_json::json!({"type": "object"}),
+            })
+        })
+        .into_iter()
+        .map(|s| s.not_honoured)
+        .collect()
+    }
+
+    /// Chat Completions carries `strict` inside the function block: a
+    /// substitution drops it there too, and names it as on the flat protocols.
+    #[test]
+    fn a_chat_substitution_names_the_strict_it_drops() {
+        let chat = |function: serde_json::Value| {
+            serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": function}],
+            })
+        };
+        let out = not_honoured_by_substitution(
+            ApiVersion::ChatCompletions,
+            chat(serde_json::json!({"name": "web_search", "strict": true, "parameters": {"type": "object"}})),
+        );
+        assert_eq!(out, vec![vec!["strict"]]);
+        // Positive control: without `strict`, nothing is named.
+        let none = not_honoured_by_substitution(
+            ApiVersion::ChatCompletions,
+            chat(serde_json::json!({"name": "web_search", "parameters": {"type": "object"}})),
+        );
+        assert_eq!(none, vec![Vec::<String>::new()]);
+    }
+
+    fn anthropic_tools(tools: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "model": "m", "max_tokens": 1,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+        })
+    }
+
+    /// Anthropic's web search and web fetch tool pages list the members a
+    /// client sets on the definition (`max_uses`, `allowed_domains` /
+    /// `blocked_domains`, `user_location`; `citations`, `max_content_tokens`,
+    /// `url_sources`, `use_cache` on fetch; `response_inclusion` from
+    /// `_20260318`) and the tool reference the properties every tool takes
+    /// (`allowed_callers`, `defer_loading`, `strict`; `cache_control`, which
+    /// a substitution keeps). A substitution clears them all, so it names
+    /// each, sorted, keys only; a member outside that vocabulary is the
+    /// fixed token `other`, never its own name; `cache_control` is not named.
+    #[test]
+    fn a_substitution_names_the_members_of_the_clients_definition_it_drops() {
+        let out = not_honoured_by_substitution(
+            ApiVersion::AnthropicMessages,
+            anthropic_tools(serde_json::json!([{
+                "type": "web_search_20250305", "name": "web_search",
+                "max_uses": 3, "allowed_domains": ["customer.example"],
+                "user_location": {"type": "approximate", "city": "Lyon", "country": "FR"},
+                "cache_control": {"type": "ephemeral"},
+                "a_clients_own_member": 1, "another_one": true,
+            }])),
+        );
+        assert_eq!(out, vec![vec!["allowed_domains", "max_uses", "other", "user_location"]]);
+        // Positive control: a definition naming none of them drops nothing.
+        let none = not_honoured_by_substitution(
+            ApiVersion::AnthropicMessages,
+            anthropic_tools(serde_json::json!([{"type": "web_search_20250305", "name": "web_search"}])),
+        );
+        assert_eq!(none, vec![Vec::<String>::new()]);
+        let fetch = not_honoured_by_substitution(
+            ApiVersion::AnthropicMessages,
+            anthropic_tools(serde_json::json!([{
+                "type": "web_fetch_20250910", "name": "web_fetch",
+                "blocked_domains": ["x.example"], "citations": {"enabled": true},
+                "max_content_tokens": 1000, "url_sources": {"user_input": {"type": "all"}},
+                "defer_loading": false, "strict": true,
+            }])),
+        );
+        assert_eq!(
+            fetch,
+            vec![vec!["blocked_domains", "citations", "defer_loading", "max_content_tokens", "strict", "url_sources"]]
+        );
+    }
+
+    /// Anthropic's server tools: "The `_20260209` versions of the web tools
+    /// default to the code execution caller only; earlier versions default to
+    /// `["direct"]`" — a caller the gateway's own search never is. So an
+    /// absent `allowed_callers` is named on `web_search_` / `web_fetch_` dated
+    /// `20260209` or later and not before; a list naming `direct` is the
+    /// caller the gateway is and is not named; one naming only a code
+    /// execution caller is.
+    #[test]
+    fn allowed_callers_is_named_where_its_default_or_its_value_is_a_caller_the_gateway_is_not() {
+        let one = |tool: serde_json::Value| {
+            not_honoured_by_substitution(ApiVersion::AnthropicMessages, anthropic_tools(serde_json::json!([tool])))
+                .remove(0)
+        };
+        let implied = vec!["allowed_callers".to_string()];
+        for ty in ["web_search_20260209", "web_search_20260318", "web_fetch_20260209", "web_fetch_20260309", "web_fetch_20260318"] {
+            assert_eq!(one(serde_json::json!({"type": ty, "name": "w"})), implied, "{ty}");
+            assert_eq!(
+                one(serde_json::json!({"type": ty, "name": "w", "allowed_callers": ["direct"]})),
+                Vec::<String>::new(),
+                "{ty}"
+            );
+            assert_eq!(
+                one(serde_json::json!({"type": ty, "name": "w", "allowed_callers": ["direct", "code_execution_20260120"]})),
+                Vec::<String>::new(),
+                "{ty}"
+            );
+            assert_eq!(
+                one(serde_json::json!({"type": ty, "name": "w", "allowed_callers": ["code_execution_20260120"]})),
+                implied,
+                "{ty}"
+            );
+        }
+        for ty in ["web_search_20250305", "web_fetch_20250910", "web_search_20260208", "code_execution_20260120"] {
+            assert_eq!(one(serde_json::json!({"type": ty, "name": "w"})), Vec::<String>::new(), "{ty}");
+        }
+        assert_eq!(
+            one(serde_json::json!({"type": "web_search_20260318", "name": "w", "response_inclusion": "full"})),
+            vec!["allowed_callers".to_string(), "response_inclusion".to_string()]
+        );
+    }
+
+    /// A personal value — `user_location` — is named by its key and its
+    /// value is nowhere in what the substitution records. Positive control:
+    /// the value IS in the client's request.
+    #[test]
+    fn a_dropped_members_value_is_never_recorded() {
+        let body = anthropic_tools(serde_json::json!([{
+            "type": "web_search_20250305", "name": "web_search",
+            "user_location": {"type": "approximate", "city": "Lyon-Secret-Town"},
+        }]));
+        assert!(body.to_string().contains("Lyon-Secret-Town"));
+        let out = not_honoured_by_substitution(ApiVersion::AnthropicMessages, body);
+        assert_eq!(out, vec![vec!["user_location"]]);
+        let badge = crate::audit::badge::AuditBadge::WebSubstitutedServer {
+            server_type: "web_search_20250305".into(),
+            not_honoured: out[0].clone(),
+        };
+        assert!(!serde_json::to_string(&badge).unwrap().contains("Lyon"));
+    }
+
+    /// OpenAI's hosted web search on Responses carries its own members
+    /// (`filters`, `user_location`, `search_context_size`); a substitution
+    /// clears them and names each. Gemini substitutes a declaration's own
+    /// members in place and drops none.
+    #[test]
+    fn every_protocol_names_what_its_substitution_clears() {
+        let responses = not_honoured_by_substitution(
+            ApiVersion::Responses,
+            serde_json::json!({
+                "model": "m", "input": "hi",
+                "tools": [{"type": "web_search", "filters": {"allowed_domains": ["a.example"]},
+                           "user_location": {"type": "approximate", "city": "Lyon"},
+                           "search_context_size": "low"}],
+            }),
+        );
+        assert_eq!(responses, vec![vec!["filters", "search_context_size", "user_location"]]);
+        let chat = not_honoured_by_substitution(
+            ApiVersion::ChatCompletions,
+            serde_json::json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "web_search", "user_location": {"type": "approximate"}}],
+            }),
+        );
+        assert_eq!(chat, vec![vec!["user_location"]]);
+        let gemini = not_honoured_by_substitution(
+            ApiVersion::GoogleGemini,
+            serde_json::json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "tools": [{"functionDeclarations": [{"name": "web_search", "parameters": {"type": "object"}}]}],
+            }),
+        );
+        assert_eq!(gemini, vec![Vec::<String>::new()]);
     }
 
     /// A same-protocol forward re-serializes the parsed request, so a field

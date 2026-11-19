@@ -260,8 +260,18 @@ pub enum AuditBadge {
     /// `google_search`) was emulated by the gateway via the substitution
     /// loop. Badged on the orchestrating `llm_audit` row; the executor's
     /// `web_audit` rows carry `surface='substitution'` and
-    /// `parent_request_id` linking back. Wiring lands in a follow-up PR.
-    WebSubstitutedServer { server_type: String },
+    /// `parent_request_id` linking back.
+    ///
+    /// `not_honoured` names, keys only and sorted, the members of the
+    /// client's own definition the gateway's search does not apply
+    /// (`max_uses`, `allowed_domains`, `user_location`, …, an unlisted member
+    /// as `other`; `api::SUBSTITUTION_MEMBERS`) — never a value. Absent on a
+    /// row that has none.
+    WebSubstitutedServer {
+        server_type: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        not_honoured: Vec<String>,
+    },
 
     /// A client-side function-tool a known client declared (Claude Code
     /// `WebFetch`/`WebSearch`, opencode `webfetch`/`websearch`) was
@@ -567,7 +577,9 @@ pub struct BadgeBuilder {
     mcp_legacy_sse: bool,
     mcp_sampling_intercepted: bool,
     llm_synthetic_sampling: bool,
-    web_search_substituted_servers: Vec<String>,
+    /// One entry per emulated server tool type, with the union of the keys
+    /// every badge for it named (sorted).
+    web_search_substituted_servers: Vec<(String, Vec<String>)>,
     web_search_substituted_clients: Vec<String>,
     web_search_substitution_max_iter: bool,
     web_search_substitution_tool_error: bool,
@@ -616,6 +628,26 @@ pub struct BadgeBuilder {
 impl BadgeBuilder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// One `WebSubstitutedServer` per server type, its keys the union of
+    /// every badge's for that type, sorted — the same set whatever order
+    /// badges are added or builders merged in.
+    fn add_substituted_server(&mut self, server_type: String, not_honoured: Vec<String>) {
+        let servers = &mut self.web_search_substituted_servers;
+        match servers.iter_mut().find(|(st, _)| *st == server_type) {
+            Some((_, keys)) => {
+                keys.extend(not_honoured);
+                keys.sort();
+                keys.dedup();
+            }
+            None => {
+                let mut keys = not_honoured;
+                keys.sort();
+                keys.dedup();
+                servers.push((server_type, keys));
+            }
+        }
     }
 
     pub fn add(&mut self, badge: AuditBadge) {
@@ -745,10 +777,8 @@ impl BadgeBuilder {
             b @ AuditBadge::ContentUnavailable => {
                 tracing::debug!(code = b.code(), "record badge handed to BadgeBuilder; ignoring (set on the record)");
             }
-            AuditBadge::WebSubstitutedServer { server_type } => {
-                if !self.web_search_substituted_servers.contains(&server_type) {
-                    self.web_search_substituted_servers.push(server_type);
-                }
+            AuditBadge::WebSubstitutedServer { server_type, not_honoured } => {
+                self.add_substituted_server(server_type, not_honoured);
             }
             AuditBadge::WebSubstitutedClient { client_label } => {
                 if !self.web_search_substituted_clients.contains(&client_label) {
@@ -1131,10 +1161,8 @@ impl BadgeBuilder {
         if other.llm_synthetic_sampling {
             self.llm_synthetic_sampling = true;
         }
-        for n in other.web_search_substituted_servers {
-            if !self.web_search_substituted_servers.contains(&n) {
-                self.web_search_substituted_servers.push(n);
-            }
+        for (server_type, not_honoured) in other.web_search_substituted_servers {
+            self.add_substituted_server(server_type, not_honoured);
         }
         for n in other.web_search_substituted_clients {
             if !self.web_search_substituted_clients.contains(&n) {
@@ -1368,8 +1396,8 @@ impl BadgeBuilder {
         if self.llm_synthetic_sampling {
             out.push(AuditBadge::LlmSyntheticSampling);
         }
-        for server_type in self.web_search_substituted_servers {
-            out.push(AuditBadge::WebSubstitutedServer { server_type });
+        for (server_type, not_honoured) in self.web_search_substituted_servers {
+            out.push(AuditBadge::WebSubstitutedServer { server_type, not_honoured });
         }
         for client_label in self.web_search_substituted_clients {
             out.push(AuditBadge::WebSubstitutedClient { client_label });
@@ -1458,6 +1486,107 @@ mod tests {
     #[test]
     fn empty_builder_finishes_empty() {
         assert!(BadgeBuilder::new().finish().is_empty());
+    }
+
+    /// What one finished builder says of the emulated server tools: each
+    /// type once, with its keys.
+    fn substituted_servers(badges: Vec<AuditBadge>) -> std::collections::BTreeMap<String, Vec<String>> {
+        badges
+            .into_iter()
+            .filter_map(|b| match b {
+                AuditBadge::WebSubstitutedServer { server_type, not_honoured } => Some((server_type, not_honoured)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        /// However the `WebSubstitutedServer` badges of a request reach the
+        /// row — added in any order, split between builders merged in any
+        /// order — it carries ONE badge per server type, whose keys are the
+        /// sorted union of every badge's for that type: no path drops a key
+        /// or repeats one.
+        #[test]
+        fn substituted_server_keys_are_the_union_in_any_order(
+            badges in proptest::collection::vec(
+                (0usize..2, proptest::collection::vec(0usize..4, 0..4)),
+                1..8,
+            ),
+            split in 0usize..8,
+            merge_first in proptest::bool::ANY,
+        ) {
+            const TYPES: [&str; 2] = ["web_search_20250305", "web_fetch_20260209"];
+            const KEYS: [&str; 4] = ["max_uses", "allowed_domains", "user_location", "other"];
+            let badges: Vec<AuditBadge> = badges
+                .into_iter()
+                .map(|(t, keys)| AuditBadge::WebSubstitutedServer {
+                    server_type: TYPES[t].to_string(),
+                    not_honoured: keys.into_iter().map(|k| KEYS[k].to_string()).collect(),
+                })
+                .collect();
+            let mut expected: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+                Default::default();
+            for b in &badges {
+                if let AuditBadge::WebSubstitutedServer { server_type, not_honoured } = b {
+                    expected.entry(server_type.clone()).or_default().extend(not_honoured.iter().cloned());
+                }
+            }
+            let expected: std::collections::BTreeMap<String, Vec<String>> =
+                expected.into_iter().map(|(t, k)| (t, k.into_iter().collect())).collect();
+
+            let mut forward = BadgeBuilder::new();
+            for b in badges.iter().cloned() {
+                forward.add(b);
+            }
+            let mut backward = BadgeBuilder::new();
+            for b in badges.iter().rev().cloned() {
+                backward.add(b);
+            }
+            let split = split.min(badges.len());
+            let (head, tail) = badges.split_at(split);
+            let mut first = BadgeBuilder::new();
+            head.iter().cloned().for_each(|b| first.add(b));
+            let mut second = BadgeBuilder::new();
+            tail.iter().cloned().for_each(|b| second.add(b));
+            let merged = if merge_first {
+                first.extend(second);
+                first
+            } else {
+                second.extend(first);
+                second
+            };
+            for (path, builder) in [("forward", forward), ("backward", backward), ("merged", merged)] {
+                let finished = builder.finish();
+                let count = finished.iter().filter(|b| matches!(b, AuditBadge::WebSubstitutedServer { .. })).count();
+                proptest::prop_assert_eq!(count, expected.len(), "{}", path);
+                proptest::prop_assert_eq!(&substituted_servers(finished), &expected, "{}", path);
+            }
+        }
+    }
+
+    /// A row written before the badge named its keys decodes to none, and a
+    /// badge with none is written without the field — the code
+    /// `web_substituted_server` is unchanged.
+    #[test]
+    fn a_substituted_server_badge_without_keys_reads_and_writes_as_before() {
+        let old: AuditBadge =
+            serde_json::from_str(r#"{"code":"web_substituted_server","server_type":"web_search_20250305"}"#).unwrap();
+        assert_eq!(
+            old,
+            AuditBadge::WebSubstitutedServer { server_type: "web_search_20250305".into(), not_honoured: vec![] }
+        );
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({"code": "web_substituted_server", "server_type": "web_search_20250305"})
+        );
+        let with_keys = AuditBadge::WebSubstitutedServer {
+            server_type: "web_search_20250305".into(),
+            not_honoured: vec!["max_uses".into()],
+        };
+        assert_eq!(
+            serde_json::to_value(&with_keys).unwrap(),
+            serde_json::json!({"code": "web_substituted_server", "server_type": "web_search_20250305", "not_honoured": ["max_uses"]})
+        );
     }
 
     #[test]
@@ -1750,6 +1879,7 @@ mod tests {
             AuditBadge::WebSchemeRefused,
             AuditBadge::WebSubstitutedServer {
                 server_type: "web_search_20250305".into(),
+                not_honoured: vec!["max_uses".into()],
             },
             AuditBadge::WebSubstitutedClient {
                 client_label: "claude-code:WebSearch".into(),
@@ -2088,7 +2218,7 @@ mod tests {
             mcp_legacy_sse: true,
             mcp_sampling_intercepted: true,
             llm_synthetic_sampling: true,
-            web_search_substituted_servers: vec!["srv".into()],
+            web_search_substituted_servers: vec![("srv".into(), vec!["max_uses".into()])],
             web_search_substituted_clients: vec!["cli".into()],
             web_search_substitution_max_iter: true,
             web_search_substitution_tool_error: true,

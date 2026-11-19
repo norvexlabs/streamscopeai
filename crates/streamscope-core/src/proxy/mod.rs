@@ -1131,7 +1131,7 @@ async fn proxy_handler_inner(
     // unlimited default) short-circuits inside the check, so these run for every
     // request — enforcement happens iff a workspace/user cap is set.
     {
-        if let Err(e) = crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage) {
+        if let Err(e) = crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage, crate::middleware::rate_limit::RateSurface::Llm) {
             send_error_audit(&state, &err_ctx, &e).await;
             state.proxy_stats.inc_errors();
             return Err(e);

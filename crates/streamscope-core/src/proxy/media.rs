@@ -1335,7 +1335,7 @@ async fn media_handler_inner(
     err_ctx.key_id = ctx.user.key_id;
 
     // --- Rate limit (RPM only for media) — no-op unless a cap is configured ---
-    if let Err(e) = crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage) {
+    if let Err(e) = crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage, crate::middleware::rate_limit::RateSurface::Llm) {
         send_media_error_audit(&state, &err_ctx, &e).await;
         state.proxy_stats.inc_errors();
         return Err(e);
@@ -2197,7 +2197,7 @@ async fn catchall_handler_inner(
     };
 
     // --- Rate limit (RPM from policy or key default) — no-op unless capped ---
-    if let Err(e) = crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage) {
+    if let Err(e) = crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage, crate::middleware::rate_limit::RateSurface::Llm) {
         send_catchall_error_audit(&state, &err_ctx, &e).await;
         state.proxy_stats.inc_errors();
         return Err(e);

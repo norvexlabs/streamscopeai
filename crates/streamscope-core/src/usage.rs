@@ -123,12 +123,19 @@ pub const BUDGET_UNITS_PER_CURRENCY_UNIT: f64 = 1_000_000.0;
 /// Metric a counter tracks. SUM-merged. Budget spend (integer millionths of the
 /// tenant's accounting currency, see [`BUDGET_UNITS_PER_CURRENCY_UNIT`]) uses the
 /// day/month windows; the per-minute request/token rates use the minute window.
+/// Requests are counted per surface — LLM, MCP, A2A — each against its own cap,
+/// so a burst on one never throttles another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageMetric {
     BudgetMicros,
-    /// Requests in the current minute window (RPM enforcement).
+    /// LLM requests (chat, media, `/v1/analyze`) in the current minute window.
     RequestsPerMinute,
+    /// MCP requests (the built-in Web server included) in the current minute
+    /// window.
+    RequestsPerMinuteMcp,
+    /// A2A requests in the current minute window.
+    RequestsPerMinuteA2a,
     /// Tokens in the current minute window (TPM enforcement).
     TokensPerMinute,
 }
@@ -142,6 +149,8 @@ impl UsageMetric {
             // reinterpreting existing rows by a factor of 10 000.
             Self::BudgetMicros => "budget_micros",
             Self::RequestsPerMinute => "rpm",
+            Self::RequestsPerMinuteMcp => "rpm_mcp",
+            Self::RequestsPerMinuteA2a => "rpm_a2a",
             Self::TokensPerMinute => "tpm",
         }
     }
@@ -204,6 +213,11 @@ impl UsageTracker {
         Self::default()
     }
 
+    /// The counters each map holds now: `(cumulative, reported, authoritative)`.
+    pub fn counter_counts(&self) -> (usize, usize, usize) {
+        (self.cumulative.len(), self.reported.len(), self.authoritative.len())
+    }
+
     fn key(scope: UsageScope, window_kind: UsageWindowKind, now_ms: u64) -> UsageCounterKey {
         UsageCounterKey {
             tenant_id: scope.tenant_id,
@@ -222,6 +236,20 @@ impl UsageTracker {
         }
         let key = Self::key(scope, window_kind, now_ms);
         *self.cumulative.entry(key).or_insert(0) += amount;
+    }
+
+    /// Hold a counter of the current window at its present cumulative (0 when
+    /// absent) so the next report names it: admin answers a report with the
+    /// counter's fleet total even when it carries no new spend, which is how
+    /// an edge learns a total it has not contributed to — a budget counter
+    /// seeded from spend made before its limit existed.
+    pub fn hold(&self, scope: UsageScope, window_kind: UsageWindowKind, now_ms: u64) {
+        let key = Self::key(scope, window_kind, now_ms);
+        // A read first: every budget check holds its counters, and only the
+        // first of a window inserts — the rest take no shard write lock.
+        if !self.cumulative.contains_key(&key) {
+            self.cumulative.entry(key).or_insert(0);
+        }
     }
 
     /// Best-effort global estimate for a counter in the current window:
@@ -327,6 +355,25 @@ mod tests {
         t.answered(&report[0].key, 42, Some(100));
         t.accrue(scope(), UsageWindowKind::Daily, now, 8);
         assert_eq!(t.estimate(scope(), UsageWindowKind::Daily, now), 108);
+    }
+
+    /// A held counter is reported at 0 before any spend, and the total admin
+    /// answers with becomes the estimate: an edge learns a seeded total
+    /// without contributing to it.
+    #[test]
+    fn a_held_counter_is_reported_and_learns_the_fleet_total() {
+        let t = UsageTracker::new();
+        let now = 1_000_000_000_000;
+        t.hold(scope(), UsageWindowKind::Monthly, now);
+        let report = t.drain_report(now);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].cumulative, 0);
+        t.answered(&report[0].key, 0, Some(40));
+        assert_eq!(t.estimate(scope(), UsageWindowKind::Monthly, now), 40);
+        // Holding again keeps the cumulative already accrued.
+        t.accrue(scope(), UsageWindowKind::Monthly, now, 5);
+        t.hold(scope(), UsageWindowKind::Monthly, now);
+        assert_eq!(t.drain_report(now)[0].cumulative, 5);
     }
 
     #[test]

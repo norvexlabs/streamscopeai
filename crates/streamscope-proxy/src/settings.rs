@@ -148,9 +148,16 @@ pub struct ProxySettings {
     /// the single-host VM appliance, where every service shares one VM and the
     /// platform-health signal is the whole VM's memory — not the proxy's slice of
     /// its own 512M cap (which reads as a meaningless single-digit %). Off on K8s
-    /// (per-pod cgroup % is the real OOM signal) and local dev. Env:
-    /// `APPLIANCE_HOST_MEMORY`. Default: false.
+    /// (per-pod cgroup % is the real OOM signal), on a Docker host (shared with
+    /// whatever else runs there) and local dev. Env: `APPLIANCE_HOST_MEMORY`.
+    /// Default: follows the deploy shape — on when the installer names the VM
+    /// shape ([`Self::stowage_shape`] `kairos`), else off.
     pub appliance_host_memory: bool,
+    /// The deploy shape the installer names in every service's environment
+    /// (`kairos` for the VM appliance). Read only to default
+    /// [`Self::appliance_host_memory`]; never an operator knob. Env:
+    /// `STOWAGE_SHAPE`. Default: None (no installer named one).
+    pub stowage_shape: Option<String>,
 
     // -- A2A gateway --
     /// Per-stream byte cap on `SendStreamingMessage` / `SubscribeToTask` SSE
@@ -216,7 +223,10 @@ pub struct ProxySettings {
     pub mcp_capability_cache_max_entries: usize,
     /// Idle TTL for session-map entries. Env: `MCP_SESSION_IDLE_TTL_SECS`. Default: 1800.
     pub mcp_session_idle_ttl_secs: u64,
-    /// Hard cap on `McpSessionMap` entries. Env: `MCP_SESSION_MAX_ENTRIES`. Default: 4096.
+    /// Entry cap of each MCP session map (sessions, upstream eras, client log
+    /// levels), each on its own; the upstream-handshake map holds a quarter of
+    /// it. Env: `MCP_SESSION_MAX_ENTRIES`.
+    /// Default: 65536.
     pub mcp_session_max_entries: usize,
     /// Legacy-SSE pending-request abandoned-id TTL.
     /// Env: `MCP_LEGACY_SSE_ABANDONED_TTL_SECS`. Default: 60.
@@ -320,6 +330,7 @@ impl Default for ProxySettings {
             edge_outbox_max_mb: 1024,
             audit_debug_endpoint: false,
             appliance_host_memory: false,
+            stowage_shape: None,
             a2a_stream_max_bytes: 8 * 1024 * 1024,
             a2a_audit_stream_max_bytes: 256 * 1024,
             a2a_stream_timeout_secs: 3600,
@@ -339,7 +350,7 @@ impl Default for ProxySettings {
             mcp_capability_cache_ttl_secs: 60,
             mcp_capability_cache_max_entries: 4096,
             mcp_session_idle_ttl_secs: 30 * 60,
-            mcp_session_max_entries: 4096,
+            mcp_session_max_entries: 65_536,
             mcp_legacy_sse_abandoned_ttl_secs: 60,
             mcp_oauth_expiry_safety_margin_secs: 30,
             mcp_sweep_interval_secs: 60,
@@ -386,6 +397,14 @@ fn memory_share_bytes(explicit_mb: Option<u64>, limit: Option<u64>, share: &Memo
 /// browser can ever send. The blank has to survive the trip through a template.
 fn non_empty(raw: Option<String>) -> Option<String> {
     raw.filter(|v| !v.trim().is_empty())
+}
+
+/// Whether the deploy shape the installer names (`STOWAGE_SHAPE`) runs this
+/// stack on a machine of its own: the VM appliance (`kairos`) only. A Docker
+/// host is shared with whatever else runs there, and a pod's own cgroup is its
+/// signal on Kubernetes.
+fn host_is_the_stacks_alone(shape: Option<&str>) -> bool {
+    shape == Some("kairos")
 }
 
 impl ProxySettings {
@@ -489,6 +508,12 @@ impl ProxySettings {
         parse_setting!("SQLITE_POOL_SIZE", cfg.sqlite_pool_size);
         parse_setting!("EDGE_OUTBOX_MAX_MB", cfg.edge_outbox_max_mb);
         parse_setting!("AUDIT_DEBUG_ENDPOINT", cfg.audit_debug_endpoint);
+        // On the VM appliance every process but the OS is the stack's, so the
+        // whole VM's memory is the platform signal; the installer names the
+        // shape in every service's environment (env-only, never centrally
+        // overridable). An explicit value wins.
+        cfg.stowage_shape = non_empty(std::env::var("STOWAGE_SHAPE").ok());
+        cfg.appliance_host_memory = host_is_the_stacks_alone(cfg.stowage_shape.as_deref());
         parse_setting!("APPLIANCE_HOST_MEMORY", cfg.appliance_host_memory);
         parse_setting!("A2A_STREAM_MAX_BYTES", cfg.a2a_stream_max_bytes);
         parse_setting!("A2A_AUDIT_STREAM_MAX_BYTES", cfg.a2a_audit_stream_max_bytes);
@@ -607,6 +632,7 @@ impl ProxySettings {
             ("EDGE_OUTBOX_MAX_MB".to_string(), self.edge_outbox_max_mb.to_string()),
             ("AUDIT_DEBUG_ENDPOINT".to_string(), self.audit_debug_endpoint.to_string()),
             ("APPLIANCE_HOST_MEMORY".to_string(), self.appliance_host_memory.to_string()),
+            ("STOWAGE_SHAPE".to_string(), self.stowage_shape.clone().unwrap_or_default()),
             ("A2A_STREAM_MAX_BYTES".to_string(), self.a2a_stream_max_bytes.to_string()),
             (
                 "A2A_AUDIT_STREAM_MAX_BYTES".to_string(),
@@ -775,6 +801,14 @@ mod tests {
             non_empty(Some("https://app.example.com".to_string())),
             Some("https://app.example.com".to_string())
         );
+    }
+
+    #[test]
+    fn only_the_vm_shape_reports_the_hosts_memory() {
+        assert!(host_is_the_stacks_alone(Some("kairos")));
+        for shape in [None, Some("docker"), Some("kubernetes"), Some(""), Some("Kairos")] {
+            assert!(!host_is_the_stacks_alone(shape), "{shape:?}");
+        }
     }
 
     #[test]

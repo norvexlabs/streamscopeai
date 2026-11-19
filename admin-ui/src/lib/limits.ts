@@ -101,8 +101,15 @@ export function compareToDefault(exception: LimitState, defaultCap: number | nul
   return own > def ? 'raised' : 'lowered';
 }
 
-/** The four limit fields an exception and a default share. */
-const LIMIT_FIELDS = ['requests_per_minute', 'tokens_per_minute', 'daily_budget', 'monthly_budget'] as const;
+/** The limit fields an exception and a default share. */
+const LIMIT_FIELDS = [
+  'requests_per_minute',
+  'requests_per_minute_mcp',
+  'requests_per_minute_a2a',
+  'tokens_per_minute',
+  'daily_budget',
+  'monthly_budget',
+] as const;
 export type LimitField = (typeof LIMIT_FIELDS)[number];
 
 /** Whether an exception raises and/or lowers ANY field against the workspace

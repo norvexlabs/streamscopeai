@@ -23,9 +23,15 @@ pub enum AppError {
     Auth(#[from] AuthError),
 
     /// A rate limit refused the request. `bucket` names which limit — `None`
-    /// for a limit outside the four limit buckets (the pre-auth IP throttle).
+    /// for a limit outside the four limit buckets (the pre-auth IP throttle);
+    /// `surface` names whose requests-per-minute cap it was — `None` on a
+    /// tokens-per-minute refusal and outside the buckets.
     #[error("rate limit exceeded: {message}")]
-    RateLimited { message: String, bucket: Option<crate::middleware::rate_limit::LimitBucket> },
+    RateLimited {
+        message: String,
+        bucket: Option<crate::middleware::rate_limit::LimitBucket>,
+        surface: Option<crate::middleware::rate_limit::RateSurface>,
+    },
 
     /// A budget refused the request; `bucket` names which one.
     #[error("budget exceeded: {message}")]
@@ -337,7 +343,13 @@ impl AppError {
                 "internal server error".to_string(),
             ),
         };
-        ClientError { status, kind, message, bucket: self.limit_bucket().map(|b| b.as_str()) }
+        ClientError {
+            status,
+            kind,
+            message,
+            bucket: self.limit_bucket().map(|b| b.as_str()),
+            surface: self.limit_surface().map(|s| s.as_str()),
+        }
     }
 }
 
@@ -446,7 +458,15 @@ impl AppError {
     /// A limit refusal without a bucket — for a throttle outside the four limit
     /// buckets (the pre-auth IP limiter).
     pub fn rate_limited(message: impl Into<String>) -> Self {
-        AppError::RateLimited { message: message.into(), bucket: None }
+        AppError::RateLimited { message: message.into(), bucket: None, surface: None }
+    }
+
+    /// Which surface's requests-per-minute cap refused the request.
+    pub fn limit_surface(&self) -> Option<crate::middleware::rate_limit::RateSurface> {
+        match self {
+            AppError::RateLimited { surface, .. } => *surface,
+            _ => None,
+        }
     }
 
     /// Which limit bucket refused the request, on a limit refusal.
@@ -736,7 +756,7 @@ mod tests {
         };
         assert_eq!(refusal.gate_refusal(), Some("queue_timeout"));
         // A rate limit is also a 429, and is not a capacity refusal.
-        let limited = AppError::RateLimited { message: "slow down".into(), bucket: None };
+        let limited = AppError::RateLimited { message: "slow down".into(), bucket: None, surface: None };
         assert_eq!(limited.gate_refusal(), None);
     }
 

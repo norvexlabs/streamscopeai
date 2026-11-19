@@ -358,7 +358,7 @@ pub async fn analyze_handler(
             "analyze requires an inline workspace key".to_string(),
         )));
     }
-    crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage)?;
+    crate::middleware::rate_limit::check_rate_limit(&ctx.user, &state.usage, crate::middleware::rate_limit::RateSurface::Llm)?;
 
     let body_bytes = axum::body::to_bytes(body, core_settings().max_body_size)
         .await

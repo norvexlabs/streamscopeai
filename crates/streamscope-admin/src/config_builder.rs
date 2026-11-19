@@ -238,9 +238,9 @@ pub async fn build_tenant_body(
     // so the key's `UserContext` lands on the mount the route layer expects:
     // `sk-*` on `/v1/*` + `/mcp/<slug>`, `vk-*` on `/fwd/{key}/...`.
     #[allow(clippy::type_complexity)]
-    let api_key_rows: Vec<(String, uuid::Uuid, uuid::Uuid, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>, uuid::Uuid, uuid::Uuid, bool, Option<f64>, Option<f64>, String, Option<uuid::Uuid>, Option<uuid::Uuid>, bool)> = sqlx::query_as(
+    let api_key_rows: Vec<(String, uuid::Uuid, uuid::Uuid, Option<String>, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>, uuid::Uuid, uuid::Uuid, bool, Option<f64>, Option<f64>, String, Option<uuid::Uuid>, Option<uuid::Uuid>, bool)> = sqlx::query_as(
         r#"SELECT k.key_hash,
-                  u.id as user_id, u.tenant_id, u.email, u.display_name,
+                  u.id as user_id, u.tenant_id, u.email, u.display_name, u.auth_source,
                   k.expires_at, k.id as key_id, k.workspace_id, k.forward_auth,
                   k.daily_budget, k.monthly_budget, k.budget_mode,
                   k.downstream_provider_id,
@@ -527,7 +527,7 @@ pub async fn build_tenant_body(
     let api_keys: Vec<EdgeApiKey> = api_key_rows
         .into_iter()
         .map(
-            |(key_hash, user_id, user_tenant_id, email, display_name, expires_at, key_id, workspace_id, forward_auth, key_daily_budget, key_monthly_budget, key_budget_mode, bound_downstream_id, qos_class_id, qos_class_elevated)| {
+            |(key_hash, user_id, user_tenant_id, email, display_name, auth_source, expires_at, key_id, workspace_id, forward_auth, key_daily_budget, key_monthly_budget, key_budget_mode, bound_downstream_id, qos_class_id, qos_class_elevated)| {
                 let granted = providers_by_workspace
                     .get(&workspace_id)
                     .cloned()
@@ -611,10 +611,12 @@ pub async fn build_tenant_body(
                     .unwrap_or_else(streamscope_core::auth::RateLimitConfig::unlimited);
                 // Member bucket: the workspace's default member limit,
                 // replaced per metric by this member's exception; absent when
-                // nothing limits the member. Enforced keyed by the membership.
+                // nothing limits the member. A service account takes no
+                // default. Enforced keyed by the membership.
                 let user_rate_override = streamscope_core::auth::member_limits::resolve_member_limit(
                     member_limit_defaults.get(&workspace_id),
                     member_limit_exceptions.get(&(workspace_id, user_id)),
+                    crate::service_account::member_kind(auth_source.as_deref()),
                 );
                 // Per-key budget bucket: baked only when this key carries an
                 // explicit daily/monthly cap; enforced keyed by key_id (budget

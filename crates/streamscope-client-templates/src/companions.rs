@@ -134,6 +134,7 @@ mod tests {
             companions,
             keyed_arrays: Default::default(),
             local_mcp: Default::default(),
+            usable_as_tool: false,
             body: String::new(),
         }
     }

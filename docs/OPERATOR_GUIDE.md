@@ -107,9 +107,17 @@ reads the mirror:
 `--registry-ca` is the PEM of the certificate authority the mirror's certificate chains to
 (certificates only). The installer records the mirror at the first install, and later upgrades and
 `updates` look for new releases there; a newer release crosses the same way. A mirror that asks for
-a sign-in is read with your own `docker login`. On Kubernetes the cluster's nodes pull
-the images themselves, so they must already trust the mirror's CA, and you give the chart a pull
-Secret for it (`imagePullSecrets` in your values).
+a sign-in is read with a login of the install's own, `--registry-login-file FILE` (`-` for standard
+input): a Docker config file holding one entry for the mirror's host, `{"auths": {"<host>":
+{"auth": "<base64 of user:password>"}}}`. Mint one per install, so revoking one install's login
+leaves every other pulling. The Docker install records it beside its directory, readable by you
+alone, and `ssai-stow registry-login FILE|-` replaces it later (`--remove` removes it); `vm create`
+sends it to the VM's first install over SSH, and `sudo ssai-stow registry-login -` on the VM
+replaces it; `k8s install` and `k8s upgrade` write the release's pull Secret from it, which a later
+upgrade without the flag keeps. `status` names the login's host, never the login, and `secrets
+export` does not carry it. Without one, the Docker install reads the mirror with your own `docker
+login`. On Kubernetes the cluster's nodes pull the images themselves, so they must already trust
+the mirror's CA.
 
 ---
 
@@ -137,6 +145,16 @@ gateway holds about 15 MB for each 256K-token turn in flight (60 MB for a millio
 admin API about 25 MB for each 256K-token session being opened (100 MB for a million). With many
 such at the same moment, choose the recommended size or larger.
 
+**Gateway memory under agents** — the gateway's memory is its share above (at least 512 MB; on
+Kubernetes, 1 GB for each of its replicas). Held to 512 MB, the smallest any shape gives it, and
+measured with 400 coding agents active at once (each sending model turns on a growing
+conversation, calling MCP tools behind one virtual server and searching and fetching the web, with
+a few seconds between steps), the gateway used about 300 MB and was still growing by about 4 MB per ten
+minutes at the end of a 15-minute hold. What 512 MB does
+not hold is a burst of large turns all in flight together — hundreds of agents each sending its
+next turn the instant the last one ends: for that load, raise the gateway's memory or run more
+gateway replicas.
+
 The VM's network is tuned at each boot for its size and for the gateway's many connections (the
 `network` profile).
 
@@ -157,8 +175,8 @@ volume; the appliance tightens retention on its own as the disk fills (see *Disk
 - **DNS names** for the five routes the appliance serves over HTTPS (see *TLS modes*): the console,
   the API, the gateway, and the two metrics endpoints.
 - For `--tls dns-cloudflare`: a **Cloudflare API token** with *Zone → DNS → Edit* on each name's zone.
-- For automated creation on **TrueNAS**: [OpenTofu](https://opentofu.org) 1.8+ and a TrueNAS API key
-  (see [section C](#c-per-platform-install-recipes)).
+- To have the VM created for you rather than by hand: [OpenTofu](https://opentofu.org) and an
+  OpenTofu root of your own (see [section C](#c-per-platform-install-recipes)).
 
 ### Step 1 — Run the guided installer
 
@@ -182,12 +200,15 @@ It walks the whole preparation end-to-end, asking what it was not given as a fla
 3. **The product** — the TLS mode, the five domains, and the install questions: the platform
    administrator's email, the organisation to create and its administrator, and the addresses
    allowed to scrape metrics. Every answer is reviewed before anything is written.
-4. **Downloads the disk image** for the platform and checks it against the release.
+4. **Downloads the disk image** for the platform and checks it against the release. Not every
+   release publishes disks: one that does not boots the newest disk set of its channel, and the
+   VM's first boot then writes the release's own OS and reboots into it once more before it
+   installs.
 5. **Writes the VM's configuration** — a seed ISO (`<hostname>-seed.iso`) for hypervisors, or a
    user-data file (`<hostname>-user-data.yaml`) for clouds — and **prints the next steps for your
-   platform**. On TrueNAS with OpenTofu it creates and starts the VM itself, then waits until the
-   install has finished. It never replaces a seed it finds: to run it again for the same host
-   name, move away the one an earlier run wrote.
+   platform**. It never creates the VM itself (an OpenTofu root of yours can: section C). It never
+   replaces a seed it finds: to run it again for the same host name, move away the one an earlier
+   run wrote.
 
 **The VM's configuration carries no secret** — but for a one-time SSH host key (written readable by
 you alone) whenever `vm create` sends something over SSH (`--secrets`, a secret input, a `byo`
@@ -233,8 +254,9 @@ ssh -t <user>@<vm> sudo ssai-stow install             # asks for what is still d
 | `--cert FILE` `--key FILE` `--ca FILE` | The `byo` certificate, its key and its issuing CA, sent over SSH to the first install. Give `--ca` for a private CA: without it the chain is checked against your workstation's trusted CAs. |
 | `--http-port N` `--https-port N` | Move the front's ports. |
 | `--set KEY=VALUE`, `--answers FILE` | The install answers and the advanced settings of § E. `--answers` is a YAML map, `KEY: value`, and may carry the front's TLS settings in a `tls` section (`mode`, `cert`, `key`, `ca`, paths relative to the file); a flag wins over the file. |
-| `--secrets FILE` | A decrypted secrets export: rebuild a VM with the secrets of one that was lost (see *Recovery playbook*). The secrets go only to the VM `vm create` made: until its install, the VM serves a one-time SSH host key its seed carries, and `vm create` refuses any other. It then records the VM's own key and prints its fingerprint; without automated creation, it prints the one-time key's fingerprint for you to check before you send the secrets. |
+| `--secrets FILE` | A decrypted secrets export: rebuild a VM with the secrets of one that was lost (see *Recovery playbook*). The secrets go only to the VM `vm create` made: until its install, the VM serves a one-time SSH host key its seed carries, and `vm create` prints that key's fingerprint for you to check before you send the secrets. |
 | `--registry PREFIX` `--registry-ca FILE` | Install from a mirror (§ A). |
+| `--registry-login-file FILE` | The VM's own login to the registry it pulls from (§ A), sent over SSH to the first install. |
 | `--tune-profile default\|network` | The VM's network tuning (default `network`, for the gateway's many connections). On an installed VM, `sudo ssai-stow install --tune-profile P` changes it, and `--tune-profile release` returns to the release's own. |
 | `--no-input` | Ask nothing: flags and defaults decide. |
 
@@ -369,6 +391,13 @@ origins — command-line tools and integrations discover the API address from th
 | `internal` | the front end's own local CA | none — smoke tests and evaluation; browsers warn |
 | `none` | plain HTTP on a loopback address | Docker only (§ G) |
 
+**Another ACME CA.** In the `acme` and `dns-cloudflare` modes the certificates come from Let's
+Encrypt unless `--acme-ca URL` names another ACME directory (an `https://` URL: a private CA such as
+step-ca, or another public one); `--acme-ca-root FILE` gives the PEM root that directory's own TLS
+chains to, when the host would not trust it otherwise. Docker installs and the VM's install re-run
+take both, and a re-run keeps them; `--acme-ca none` goes back to Let's Encrypt, and a move to
+`byo` or `internal` drops them.
+
 Every HTTPS route sends `Strict-Transport-Security`, except with `internal`, where a pin would make
 the self-signed warning impossible to click through. With `byo` and a **private** CA, make sure every
 browser trusts that CA before the first visit.
@@ -429,9 +458,8 @@ firewall drops everything except SSH (from `--ssh-allow`) and the front's HTTP/H
 
 #### MAC pinning
 
-Most hypervisors mint a random MAC per VM. Pin the NIC MAC and reserve the matching DHCP lease so a
-re-created VM keeps the same IP (handy when DNS records point at the VM). A TrueNAS VM made by
-`vm create --create opentofu` already gets a MAC derived from its name.
+Most hypervisors mint a random MAC per VM. Give the NIC a fixed MAC on the platform and reserve the
+matching DHCP lease so a re-created VM keeps the same IP (handy when DNS records point at the VM).
 
 ---
 
@@ -452,23 +480,39 @@ prints the remaining steps:
 
 Give the VM UEFI firmware, a VirtIO (or the platform's default) NIC and no QXL display (see Step 2).
 
-### TrueNAS (automated, OpenTofu)
+### Creating the VM with OpenTofu (TrueNAS and others)
 
-On TrueNAS `vm create` can create the VM itself:
+`vm create` writes the disk and the seed as files and prints the steps by hand; it creates no VM. To
+have the VM created for you, keep an **OpenTofu root of your own**: `ssai-stow vm seed --json --platform
+<platform>` (with the same machine, TLS and answer flags as `vm create`) prints what a new VM of the
+release needs at its first boot — its disk, its seed, its NICs, its size (`size`, the release's
+minimum and recommendation) and, for a cloud's firewall in front of it, the ports and sources to let
+through (`firewall`) — and the `norvexlabs/stowage` OpenTofu provider reads it (`stowage_vm_seed`),
+gives the VM over SSH what its first install waits for, and waits for that install. A complete root
+for each platform — TrueNAS, Proxmox VE, libvirt, VMware, AWS, Azure, Google Cloud, Scaleway — is
+among that provider's examples (`examples/guides/<platform>-vm` in
+`norvexlabs/terraform-provider-stowage`): copy it into your root, give it your platform's
+credentials and `tofu apply`. `tofu destroy` removes what it made; its state is your root's alone.
 
-```bash
-export TRUENAS_URL=https://truenas.example.com TRUENAS_API_KEY=…   # TRUENAS_INSECURE_SKIP_VERIFY=1 for a self-signed host
-sh streamscopeai.sh vm create --platform truenas --create opentofu \
-  --hostname streamscopeai --pool tank --dataset vms --bridge br0 \
-  --tls dns-cloudflare --domains console=…,api=…,gateway=…,metrics-api=…,metrics-gateway=… \
-  --ssh-allow 192.168.1.0/24 --timezone Europe/Paris
-```
+On TrueNAS the example runs three steps through the installer where the platform's own provider
+has none yet: `ssai-stow vm truenas import-image` (writes the disk image into a zvol), `vm truenas
+seed` (uploads the seed ISO) and `vm truenas stop` (stops the VM before its devices are deleted).
+They read the host from `TRUENAS_URL` (or `TRUENAS_ENDPOINT`, the provider's WebSocket URL) and the
+key from `TRUENAS_API_KEY` — from the environment only, never a file — with `TRUENAS_CA_CERT` (a CA
+file) or `TRUENAS_INSECURE_SKIP_VERIFY=1` for a self-signed host, and are safe to run again.
 
-Its size is the recommended VM unless `--cpus`, `--memory` (MiB) or `--disk` (GiB, the data space;
-the OS systems' space is added) say otherwise (see *VM sizing*). It uploads the disk and the seed, creates the VM (UEFI, autostart, a MAC derived from its name),
-starts it, and waits (`--wait`, default 20m) until `ssai-stow status` on the VM reports the
-install finished. The API key is read from the environment only and never written to a file. Remove
-such a VM, its disk and its uploads with `ssai-stow vm destroy <hostname>`.
+**The VM's SSH host key.** The commands that reach the VM over SSH from your workstation (`vm
+host-key`) take its key as one known_hosts line, `--known-hosts-line LINE`: the seed's
+`known_hosts_line` until the first install retires that one-time key, then the line `vm host-key
+--json` prints.
+
+**A VM created by an installer of release 2026.11.65 or earlier with `vm create --create
+opentofu`** keeps running and upgrading as any other VM; only its creation state is left behind, in
+`~/.local/state/streamscopeai/vms/<hostname>` on the workstation that created it, which this
+installer no longer reads. To remove such a VM, run that earlier installer's `vm destroy
+<hostname>`; to manage it with OpenTofu from now on, adopt it into a root of your own with `import`
+blocks (each example lists its resources' import IDs). Its host key for `--known-hosts-line` is
+that directory's `known_hosts`.
 
 ### Other hypervisors and clouds
 
@@ -511,6 +555,9 @@ slot — **none of that interrupts service** — and reboots after 30 seconds (`
 reboot activates it). That reboot is the upgrade's only downtime. On the way up, the boot dumps the
 database before the new release migrates it. The command ends at the reboot it schedules: after it,
 `ssai-stow status` and `ssai-stow events` tell how it went.
+`upgrade --dry-run` and `rollback --dry-run` run every check the verb runs first and print the
+plan, changing nothing; a check that says no exits 3 (refused, nothing changed), as does any verb
+told "not now" — a job running, a reboot scheduled, a boot not yet judged — with what to wait for.
 
 **The health gate.** After an upgrade, the first boot of the new system is on trial: unless the
 install is up, on the new release and ready within 10 minutes, the gate reboots and the VM falls back
@@ -631,7 +678,7 @@ The defaults are a daily backup at 03:00 UTC (within a 15-minute window; one mis
 off runs when it is back), kept 30 days (`0` keeps every one). `--recipient` takes 1 to 16 age public
 keys; any one's private key decrypts. `backup verify --destination … --rclone-config … --recipient …`
 tries settings without saving them. Each backup is named
-`streamscope-<profile>-<UTC time>-<version>-r<revision>.pgdump.age`.
+`streamscopeai-<profile>-<UTC time>-<version>-r<revision>.pgdump.age`.
 
 > **Protect the backup bucket.** The destination credentials live on the appliance, so use a
 > **versioned / immutable** bucket (S3 Object Lock, B2 lifecycle) and a **least-privilege**
@@ -650,8 +697,16 @@ leaves the database as it was. Then the stack comes back and provisioning runs o
 A backup restores onto **the release it was taken from**: restore before upgrading, or roll back
 first. A `config` backup is refused (restoring it would drop every row it left out).
 
+**A restore loads only what this install's own backups uploaded.** Each backup records the SHA-256
+of what it uploaded, and a restore checks every object against it before anything stops, refusing
+one that differs — so whoever can write the bucket cannot hand the appliance a dump of their own.
+A backup the install holds no record of — one taken by another VM (the one a rebuilt VM replaces,
+a restore drill's source) — is refused naming `--unrecorded`, which loads it unchecked: give it
+only for a backup you know you made, as a dump's statements run with the database owner's rights.
+
 **Restore drill** (monthly — an untested backup is a broken backup): build a scratch VM from the
-secrets export (*Recovery playbook*, scenario 6), restore the latest backup onto it and sanity-check
+secrets export (*Recovery playbook*, scenario 6), restore the latest backup onto it (`--unrecorded`:
+the scratch VM did not take it) and sanity-check
 it. Record the wall-clock (your RTO) and the schedule cadence (your RPO).
 
 ### Disk pressure
@@ -705,7 +760,7 @@ Scenarios from least to most severe:
    ssh <user>@<vm> sudo ssai-stow install --given - < byo.yaml   # if it served byo: project, tls of cert and key as PEM (§ D)
    ssh <user>@<vm> ssai-stow backup config --destination … --rclone-config - --recipient age1… < rclone.conf
    ssh <user>@<vm> ssai-stow backup list
-   ssh -t <user>@<vm> ssai-stow restore <object> --identity - < backup.key
+   ssh -t <user>@<vm> ssai-stow restore <object> --unrecorded --identity - < backup.key   # the lost VM's backup
    ```
 
    The new VM starts unprovisioned and says so in `status` (`not provisioned: a backup … is
@@ -733,7 +788,8 @@ On the VM (over SSH):
 | `ssai-stow rollback [--yes]` | Reboot into the passive system: back to the release the last upgrade replaced |
 | `ssai-stow reboot \| shutdown [--drain-secs N]` | Drain (default 30 s, at most 600), then reboot / power off |
 | `ssai-stow backup config \| run \| status \| list \| verify` | Backups (see *Backup & restore*); `backup config --lock` / `--unlock` keeps the settings from the console or gives them back |
-| `ssai-stow restore <object> [--identity FILE\|-]` | Load a backup into the database |
+| `ssai-stow restore <object> [--identity FILE\|-] [--unrecorded]` | Load a backup into the database; `--unrecorded` loads one this install did not take (see *Backup & restore*) |
+| `sudo ssai-stow registry-login FILE\|- \| --remove` | Record or remove the VM's own registry login (§ A) |
 | `ssai-stow secrets export --recipient age1… [-o FILE\|-]` | The install's secrets, encrypted, for disaster recovery |
 | `ssai-stow secrets rotate AUTH_SECRET [--stage \| --finish]` | Rotate the signing secret (see *Rotating `AUTH_SECRET`*) |
 | `ssai-stow network [set \| confirm \| revert \| reset]` | The network settings (see below) |
@@ -1136,7 +1192,8 @@ never on their public service ports:
   gateway-overhead histogram (the platform's own processing time, excluding the upstream provider),
   an end-to-end request-latency histogram (measured from the moment the upstream call starts, so
   model generation time dominates), pending locally-buffered audit records, when the console last
-  had nothing newer for the gateway, and container CPU/memory.
+  had nothing newer for the gateway, what it holds per user and per session, and container
+  CPU/memory.
 - **Admin API** — database-pool utilisation, responses by status class, uptime.
 
 The endpoint is **unauthenticated by design** and carries no tenant or conversation data — only
@@ -1166,6 +1223,29 @@ use `rate()` / `increase()` / `histogram_quantile()` over them. Useful starting 
 content a gateway sends the console, every resend included — a gateway names what the console
 already stored from it rather than sending it again, so in a steady state these grow with what
 sessions add rather than with their length).
+
+What a gateway holds per user and per session is read as gauges, so a sizing question has an
+answer before memory runs out: `streamscope_proxy_session_detector_held_bytes`, `…_turns` and
+`…_users` (the recent turns it keeps to recognise a conversation's next turn — bounded by the
+session-tracking capacity above),
+`streamscope_proxy_usage_counters{map}` (the budget and rate counters it tracks),
+`streamscope_proxy_mcp_sessions`, `…_mcp_upstream_sessions`, `…_mcp_upstream_handshakes`,
+`…_mcp_upstream_eras` and `…_mcp_upstream_listeners` (MCP client sessions, the upstream
+connections behind them, what each upstream server speaks, and the notification streams held
+open). The client sessions, the
+upstream eras and the clients' log levels each hold at most `MCP_SESSION_MAX_ENTRIES` entries
+(65,536 by default, a few hundred bytes each), and the upstream connections the gateway opens
+itself, which take 2–4 KB each, a quarter of it (16,384 by default, at most ~60 MB); a new entry
+past a limit is refused and counted in `streamscope_proxy_mcp_session_cap_drops_total{map}`. The
+upstream sessions behind a client session (about 230 bytes each, one per upstream it reaches) have
+no limit of their own: they are kept while their client session is held or in use. The
+notification streams have a limit of their own, logged when reached. Past a limit the calls still
+succeed — some slower; a log level a client sets may not be kept, and a refused client session's
+calls reach their server without the protocol version it agreed — until an idle entry expires (`MCP_SESSION_IDLE_TTL_SECS`, 30 minutes). A rising count means the gateway
+serves more MCP users within that window than the cap allows: raise it in **Settings → Advanced**;
+each gateway reads the new value when it restarts.
+`streamscope_proxy_outbox_shipped_records_total` counts the audit records the console has answered
+for; beside `streamscope_proxy_pending_audit_records` it shows whether the backlog is draining.
 
 **A gateway that cannot reach the console keeps serving** the configuration it last received. A
 gateway restarted during the outage starts from the copy it saved on disk and logs that it does —
@@ -1405,9 +1485,19 @@ only reports success once the system is live. Point your DNS at the Ingress addr
 provisioning** (tenants, providers, OIDC), mint an **operator key** rather than scripting a human
 login — see [§ D, Automating the admin API](#automating-the-admin-api-operator-key).
 
-**Keep a copy of the release's Secret off the cluster** — it holds `ENCRYPTION_KEY`, without which a
-restored database cannot decrypt its stored provider credentials:
-`kubectl -n <ns> get secret <release>-stowage -o yaml`, stored in your secret store.
+**Keep the release's secrets off the cluster** — they hold `ENCRYPTION_KEY`, without which a
+restored database cannot decrypt its stored provider credentials. Export them encrypted to an age
+key of yours, in the same format as the VM's and Docker's secrets export:
+
+```bash
+ssai-stow k8s secrets export --namespace <ns> --recipient age1… -o streamscope-secrets.age
+```
+
+It carries the generated secrets, the secret inputs and the provisioned administrators'
+credentials, never the registry login. A first install on a new cluster — or on any shape — takes
+the decrypted file back with `--secrets FILE` (`-` for standard input): `k8s install --secrets` is
+refused where the release's Secret already exists, and leaves provisioning to an explicit `k8s
+provision`, run once the old install's database is restored.
 
 ### Step 4 — Verify the install
 
@@ -1590,7 +1680,7 @@ enforcement before relying on them.
   `objectStore` takes every provider the plugin supports (S3 and compatibles, Azure Blob, Google
   Cloud Storage) and workload identity in place of a key Secret; see the plugin's documentation. The
   first base backup is taken as soon as backups are on; `kubectl -n <ns> get backups` lists them.
-  Keep the copy of the release's Secret beside the backups: a restored database is unreadable
+  Keep the secrets export (Step 3) beside the backups: a restored database is unreadable
   without its `ENCRYPTION_KEY`. Restoring: *Diagnostics & recovery*, scenario 6.
 - **Standby and failover, per database mode.**
   - `external` — turn on the provider's high-availability option (RDS Multi-AZ, Cloud SQL high
@@ -1711,6 +1801,7 @@ Useful options:
 | `--address 127.0.0.2` | another loopback address, e.g. to run two installs side by side (`::1` for IPv6) |
 | `--ipv6` | IPv6 on the install's network (Docker 27 or later), so the front sees an IPv6 client's own address |
 | `--registry PREFIX --registry-ca FILE` | pull from a mirror (§ A) |
+| `--registry-login-file FILE\|-` | the install's own registry login (§ A) |
 | `--offline` | use images already loaded on the host; no registry contact |
 | `--dry-run` | print every value it would record (secrets redacted), and change nothing |
 
@@ -1925,7 +2016,9 @@ database to `streamscopeai/snapshots/` first.
 
 Keep the secrets export beside the backups: to rebuild on a new host, install with the decrypted
 export (`sh streamscopeai.sh --secrets secrets.yaml`, the same release) — it starts without
-provisioning, waiting for your data — then `restore` the backup into it. With `--tls internal`, the new
+provisioning, waiting for your data — then `restore --unrecorded` the backup into it (the new install
+took none of the lost one's backups, so it holds no record to check them against; see § D, *Backup &
+restore*). With `--tls internal`, the new
 install keeps the lost one's root, so the clients that trusted it still do. If the database must
 survive the loss of a host, run a managed database or CloudNativePG on Kubernetes (§ F, *Backups,
 HA, and scaling*).

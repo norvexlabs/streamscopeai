@@ -304,6 +304,11 @@ pub struct PendingShare {
 }
 
 impl PendingShare {
+    /// The audit records it carries.
+    pub fn record_count(&self) -> u64 {
+        self.record_ids.len() as u64
+    }
+
     /// The blob this share goes up alone, ahead of its records: sent raw by
     /// itself rather than inside an ingest request.
     pub fn upload(&self) -> Option<&BlobContent> {

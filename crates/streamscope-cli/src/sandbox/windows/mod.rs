@@ -24,3 +24,4 @@ pub mod run;
 pub mod setup;
 #[cfg(windows)]
 pub mod sweep;
+pub mod vt_modes;

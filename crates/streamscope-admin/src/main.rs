@@ -118,6 +118,7 @@ macro_rules! live_route_sql {
 mod agent;
 mod alerts;
 mod audit_store;
+mod budget_seed;
 mod authz;
 mod batch_delete;
 mod body_read;

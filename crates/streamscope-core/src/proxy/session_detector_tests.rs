@@ -492,6 +492,41 @@ fn the_cap_evicts_a_whole_user_and_returns() {
     assert_eq!(listed(&detector, second, key_id).len(), 1);
 }
 
+/// A user's first turn, then two other users' turns that push it past the cap,
+/// then the user's next turn of the same conversation: `(first, next)`.
+fn next_turn_after_eviction(client_session_id: Option<&str>) -> (SessionInfo, SessionInfo) {
+    let detector = SessionDetector::with_capacity(1, HOUR, 2 * weight(1));
+    let (user, key, tenant) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let first = detector.detect(user, key, tenant, &h(&["m1"]), root(&["m1"]), client_session_id);
+    detector.record(user, key, Uuid::new_v4(), &first, &h(&["m1"]), client_session_id);
+    for (i, other) in [Uuid::new_v4(), Uuid::new_v4()].into_iter().enumerate() {
+        std::thread::sleep(Duration::from_millis(2));
+        detector.record(other, key, Uuid::new_v4(), &baseline(), &h(&[&format!("other_{i}")]), None);
+    }
+    assert!(detector.recent_turns.get(&(user, key)).is_none(), "the cap evicted the first user");
+    let next = detector.detect(user, key, tenant, &h(&["m1", "m2"]), root(&["m1", "m2"]), client_session_id);
+    (first, next)
+}
+
+#[test]
+fn an_evicted_user_under_a_client_session_id_keeps_its_session() {
+    // Nothing the detector holds continues the turn, so it names a thread of
+    // its own — derived from the client's id and the thread's first message,
+    // which are what the evicted turn's session was derived from.
+    let (first, next) = next_turn_after_eviction(Some("s"));
+    assert_eq!(next.session_id, first.session_id);
+}
+
+#[test]
+fn an_evicted_user_without_a_client_session_id_starts_a_new_session() {
+    // The documented cost of a bounded cache for a client sending no session
+    // id: a header-less thread's id is random, since one derived from its
+    // first message alone would merge every conversation opening with "hi".
+    let (first, next) = next_turn_after_eviction(None);
+    assert_ne!(next.session_id, first.session_id);
+    assert!(next.parent_request_id.is_none());
+}
+
 #[test]
 fn a_pass_forgets_whole_conversations_least_recently_active_first() {
     // One user's long conversation and another's short one, past the cap:

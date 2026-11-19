@@ -18,9 +18,10 @@
 //! one an observe check only recorded) goes out as sent. An item a detector
 //! failed on is not recorded.
 //!
-//! The record is this process's own, bounded in bytes (the least recently used
-//! entry goes first) and forgotten after a day: what it does not hold is screened again — a missing entry costs a
-//! scan, never a skipped one.
+//! The record is this process's own, bounded in bytes of memory — each entry
+//! weighed with what it costs in the cache, not only its text — (the least
+//! recently used entry goes first) and forgotten after a day: what it does not
+//! hold is screened again — a missing entry costs a scan, never a skipped one.
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -30,9 +31,24 @@ use sha2::{Digest, Sha256};
 use super::GuardrailSettings;
 use crate::audit::badge::AuditBadge;
 
-/// How many bytes the record holds — its keys and the texts an edit keeps,
-/// weighed per entry.
+/// How many bytes of memory the record holds, every entry weighed by
+/// [`weight`].
 const CAPACITY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// What an entry costs the cache beside its key and texts: the cache's own
+/// bookkeeping (its entry, value and order records, the shared key) and the
+/// record's allocation — about 340 bytes measured under load, rounded up.
+const ENTRY_OVERHEAD_BYTES: usize = 384;
+
+/// An entry's weight against [`CAPACITY_BYTES`]: what its key and texts
+/// occupy (their allocations, not their lengths: the texts' list and each
+/// text) and [`ENTRY_OVERHEAD_BYTES`].
+fn weight(key: &String, screened: &Screened) -> u32 {
+    let texts: usize = screened.texts.capacity() * std::mem::size_of::<(usize, String)>()
+        + screened.texts.iter().map(|(_, t)| t.capacity()).sum::<usize>();
+    let badges = screened.badges.capacity() * std::mem::size_of::<AuditBadge>();
+    u32::try_from(key.capacity() + texts + badges + ENTRY_OVERHEAD_BYTES).unwrap_or(u32::MAX)
+}
 
 /// How long an entry is kept, read or not: a verdict outlives no detector
 /// change behind the same settings (a model upgraded at the same endpoint) by
@@ -60,10 +76,7 @@ static SCREENED: LazyLock<moka::future::Cache<String, Arc<Screened>>> = LazyLock
     moka::future::Cache::builder()
         .eviction_policy(moka::policy::EvictionPolicy::lru())
         .max_capacity(CAPACITY_BYTES)
-        .weigher(|key: &String, screened: &Arc<Screened>| {
-            let texts: usize = screened.texts.iter().map(|(_, t)| t.len()).sum();
-            u32::try_from(key.len() + texts + 64).unwrap_or(u32::MAX)
-        })
+        .weigher(|key: &String, screened: &Arc<Screened>| weight(key, screened))
         .time_to_live(LIFETIME)
         .build()
 });
@@ -94,6 +107,13 @@ fn entry(tenant: uuid::Uuid, fingerprint: &str, protocol: &str, item_key: &str, 
         Some(c) => format!("{tenant}|{fingerprint}|{protocol}|{item_key}|{c}"),
         None => format!("{tenant}|{fingerprint}|{protocol}|{item_key}"),
     }
+}
+
+/// [`entry`] as the cache holds it: no spare capacity.
+fn held_entry(tenant: uuid::Uuid, fingerprint: &str, protocol: &str, item_key: &str, conversation: Option<uuid::Uuid>) -> String {
+    let mut key = entry(tenant, fingerprint, protocol, item_key, conversation);
+    key.shrink_to_fit();
+    key
 }
 
 /// What was done to this item, screened under these settings for this tenant
@@ -130,5 +150,23 @@ pub async fn record(
     } else {
         return;
     };
-    SCREENED.insert(entry(tenant, fingerprint, protocol, item_key, held_for), Arc::new(screened)).await;
+    SCREENED.insert(held_entry(tenant, fingerprint, protocol, item_key, held_for), Arc::new(screened)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_entry_weighs_what_it_occupies_not_only_its_text() {
+        let key = held_entry(uuid::Uuid::nil(), "f", "anthropic", "k", Some(uuid::Uuid::nil()));
+        assert_eq!(key.capacity(), key.len(), "a held key keeps no spare capacity");
+        let plain = weight(&key, &Screened::default()) as usize;
+        assert_eq!(plain, key.capacity() + ENTRY_OVERHEAD_BYTES);
+        // Every byte an edit keeps counts, at its allocation.
+        let mut text = String::with_capacity(1000);
+        text.push_str("[REDACTED]");
+        let edited = Screened { texts: vec![(0, text)], badges: Vec::new(), found: true };
+        assert_eq!(weight(&key, &edited) as usize, plain + edited.texts.capacity() * std::mem::size_of::<(usize, String)>() + 1000);
+    }
 }

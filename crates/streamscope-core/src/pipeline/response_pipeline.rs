@@ -498,6 +498,8 @@ async fn record_mixed_pending_into_cache(
         arguments: serde_json::Value,
         thought_signature: Option<String>,
         dispatch: &'a Result<crate::web::DispatchOutcome, crate::web::WebError>,
+        op: crate::config::tool_rules::WebInterceptKind,
+        declares: crate::web::DeclaredArgs,
     }
     let mut candidates: Vec<ParkCandidate<'_>> = Vec::new();
     for (p, outcome) in pending.iter().zip(dispatch_outcomes.iter()) {
@@ -534,6 +536,8 @@ async fn record_mixed_pending_into_cache(
             arguments,
             thought_signature: p.thought_signature.clone(),
             dispatch: outcome,
+            op: p.binding.web_op(),
+            declares: p.binding.declares,
         });
     }
     if candidates.is_empty() {
@@ -595,15 +599,11 @@ async fn record_mixed_pending_into_cache(
                 None if guardrail_spotlight => (spotlight_wrap(&o.folded), false),
                 None => (o.folded.clone(), false),
             },
-            Err(err) => {
-                // The same text the same-request fold sends: the category, so
-                // no upstream or parse detail reaches the conversation.
-                let payload = serde_json::json!({
-                    "error": err.tool_result_text(),
-                    "category": err.category(),
-                });
-                (payload.to_string(), true)
-            }
+            // The bare `model_text` — the form the same-request fold sends
+            // every error tool result in, a refused call's
+            // (`WebError::PolicyBlocked`) included: a code the model knows and
+            // what to do, never an upstream detail or the audit category.
+            Err(err) => (err.model_text(c.op, c.declares), true),
         };
         cache.record(
             session_uuid,
@@ -2364,7 +2364,7 @@ impl ResponsePipeline {
                         Err(e) => DomainEvent::ServerToolError {
                             index: p.tool_call_index,
                             tool_use_id: tool_use_id.clone(),
-                            error_kind: e.category().to_string(),
+                            error_kind: e.model_code(p.binding.web_op()),
                         },
                     };
                     for chunk in emitter.process_streaming_event(&result_event, None) {
@@ -2372,18 +2372,16 @@ impl ResponsePipeline {
                     }
                 }
                 if let Some(acc) = &mut accumulator {
-                    // One badge per unique `server_type` in the round —
-                    // BadgeBuilder dedupes across multiple rounds so
-                    // operators see one chip per emulated server-tool kind.
-                    let mut seen: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
+                    // A badge per visible call, with the members its binding
+                    // does not honour — BadgeBuilder folds them into one chip
+                    // per emulated server-tool kind, keys unioned, across
+                    // calls and rounds.
                     for p in pending.iter().filter(|p| p.blocked.is_none()) {
-                        if let Some(st) = p.binding.original_server_type.as_ref()
-                            && seen.insert(st.clone())
-                        {
+                        if let Some(st) = p.binding.original_server_type.as_ref() {
                             acc.badges.add(
                                 crate::audit::badge::AuditBadge::WebSubstitutedServer {
                                     server_type: st.clone(),
+                                    not_honoured: p.binding.not_honoured.clone(),
                                 },
                             );
                         }
@@ -2423,7 +2421,7 @@ impl ResponsePipeline {
                     }
                     Err(e) => {
                         had_executor_error |= !matches!(e, crate::web::WebError::PolicyBlocked(_));
-                        let safe_msg = e.tool_result_text();
+                        let safe_msg = e.model_text(p.binding.web_op(), p.binding.declares);
                         tool_results.push((tool_use_id.clone(), safe_msg, true));
                     }
                 }
@@ -3506,7 +3504,7 @@ impl ResponsePipeline {
                         }
                         Err(e) => {
                             had_executor_error |= !matches!(e, crate::web::WebError::PolicyBlocked(_));
-                            let safe_msg = e.tool_result_text();
+                            let safe_msg = e.model_text(p.binding.web_op(), p.binding.declares);
                             tool_results.push((tool_use_id, safe_msg, true));
                         }
                     }
@@ -3546,14 +3544,13 @@ impl ResponsePipeline {
                 // post-loop walker can prepend native server-tool blocks
                 // into the final body, and emit one
                 // `WebSubstitutedServer` chip per unique `server_type`
-                // (BadgeBuilder dedupes across rounds).
+                // (BadgeBuilder folds calls and rounds into one, keys
+                // unioned).
                 let any_visible_mode = pending
                     .iter()
                     .any(|p| p.binding.original_server_type.is_some());
                 if any_visible_mode {
                     let mut visible_calls: Vec<response_blocks::VisibleModeCall> = Vec::new();
-                    let mut seen_server_types: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
                     for (p, r) in pending.iter().zip(dispatch_results.iter()) {
                         let Some(server_type) = p.binding.original_server_type.as_ref() else {
                             continue;
@@ -3563,13 +3560,10 @@ impl ResponsePipeline {
                         if p.blocked.is_some() {
                             continue;
                         }
-                        if seen_server_types.insert(server_type.clone()) {
-                            sub_badges.add(
-                                crate::audit::badge::AuditBadge::WebSubstitutedServer {
-                                    server_type: server_type.clone(),
-                                },
-                            );
-                        }
+                        sub_badges.add(crate::audit::badge::AuditBadge::WebSubstitutedServer {
+                            server_type: server_type.clone(),
+                            not_honoured: p.binding.not_honoured.clone(),
+                        });
                         let tool_use_id = resolve_sub_tool_use_id(&p.tool_use_id, round_offset + p.tool_call_index, request_id);
                         let input: serde_json::Value =
                             serde_json::from_str(&p.arguments_json)
@@ -3592,7 +3586,7 @@ impl ResponsePipeline {
                                 response_blocks::VisibleModeOutcome::Success(content)
                             }
                             Err(e) => response_blocks::VisibleModeOutcome::Error(
-                                e.category().to_string(),
+                                e.model_code(p.binding.web_op()),
                             ),
                         };
                         visible_calls.push(response_blocks::VisibleModeCall {
@@ -8502,7 +8496,7 @@ fn synthesize_anthropic_frames(
                 "tool_use_id": tool_use_id,
                 "content": {
                     "type": "web_search_tool_result_error",
-                    "error_code": translate::anthropic_web_search_error_code(error_kind)
+                    "error_code": translate::anthropic_web_search_error_code(*error_kind)
                 }
             }),
             None,
@@ -9778,6 +9772,8 @@ mod tests {
                 },
                 action: "substitute".to_string(),
                 original_server_type: None,
+                declares: Default::default(),
+                not_honoured: Vec::new(),
             },
             tool_use_id: id.map(|s| s.to_string()),
             tool_name: name.to_string(),
@@ -11018,6 +11014,8 @@ mod tests {
                 },
                 action: "intercept_only".into(),
                 original_server_type: original_server_type.map(str::to_string),
+                declares: Default::default(),
+                not_honoured: Vec::new(),
             },
             tool_use_id: tool_use_id.map(str::to_string),
             tool_name: "web_search".into(),
@@ -11253,6 +11251,11 @@ mod tests {
         assert_eq!(drained[0].result_text, r#"{"hits":[]}"#);
         assert_eq!(drained[1].tool_use_id, "tu_err");
         assert!(drained[1].is_error);
+        // The bare text the same-request fold sends for the same error.
+        assert_eq!(
+            drained[1].result_text,
+            crate::web::WebError::NoBackend.model_text(pending[1].binding.web_op(), pending[1].binding.declares)
+        );
     }
 
     /// Guardrail with a classifier configured (unreachable URL so the scan
@@ -11394,7 +11397,7 @@ mod tests {
             super::DomainEvent::ServerToolError {
                 index: 0,
                 tool_use_id: "srvtoolu_1".into(),
-                error_kind: "unavailable".into(),
+                error_kind: crate::web::ModelErrorCode::Unavailable,
             },
         ] {
             out.extend(emitter.process_streaming_event(&event, None));

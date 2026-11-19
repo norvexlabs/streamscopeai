@@ -405,3 +405,43 @@
   path: /usr/libexec/docker/cli-plugins/docker-compose
   reason: "github.com/klauspost/compress in docker-compose, Docker's latest package for Ubuntu 26.04 (Compose 5.7.0, compress 1.20.0); a crafted zstd frame panics the reader; re-checked 2026-11-06: no release of it is built with the fix yet"
   expires: 2027-01-01
+- id: CVE-2026-107496
+  artifact: postgres
+  package: libcrypto3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-107496
+  artifact: postgres
+  package: libssl3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-88823
+  artifact: postgres
+  package: libcrypto3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-88823
+  artifact: postgres
+  package: libssl3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-95691
+  artifact: postgres
+  package: libcrypto3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-95691
+  artifact: postgres
+  package: libssl3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-95692
+  artifact: postgres
+  package: libcrypto3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19
+- id: CVE-2026-95692
+  artifact: postgres
+  package: libssl3
+  reason: "OpenSSL 3.5.9-r0 in the official postgres image; 3.5.9-r1 is out, not yet in the image (its newest 18.7-alpine3.24 digest still carries r0). The database is reached only by the stack's own services, never published"
+  expires: 2026-12-19

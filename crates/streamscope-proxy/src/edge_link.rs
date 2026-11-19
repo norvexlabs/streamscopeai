@@ -1021,6 +1021,7 @@ impl IngestLoop {
             if let Err(e) = &applied {
                 tracing::warn!(tenant = %share.share.tenant, "applying an ingest outcome to the outbox failed: {e}");
             }
+            self.proxy_stats.record_outbox_shipped(shipped_records(outcome, &applied, share.record_count()));
             if backs_off(outcome, &applied) {
                 retried += 1;
             }
@@ -1213,6 +1214,15 @@ async fn upload(
         }
         None => anyhow::bail!("blob upload answered {status}"),
     }
+}
+
+/// The records an applied ingest answer let go of as shipped: those of a share
+/// admin-api stored (`Committed`) or refused for their data (`Rejected`), once
+/// the outbox applied it. A deleted tenant's records are dropped, not shipped,
+/// and a `Retry` keeps them.
+fn shipped_records(outcome: &ShareOutcome, applied: &Result<Applied, anyhow::Error>, records: u64) -> u64 {
+    let shipped = matches!(outcome, ShareOutcome::Committed | ShareOutcome::Rejected { .. }) && applied.is_ok();
+    if shipped { records } else { 0 }
 }
 
 /// Whether a share's answer, as the outbox applied it, backs the ingest loop
@@ -1523,6 +1533,21 @@ mod tests {
         assert_eq!(read(S::PAYLOAD_TOO_LARGE, &answer("edge_blob_refused")), "retried");
         assert_eq!(read(S::NOT_FOUND, &answer("tenant_not_found")), "retried");
         assert_eq!(read(S::INTERNAL_SERVER_ERROR, &answer("internal_error")), "retried");
+    }
+
+    #[test]
+    fn only_records_admin_stored_or_refused_count_as_shipped() {
+        let ok = || -> Result<Applied, anyhow::Error> { Ok(Applied::Deleted) };
+        let rejected = ShareOutcome::Rejected { rows: vec![], reason: "bad".into() };
+        assert_eq!(shipped_records(&ShareOutcome::Committed, &ok(), 3), 3);
+        assert_eq!(shipped_records(&rejected, &ok(), 3), 3);
+        assert_eq!(shipped_records(&ShareOutcome::TenantDeleted, &ok(), 3), 0, "dropped, not shipped");
+        assert_eq!(shipped_records(&ShareOutcome::Retry { missing: vec![] }, &Ok(Applied::Kept), 3), 0);
+        assert_eq!(
+            shipped_records(&ShareOutcome::Committed, &Err(anyhow::anyhow!("disk")), 3),
+            0,
+            "the outbox still holds what it failed to let go"
+        );
     }
 
     #[test]

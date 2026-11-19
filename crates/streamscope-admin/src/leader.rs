@@ -58,6 +58,11 @@ pub const LOCK_EDGE_EVENTS: i64 = 737010;
 /// (`config_bump_commit` in migration 020 spells the number), so bump ids are
 /// assigned in commit order.
 pub const LOCK_CONFIG_BUMPS: i64 = 737011;
+/// The class of the transaction lock that orders one tenant's organisation
+/// ceiling writes (`budget_seed::lock_ceiling`): the two-key form
+/// `pg_advisory_xact_lock(class, hashtext(tenant))`, a key space apart from
+/// the one-key locks above.
+pub const LOCK_ORG_CEILING: i32 = 737013;
 
 /// Try to acquire a session-level advisory lock on a dedicated connection.
 ///

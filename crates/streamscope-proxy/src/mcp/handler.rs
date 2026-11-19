@@ -54,7 +54,7 @@ use super::jsonrpc::{
     MCP_BLOCKED_BY_POLICY,
     MCP_OAUTH_CLIENT_NOT_CONFIGURED, MCP_UPSTREAM_SSRF_REFUSED, MCP_USER_CREDENTIAL_EXPIRED,
     MCP_USER_CREDENTIAL_MISSING, MCP_USER_OAUTH_REFRESH_FAILED,
-    METHOD_NOT_FOUND, PARSE_ERROR, ROUTE_NOT_FOUND, TOOL_NOT_FOUND,
+    METHOD_NOT_FOUND, PARSE_ERROR, ROUTE_NOT_FOUND,
     UPSTREAM_CREDENTIAL_UNAVAILABLE, UPSTREAM_ERROR,
 };
 /// Ceiling on an inbound MCP request body. Shared by the normal read and by
@@ -456,7 +456,7 @@ pub(crate) fn upstream_error_to_jsonrpc(err: &UpstreamError, sign_ins_url: Optio
         ),
         UpstreamError::Http { status, .. } => (UPSTREAM_ERROR, format!("upstream HTTP {status}")),
         UpstreamError::Transport(_) => (UPSTREAM_ERROR, "upstream transport error".into()),
-        UpstreamError::Decode(_) => (UPSTREAM_ERROR, "upstream returned malformed JSON".into()),
+        UpstreamError::Decode(_) => (UPSTREAM_ERROR, MALFORMED_UPSTREAM_JSON.into()),
         UpstreamError::EmptyBody => (UPSTREAM_ERROR, "upstream returned empty body".into()),
         UpstreamError::ResponseTooLarge { limit } => (
             UPSTREAM_ERROR,
@@ -875,23 +875,13 @@ fn validate_era_body(
 /// status code, and a JSON-RPC error body carrying the typed `data` payload
 /// the client branches on.
 fn modern_error_response(id: RpcId, err: &ModernError) -> Response<Body> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": err.code,
-            "message": err.message,
-            "data": err.data,
-        }
-    });
-    // `data: null` is legal JSON-RPC but noise on the wire; drop it when the
-    // error carries no typed payload.
-    let mut body = body;
-    if err.data.is_none()
-        && let Some(e) = body.get_mut("error").and_then(|e| e.as_object_mut())
-    {
-        e.remove("data");
-    }
+    let body = JsonRpcResponse {
+        jsonrpc: "2.0".into(),
+        id,
+        result: None,
+        error: Some(err.clone().into()),
+        audit_error: None,
+    };
     let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     Response::builder()
         .status(err.status)
@@ -1789,6 +1779,7 @@ async fn handle_authenticated_request(
     if let Err(e) = streamscope_core::middleware::rate_limit::check_rate_limit(
         &identity.user,
         &state.app.usage,
+        streamscope_core::middleware::rate_limit::RateSurface::Mcp,
     ) {
         return rate_limited_response(&state, &identity, request_id, &slug, &request, &virtual_server,
             started, request_bytes, user_agent.clone(), mcp_session_id.clone(), e).await;
@@ -2119,18 +2110,21 @@ async fn handle_authenticated_request(
         super::policy::PolicyDecision::Allow(None)
     };
 
-    // Branch on the policy decision. `Block` returns -32506 immediately.
-    // `Replace` rebuilds the request with mutated params before dispatch.
-    // `Allow` proceeds with the original request; any classification result
-    // is captured for the audit row.
+    // Branch on the policy decision. `Block` answers immediately: a blocked
+    // `tools/call` as a tool execution error (a result with `isError` naming
+    // the rule, so the model can adapt — MCP § Tools, Error Handling), every
+    // other method, which has no such result, as JSON-RPC -32506; the audit
+    // row records -32506 either way. `Replace` rebuilds the request with
+    // mutated params before dispatch. `Allow` proceeds with the original
+    // request; any classification result is captured for the audit row.
     let (request, policy_classification) = match policy_decision {
         super::policy::PolicyDecision::Block { result, message } => {
-            let resp = error_response(
-                StatusCode::OK,
-                request.id.clone().unwrap_or(RpcId::Null),
-                MCP_BLOCKED_BY_POLICY,
-                message.clone(),
-            );
+            let rpc_id = request.id.clone().unwrap_or(RpcId::Null);
+            let resp = if scope == McpScope::ToolCall {
+                blocked_tool_call_response(rpc_id, &message, &era, &gateway_server_info(&virtual_server))
+            } else {
+                error_response(StatusCode::OK, rpc_id, MCP_BLOCKED_BY_POLICY, message.clone())
+            };
             emit_audit_with_policy(
                 &state,
                 &identity,
@@ -2522,11 +2516,13 @@ async fn handle_method_streaming(
     let (route, suffix) = match resolved {
         Some(found) => found,
         None => {
-            let msg = format!("no route serves {name:?}");
+            // An unknown tool or prompt is a protocol error, `-32602` (Invalid
+            // params) in every revision's tools and prompts error handling.
+            let msg = unknown_name_message(&name);
             let resp = era_error_response(
                 StatusCode::OK,
                 rpc_id,
-                TOOL_NOT_FOUND,
+                INVALID_PARAMS,
                 msg.clone(),
                 &auth.era,
             );
@@ -2535,7 +2531,7 @@ async fn handle_method_streaming(
                 &state, &identity, request_id, &slug,
                 Some(virtual_server_id), None, method.clone(),
                 tid, pid, rid,
-                Some(TOOL_NOT_FOUND), Some(msg),
+                Some(INVALID_PARAMS), Some(msg),
                 started, Instant::now(), request_bytes, 0,
                 user_agent, mcp_session_id, resp.status(),
                 policy_classification, policy_app_id,
@@ -2576,12 +2572,15 @@ async fn handle_method_streaming(
     if let Some(f) = route_filter
         && !f.permits(&suffix)
     {
-        let msg = format!("name '{suffix}' is denied by route filter");
+        // A name the route filters out is one this virtual server does not
+        // have: answered exactly as an unknown tool or prompt above, so the
+        // answer does not tell a client the route exists and denies it. The
+        // audit row keeps the reason.
         let resp = era_error_response(
             StatusCode::OK,
             rpc_id,
-            TOOL_NOT_FOUND,
-            msg.clone(),
+            INVALID_PARAMS,
+            unknown_name_message(&name),
             &auth.era,
         );
         let (tid, pid, rid) = make_audit_ids(&name);
@@ -2589,7 +2588,7 @@ async fn handle_method_streaming(
             &state, &identity, request_id, &slug,
             Some(virtual_server_id), Some(upstream.id), method.clone(),
             tid, pid, rid,
-            Some(TOOL_NOT_FOUND), Some(msg),
+            Some(INVALID_PARAMS), Some(format!("name '{suffix}' is denied by route filter")),
             started, Instant::now(), request_bytes, 0,
             user_agent, mcp_session_id, resp.status(),
             policy_classification, policy_app_id,
@@ -2846,31 +2845,33 @@ async fn handle_method_streaming(
             // revision does not define. Runs before the audit tuple is read
             // so the row records what the client was actually told when the
             // gateway had to refuse a question on its behalf.
-            if let Some(relay) = &modern_relay {
-                relay.adapt_response(&mut resp_value);
-            }
+            let relayed = adapt_one_shot_reply(
+                modern_relay.as_ref(),
+                super::virtual_servers::is_internal(&upstream),
+                &mut resp_value,
+            );
             // Audit records the upstream's own error code; only the wire copy
             // is renumbered for a modern client, so an operator reading the
-            // row still sees what the upstream actually said.
-            let err_tuple = resp_value.error.as_ref().map(|e| (e.code, e.message.clone()));
-            if auth.era.is_modern() {
-                if let Some(result) = resp_value.result.as_mut() {
-                    modern::stamp_result(
-                        result,
-                        &method,
-                        &server_info,
-                        modern_cache_hint(&method, std::slice::from_ref(&upstream)),
-                    );
-                }
-                if let Some(err) = resp_value.error.as_mut() {
-                    modern::modernize_error(err);
-                }
-            }
+            // row still sees what the upstream actually said. An upstream
+            // tool's own failure (`isError`) is recorded as one too; every
+            // recorded text — an upstream's or the gateway's own server's —
+            // goes through `redact_upstream_body`: bounded, with the
+            // upstream's own credentials this call used and any `Bearer`
+            // token stripped.
+            let err_tuple = upstream_reply_outcome(&resp_value, scope, &upstream_auth);
+            let status = stamp_one_shot_reply(
+                &mut resp_value,
+                &method,
+                &server_info,
+                modern_cache_hint(&method, std::slice::from_ref(&upstream)),
+                &auth.era,
+                relayed,
+            );
             let body_bytes = serde_json::to_vec(&resp_value).unwrap_or_else(|_| b"{}".to_vec());
             let response_bytes = body_bytes.len() as i32;
             let builder = stamp_session_id(
                 Response::builder()
-                    .status(StatusCode::OK)
+                    .status(status)
                     .header("Content-Type", "application/json"),
                 response_session_id.as_ref(),
                 auth.era.is_modern(),
@@ -2887,7 +2888,7 @@ async fn handle_method_streaming(
                 err_tuple.map(|(_, m)| m),
                 started, Instant::now(), request_bytes, response_bytes,
                 user_agent, mcp_session_id.or(response_session_id),
-                StatusCode::OK,
+                status,
                 policy_classification, policy_app_id,
                 policy_detection_method.clone(),
                 request.params.clone(), resp_value.result.clone(),
@@ -3079,23 +3080,26 @@ impl ModernStreamCtx {
 /// streaming one: the same method, stamped or unstamped depending on how the
 /// upstream chose to answer.
 ///
-/// Returns `None` for anything that is not a response to our request, leaving
-/// notifications and server-initiated requests untouched.
+/// Stamps the parsed event in place and returns whether it changed; `false`
+/// for anything that is not a response to our request, leaving notifications
+/// and server-initiated requests untouched, so their bytes are kept.
 ///
 /// The two streaming methods are not `CacheableResult`s, so no freshness hint
 /// is added — passing one here would attach `ttlMs` to a tool call.
 fn stamp_streamed_response(
-    raw: &str,
+    value: &mut serde_json::Value,
     method: &str,
     server_info: &serde_json::Value,
-) -> Option<String> {
-    let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let obj = value.as_object_mut()?;
-    if obj.contains_key("method") || !obj.contains_key("id") {
-        return None;
+) -> bool {
+    if !is_final_response(value) {
+        return false;
     }
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
     if let Some(result) = obj.get_mut("result") {
         modern::stamp_result(result, method, server_info, None);
+        true
     } else if let Some(err) = obj.get_mut("error")
         && let Ok(mut parsed) =
             serde_json::from_value::<super::jsonrpc::JsonRpcError>(err.clone())
@@ -3108,14 +3112,142 @@ fn stamp_streamed_response(
         let before = parsed.code;
         modern::modernize_error(&mut parsed);
         if parsed.code == before {
-            return None;
+            return false;
         }
-        *err = serde_json::to_value(&parsed).ok()?;
+        match serde_json::to_value(&parsed) {
+            Ok(renumbered) => {
+                *err = renumbered;
+                true
+            }
+            Err(_) => false,
+        }
     } else {
+        false
+    }
+}
+
+/// Bring a route's one-shot reply into the client's shape through the modern
+/// `relay` (a modern upstream's), and say whether what it now carries is the
+/// upstream's own answer (`true`, *relayed*) or one the gateway produced: the
+/// gateway's own server's (`internal`), or a refusal the relay put in the
+/// upstream's place. The answer decides the HTTP status
+/// ([`stamp_one_shot_reply`]).
+fn adapt_one_shot_reply(relay: Option<&ModernUpstreamRelay>, internal: bool, resp: &mut JsonRpcResponse) -> bool {
+    let gateway_refused = relay.is_some_and(|relay| relay.adapt_response(resp));
+    !internal && !gateway_refused
+}
+
+/// What a route's one-shot reply records on the audit row — an upstream's
+/// answer or the gateway's own server's: the error it carries for the audit
+/// ([`JsonRpcResponse::audited_error`]: its JSON-RPC error, else the failure
+/// the gateway's server recorded beside an `isError` result), else — for a
+/// `tools/call` — its result's own failure, by [`reply_outcome`]. `None`: a
+/// success. Nothing here reaches the client.
+fn upstream_reply_outcome(
+    resp: &JsonRpcResponse,
+    scope: McpScope,
+    upstream_auth: &UpstreamAuth,
+) -> Option<(i32, String)> {
+    let error = resp.audited_error().map(|e| (e.code, e.message.as_str()));
+    reply_outcome(error, resp.result.as_ref(), scope, upstream_auth)
+}
+
+/// What a reply a [`dispatch`] arm forwarded records: its error
+/// ([`JsonRpcResponse::audited_error`]) by [`recorded_upstream_error`]; `None`
+/// for a success. None of those arms is a `tools/call`, so a result's own
+/// failure is not read. Nothing here reaches the client.
+fn dispatched_reply_outcome(resp: &JsonRpcResponse) -> Option<(i32, String)> {
+    let error = resp.audited_error()?;
+    Some(recorded_upstream_error(error.code, &error.message))
+}
+
+/// An upstream error a [`dispatch`] arm records, its text through
+/// [`upstream::redact_upstream_text`]: bounded and stripped of any `Bearer`
+/// token — the generic patterns only. No upstream credential is stripped:
+/// the arm holds none, and none is resolved to do it.
+fn recorded_upstream_error(code: i32, message: &str) -> (i32, String) {
+    (code, upstream::redact_upstream_text(message))
+}
+
+/// The one rule an answer's audit outcome follows, one-shot or streamed: its
+/// error (`code`, `message`), else — for a `tools/call` — its result's own
+/// failure (`isError`, [`MCP_TOOL_EXECUTION_ERROR`]); every text through
+/// [`upstream::redact_upstream_body`], which bounds it and strips the
+/// upstream's own credentials (the auth this `tools/call` / `prompts/get`
+/// used) plus any `Bearer` token. A [`dispatch`] arm's reply strips no
+/// upstream credential ([`recorded_upstream_error`]). `None`: a success.
+///
+/// [`MCP_TOOL_EXECUTION_ERROR`]: super::jsonrpc::MCP_TOOL_EXECUTION_ERROR
+fn reply_outcome(
+    error: Option<(i32, &str)>,
+    result: Option<&serde_json::Value>,
+    scope: McpScope,
+    upstream_auth: &UpstreamAuth,
+) -> Option<(i32, String)> {
+    if let Some((code, message)) = error {
+        return Some((code, upstream::redact_upstream_body(message, upstream_auth)));
+    }
+    let failure = result.filter(|_| scope == McpScope::ToolCall).and_then(super::jsonrpc::tool_failure_text)?;
+    Some((super::jsonrpc::MCP_TOOL_EXECUTION_ERROR, upstream::redact_upstream_body(&failure, upstream_auth)))
+}
+
+/// The outcome a streamed event records when it is the final response to the
+/// gateway's request — the event every other final-response step reads
+/// (no `method`, an `id`) — by [`reply_outcome`], as
+/// [`upstream_reply_outcome`] reads a one-shot reply: `None` for any other
+/// event, `Some(None)` for a final response that is a success. Its `error`
+/// reads through [`streamed_error_outcome`]. The one place a streamed event
+/// is judged final for the audit; it reads the value the pump parsed for the
+/// outcome, the modern stamp and the classification alike.
+fn streamed_reply_outcome(
+    value: &serde_json::Value,
+    scope: McpScope,
+    upstream_auth: &UpstreamAuth,
+) -> Option<Option<(i32, String)>> {
+    if !is_final_response(value) {
         return None;
     }
-    serde_json::to_string(&value).ok()
+    let obj = value.as_object()?;
+    if let Some(err) = obj.get("error") {
+        return Some(Some(streamed_error_outcome(err, upstream_auth)));
+    }
+    Some(reply_outcome(None, obj.get("result"), scope, upstream_auth))
 }
+
+/// Whether a streamed event is the final response to the gateway's request:
+/// an object with an `id` and no `method` — not a notification (no `id`) nor
+/// a server-initiated request (a `method`). The one predicate every
+/// final-response step on a stream reads.
+fn is_final_response(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(|obj| !obj.contains_key("method") && obj.contains_key("id"))
+}
+
+/// What a JSON-RPC `error` object carried on a stream records — a streamed
+/// final response's, or the MRTR terminate message the gateway writes in its
+/// place: its code and its message, as [`reply_outcome`] records an error.
+/// One without an `i32` `code` is the error a one-shot reply of that shape
+/// records — it does not decode, so [`UPSTREAM_ERROR`] with
+/// [`MALFORMED_UPSTREAM_JSON`].
+fn streamed_error_outcome(err: &serde_json::Value, upstream_auth: &UpstreamAuth) -> (i32, String) {
+    let code = err.get("code").and_then(serde_json::Value::as_i64).and_then(|c| i32::try_from(c).ok());
+    let message = err.get("message").and_then(serde_json::Value::as_str).unwrap_or_default();
+    match code {
+        Some(code) => (code, upstream::redact_upstream_body(message, upstream_auth)),
+        None => (UPSTREAM_ERROR, MALFORMED_UPSTREAM_JSON.to_string()),
+    }
+}
+
+/// What the client is told of a tool or prompt name this virtual server does
+/// not have — no route serves it, or its route filters it out: one message
+/// for both, so the answer is no oracle for a route's filter.
+fn unknown_name_message(name: &str) -> String {
+    format!("no route serves {name:?}")
+}
+
+/// What a reply the JSON-RPC types cannot read records — a one-shot body that
+/// does not decode, or a streamed final response whose `error` has no `i32`
+/// `code` — under [`UPSTREAM_ERROR`].
+const MALFORMED_UPSTREAM_JSON: &str = "upstream returned malformed JSON";
 
 /// What one pumped SSE event decided about the rest of the stream.
 ///
@@ -3136,6 +3268,11 @@ enum PumpOutcome {
     /// carry no error at all.
     Terminated(Option<(i32, String)>),
 }
+
+/// What the client is told when an upstream asks an input request this
+/// gateway does not know: not a `-32021` — it names no capability the client
+/// could add — but the upstream's failure.
+const UNKNOWN_INPUT_REQUEST: &str = "the upstream asked for an input this gateway does not know";
 
 /// A JSON-RPC error message for the MRTR terminate path, with the code brought
 /// into the era's legal range.
@@ -3260,20 +3397,23 @@ async fn mrtr_bridge(
             client_capabilities: mrtr.client_capabilities.clone(),
             log_level: None,
         };
-        if !meta.supports_input_request(&method) {
-            let err = ModernError::missing_client_capability(
-                modern::required_capability_for(&method),
-                format!("the upstream requires {method}, which this request did not declare support for"),
-            );
-            return MrtrOutcome::Terminate(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": mrtr.rpc_id,
-                "error": {
-                    "code": err.code,
-                    "message": err.message,
-                    "data": err.data,
-                }
-            }));
+        match modern::check_input_capabilities(&meta, std::slice::from_ref(&method)) {
+            modern::InputCapabilityCheck::Declared => {}
+            modern::InputCapabilityCheck::Unknown(_) => {
+                return MrtrOutcome::Terminate(mrtr_error(
+                    &mrtr.rpc_id,
+                    UPSTREAM_ERROR,
+                    UNKNOWN_INPUT_REQUEST,
+                    &mrtr.era,
+                ));
+            }
+            modern::InputCapabilityCheck::Missing(err) => {
+                return MrtrOutcome::Terminate(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": mrtr.rpc_id,
+                    "error": super::jsonrpc::JsonRpcError::from(err),
+                }));
+            }
         }
 
         let request_state = match streamscope_core::mcp::tokens::encode_request_state(
@@ -3469,6 +3609,9 @@ fn stream_method_response(
         let log_count: u32 = 0;
         let mut response_bytes_out: i32 = 0;
         let mut had_error: Option<(i32, String)> = None;
+        // What the final response to the request reported, as the audit
+        // records it (`streamed_reply_outcome`): the first one read wins.
+        let mut final_outcome: Option<Option<(i32, String)>> = None;
 
         // Inner closure to process one decoded event. Returns false if the
         // downstream channel is closed (client disconnect) so the outer loop
@@ -3487,6 +3630,8 @@ fn stream_method_response(
             response_bytes_out: &mut i32,
             mrtr: Option<&mut ModernStreamCtx>,
             modern_relay: Option<&ModernUpstreamRelay>,
+            scope: McpScope,
+            final_outcome: &mut Option<Option<(i32, String)>>,
         ) -> PumpOutcome {
             // ── Sampling intercept fork ──
             //
@@ -3559,15 +3704,8 @@ fn stream_method_response(
                         // SUCCESS — the bridge worked — and must leave the row
                         // free of any error; only a genuine error terminate
                         // carries one.
-                        let audit_outcome = message.get("error").and_then(|e| {
-                            let code = e.get("code")?.as_i64()? as i32;
-                            let msg = e
-                                .get("message")?
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            Some((code, msg))
-                        });
+                        let audit_outcome =
+                            message.get("error").map(|e| streamed_error_outcome(e, upstream_auth));
                         let wire = format!(
                             "event: message\ndata: {}\n\n",
                             serde_json::to_string(&message).unwrap_or_else(|_| "{}".into())
@@ -3644,6 +3782,21 @@ fn stream_method_response(
                 ev.data = adapted;
             }
 
+            // Parsed here, after every rewrite above (each of which parses
+            // the event for itself): the audit outcome, the modern stamp and
+            // the classification below share this one parse.
+            let mut parsed: Option<serde_json::Value> = serde_json::from_str(&ev.data).ok();
+
+            // The final response's outcome for the audit, read as the one-shot
+            // path reads it: after the relay adapted it, before the modern
+            // stamp renumbers the wire copy.
+            if final_outcome.is_none()
+                && let Some(outcome) =
+                    parsed.as_ref().and_then(|v| streamed_reply_outcome(v, scope, upstream_auth))
+            {
+                *final_outcome = Some(outcome);
+            }
+
             // Bring the final response up to modern shape. Runs after every
             // URI rewrite above so the stamps land on the body the client
             // actually receives, and before the classification below so the
@@ -3651,12 +3804,14 @@ fn stream_method_response(
             // replayed event that differed from the original would be a
             // second, quieter version of the same bug.
             if let Some((method, server_info)) = &modern_stamp
-                && let Some(stamped) = stamp_streamed_response(&ev.data, method, server_info)
+                && let Some(value) = parsed.as_mut()
+                && stamp_streamed_response(value, method, server_info)
+                && let Ok(stamped) = serde_json::to_string(value)
             {
                 ev.data = stamped;
             }
 
-            let classified = super::multiplex::classify_sse_event(&ev.data);
+            let classified = super::multiplex::classify_parsed(parsed.as_ref());
             let publish_to_bus = matches!(
                 classified.kind,
                 super::multiplex::EventKind::Sampling { .. }
@@ -3910,6 +4065,8 @@ fn stream_method_response(
                             &mut response_bytes_out,
                             mrtr.as_mut(),
                             modern_relay.as_ref(),
+                            scope,
+                            &mut final_outcome,
                         )
                         .await
                         {
@@ -3972,6 +4129,8 @@ fn stream_method_response(
                 &mut response_bytes_out,
                 mrtr.as_mut(),
                 modern_relay.as_ref(),
+                scope,
+                &mut final_outcome,
             )
             .await
             {
@@ -3988,6 +4147,13 @@ fn stream_method_response(
         ) = counters;
         if !client_connected && !gateway_terminated && had_error.is_none() {
             had_error = Some((UPSTREAM_ERROR, "client disconnected mid-stream".into()));
+        }
+        // A stream that ran to its end records what its final response
+        // reported. A stream the gateway ended keeps what it told the client
+        // (an `input_required` leg is a success), and a transport failure or
+        // a disconnect keeps precedence.
+        if !gateway_terminated && had_error.is_none() {
+            had_error = final_outcome.flatten();
         }
 
         // Per-request audit row for the original tools/call. Annotates the
@@ -4061,7 +4227,7 @@ fn stream_method_response(
             detection_method: policy_detection_method.clone(),
             latency_total_ms: total_ms,
             status_code: Some(200),
-            error_category: rpc_err_code.is_some().then(|| "rpc_error".to_string()),
+            error_category: rpc_err_code.map(|c| super::jsonrpc::audit_error_category(c).to_string()),
             error_detail: rpc_err_msg.clone(),
             limit_bucket: None,
             virtual_server_id,
@@ -5480,7 +5646,7 @@ async fn dispatch(
             // the URI a failed read names under `error.data.uri` as it is of
             // `result.contents[].uri`.
             super::multiplex::rewrite_response_uris(&mut resp, &route.prefix);
-            let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
+            let err_tuple = dispatched_reply_outcome(&resp);
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
 
@@ -5549,7 +5715,7 @@ async fn dispatch(
             }
             let (resp, sid) =
                 call_cached(cache, auth, upstream, &request, mcp_session_id, &route.prefix).await?;
-            let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
+            let err_tuple = dispatched_reply_outcome(&resp);
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
 
@@ -5599,17 +5765,11 @@ async fn dispatch(
                             )
                         }
                         Err(_) => {
-                            // A ref naming something that does not resolve is a
-                            // bad parameter, not a missing method — but that is
-                            // a claim about the MODERN wire only. Carrying the
-                            // uri is what lets the era gate renumber it to
-                            // `-32602` there while legacy keeps the `-32001` it
-                            // has read for three revisions.
                             return Ok((
-                                resource_not_found(request_id, uri),
+                                unknown_completion_ref(request_id, ref_type, ref_obj),
                                 None,
                                 None,
-                                Some((ROUTE_NOT_FOUND, "unknown resource uri in completion ref".into())),
+                                Some((INVALID_PARAMS, "unknown resource uri in completion ref".into())),
                             ));
                         }
                     }
@@ -5631,29 +5791,11 @@ async fn dispatch(
             let route = match route {
                 Some(r) => r,
                 None => {
-                    // A `ref/resource` names a URI, so it answers exactly as the
-                    // unresolvable ref above and as `resources/read` does —
-                    // otherwise one unroutable resource ref renumbers to
-                    // `-32602` and its neighbour to `-32601` for the same
-                    // method. A `ref/prompt` has no URI to name, so it keeps the
-                    // bare code: there is nothing for the era gate to recognise,
-                    // and inventing a `uri` field to trigger it would put a
-                    // value on the wire that names nothing.
-                    let resp = match ref_obj.get("uri").and_then(|v| v.as_str()) {
-                        Some(uri) if ref_type == "ref/resource" => {
-                            resource_not_found(request_id, uri)
-                        }
-                        _ => JsonRpcResponse::err(
-                            request_id,
-                            ROUTE_NOT_FOUND,
-                            "no route for completion ref",
-                        ),
-                    };
                     return Ok((
-                        resp,
+                        unknown_completion_ref(request_id, ref_type, ref_obj),
                         None,
                         None,
-                        Some((ROUTE_NOT_FOUND, "no route for completion ref".into())),
+                        Some((INVALID_PARAMS, "no route for completion ref".into())),
                     ));
                 }
             };
@@ -5678,12 +5820,15 @@ async fn dispatch(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !filter.permits(unprefixed_name) {
-                    let msg = format!("prompt '{unprefixed_name}' is denied by route filter");
+                    // A filtered name answers exactly as a name no route
+                    // serves ([`unknown_completion_ref`]), so the answer tells
+                    // a client nothing of the filter. The audit row keeps the
+                    // reason.
                     return Ok((
-                        JsonRpcResponse::err(request_id, TOOL_NOT_FOUND, msg.clone()),
+                        unknown_completion_ref(request_id, ref_type, ref_obj),
                         None,
                         None,
-                        Some((TOOL_NOT_FOUND, msg)),
+                        Some((INVALID_PARAMS, format!("prompt '{unprefixed_name}' is denied by route filter"))),
                     ));
                 }
             }
@@ -5706,7 +5851,7 @@ async fn dispatch(
             }
             let (resp, sid) =
                 call_cached(cache, auth, upstream, &request, mcp_session_id, &route.prefix).await?;
-            let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
+            let err_tuple = dispatched_reply_outcome(&resp);
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
 
@@ -5837,12 +5982,8 @@ async fn dispatch(
                     UPSTREAM_ERROR,
                     "logging/setLevel: no upstream accepted".into(),
                 ));
-                Ok((
-                    JsonRpcResponse::err(request_id, code, msg.clone()),
-                    response_session_id,
-                    None,
-                    Some((code, msg)),
-                ))
+                let recorded = recorded_upstream_error(code, &msg);
+                Ok((JsonRpcResponse::err(request_id, code, msg), response_session_id, None, Some(recorded)))
             }
         }
 
@@ -5894,7 +6035,7 @@ async fn dispatch(
             };
             let (resp, sid) =
                 call_cached(cache, auth, upstream, request, mcp_session_id, &route.prefix).await?;
-            let err_tuple = resp.error.as_ref().map(|e| (e.code, e.message.clone()));
+            let err_tuple = dispatched_reply_outcome(&resp);
             Ok((resp, sid, Some(upstream.id), err_tuple))
         }
     }
@@ -5968,10 +6109,7 @@ fn era_render_error(
     let mut status = status;
     if let Some(err) = body.error.as_mut() {
         if era.is_modern() {
-            // Renumber first, then choose the status from the renumbered code:
-            // the status must agree with the code the client actually reads.
-            modern::modernize_error(err);
-            let mandated = modern::http_status_for_error(err.code);
+            let mandated = modernize_error_with_status(err);
             if mandated != StatusCode::OK {
                 status = mandated;
             }
@@ -6076,6 +6214,88 @@ fn stamp_session_id(
     }
 }
 
+/// A `tools/call` a tool-call rule blocked, answered as a tool execution error
+/// whose text is the rule's message — the same words a JSON-RPC refusal
+/// carries — stamped for a modern client like every other `tools/call`
+/// result.
+fn blocked_tool_call_response(
+    id: RpcId,
+    message: &str,
+    era: &ProtocolEra,
+    server_info: &serde_json::Value,
+) -> Response<Body> {
+    let mut body = JsonRpcResponse::tool_execution_error(
+        id,
+        message,
+        super::jsonrpc::JsonRpcError { code: MCP_BLOCKED_BY_POLICY, message: message.to_string(), data: None },
+    );
+    let status = stamp_reply_for_era(&mut body, "tools/call", server_info, None, era);
+    rpc_error_response(status, &body)
+}
+
+/// Renumber `err` for a modern client, then the HTTP status it must travel
+/// with — chosen from the RENUMBERED code, because the status must agree with
+/// the code the client actually reads (2026-07-28 Streamable HTTP mandates
+/// `400` for `-32020`/`-32021`/`-32022` and `404` for `-32601`). The one
+/// derivation behind every modern error the gateway answers: a rendered
+/// error, a dispatched reply and a one-shot reply.
+fn modernize_error_with_status(err: &mut super::jsonrpc::JsonRpcError) -> StatusCode {
+    modern::modernize_error(err);
+    modern::http_status_for_error(err.code)
+}
+
+/// A one-shot reply to a `tools/call` or `prompts/get` — an upstream's, the
+/// gateway's own server's, or a refusal the gateway built — brought to the
+/// shape the client's revision defines, and the HTTP status it travels with.
+/// Modern (2026-07-28): a result carries `resultType` ("Servers implementing
+/// this protocol version MUST include this field") and the server identity in
+/// `_meta`, and an error is renumbered out of the frozen band, its status
+/// derived from the renumbered code ([`modernize_error_with_status`]). Legacy
+/// (2025-11-25 and earlier): left exactly as built, and `200` — its transport
+/// mandates no status for a JSON-RPC error answering a request.
+#[must_use]
+fn stamp_reply_for_era(
+    resp: &mut JsonRpcResponse,
+    method: &str,
+    server_info: &serde_json::Value,
+    cache_hint: Option<modern::CacheHint>,
+    era: &ProtocolEra,
+) -> StatusCode {
+    if !era.is_modern() {
+        return StatusCode::OK;
+    }
+    if let Some(result) = resp.result.as_mut() {
+        modern::stamp_result(result, method, server_info, cache_hint);
+    }
+    match resp.error.as_mut() {
+        Some(err) => modernize_error_with_status(err),
+        None => StatusCode::OK,
+    }
+}
+
+/// [`stamp_reply_for_era`] for the one-shot reply of a route. The status
+/// follows the code only for an error the GATEWAY produced — its own server's,
+/// or a refusal it put in an upstream's place (a `-32021` for a question the
+/// client did not declare it can answer, which 2026-07-28 Streamable HTTP
+/// sends with `400`). An error the upstream produced (`relayed`), answering
+/// in-band (HTTP 200), is relayed renumbered for a modern client and still
+/// with `200`, the status it arrived with — its frozen-band codes are the
+/// upstream's own vocabulary (the TypeScript SDK's `-32001` request timeout,
+/// say), and the `404` the renumbered `-32601` would carry would tell the
+/// client the gateway does not implement the method.
+#[must_use]
+fn stamp_one_shot_reply(
+    resp: &mut JsonRpcResponse,
+    method: &str,
+    server_info: &serde_json::Value,
+    cache_hint: Option<modern::CacheHint>,
+    era: &ProtocolEra,
+    relayed: bool,
+) -> StatusCode {
+    let status = stamp_reply_for_era(resp, method, server_info, cache_hint, era);
+    if relayed { StatusCode::OK } else { status }
+}
+
 fn error_response(
     status: StatusCode,
     id: RpcId,
@@ -6123,6 +6343,36 @@ fn resource_not_found(id: RpcId, uri: &str) -> JsonRpcResponse {
     )
 }
 
+/// The answer to a `completion/complete` whose `ref` names a prompt or a
+/// resource this virtual server does not serve — no route serves it, a URI
+/// the gateway did not mint, or a prompt its route filters out.
+///
+/// `-32602` (Invalid params) on every era: the Completion page of both
+/// 2025-11-25 and 2026-07-28 answers an invalid prompt name with it, and a ref
+/// is a parameter of the call, not a missing endpoint. A prompt ref carries
+/// the message `prompts/get` gives an unknown or filtered name, so a filtered
+/// and an unknown prompt answer alike; a resource ref carries its `uri` in
+/// `data`, as the 2026-07-28 resource-not-found answer does.
+fn unknown_completion_ref(
+    id: RpcId,
+    ref_type: &str,
+    ref_obj: &serde_json::Map<String, serde_json::Value>,
+) -> JsonRpcResponse {
+    match (ref_type, ref_obj.get("uri").and_then(|v| v.as_str())) {
+        ("ref/resource", Some(uri)) => JsonRpcResponse::err_with_data(
+            id,
+            INVALID_PARAMS,
+            "resource not found",
+            serde_json::json!({ "uri": uri }),
+        ),
+        ("ref/resource", None) => JsonRpcResponse::err(id, INVALID_PARAMS, "resource not found"),
+        _ => {
+            let name = ref_obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            JsonRpcResponse::err(id, INVALID_PARAMS, unknown_name_message(name))
+        }
+    }
+}
+
 /// The freshness hint to attach to a modern result, or `None` when the method
 /// is not a `CacheableResult`.
 ///
@@ -6162,22 +6412,13 @@ fn finalize_modern_response(
     if !era.is_modern() {
         return StatusCode::OK;
     }
-    if let Some(result) = resp.result.as_mut() {
-        modern::stamp_result(
-            result,
-            method,
-            &gateway_server_info(virtual_server),
-            modern_cache_hint(method, upstreams),
-        );
-    }
-    if let Some(err) = resp.error.as_mut() {
-        // Renumber first, then choose the status from the renumbered code:
-        // the status must agree with the code the client actually reads, and
-        // `modernize_error` is what decides that code.
-        modern::modernize_error(err);
-        return modern::http_status_for_error(err.code);
-    }
-    StatusCode::OK
+    stamp_reply_for_era(
+        resp,
+        method,
+        &gateway_server_info(virtual_server),
+        modern_cache_hint(method, upstreams),
+        era,
+    )
 }
 
 /// What the gateway learned by opening its connection to every enabled route.
@@ -7502,11 +7743,13 @@ impl ModernUpstreamRelay {
     /// `Ok(None)` — an ordinary result; relay it untouched.
     /// `Ok(Some(result))` — relay this instead (an `InputRequiredResult`
     /// re-wrapped around a state only this gateway can verify).
-    /// `Err((code, message))` — the client cannot be asked; fail the call.
+    /// `Err(error)` — the client cannot be asked; fail the call with this
+    /// error, `data` included (a `-32021`'s `requiredCapabilities`).
     fn adapt_result(
         &self,
         result: &serde_json::Value,
-    ) -> Result<Option<serde_json::Value>, (i32, String)> {
+    ) -> Result<Option<serde_json::Value>, super::jsonrpc::JsonRpcError> {
+        let fail = |code: i32, message: String| super::jsonrpc::JsonRpcError { code, message, data: None };
         let required = match modern::parse_input_required(result) {
             modern::InputRequiredShape::No => return Ok(None),
             modern::InputRequiredShape::Malformed => {
@@ -7515,7 +7758,7 @@ impl ModernUpstreamRelay {
                     method = %self.method,
                     "MCP MRTR: upstream claimed input_required without the fields to answer it"
                 );
-                return Err((
+                return Err(fail(
                     UPSTREAM_ERROR,
                     "the upstream asked for input but did not say what to answer".to_string(),
                 ));
@@ -7527,7 +7770,7 @@ impl ModernUpstreamRelay {
         // returning one anywhere else is not a request we can retry, because
         // the client's own revision would not know to.
         if !modern::supports_input_required(&self.method) {
-            return Err((
+            return Err(fail(
                 UPSTREAM_ERROR,
                 format!("the upstream answered {} with an input request, which that method may not carry", self.method),
             ));
@@ -7543,7 +7786,7 @@ impl ModernUpstreamRelay {
         // client's behalf would be a bounded re-issue loop the gateway does
         // not have; nothing here silently degrades into one.)
         if !self.downstream_era.is_modern() {
-            return Err((
+            return Err(fail(
                 super::jsonrpc::MCP_UPSTREAM_INPUT_UNSUPPORTED,
                 "the upstream requires interactive input, which this protocol revision cannot carry through the gateway".to_string(),
             ));
@@ -7555,16 +7798,17 @@ impl ModernUpstreamRelay {
             client_capabilities: self.client_capabilities.clone(),
             log_level: None,
         };
-        for asked in modern::input_required_methods(&required.input_requests) {
-            if !meta.supports_input_request(&asked) {
-                let err = ModernError::missing_client_capability(
-                    modern::required_capability_for(&asked),
-                    format!(
-                        "the upstream requires {asked}, which this request did not declare support for"
-                    ),
+        match modern::check_input_capabilities(&meta, &modern::input_required_methods(&required.input_requests)) {
+            modern::InputCapabilityCheck::Declared => {}
+            modern::InputCapabilityCheck::Unknown(method) => {
+                tracing::warn!(
+                    upstream_id = %self.upstream_id,
+                    asked = %method,
+                    "MCP MRTR: upstream asked for an input request this gateway does not know"
                 );
-                return Err((err.code, err.message));
+                return Err(fail(UPSTREAM_ERROR, UNKNOWN_INPUT_REQUEST.to_string()));
             }
+            modern::InputCapabilityCheck::Missing(err) => return Err(err.into()),
         }
 
         // The upstream's own `requestState` is opaque and says nothing about
@@ -7590,7 +7834,7 @@ impl ModernUpstreamRelay {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(error = %e, "MCP MRTR: could not wrap the upstream's requestState");
-                return Err((
+                return Err(fail(
                     INTERNAL_ERROR,
                     "could not prepare the input request".to_string(),
                 ));
@@ -7626,24 +7870,35 @@ impl ModernUpstreamRelay {
         modern::downgrade_result(result)
     }
 
-    /// Apply both halves to a one-shot JSON-RPC reply.
-    fn adapt_response(&self, resp: &mut JsonRpcResponse) {
+    /// Apply both halves to a one-shot JSON-RPC reply. Returns whether the
+    /// upstream's answer was replaced by an error the GATEWAY built (a
+    /// question the client cannot be asked, say): that error is the
+    /// gateway's own decision, and travels with the status its code mandates
+    /// ([`stamp_one_shot_reply`]); an upstream's own error, translated or
+    /// not, is `false`.
+    fn adapt_response(&self, resp: &mut JsonRpcResponse) -> bool {
         if let Some(err) = resp.error.as_mut() {
             self.adapt_error(err);
-            return;
+            return false;
         }
         let Some(result) = resp.result.as_ref() else {
-            return;
+            return false;
         };
         match self.adapt_result(result) {
             Ok(None) => {
                 if let Some(r) = resp.result.as_mut() {
                     self.downgrade_for_legacy(r);
                 }
+                false
             }
-            Ok(Some(replacement)) => resp.result = Some(replacement),
-            Err((code, message)) => {
-                *resp = JsonRpcResponse::err(resp.id.clone(), code, message);
+            Ok(Some(replacement)) => {
+                resp.result = Some(replacement);
+                false
+            }
+            Err(error) => {
+                resp.result = None;
+                resp.error = Some(error);
+                true
             }
         }
     }
@@ -7656,10 +7911,10 @@ impl ModernUpstreamRelay {
     /// is the answer this conversion is about.
     fn adapt_stream_event(&self, raw: &str) -> Option<String> {
         let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
-        let obj = value.as_object_mut()?;
-        if obj.contains_key("method") || !obj.contains_key("id") {
+        if !is_final_response(&value) {
             return None;
         }
+        let obj = value.as_object_mut()?;
         if let Some(err) = obj.get_mut("error") {
             let mut parsed: super::jsonrpc::JsonRpcError =
                 serde_json::from_value(err.clone()).ok()?;
@@ -7691,12 +7946,12 @@ impl ModernUpstreamRelay {
                 obj.insert("result".to_string(), replacement);
                 serde_json::to_string(&value).ok()
             }
-            Err((code, message)) => {
+            Err(error) => {
+                // The stream's status (200) is already sent, so a `-32021`
+                // here travels without the `400` 2026-07-28 Streamable HTTP
+                // mandates for it — a recorded deviation; its `data` is kept.
                 obj.remove("result");
-                obj.insert(
-                    "error".to_string(),
-                    serde_json::json!({ "code": code, "message": message }),
-                );
+                obj.insert("error".to_string(), serde_json::to_value(&error).ok()?);
                 serde_json::to_string(&value).ok()
             }
         }
@@ -8874,10 +9129,17 @@ async fn rate_limited_response(
     };
     // Which limit refused, on the wire (`error.data.bucket`, the JSON-RPC
     // counterpart of the HTTP error body's `bucket`) and on the audit row.
+    // A requests-per-minute refusal also names its surface (`error.data.surface`).
     let bucket = err.limit_bucket();
     let id = request.id.clone().unwrap_or(RpcId::Null);
     let body = match bucket {
-        Some(b) => JsonRpcResponse::err_with_data(id, rpc_code, msg.clone(), serde_json::json!({ "bucket": b.as_str() })),
+        Some(b) => {
+            let mut data = serde_json::json!({ "bucket": b.as_str() });
+            if let Some(surface) = err.limit_surface() {
+                data["surface"] = surface.as_str().into();
+            }
+            JsonRpcResponse::err_with_data(id, rpc_code, msg.clone(), data)
+        }
         None => JsonRpcResponse::err(id, rpc_code, msg.clone()),
     };
     let resp = rpc_error_response(http_status, &body);
@@ -9151,7 +9413,7 @@ async fn emit_audit_with_policy(
         detection_method: detection_method.or_else(|| identity.detection_method.clone()),
         latency_total_ms: total_ms,
         status_code: Some(status.as_u16()),
-        error_category: error_code.is_some().then(|| "rpc_error".to_string()),
+        error_category: error_code.map(|c| super::jsonrpc::audit_error_category(c).to_string()),
         error_detail: error_message.clone(),
         virtual_server_id: vs_id,
         upstream_server_id,
@@ -9538,10 +9800,6 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// The gateway's own `-32004` sits in the sub-range this revision froze,
-    /// where a receiver MUST NOT assign it meaning. A modern client gets the
-    /// standard code instead — and the original under `data`, so the
-    /// renumbering costs an operator nothing.
     /// The session header is the gateway's own upstream session id. A modern
     /// server neither mints nor echoes one, and echoing this particular value
     /// additionally discloses internal routing state.
@@ -9575,18 +9833,543 @@ mod tests {
         }
     }
 
+    /// An upstream's answer records its JSON-RPC error, else a `tools/call`
+    /// result's own failure (`isError`, the audit-only -32510) — each text
+    /// bounded and stripped of the request's secrets — and nothing for a
+    /// success or for `isError` on a method that has none. A streamed event
+    /// is read the same, only when it is the final response (no `method`,
+    /// an `id`, a null one included); a notification or a server request
+    /// records nothing.
+    #[test]
+    fn an_upstream_answer_records_its_error_or_its_tools_own_failure() {
+        let auth = UpstreamAuth::none();
+        let failed = serde_json::json!({"content": [{"type": "text", "text": "no such file"}], "isError": true});
+        let ok = serde_json::json!({"content": [{"type": "text", "text": "done"}], "isError": false});
+        let reply = |result: &serde_json::Value| JsonRpcResponse::ok(RpcId::Number(1.into()), result.clone());
+        assert_eq!(
+            upstream_reply_outcome(&reply(&failed), McpScope::ToolCall, &auth),
+            Some((super::super::jsonrpc::MCP_TOOL_EXECUTION_ERROR, "no such file".to_string()))
+        );
+        assert_eq!(upstream_reply_outcome(&reply(&ok), McpScope::ToolCall, &auth), None);
+        assert_eq!(upstream_reply_outcome(&reply(&failed), McpScope::PromptGet, &auth), None);
+        let long = "x".repeat(5_000);
+        let err = JsonRpcResponse::err(RpcId::Number(1.into()), -32000, format!("Bearer abc.def {long}"));
+        let (code, text) = upstream_reply_outcome(&err, McpScope::ToolCall, &auth).unwrap();
+        assert_eq!(code, -32000);
+        assert!(text.len() < 400 && !text.contains("abc.def"), "{text}");
+        // The MRTR terminate message the gateway writes in an upstream's
+        // place reads through the streamed decoder: its era-renumbered code,
+        // its text bounded and stripped; a code no `i32` holds does not decode.
+        let terminate = mrtr_error(&RpcId::Number(1.into()), -32000, &format!("Bearer abc.def {long}"), &ProtocolEra::Legacy("2025-11-25".into()));
+        let (code, text) = streamed_error_outcome(&terminate["error"], &auth);
+        assert_eq!(code, -32000);
+        assert!(text.len() < 400 && !text.contains("abc.def"), "{text}");
+        assert_eq!(
+            streamed_error_outcome(&serde_json::json!({"code": 1_i64 << 40, "message": "x"}), &auth),
+            (UPSTREAM_ERROR, MALFORMED_UPSTREAM_JSON.to_string())
+        );
+
+        let event = |v: serde_json::Value| v;
+        assert_eq!(
+            streamed_reply_outcome(&event(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": failed})), McpScope::ToolCall, &auth),
+            Some(Some((super::super::jsonrpc::MCP_TOOL_EXECUTION_ERROR, "no such file".to_string())))
+        );
+        assert_eq!(
+            streamed_reply_outcome(
+                &event(serde_json::json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32603, "message": "boom"}})),
+                McpScope::ToolCall,
+                &auth
+            ),
+            Some(Some((-32603, "boom".to_string())))
+        );
+        // A final response that is a success: final, nothing recorded.
+        let success = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": ok});
+        assert_eq!(streamed_reply_outcome(&event(success.clone()), McpScope::ToolCall, &auth), Some(None), "{success}");
+        // An error without an `i32` code: the error a one-shot reply of that
+        // shape records, since it does not decode.
+        for unreadable in [
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": 99_999_999_999_i64, "message": "x"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "no code"}}),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {"code": "E1", "message": "x"}}),
+        ] {
+            assert!(serde_json::from_value::<JsonRpcResponse>(unreadable.clone()).is_err(), "{unreadable}");
+            assert_eq!(
+                streamed_reply_outcome(&event(unreadable.clone()), McpScope::ToolCall, &auth),
+                Some(Some((UPSTREAM_ERROR, MALFORMED_UPSTREAM_JSON.to_string()))),
+                "{unreadable}"
+            );
+        }
+        assert_eq!(
+            upstream_error_to_jsonrpc(&UpstreamError::Decode(serde_json::from_str::<u8>("x").unwrap_err()), None),
+            (UPSTREAM_ERROR, MALFORMED_UPSTREAM_JSON.to_string())
+        );
+        // Not the final response: a notification, a server request, not an
+        // object.
+        for other in [
+            event(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {"isError": true}})),
+            event(serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "sampling/createMessage", "params": {}})),
+            serde_json::json!("not an object"),
+        ] {
+            assert_eq!(streamed_reply_outcome(&other, McpScope::ToolCall, &auth), None, "{other}");
+        }
+    }
+
+    /// What a `dispatch` arm records of an upstream's error — a
+    /// `resources/read` reply's (`dispatched_reply_outcome`), the
+    /// `logging/setLevel` fan-out's (`recorded_upstream_error`) — is its code
+    /// and its text bounded and stripped of a `Bearer` token, read with no
+    /// credential: neither helper takes one, so recording it resolves none.
+    /// A success records nothing; a short plain message is kept as sent.
+    #[test]
+    fn a_dispatched_upstream_error_is_recorded_bounded_and_stripped_without_auth() {
+        let _: fn(&JsonRpcResponse) -> Option<(i32, String)> = dispatched_reply_outcome;
+        let _: fn(i32, &str) -> (i32, String) = recorded_upstream_error;
+        let message = format!("Bearer abc.def.ghi {}", "x".repeat(20_000));
+        let read = JsonRpcResponse::err(RpcId::Number(1.into()), -32002, message.clone());
+        let (code, text) = dispatched_reply_outcome(&read).unwrap();
+        assert_eq!(code, -32002);
+        assert!(text.len() < 400 && text.ends_with("…[truncated]"), "{text}");
+        assert!(!text.contains("abc.def.ghi") && text.starts_with("Bearer <REDACTED>"), "{text}");
+        let (code, text) = recorded_upstream_error(-32602, &message);
+        assert_eq!(code, -32602);
+        assert!(text.len() < 400 && !text.contains("abc.def.ghi") && text.starts_with("Bearer <REDACTED>"), "{text}");
+        assert_eq!(recorded_upstream_error(-32602, "bad level"), (-32602, "bad level".to_string()));
+        let ok = JsonRpcResponse::ok(RpcId::Number(1.into()), serde_json::json!({"contents": []}));
+        assert_eq!(dispatched_reply_outcome(&ok), None);
+    }
+
+    /// A `tools/call` a rule blocked is a tool execution error in both eras —
+    /// a result with `isError` whose text is the rule's message, never a
+    /// JSON-RPC error — stamped as every modern `tools/call` result is for a
+    /// modern client and left bare for a legacy one; the audit's -32506 never
+    /// reaches the wire.
+    #[tokio::test]
+    async fn a_blocked_tool_call_is_an_is_error_result_in_both_eras() {
+        let info = serde_json::json!({"name": "vs", "version": "1"});
+        let legacy = error_body(blocked_tool_call_response(
+            RpcId::Number(3.into()),
+            "Shell is blocked: no rm -rf",
+            &ProtocolEra::Legacy("2025-11-25".into()),
+            &info,
+        ))
+        .await;
+        assert_eq!(legacy, serde_json::json!({"jsonrpc": "2.0", "id": 3, "result": {
+            "content": [{"type": "text", "text": "Shell is blocked: no rm -rf"}], "isError": true}}));
+        let modern = error_body(blocked_tool_call_response(
+            RpcId::Number(3.into()),
+            "Shell is blocked: no rm -rf",
+            &ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string()),
+            &info,
+        ))
+        .await;
+        assert!(modern.get("error").is_none(), "{modern}");
+        assert_eq!(modern["result"]["isError"], true);
+        assert_eq!(modern["result"]["content"][0]["text"], "Shell is blocked: no rm -rf");
+        assert_eq!(modern["result"]["resultType"], "complete");
+        assert_eq!(modern["result"]["_meta"][modern::META_SERVER_INFO], info);
+    }
+
+    /// A one-shot reply's HTTP status is the one its client's era mandates for its error code.
+    #[tokio::test]
+    async fn a_one_shot_reply_travels_with_the_status_its_era_mandates_for_its_code() {
+        let info = serde_json::json!({"name": "gw", "version": "1"});
+        let id = || RpcId::Number(1.into());
+        let cases = [
+            (modern::HEADER_MISMATCH, StatusCode::BAD_REQUEST),
+            (modern::MISSING_REQUIRED_CLIENT_CAPABILITY, StatusCode::BAD_REQUEST),
+            (super::super::jsonrpc::METHOD_NOT_FOUND, StatusCode::NOT_FOUND),
+            (INVALID_PARAMS, StatusCode::OK),
+        ];
+        let modern_era = ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string());
+        let legacy_era = ProtocolEra::Legacy("2025-11-25".into());
+        for (code, mandated) in cases {
+            let mut reply = JsonRpcResponse::err(id(), code, "refused");
+            let status = stamp_reply_for_era(&mut reply, "tools/call", &info, None, &modern_era);
+            assert_eq!(status, mandated, "modern {code}");
+            // The same derivation as a rendered error of the same code.
+            let rendered = era_render_error(StatusCode::OK, JsonRpcResponse::err(id(), code, "refused"), &modern_era);
+            assert_eq!(rendered.status(), status, "modern {code}: one derivation");
+
+            let mut reply = JsonRpcResponse::err(id(), code, "refused");
+            assert_eq!(stamp_reply_for_era(&mut reply, "tools/call", &info, None, &legacy_era), StatusCode::OK, "legacy {code}");
+        }
+        // Positive control: a result is 200 in both eras.
+        for era in [&modern_era, &legacy_era] {
+            let mut ok = JsonRpcResponse::ok(id(), serde_json::json!({"content": []}));
+            assert_eq!(stamp_reply_for_era(&mut ok, "tools/call", &info, None, era), StatusCode::OK);
+        }
+    }
+
+    /// An upstream's own in-band error is relayed to a modern client renumbered
+    /// out of the frozen band — the TypeScript SDK's `-32001` (RequestTimeout) read as the
+    /// frozen band's `-32601`, its original under `data.streamscopeCode` — and
+    /// with the `200` it arrived with, never the `404` that tells a client the
+    /// RPC is not implemented. Positive control: the gateway's own server's
+    /// `-32601` travels with the `404` the revision mandates.
+    #[test]
+    fn a_relayed_upstream_error_keeps_its_200_and_a_gateway_error_takes_its_mandated_status() {
+        let info = serde_json::json!({"name": "gw", "version": "1"});
+        let modern_era = ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string());
+        let id = || RpcId::Number(1.into());
+
+        let mut relayed = JsonRpcResponse::err(id(), ROUTE_NOT_FOUND, "Request timed out");
+        let status = stamp_one_shot_reply(&mut relayed, "tools/call", &info, None, &modern_era, true);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::to_value(&relayed).unwrap(),
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "error": {
+                "code": super::super::jsonrpc::METHOD_NOT_FOUND,
+                "message": "Request timed out",
+                "data": {"streamscopeCode": ROUTE_NOT_FOUND}}})
+        );
+
+        let mut own = JsonRpcResponse::err(id(), super::super::jsonrpc::METHOD_NOT_FOUND, "Method not found");
+        let status = stamp_one_shot_reply(&mut own, "tools/call", &info, None, &modern_era, false);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A refusal the relay builds in a modern upstream's place is the
+    /// gateway's error, sent with the status its code mandates — 2026-07-28
+    /// Streamable HTTP: "modern servers also use `400` for
+    /// `UnsupportedProtocolVersionError`, `MissingRequiredClientCapabilityError`,
+    /// and header-validation failures" — so a question the client did not
+    /// declare it can answer is a `-32021` with `400`. Positive control: the
+    /// upstream's own `-32001`, relayed unchanged, keeps its `200`, and a
+    /// result passes as the upstream's. The gateway's own server's error is
+    /// never relayed.
+    #[test]
+    fn a_refusal_the_relay_builds_takes_its_mandated_status_and_an_upstreams_own_error_keeps_200() {
+        let info = serde_json::json!({"name": "gw", "version": "1"});
+        let modern_era = ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string());
+        let relay = ModernUpstreamRelay {
+            downstream_era: modern_era.clone(),
+            client_capabilities: serde_json::json!({}),
+            tenant_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            virtual_server_id: Uuid::new_v4(),
+            upstream_id: Uuid::new_v4(),
+            method: "tools/call".to_string(),
+            params_digest: "digest".to_string(),
+            server_info: info.clone(),
+        };
+        let id = || RpcId::Number(1.into());
+
+        let mut asked = JsonRpcResponse::ok(
+            id(),
+            serde_json::json!({"resultType": "input_required", "inputRequests": {
+                "confirm": {"method": "elicitation/create", "params": {"message": "sure?"}}}}),
+        );
+        assert!(!adapt_one_shot_reply(Some(&relay), false, &mut asked));
+        assert_eq!(asked.error.as_ref().map(|e| e.code), Some(modern::MISSING_REQUIRED_CLIENT_CAPABILITY));
+        assert_eq!(
+            asked.error.as_ref().and_then(|e| e.data.clone()),
+            Some(serde_json::json!({"requiredCapabilities": {"elicitation": {}}}))
+        );
+        let status = stamp_one_shot_reply(&mut asked, "tools/call", &info, None, &modern_era, false);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let mut own = JsonRpcResponse::err(id(), ROUTE_NOT_FOUND, "Request timed out");
+        assert!(adapt_one_shot_reply(Some(&relay), false, &mut own));
+        assert_eq!(stamp_one_shot_reply(&mut own, "tools/call", &info, None, &modern_era, true), StatusCode::OK);
+
+        let mut ok = JsonRpcResponse::ok(id(), serde_json::json!({"content": []}));
+        assert!(adapt_one_shot_reply(Some(&relay), false, &mut ok));
+        assert!(ok.error.is_none());
+        let mut internal = JsonRpcResponse::err(id(), INVALID_PARAMS, "Unknown tool: web_x");
+        assert!(!adapt_one_shot_reply(None, true, &mut internal));
+    }
+
+    /// A modern upstream's `InputRequiredResult` asking what the client did
+    /// not declare is answered with a `-32021` whose `data` the 2026-07-28
+    /// schema requires: `requiredCapabilities: ClientCapabilities`, listing
+    /// every missing capability (§ `_meta`: "whose
+    /// `data.requiredCapabilities` lists the missing capabilities") — on the
+    /// one-shot JSON answer and on the SSE one alike. Positive control: an
+    /// input the client declared is relayed as an `input_required` result. An
+    /// input method the gateway does not know is the upstream's failure, never
+    /// a `-32021` naming nothing; a legacy client gets the gateway's
+    /// `-32509` and no modern payload.
+    #[test]
+    fn a_relayed_input_request_the_client_cannot_answer_names_every_missing_capability() {
+        use serde_json::json;
+        // SAFETY: same value as every other ENCRYPTION_KEY setter in this
+        // binary; the positive control mints a `requestState` under it.
+        unsafe {
+            std::env::set_var("ENCRYPTION_KEY", "test-mcp-token-secret-very-long");
+        }
+        let modern_era = ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string());
+        let relay = |era: ProtocolEra, caps: serde_json::Value| ModernUpstreamRelay {
+            downstream_era: era,
+            client_capabilities: caps,
+            tenant_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            virtual_server_id: Uuid::new_v4(),
+            upstream_id: Uuid::new_v4(),
+            method: "tools/call".to_string(),
+            params_digest: "digest".to_string(),
+            server_info: json!({"name": "gw", "version": "1"}),
+        };
+        let asking = |methods: &[&str]| {
+            let requests: serde_json::Map<String, serde_json::Value> = methods
+                .iter()
+                .enumerate()
+                .map(|(i, m)| (format!("q{i}"), json!({"method": m, "params": {}})))
+                .collect();
+            json!({"resultType": "input_required", "inputRequests": requests})
+        };
+        let one_shot = |relay: &ModernUpstreamRelay, result: serde_json::Value| {
+            let mut resp = JsonRpcResponse::ok(RpcId::Number(1.into()), result);
+            relay.adapt_response(&mut resp);
+            serde_json::to_value(&resp).unwrap()
+        };
+        let streamed = |relay: &ModernUpstreamRelay, result: serde_json::Value| {
+            let raw = json!({"jsonrpc": "2.0", "id": 1, "result": result}).to_string();
+            serde_json::from_str::<serde_json::Value>(&relay.adapt_stream_event(&raw).unwrap()).unwrap()
+        };
+
+        let bare = relay(modern_era.clone(), json!({}));
+        let two = asking(&["elicitation/create", "sampling/createMessage"]);
+        for wire in [one_shot(&bare, two.clone()), streamed(&bare, two)] {
+            assert_eq!(wire["error"]["code"], json!(modern::MISSING_REQUIRED_CLIENT_CAPABILITY), "{wire}");
+            assert_eq!(
+                wire["error"]["data"],
+                json!({"requiredCapabilities": {"elicitation": {}, "sampling": {}}}),
+                "{wire}"
+            );
+            assert!(wire.get("result").is_none(), "{wire}");
+        }
+
+        let declared = relay(modern_era.clone(), json!({"elicitation": {}}));
+        let one = asking(&["elicitation/create"]);
+        for wire in [one_shot(&declared, one.clone()), streamed(&declared, one)] {
+            assert!(wire.get("error").is_none(), "{wire}");
+            assert_eq!(wire["result"]["resultType"], "input_required", "{wire}");
+        }
+
+        let unknown = asking(&["elicitation/create", "x/new"]);
+        for wire in [one_shot(&bare, unknown.clone()), streamed(&bare, unknown)] {
+            assert_eq!(wire["error"]["code"], json!(UPSTREAM_ERROR), "{wire}");
+            assert!(wire["error"].get("data").is_none(), "{wire}");
+        }
+
+        let legacy = relay(ProtocolEra::Legacy("2025-11-25".into()), json!({}));
+        let one = asking(&["elicitation/create"]);
+        for wire in [one_shot(&legacy, one.clone()), streamed(&legacy, one)] {
+            assert_eq!(wire["error"]["code"], json!(super::super::jsonrpc::MCP_UPSTREAM_INPUT_UNSUPPORTED), "{wire}");
+            assert!(wire["error"].get("data").is_none(), "{wire}");
+        }
+    }
+
+    /// The gateway's own server's failure text reaches the audit row through
+    /// the same bound and redaction as an upstream's; its code is its own.
+    #[test]
+    fn the_gateway_servers_failure_text_is_bounded_like_an_upstreams() {
+        let auth = UpstreamAuth::none();
+        let long = "y".repeat(5_000);
+        let reply = JsonRpcResponse::tool_execution_error(
+            RpcId::Number(1.into()),
+            "the model's text",
+            super::super::jsonrpc::JsonRpcError {
+                code: super::super::jsonrpc::MCP_TOOL_EXECUTION_ERROR,
+                message: format!("Bearer abc.def {long}"),
+                data: None,
+            },
+        );
+        for scope in [McpScope::ToolCall, McpScope::PromptGet] {
+            let (code, text) = upstream_reply_outcome(&reply, scope, &auth).unwrap();
+            assert_eq!(code, super::super::jsonrpc::MCP_TOOL_EXECUTION_ERROR, "{scope:?}");
+            assert!(text.len() < 400 && !text.contains("abc.def"), "{scope:?}: {text}");
+        }
+        let ok = JsonRpcResponse::ok(RpcId::Number(1.into()), serde_json::json!({"content": []}));
+        assert_eq!(upstream_reply_outcome(&ok, McpScope::ToolCall, &auth), None);
+    }
+
+    /// Every answer the gateway builds itself for a `/mcp/web` tool or a
+    /// refused call, through the egress step its path takes, shaped from the
+    /// revision each client speaks. Modern (2026-07-28 `Result`):
+    /// "`resultType` … Servers implementing this protocol version MUST include
+    /// this field", the server identity in `_meta`
+    /// (`io.modelcontextprotocol/serverInfo`, "SHOULD include this field on
+    /// every response"), and a `tools/list` — a `CacheableResult` — its
+    /// required `ttlMs` and `cacheScope` (always `private` here); a JSON-RPC
+    /// error is an error response, with no result field at all. Legacy
+    /// (2025-11-25, 2025-06-18, 2025-03-26 `Result`: `_meta` and nothing
+    /// else declared): none of those fields. Unknown or filtered-out tools and
+    /// prompts are `-32602` in every revision's tools and prompts error
+    /// handling.
+    #[tokio::test]
+    async fn every_answer_the_gateway_builds_is_shaped_for_the_clients_revision() {
+        use super::super::virtual_servers::web as builtin;
+        use serde_json::json;
+        use streamscope_core::config::tool_rules::WebInterceptKind;
+        use streamscope_core::web::{SearchHit, SearchResult, WebError, WebProvider, WebSettings};
+
+        let vs: McpVirtualServer = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "tenant_id": Uuid::new_v4(), "slug": "web", "name": "Web",
+        }))
+        .unwrap();
+        let info = gateway_server_info(&vs);
+        let upstreams = vec![crate::mcp::upstream_auth::test_support::upstream(
+            streamscope_core::config::mcp::McpAuthMode::Headers,
+            json!([]),
+            json!({}),
+        )];
+        let settings = WebSettings {
+            backend: Some(WebProvider::Searxng),
+            endpoint: Some("https://search.example.com".into()),
+            ..WebSettings::default()
+        };
+        let search = SearchResult {
+            hits: vec![SearchHit { url: "https://a.test/".into(), title: "A".into(), snippet: None, published: None }],
+            total_filtered: 0,
+            backend: WebProvider::Searxng,
+        };
+        let id = || RpcId::Number(1.into());
+
+        // (name, method, answer as the client receives it) for one era.
+        let answers = |era: &ProtocolEra| {
+            let era = era.clone();
+            let settings = settings.clone();
+            let search = search.clone();
+            let info = info.clone();
+            let vs = vs.clone();
+            let upstreams = upstreams.clone();
+            async move {
+                let mut out: Vec<(&str, &str, serde_json::Value)> = Vec::new();
+                // `tools/list` reaches the client through `finalize_modern_response`.
+                let mut list = builtin::handle_tools_list(id(), &settings);
+                finalize_modern_response(&mut list, "tools/list", &vs, &upstreams, &era);
+                out.push(("tools/list", "tools/list", serde_json::to_value(&list).unwrap()));
+                // A `tools/call` one-shot reply, through `stamp_reply_for_era`.
+                for (name, mut reply) in [
+                    ("search ok", builtin::tool_result(id(), &search, true)),
+                    ("fetch ok", builtin::tool_result(id(), &json!({"final_url": "https://a.test/"}), false)),
+                    (
+                        "tool error",
+                        builtin::tool_error(id(), &WebError::InvalidArguments("missing field `url`".into()), WebInterceptKind::Fetch),
+                    ),
+                    ("web unknown tool", builtin::unknown_tool(id(), "nope")),
+                ] {
+                    let status =
+                        stamp_reply_for_era(&mut reply, "tools/call", &info, modern_cache_hint("tools/call", &upstreams), &era);
+                    assert_eq!(status, StatusCode::OK, "{name}");
+                    out.push((name, "tools/call", serde_json::to_value(&reply).unwrap()));
+                }
+                out.push((
+                    "blocked call",
+                    "tools/call",
+                    error_body(blocked_tool_call_response(id(), "Shell is blocked", &era, &info)).await,
+                ));
+                out.push((
+                    "no route serves the tool",
+                    "tools/call",
+                    error_body(era_error_response(StatusCode::OK, id(), INVALID_PARAMS, unknown_name_message("x"), &era)).await,
+                ));
+                // A prompt the route filters out, answered by `dispatch` and
+                // rendered through `finalize_modern_response`.
+                let mut prompt = JsonRpcResponse::err(id(), INVALID_PARAMS, unknown_name_message("ns__p"));
+                let status = finalize_modern_response(&mut prompt, "prompts/get", &vs, &upstreams, &era);
+                assert_eq!(status, StatusCode::OK);
+                out.push(("filtered prompt", "prompts/get", serde_json::to_value(&prompt).unwrap()));
+                out
+            }
+        };
+
+        // A protocol error answers only what is not this server's tool or
+        // prompt; every other answer is a result (MCP § Tools, Error Handling).
+        let is_protocol_error = |name: &str| ["web unknown tool", "no route serves the tool", "filtered prompt"].contains(&name);
+        let modern_era = ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string());
+        for (name, method, wire) in answers(&modern_era).await {
+            assert_eq!(wire.get("error").is_some(), is_protocol_error(name), "{name}: {wire}");
+            assert_eq!(wire.get("result").is_some(), !is_protocol_error(name), "{name}: {wire}");
+            if let Some(result) = wire.get("result") {
+                assert_eq!(result["resultType"], "complete", "{name}: {wire}");
+                assert_eq!(result["_meta"][modern::META_SERVER_INFO], info, "{name}");
+                if method == "tools/list" {
+                    assert!(result["ttlMs"].is_u64(), "{name}: {wire}");
+                    assert_eq!(result["cacheScope"], "private", "{name}");
+                } else {
+                    assert!(result.get("ttlMs").is_none() && result.get("cacheScope").is_none(), "{name}: {wire}");
+                }
+            } else {
+                assert_eq!(wire["error"]["code"], INVALID_PARAMS, "{name}: {wire}");
+                assert!(wire["error"].get("data").is_none(), "{name}: a standard code needs no renumbering: {wire}");
+            }
+        }
+        for legacy in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+            for (name, _, wire) in answers(&ProtocolEra::Legacy(legacy.into())).await {
+                assert_eq!(wire.get("error").is_some(), is_protocol_error(name), "{legacy} {name}: {wire}");
+                if let Some(result) = wire.get("result") {
+                    for modern_only in ["resultType", "_meta", "ttlMs", "cacheScope"] {
+                        assert!(result.get(modern_only).is_none(), "{legacy} {name}: {modern_only} in {wire}");
+                    }
+                } else {
+                    assert_eq!(wire["error"]["code"], INVALID_PARAMS, "{legacy} {name}: {wire}");
+                }
+            }
+        }
+    }
+
+    /// MCP § Completion, Error Handling (2025-11-25 and 2026-07-28 alike):
+    /// "Invalid prompt name: `-32602` (Invalid params)". A `ref` naming a
+    /// prompt or a resource this virtual server does not serve is that error
+    /// on every era, a resource ref naming its `uri` in `data` — never the
+    /// gateway's frozen-band `-32001`, which a modern client would read as a
+    /// missing method (`-32601`, HTTP 404).
+    #[test]
+    fn an_unknown_completion_ref_is_invalid_params_on_every_era() {
+        use serde_json::json;
+        let vs: McpVirtualServer = serde_json::from_value(json!({
+            "id": Uuid::new_v4(), "tenant_id": Uuid::new_v4(), "slug": "vs", "name": "VS",
+        }))
+        .unwrap();
+        let refs = [
+            json!({"type": "ref/prompt", "name": "nope__p"}),
+            json!({"type": "ref/resource", "uri": "stsmcp://gone/Zm9v"}),
+            json!({"type": "ref/resource"}),
+        ];
+        let eras = [
+            ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string()),
+            ProtocolEra::Legacy("2025-11-25".into()),
+            ProtocolEra::Legacy("2025-03-26".into()),
+        ];
+        for era in &eras {
+            for r in &refs {
+                let ref_obj = r.as_object().unwrap();
+                let ref_type = ref_obj["type"].as_str().unwrap();
+                let mut resp = unknown_completion_ref(RpcId::Number(1.into()), ref_type, ref_obj);
+                let status = finalize_modern_response(&mut resp, "completion/complete", &vs, &[], era);
+                assert_eq!(status, StatusCode::OK, "{era:?} {r}");
+                let wire = serde_json::to_value(&resp).unwrap();
+                assert_eq!(wire["error"]["code"], json!(-32602), "{era:?} {r}: {wire}");
+                assert!(wire.get("result").is_none(), "{era:?} {r}: {wire}");
+                match ref_obj.get("uri") {
+                    Some(uri) => assert_eq!(wire["error"]["data"], json!({"uri": uri}), "{era:?}: {wire}"),
+                    None => assert!(wire["error"].get("data").is_none(), "{era:?} {r}: {wire}"),
+                }
+                if ref_type == "ref/prompt" {
+                    assert_eq!(wire["error"]["message"], json!(unknown_name_message("nope__p")), "{wire}");
+                }
+            }
+        }
+    }
+
+    /// The gateway's own `-32003` sits in the sub-range this revision froze,
+    /// where a receiver MUST NOT assign it meaning. A modern client gets the
+    /// standard code instead — and the original under `data`, so the
+    /// renumbering costs an operator nothing.
     #[tokio::test]
     async fn gateway_codes_are_renumbered_for_a_modern_client() {
         let resp = era_error_response(
             StatusCode::OK,
             RpcId::Number(1.into()),
-            TOOL_NOT_FOUND,
-            "no such tool",
+            UPSTREAM_ERROR,
+            "upstream failed",
             &ProtocolEra::Modern(modern::MODERN_PROTOCOL_VERSION.to_string()),
         );
         let body = error_body(resp).await;
-        assert_eq!(body["error"]["code"], INVALID_PARAMS);
-        assert_eq!(body["error"]["data"]["streamscopeCode"], TOOL_NOT_FOUND);
+        assert_eq!(body["error"]["code"], INTERNAL_ERROR);
+        assert_eq!(body["error"]["data"]["streamscopeCode"], UPSTREAM_ERROR);
     }
 
     /// The positive control, and the reason the renumbering is era-gated at
@@ -9598,12 +10381,12 @@ mod tests {
         let resp = era_error_response(
             StatusCode::OK,
             RpcId::Number(1.into()),
-            TOOL_NOT_FOUND,
-            "no such tool",
+            UPSTREAM_ERROR,
+            "upstream failed",
             &ProtocolEra::Legacy("2025-11-25".into()),
         );
         let body = error_body(resp).await;
-        assert_eq!(body["error"]["code"], TOOL_NOT_FOUND);
+        assert_eq!(body["error"]["code"], UPSTREAM_ERROR);
         assert!(body["error"].get("data").is_none(), "{body}");
     }
 

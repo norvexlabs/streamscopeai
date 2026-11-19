@@ -206,6 +206,20 @@ pub enum WebInterceptKind {
     Fetch,
 }
 
+impl WebInterceptKind {
+    /// The optional arguments the executor reads, each as a whole number: a
+    /// fetch's `max_length` and `start_index`, a search's `max_results`. The
+    /// one list what a definition declares is read from
+    /// ([`crate::web::DeclaredArgs`]) and a failed call names
+    /// ([`crate::web::WebError::model_text`]), in this order.
+    pub fn optional_integer_args(self) -> &'static [&'static str] {
+        match self {
+            Self::Search => &["max_results"],
+            Self::Fetch => &["max_length", "start_index"],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {

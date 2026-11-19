@@ -490,7 +490,7 @@ impl AnthropicResponseBuilder {
             } => {
                 self.emit_web_search_tool_result_error(
                     tool_use_id,
-                    error_kind,
+                    *error_kind,
                     &mut sse_events,
                 );
             }
@@ -587,7 +587,7 @@ impl AnthropicResponseBuilder {
     fn emit_web_search_tool_result_error(
         &mut self,
         tool_use_id: &str,
-        error_kind: &str,
+        error_kind: crate::web::ModelErrorCode,
         sse_events: &mut Vec<String>,
     ) {
         self.close_current_block(sse_events);
@@ -2217,31 +2217,37 @@ impl ResponsesResponseBuilder {
 }
 
 /// The `web_search_tool_result_error.error_code` for a search the gateway ran
-/// and could not complete, from the dispatch's error category. Anthropic's
-/// schema is a closed set, so every category lands on one of its values —
-/// `unavailable` ("an internal error occurred") for anything the client did
-/// not cause and could not fix by asking differently.
-pub(crate) fn anthropic_web_search_error_code(category: &str) -> &'static str {
-    match category {
-        "rate_limited" => "too_many_requests",
-        "invalid_url" | "scheme_refused" | "ssrf_refused" | "url_filter_denied" => {
-            "invalid_tool_input"
-        }
-        "oversized" => "request_too_large",
-        _ => "unavailable",
+/// and could not complete. Anthropic's set is closed — `too_many_requests`,
+/// `invalid_tool_input`, `max_uses_exceeded`, `query_too_long`,
+/// `request_too_large`, `unavailable` — so every failure lands on one of them:
+/// the model's own input (or a policy refusing it) is `invalid_tool_input`,
+/// and `unavailable` ("an internal error occurred") is anything the client did
+/// not cause and could not fix by asking differently. `request_too_large` names
+/// a too-large REQUEST (a long domain list), never a result too large to keep.
+pub(crate) fn anthropic_web_search_error_code(code: crate::web::ModelErrorCode) -> &'static str {
+    use crate::web::ModelErrorCode::*;
+    match code {
+        TooManyRequests => "too_many_requests",
+        InvalidToolInput | UrlNotAllowed => "invalid_tool_input",
+        UrlNotAccessible | ContentTooLarge | Unavailable => "unavailable",
     }
 }
 
-/// The `action` of a `web_search_call` item for a search the gateway ran: the
-/// query the model asked for, when its arguments name one.
-pub(crate) fn responses_web_search_action(input_delta: &str) -> Value {
+/// The `action` of a `web_search_call` item for a search the gateway ran, from
+/// the call's JSON arguments: the query the model asked for, when they name
+/// one, as `queries` ("The search queries.") and as `query` ("The search
+/// query."), the two optional members the Responses search action defines.
+/// The streamed and the whole-body renderings both build it here.
+pub(crate) fn responses_web_search_action(arguments: &str) -> Value {
+    let input = serde_json::from_str::<Value>(arguments).unwrap_or(Value::Null);
+    responses_web_search_action_of(&input)
+}
+
+/// [`responses_web_search_action`] over arguments already parsed.
+pub(crate) fn responses_web_search_action_of(input: &Value) -> Value {
     let mut action = serde_json::json!({"type": "search"});
-    if let Some(q) = serde_json::from_str::<Value>(input_delta)
-        .ok()
-        .as_ref()
-        .and_then(|v| v.get("query"))
-        .and_then(|v| v.as_str())
-    {
+    if let Some(q) = input.get("query").and_then(Value::as_str) {
+        action["queries"] = serde_json::json!([q]);
         action["query"] = Value::String(q.to_string());
     }
     action
@@ -4748,7 +4754,7 @@ mod tests {
         let err_events = builder.process_event(&DomainEvent::ServerToolError {
             index: 1,
             tool_use_id: "tu_sub_abc_1".to_string(),
-            error_kind: "rate_limited".to_string(),
+            error_kind: crate::web::ModelErrorCode::TooManyRequests,
         });
         let joined = err_events.join("\n");
         assert!(joined.contains("\"type\":\"web_search_tool_result_error\""));
@@ -6155,7 +6161,7 @@ mod tests {
         let events = builder.process_event(&DomainEvent::ServerToolError {
             index: 0,
             tool_use_id: call_id.to_string(),
-            error_kind: "no_backend".to_string(),
+            error_kind: crate::web::ModelErrorCode::Unavailable,
         });
         let joined = events.join("");
         // The spec has no failed-search event: the failure is the item's status.
@@ -7785,5 +7791,20 @@ mod tests {
         assert_eq!(chat["choices"][0]["message"]["tool_calls"][0], serde_json::json!({
             "id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Begin Patch"}}), "{chat}");
         assert_eq!(chat["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    /// A gateway-run search is a Responses search action (`WebSearchCall`'s
+    /// `Search`): its query as `queries` and as `query`, the two optional
+    /// members the specification defines for it. Arguments naming no query
+    /// state none — never an empty list or a null.
+    #[test]
+    fn a_gateway_run_search_action_names_its_query_as_queries() {
+        assert_eq!(
+            responses_web_search_action(r#"{"query":"rust 2026","max_results":3}"#),
+            serde_json::json!({"type": "search", "queries": ["rust 2026"], "query": "rust 2026"}),
+        );
+        for args in ["{}", "", "not json", r#"{"query": 7}"#] {
+            assert_eq!(responses_web_search_action(args), serde_json::json!({"type": "search"}), "{args}");
+        }
     }
 }

@@ -175,6 +175,8 @@
 
   const poolCaps = $derived({
     rpm: effectiveCap(decodeLimit(limits?.pool.requests_per_minute, 'pool_rate'), null),
+    rpmMcp: effectiveCap(decodeLimit(limits?.pool.requests_per_minute_mcp, 'pool_rate'), null),
+    rpmA2a: effectiveCap(decodeLimit(limits?.pool.requests_per_minute_a2a, 'pool_rate'), null),
     tpm: effectiveCap(decodeLimit(limits?.pool.tokens_per_minute, 'pool_rate'), null),
     daily: effectiveCap(decodeLimit(limits?.pool.daily_budget, 'pool_budget'), limits?.tenant_default_daily_budget),
     monthly: effectiveCap(decodeLimit(limits?.pool.monthly_budget, 'pool_budget'), limits?.tenant_default_monthly_budget),
@@ -184,6 +186,8 @@
   // default", never a cap of zero.
   const defaultCaps = $derived({
     rpm: effectiveCap(decodeLimit(limits?.member_defaults.requests_per_minute, 'member_default'), null),
+    rpmMcp: effectiveCap(decodeLimit(limits?.member_defaults.requests_per_minute_mcp, 'member_default'), null),
+    rpmA2a: effectiveCap(decodeLimit(limits?.member_defaults.requests_per_minute_a2a, 'member_default'), null),
     tpm: effectiveCap(decodeLimit(limits?.member_defaults.tokens_per_minute, 'member_default'), null),
     daily: effectiveCap(decodeLimit(limits?.member_defaults.daily_budget, 'member_default'), null),
     monthly: effectiveCap(decodeLimit(limits?.member_defaults.monthly_budget, 'member_default'), null),
@@ -593,12 +597,12 @@
       <div class="px-6 py-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
         <div class="space-y-1">
           <div class="text-xs font-semibold text-(--text-secondary) uppercase tracking-wider">{msg.portal_team_pool()} <span class="normal-case font-normal">· {msg.portal_team_set_by_admin()}</span></div>
-          <div class="text-(--text-primary)">{msg.limits_rpm_short()} {capText(poolCaps.rpm)} · {msg.limits_tpm_short()} {capText(poolCaps.tpm)}</div>
+          <div class="text-(--text-primary)">{msg.limits_rpm_short()} {capText(poolCaps.rpm)} · {msg.limits_rpm_mcp_short()} {capText(poolCaps.rpmMcp)} · {msg.limits_rpm_a2a_short()} {capText(poolCaps.rpmA2a)} · {msg.limits_tpm_short()} {capText(poolCaps.tpm)}</div>
           <div class="text-(--text-primary)">{msg.limits_daily_short()} {moneyCap(poolCaps.daily)} · {msg.limits_monthly_short()} {moneyCap(poolCaps.monthly)}</div>
         </div>
         <div class="space-y-1">
           <div class="text-xs font-semibold text-(--text-secondary) uppercase tracking-wider">{msg.portal_team_member_default()} <span class="normal-case font-normal">· {msg.portal_team_set_by_admin()}</span></div>
-          <div class="text-(--text-primary)">{msg.limits_rpm_short()} {capText(defaultCaps.rpm)} · {msg.limits_tpm_short()} {capText(defaultCaps.tpm)}</div>
+          <div class="text-(--text-primary)">{msg.limits_rpm_short()} {capText(defaultCaps.rpm)} · {msg.limits_rpm_mcp_short()} {capText(defaultCaps.rpmMcp)} · {msg.limits_rpm_a2a_short()} {capText(defaultCaps.rpmA2a)} · {msg.limits_tpm_short()} {capText(defaultCaps.tpm)}</div>
           <div class="text-(--text-primary)">{msg.limits_daily_short()} {moneyCap(defaultCaps.daily)} · {msg.limits_monthly_short()} {moneyCap(defaultCaps.monthly)}</div>
         </div>
       </div>

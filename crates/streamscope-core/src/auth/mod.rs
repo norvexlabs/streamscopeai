@@ -154,8 +154,15 @@ impl UserContext {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RateLimitConfig {
-    /// Requests per minute.
+    /// LLM requests per minute — chat, media and `/v1/analyze` (0 = unlimited).
     pub requests_per_minute: u32,
+    /// MCP requests per minute, the built-in Web server included (0 =
+    /// unlimited).
+    #[serde(default)]
+    pub requests_per_minute_mcp: u32,
+    /// A2A requests per minute (0 = unlimited).
+    #[serde(default)]
+    pub requests_per_minute_a2a: u32,
     /// Tokens per minute.
     pub tokens_per_minute: u32,
     /// Daily budget in the tenant's accounting currency (0 = unlimited).
@@ -176,6 +183,8 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             requests_per_minute: 60,
+            requests_per_minute_mcp: 60,
+            requests_per_minute_a2a: 60,
             tokens_per_minute: 100_000,
             daily_budget: 0.0,
             monthly_budget: 0.0,
@@ -191,6 +200,8 @@ impl RateLimitConfig {
     pub fn unlimited() -> Self {
         Self {
             requests_per_minute: 0,
+            requests_per_minute_mcp: 0,
+            requests_per_minute_a2a: 0,
             tokens_per_minute: 0,
             daily_budget: 0.0,
             monthly_budget: 0.0,
@@ -204,6 +215,8 @@ impl RateLimitConfig {
     pub fn budget_only(daily_budget: f64, monthly_budget: f64, alert_only: bool) -> Self {
         Self {
             requests_per_minute: 0,
+            requests_per_minute_mcp: 0,
+            requests_per_minute_a2a: 0,
             tokens_per_minute: 0,
             daily_budget,
             monthly_budget,

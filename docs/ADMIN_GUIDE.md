@@ -1148,15 +1148,27 @@ A workspace is where access, budget, and key issuance come together.
    set applies — **the tightest wins** — so a tightly-capped key never exceeds its own limit even
    inside a generous workspace. Each field is set to **Inherit**, **Unlimited** or a value; the page
    never asks you to leave a field blank or type 0 to mean something.
-   - **Workspace pool** — the RPM/TPM and daily/monthly budget all members share. A rate you do not
-     set is unlimited. A budget you do not set **inherits the tenant's default budget** (Settings →
+   Requests per minute are capped **per surface**, each with its own field at every level: **LLM**
+   (chat, embeddings, audio, images, video and out-of-band analysis), **MCP** (every MCP server,
+   the built-in Web server included) and **A2A**. Each surface counts only its own requests, so a
+   burst of MCP calls never throttles a member's chat and the reverse; tokens per minute and the
+   budgets are shared by every surface. A rate is **per surface**, never a combined total: a pool
+   at 60 LLM, 60 MCP and 60 A2A requests a minute lets a member's requests on all three together
+   reach 180 a minute. To hold one surface tighter, lower its own field — for example set the
+   pool's MCP rate to 20 and leave its LLM rate at 60.
+   - **Workspace pool** — the request rates, the TPM and the daily/monthly budget all members
+     share. A rate you do not set is unlimited. A budget you do not set **inherits the tenant's default budget** (Settings →
      Budget) — and that holds for every workspace with no budget of its own, including one whose
      limits were never opened; the field shows the value it inherits.
    - **Each member — default** — a limit applied to **every member separately** (e.g. 60 requests
      a minute and $5 a day each), so one person cannot use up the whole pool. A person who belongs
-     to two workspaces has a separate limit, and separate usage, in each. The Agent and Inline AI
-     workspaces take no member default — one service member carries all their traffic; use the
-     pool there.
+     to two workspaces has a separate limit, and separate usage, in each. A workspace you create
+     starts with a member default of **120 LLM, 300 MCP and 60 A2A requests a minute** (no token
+     rate, no budget); change or clear it like any other value. The default applies to people:
+     a **service account** that is a member of the workspace is not covered by it, and is held
+     only by the workspace pool, the organisation ceiling and an exception you set for it. The
+     Agent and Inline AI workspaces take no member default — one service member carries all
+     their traffic; use the pool there.
    - **Member exceptions** — a member exception **replaces the workspace's default member limit for
      that member — higher or lower** — field by field: a field left on *Inherit* keeps the default.
      An exception never lifts a member above the workspace's own pool or the organisation ceiling.
@@ -1175,7 +1187,9 @@ A workspace is where access, budget, and key issuance come together.
    A refused request says which limit refused it: the 429 response carries `bucket`
    (`organisation`, `workspace`, `member` or `key`) beside the message — on an MCP call, as
    `error.data.bucket` of the JSON-RPC error — and the request's audit entry records the same,
-   shown in the console and in the member's **My Requests**.
+   shown in the console and in the member's **My Requests**. A request-rate refusal also carries
+   `surface` (`llm`, `mcp` or `a2a`; `error.data.surface` on an MCP call), and its message names
+   the surface ("your member MCP requests-per-minute limit reached").
    Each budget has a **mode**: *Enforce* (the default — an over-budget request is blocked) or
    *Alert only* (the request goes through, but you still get the approaching/over-budget
    notification). Alert-only is for "track and warn, don't interrupt" production workloads.
@@ -1184,9 +1198,13 @@ A workspace is where access, budget, and key issuance come together.
    close each budget is without leaving the page. A **daily** budget runs over the UTC day; a
    **monthly** budget runs over a fixed 30-day period (consecutive 30-day blocks in UTC), not the
    calendar month. The workspace pool counts every priced request, whether or not it has a budget.
-   A **member limit, a key budget and the organisation ceiling count from the moment they are
-   set**: spend made earlier in the same day or 30-day period does not count toward them, so the
-   first period after you set one can run over its value by what was already spent. Budget notifications for members are grouped per
+   A **budget you set counts the spend already recorded in its current window**: a member, key
+   or organisation budget set where there was none, part-way through a day or 30-day period,
+   starts from what was already recorded for it in that window — so a $50 monthly member budget
+   set after $40 of recorded spend leaves $10. A member's or a key's spend is what the gateway's
+   audit trail holds within your retention when you save the budget; the organisation's is the
+   running spend of the workspaces that count toward its ceiling. Requests still finishing or not
+   yet recorded at that moment are not included. Budget notifications for members are grouped per
    workspace ("3 members of Data Science reached their daily member budget") so a default that
    applies to everyone cannot flood your notifications.
    Above all of these sits an optional **organisation ceiling** — one daily and monthly cap for
@@ -2159,7 +2177,32 @@ is fetched, and a blocked call is never fetched — the model is told it was blo
 request's audit shows the blocked call. The Claude Code rule also covers a WebFetch that Claude Code
 has not loaded yet but lists as available, and a conversation in which the model already loaded
 WebFetch keeps working on an Anthropic provider once the rule is enabled — or once WebFetch is
-blocked. A non-bypassable SSRF guard refuses private
+blocked.
+
+**What the model sees.** On `/mcp/web` each tool lists a title, a description saying when to use
+it and what comes back, read-only hints, and — for `web_search` — the shape of its result.
+`web_fetch` returns a page's readable text; a model can ask for at most `max_length` characters
+from `start_index` on, and a page cut short says so and where to resume. The fetch byte cap still
+bounds the whole page. A call that fails — arguments that do not match the tool, an address that may
+not be fetched, a site that does not answer, no search backend, too many requests — is answered as
+a failed tool result the model can act on, starting with a short code (`invalid_tool_input`,
+`url_not_allowed`, `url_not_accessible`, `content_too_large`, `too_many_requests`, `unavailable`)
+followed by what to do; the audit still records it as a failed call with its own category. A call a
+tool-call rule blocks on `/mcp/web` is still refused as a policy block. A substituted client tool
+keeps its own name and the rule's parameters: the built-in fetch rules offer the optional
+`max_length` and `start_index`, and a rule you edited down to `url` alone keeps working (a cut page
+then says only that it was cut). A failed substituted call reaches the model as an error result
+with the same text. For a provider's server-side search the client receives the provider's own
+failure shape: an Anthropic client an error code from Anthropic's set, an OpenAI Responses client a
+search call marked `failed`, a Gemini client no grounding source for that search.
+
+When the gateway runs a provider's server-side web search itself, the limits the client set on
+that tool — a `max_uses`, a domain list, a `user_location`, a code-execution caller (the default of
+Anthropic's `_20260209` and later web tools) — are not applied; this tab's settings are. The
+request's **Server Tool Substituted** badge lists them by name only, never their values (a setting
+the gateway has no name for reads `other`), on a request in which the model searched.
+
+A non-bypassable SSRF guard refuses private
 targets on fetch unless the platform's **Web fetch** egress list lists them, and the cloud metadata
 address always (the URL filter chain runs first, the security guard second). A search backend on a
 private address needs the **Extensions** egress list. Use the
@@ -2712,6 +2755,17 @@ Identifies the **AI clients/apps** hitting the gateway and serves them per-app o
   to ship something that looks right and cannot connect. If a tool genuinely reads its key only from
   a shell variable, say so with **Key delivery → environment** and the Quickstart shows the user the
   key itself instead.
+
+  **Usable as a tool by the workspace's other clients** is for a client that agents run as a tool —
+  Open Code Review, which coding agents call as a review skill, has it on in each template that writes its gateway endpoint (not in its MCP-only one, which a developer merges beside their own provider settings). When a
+  developer starts another client in the sandbox (`ssai run`), the sandbox normally gives the agent
+  that client's own configuration only, so a tool the agent starts finds none and fails. With this on,
+  the sandbox also gives the agent this client's configuration, when the developer provisioned both
+  clients for the same workspace outside any project (their user-wide configuration; a client
+  provisioned into a project is given no other client's). That exposes
+  this client's **gateway key** to the agent of the other client: it can read it and use it, within
+  the same workspace, user and limits. Turn it off for a client you do not want reachable that way;
+  the change reaches a developer's machine with their next `ssai sync`.
 - **CLI Sessions** — every machine a member has signed in on with `ssai login`, with the
   device name it reported, who it belongs to, when it was **last active**, and how long it has left.
   Last-active is recorded about once a minute rather than on every request, so it answers which

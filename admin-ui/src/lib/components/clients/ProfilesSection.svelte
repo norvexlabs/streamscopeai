@@ -549,6 +549,22 @@
               </label>
             {/if}
           </div>
+          <label class="flex items-start gap-2 text-xs text-(--text-secondary)">
+            <input
+              type="checkbox"
+              bind:checked={t.usable_as_tool}
+              onchange={form.markDirty}
+              data-testid="template-usable-as-tool"
+              class="mt-0.5 rounded-sm border-(--border) bg-(--bg-primary) text-(--accent) focus:ring-(--accent)" />
+            <span>
+              Usable as a tool by the workspace's other clients
+              <span class="block mt-1 opacity-70">
+                When on, a developer running another client in the sandbox (<code>ssai run</code>) lets its
+                agent run this one as a tool: the sandbox gives the agent this client's provisioned config,
+                so the gateway key in it is readable by that agent.
+              </span>
+            </span>
+          </label>
           <label class="block text-xs text-(--text-secondary)">Instructions (rendered above the snippet)
             <textarea bind:value={t.instructions} oninput={form.markDirty} rows="2" class="w-full mt-1 px-3 py-1.5 bg-(--bg-primary) border border-(--border) rounded-lg text-(--text-primary) text-sm"></textarea>
           </label>

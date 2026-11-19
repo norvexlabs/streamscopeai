@@ -356,11 +356,47 @@ pub async fn search(
     Ok(final_result)
 }
 
-/// Run a fetch. Same audit/policy/filter pipeline.
+/// A fetch's answer: the slice of the page the caller is handed, and the
+/// untrusted text of the WHOLE page, which is what a guardrail scores.
+///
+/// **Invariant: the guardrail scores the whole page, never the slice.** The
+/// caller chooses `start_index` and `max_length`, so a payload split across two
+/// slices would be scored half by half and pass both times; withholding is
+/// decided on the whole page (its verdict then covers every slice of it) and
+/// only then is the slice cut.
+#[derive(Debug)]
+pub struct Fetched {
+    /// The slice `req` asked for ([`FetchResult::take_slice`]) — what the
+    /// caller is handed and what the audit row's response records.
+    pub result: FetchResult,
+    /// [`FetchResult::classifiable`] of the whole page, before the cut.
+    pub classifiable: String,
+    /// The whole extracted page's size in bytes — what was scanned, beside
+    /// the slice's own `extracted_size`.
+    pub page_extracted_size: usize,
+}
+
+impl Fetched {
+    /// Take the whole page's untrusted text, THEN cut the slice `req` asks
+    /// for — the one order that keeps the invariant on [`Fetched`].
+    fn cut(mut page: FetchResult, req: &FetchRequest, paging: super::types::Paging) -> Self {
+        let classifiable = page.classifiable();
+        let page_extracted_size = page.extracted_text.len();
+        page.take_slice(req, paging);
+        Self { result: page, classifiable, page_extracted_size }
+    }
+}
+
+/// Run a fetch. Same audit/policy/filter pipeline. The page is scanned whole
+/// (on the direct surface here; on the substitution surface by the fold-back,
+/// from [`Fetched::classifiable`]), then cut to the slice `req` asks for; the
+/// audit row records the slice delivered and the size of the page scanned.
+/// `paging` says whether a cut slice may name where to resume.
 pub async fn fetch(
     ctx: &WebContext<'_>,
     req: FetchRequest,
-) -> Result<FetchResult, WebError> {
+    paging: super::types::Paging,
+) -> Result<Fetched, WebError> {
     let started = Instant::now();
     let request_args = serde_json::to_value(&req).ok();
 
@@ -369,6 +405,15 @@ pub async fn fetch(
     // substitution agent loop's stream is dropped.
     if ctx.is_cancelled() {
         let e = WebError::Cancelled;
+        emit_error(ctx, "fetch", &req.url, &e, request_args, started.elapsed().as_millis() as u64).await;
+        return Err(e);
+    }
+
+    // At least one character, as the tool declares (`minimum: 1`) and as the
+    // reference fetch server holds it: a slice of none would answer an empty
+    // page whose notice sends the caller back to the same index, for ever.
+    if req.max_length == Some(0) {
+        let e = WebError::InvalidArguments("`max_length` must be at least 1".into());
         emit_error(ctx, "fetch", &req.url, &e, request_args, started.elapsed().as_millis() as u64).await;
         return Err(e);
     }
@@ -524,14 +569,21 @@ pub async fn fetch(
         }
     }
 
+    // The whole page's untrusted text, taken BEFORE the cut: every guardrail
+    // scores it (see `Fetched`), so a slice boundary cannot split a payload.
+    let Fetched { result, classifiable, page_extracted_size } = Fetched::cut(result, &req, paging);
+
     // Build content-summary stub for audit. Phase 1 doesn't actually persist
     // the bytes into audit_media_blobs — that wiring lives at the edge audit
     // layer; the summary fields here are placeholders for that hop.
+    // `extracted_size` is the slice delivered, `page_extracted_size` the whole
+    // extracted page the guardrail scanned.
     let raw_size = raw_bytes.len();
     let extracted_size = result.extracted_text.len();
     let fetch_content_summary = serde_json::json!({
         "raw_size": raw_size,
         "extracted_size": extracted_size,
+        "page_extracted_size": page_extracted_size,
         "fetch_url": result.url,
         "final_url": result.final_url,
         "redirect_chain": result.redirect_chain,
@@ -540,11 +592,11 @@ pub async fn fetch(
 
     let response_summary = serde_json::to_value(&result).ok();
 
-    // Direct `/mcp/web` observe scan over the fetched page's extracted text
-    // before it reaches the client. No-op on the substitution surface. Runs
-    // before the record is stamped so `latency_total_ms` includes the scan the
-    // caller actually waited on (parity with the `search` path).
-    let guardrail_badges = guardrail_observe_badges(ctx, &result.classifiable()).await;
+    // Direct `/mcp/web` observe scan over the whole fetched page (not the
+    // slice) before the slice reaches the client. No-op on the substitution
+    // surface. Runs before the record is stamped so `latency_total_ms` includes
+    // the scan the caller actually waited on (parity with the `search` path).
+    let guardrail_badges = guardrail_observe_badges(ctx, &classifiable).await;
 
     let mut record = base_record(
         ctx,
@@ -572,7 +624,7 @@ pub async fn fetch(
     record.badges.extend(guardrail_badges);
     emit(ctx, record).await;
 
-    Ok(result)
+    Ok(Fetched { result, classifiable, page_extracted_size })
 }
 
 /// Build the common audit-row skeleton.
@@ -778,11 +830,13 @@ pub async fn dispatch_intercept(
             }
             WebInterceptKind::Fetch => {
                 let req: FetchRequest = parse_audited_args(ctx, "fetch", arguments_json).await?;
-                let result = fetch(ctx, req).await?;
-                // The page body is not the only untrusted surface the model reads
-                // — the response content-type and every redirect hop are
+                let paging = binding.declares.paging();
+                let Fetched { result, classifiable, .. } = fetch(ctx, req, paging).await?;
+                // The WHOLE page's untrusted text (see `Fetched`): the fold-back
+                // decides withholding on it, then hands the model the slice. The
+                // page body is not the only untrusted surface the model reads —
+                // the response content-type and every redirect hop are
                 // attacker-chosen too. See `FetchResult::classifiable`.
-                let classifiable = result.classifiable();
                 let target = result.final_url.clone();
                 let folded = serde_json::to_string(&result)
                     .map_err(|e| WebError::Internal(format!("serialize fetch result: {e}")))?;
@@ -794,8 +848,9 @@ pub async fn dispatch_intercept(
 
 /// Result of one intercepted web tool-call. `folded` is the JSON-stringified
 /// `SearchResult`/`FetchResult` the agent loop feeds back to the model as a
-/// `tool_result`; `classifiable` is the raw untrusted text (fetched page body /
-/// joined search snippets) the inline guardrail scores — kept separate so the
+/// `tool_result`; `classifiable` is the raw untrusted text (the WHOLE fetched
+/// page, whatever slice `folded` carries — see [`Fetched`] — or the joined
+/// search snippets) the inline guardrail scores — kept separate so the
 /// classifier sees clean prose, not the JSON envelope. `target` is the fetched
 /// URL or search query, shown on the guardrail trace step.
 #[derive(Debug, Clone)]
@@ -815,7 +870,7 @@ fn normalize_args(arguments_json: &str) -> &str {
 
 fn parse_args<T: serde::de::DeserializeOwned>(arguments_json: &str) -> Result<T, WebError> {
     serde_json::from_str(normalize_args(arguments_json))
-        .map_err(|e| WebError::InvalidConfig(format!("parse intercept args: {e}")))
+        .map_err(|e| WebError::InvalidArguments(e.to_string()))
 }
 
 /// Longest raw-argument prefix kept as a row's `query` when nothing better can
@@ -906,6 +961,50 @@ fn cap_provider_response(
 mod tests {
     use super::*;
 
+    /// The guardrail scores the WHOLE page, whatever slice the caller asks
+    /// for: a payload the caller's `max_length` / `start_index` split across
+    /// two slices is whole in the text each slice's scan reads, while each
+    /// slice delivers only its part. Positive control: a clean page slices as
+    /// asked, and its scanned text is the whole page too.
+    #[test]
+    fn a_payload_split_across_two_slices_is_scanned_whole_in_each() {
+        let page = |text: &str| FetchResult {
+            url: "https://a.test/".into(),
+            final_url: "https://a.test/".into(),
+            content_type: "text/plain".into(),
+            status: 200,
+            extracted_text: text.into(),
+            redirect_chain: Vec::new(),
+            extracted_size: text.len(),
+            raw_size: text.len(),
+            start_index: 0,
+            total_length: 0,
+            next_start_index: None,
+            notice: None,
+        };
+        let ask = |max_length, start_index| FetchRequest { url: "https://a.test/".into(), max_length, start_index };
+        let payload = "INJECTION_CANARY";
+        let text = format!("Revenue grew steadily. {payload} Revenue grew again.");
+        let cut = (text.find(payload).expect("payload") + payload.len() / 2) as u64;
+
+        let first = Fetched::cut(page(&text), &ask(Some(cut), None), super::super::types::Paging::Offered);
+        let second = Fetched::cut(page(&text), &ask(None, Some(cut)), super::super::types::Paging::Offered);
+        for slice in [&first, &second] {
+            assert!(!slice.result.extracted_text.contains(payload), "the slice holds part of it: {slice:?}");
+            assert!(slice.classifiable.contains(payload), "the scan reads it whole: {slice:?}");
+            assert_eq!(slice.page_extracted_size, text.len());
+            assert_eq!(slice.result.extracted_size, slice.result.extracted_text.len());
+        }
+        assert_eq!(format!("{}{}", first.result.extracted_text, second.result.extracted_text), text);
+
+        let clean = "Revenue grew steadily across all regions.";
+        let sliced = Fetched::cut(page(clean), &ask(Some(7), None), super::super::types::Paging::Offered);
+        assert_eq!(sliced.result.extracted_text, "Revenue");
+        assert_eq!(sliced.result.next_start_index, Some(7));
+        assert!(sliced.classifiable.starts_with(clean), "{:?}", sliced.classifiable);
+        assert_eq!((sliced.page_extracted_size, sliced.result.extracted_size), (clean.len(), 7));
+    }
+
     #[test]
     fn cap_returns_value_under_limit() {
         let v = serde_json::json!({"a": 1});
@@ -955,6 +1054,53 @@ mod tests {
         }
     }
 
+    /// Every seeded web substitution declares a schema the ONE executor reads:
+    /// its required keys are declared, a call naming only them parses (as an
+    /// administrator's edited rule declaring only `url` or `query` must), and a
+    /// fetch substitute declares the optional paging arguments, which parse
+    /// too. A wrong type is refused as the model's input.
+    #[test]
+    fn every_seeded_web_substitution_schema_parses_through_the_executor() {
+        let rules: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../../../seeds/tool-policy/rules.json")).expect("rules.json");
+        let mut seen = 0;
+        for rule in rules.iter().filter(|r| r["id"].as_str().is_some_and(|id| id.starts_with("WS-SUB-"))) {
+            seen += 1;
+            let id = rule["id"].as_str().unwrap_or_default();
+            let params = &rule["action"]["with"]["parameters"];
+            let kind = rule["action"]["intercept"]["kind"].as_str().unwrap_or_default();
+            let props = params["properties"].as_object().unwrap_or_else(|| panic!("{id}: properties"));
+            let required: Vec<&str> =
+                params["required"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            for key in &required {
+                assert!(props.contains_key(*key), "{id}: required `{key}` is declared");
+            }
+            match kind {
+                "search" => {
+                    assert_eq!(required, ["query"], "{id}");
+                    let minimal: SearchRequest = parse_args(r#"{"query":"rust"}"#).expect(id);
+                    assert_eq!((minimal.query.as_str(), minimal.max_results), ("rust", None));
+                }
+                "fetch" => {
+                    assert_eq!(required, ["url"], "{id}");
+                    let minimal: FetchRequest = parse_args(r#"{"url":"https://a.test/"}"#).expect(id);
+                    assert_eq!((minimal.max_length, minimal.start_index), (None, None), "{id}: the whole page by default");
+                    assert!(props.contains_key("max_length") && props.contains_key("start_index"), "{id}: declares paging");
+                    for key in ["max_length", "start_index"] {
+                        assert_eq!(props[key]["type"], "integer", "{id}: {key}");
+                    }
+                    let paged: FetchRequest =
+                        parse_args(r#"{"url":"https://a.test/","max_length":2000,"start_index":4000}"#).expect(id);
+                    assert_eq!((paged.max_length, paged.start_index), (Some(2000), Some(4000)));
+                }
+                other => panic!("{id}: unknown executor kind {other:?}"),
+            }
+        }
+        assert_eq!(seen, 11, "every seeded web substitution was checked");
+        let wrong = parse_args::<FetchRequest>(r#"{"url":"https://a.test/","max_length":"lots"}"#).unwrap_err();
+        std::assert_matches!(wrong, WebError::InvalidArguments(_));
+    }
+
     #[test]
     fn parse_args_accepts_empty_as_default_object() {
         let parsed: serde_json::Value = parse_args("").unwrap();
@@ -973,7 +1119,7 @@ mod tests {
     #[test]
     fn parse_args_surfaces_invalid_json() {
         let err = parse_args::<SearchRequest>("not json").unwrap_err();
-        assert_eq!(err.category(), "config_invalid");
+        assert_eq!(err.category(), "invalid_arguments");
     }
 
     /// A search client on the `extensions` list (empty in this crate's tests
@@ -1113,6 +1259,8 @@ mod tests {
             },
             action: "substitute".into(),
             original_server_type: None,
+            declares: Default::default(),
+            not_honoured: Vec::new(),
         };
 
         let err = dispatch_intercept(&binding, r#"{"query":"x"}"#, &ctx)
@@ -1139,6 +1287,8 @@ mod tests {
             },
             action: "substitute".into(),
             original_server_type: None,
+            declares: Default::default(),
+            not_honoured: Vec::new(),
         };
         let err = dispatch_intercept(&fetch_binding, r#"{"url":"not a url"}"#, &ctx)
             .await
@@ -1154,7 +1304,7 @@ mod tests {
         // Argument decoding is the one step that runs before `search`/`fetch`,
         // so it is the one place a web call could fail without leaving a
         // `web_audit` row. It must audit like every other failure: one row,
-        // `config_invalid`, carrying the raw arguments.
+        // `invalid_arguments`, carrying the raw arguments.
         use crate::config::tool_rules::{InterceptKind, WebInterceptKind};
         use crate::proxy::content::InterceptBinding;
 
@@ -1191,17 +1341,19 @@ mod tests {
             },
             action: "substitute".into(),
             original_server_type: None,
+            declares: Default::default(),
+            not_honoured: Vec::new(),
         };
 
         // Valid JSON, wrong shape — a known field with the wrong type, the shape
         // a model actually emits when it guesses the schema. (An *unknown* field
         // would not fail: serde ignores those.) `url` is still recoverable.
-        let err = dispatch_intercept(&binding, r#"{"url":"http://x.test/","max_bytes":"lots"}"#, &ctx)
+        let err = dispatch_intercept(&binding, r#"{"url":"http://x.test/","max_length":"lots"}"#, &ctx)
             .await
             .unwrap_err();
-        assert_eq!(err.category(), "config_invalid");
+        assert_eq!(err.category(), "invalid_arguments");
         let rec = rx.try_recv().expect("audit row emitted for unparseable args");
-        assert_eq!(rec.error_category.as_deref(), Some("config_invalid"));
+        assert_eq!(rec.error_category.as_deref(), Some("invalid_arguments"));
         assert_eq!(rec.operation, "fetch");
         assert_eq!(rec.query.as_deref(), Some("http://x.test/"));
         assert!(rec.request_args.is_some(), "raw arguments retained on the row");
@@ -1209,7 +1361,7 @@ mod tests {
         // Not JSON at all — no typed field to recover, so the row falls back to
         // the raw text. It must still name something.
         let err = dispatch_intercept(&binding, "not json", &ctx).await.unwrap_err();
-        assert_eq!(err.category(), "config_invalid");
+        assert_eq!(err.category(), "invalid_arguments");
         let rec = rx.try_recv().expect("audit row emitted for non-JSON args");
         assert_eq!(rec.query.as_deref(), Some("not json"));
 
@@ -1311,9 +1463,10 @@ mod tests {
         };
         let req = FetchRequest {
             url: "http://example.test/page".into(),
-            max_bytes: None,
+            max_length: None,
+            start_index: None,
         };
-        let err = fetch(&ctx, req).await.unwrap_err();
+        let err = fetch(&ctx, req, super::super::types::Paging::Offered).await.unwrap_err();
         assert_eq!(err.category(), "cancelled");
 
         let rec = rx.try_recv().expect("audit row emitted on cancelled fetch");
@@ -1323,13 +1476,53 @@ mod tests {
         assert_eq!(rec.query.as_deref(), Some("http://example.test/page"));
     }
 
+    /// `max_length: 0` is refused as the caller's argument — one audited
+    /// row, the model told to pass at least 1 — before any fetch. Positive
+    /// control: `max_length: 1` passes the check and reaches the next one
+    /// (the URL's, which this test's URL fails, so no network is needed).
+    #[tokio::test]
+    async fn a_fetch_of_no_characters_is_refused_as_invalid_arguments() {
+        let (tx, mut rx) = crate::audit::counted_channel::<WebAuditRecord>(4);
+        let settings = WebSettings::default();
+        let client = test_search_clients();
+        let ctx = WebContext {
+            settings: &settings,
+            credential: None,
+            search_clients: &client,
+            audit_tx: Some(&tx),
+            request_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            upstream_server_id: Uuid::new_v4(),
+            key_id: None,
+            app_id: None,
+            session_id: None,
+            user_agent: None,
+            detection_method: None,
+            ip: None,
+            surface: WebSurface::Substitution,
+            parent_request_id: Some(Uuid::new_v4()),
+            tool_use_id: None,
+            cancel_token: None,
+        };
+        let ask = |max_length| FetchRequest { url: "not a url".into(), max_length, start_index: Some(3) };
+        let err = fetch(&ctx, ask(Some(0)), super::super::types::Paging::Offered).await.unwrap_err();
+        std::assert_matches!(&err, WebError::InvalidArguments(d) if d.contains("at least 1"));
+        assert!(err
+            .model_text(crate::config::tool_rules::WebInterceptKind::Fetch, super::super::types::DeclaredArgs::ALL)
+            .starts_with("invalid_tool_input: "));
+        let rec = rx.try_recv().expect("one audited row");
+        assert_eq!(rec.error_category.as_deref(), Some("invalid_arguments"));
+        assert!(rx.try_recv().is_err());
+
+        let err = fetch(&ctx, ask(Some(1)), super::super::types::Paging::Offered).await.unwrap_err();
+        assert_eq!(err.category(), "invalid_url", "one character is a valid ask");
+    }
+
     #[test]
-    fn cancelled_error_round_trips_through_category_and_rpc_code() {
-        // Cancelled is a new variant — confirm both downstream surfaces
-        // (admin audit category, MCP rpc_code) land the right values.
-        let e = WebError::Cancelled;
-        assert_eq!(e.category(), "cancelled");
-        assert_eq!(e.rpc_code(), -32003);
+    fn a_cancelled_call_has_its_own_audit_category() {
+        assert_eq!(WebError::Cancelled.category(), "cancelled");
     }
 
     /// Architecture test: every code path that runs a web search or fetch

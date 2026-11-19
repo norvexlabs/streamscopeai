@@ -94,6 +94,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
 ] }
+# The Task Scheduler's COM interfaces (the sandbox account's tasks, deleted
+# after a run), which windows-sys does not carry.
+windows = { version = "0.62", features = ["Win32_System_Com", "Win32_System_Ole", "Win32_System_TaskScheduler", "Win32_System_Variant"] }
 
 [dev-dependencies]
 # PKCE cross-check: the CLI hand-rolls verifier/challenge generation to keep

@@ -1308,6 +1308,7 @@ pub(crate) fn provision_one(
         files,
         last_provisioned: chrono::Utc::now(),
         launch_command: cb.launch_command.clone(),
+        usable_as_tool: cb.template.usable_as_tool,
     }))
 }
 
@@ -3446,6 +3447,7 @@ mod scope_split_tests {
             companions: Vec::new(),
             keyed_arrays: Default::default(),
             local_mcp: Default::default(),
+            usable_as_tool: false,
             body: String::new(),
         }
     }
@@ -4335,6 +4337,7 @@ mod splice_tests {
             }],
             keyed_arrays: Default::default(),
             local_mcp: Default::default(),
+            usable_as_tool: false,
             body: String::new(),
         }
     }
@@ -4559,6 +4562,7 @@ mod group_tests {
                 files: vec![],
                 last_provisioned: chrono::Utc::now(),
                 launch_command: None,
+                usable_as_tool: false,
             }],
             ..Default::default()
         };

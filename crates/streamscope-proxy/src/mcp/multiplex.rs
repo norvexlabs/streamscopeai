@@ -91,16 +91,18 @@ impl ListChangedKind {
     }
 }
 
-/// Inspect a decoded SSE event's `data` payload and decide what audit /
-/// log signal to emit. The raw bytes are already attached on the wire; this
-/// only classifies for the side-channel.
+/// Decide what audit / log signal a decoded SSE event's `data` payload
+/// emits, from the payload as parsed (`None`: not JSON, a passthrough). The
+/// raw bytes are already attached on the wire; this only classifies for the
+/// side-channel.
+pub fn classify_parsed(parsed: Option<&serde_json::Value>) -> ClassifiedEvent {
+    ClassifiedEvent { kind: parsed.map_or(EventKind::Passthrough, classify_value) }
+}
+
+/// [`classify_parsed`] over the raw `data` payload.
+#[cfg(test)]
 pub fn classify_sse_event(data: &str) -> ClassifiedEvent {
-    let parsed: Option<serde_json::Value> = serde_json::from_str(data).ok();
-    let kind = match parsed.as_ref() {
-        Some(v) => classify_value(v),
-        None => EventKind::Passthrough,
-    };
-    ClassifiedEvent { kind }
+    classify_parsed(serde_json::from_str::<serde_json::Value>(data).ok().as_ref())
 }
 
 pub fn classify_value(v: &serde_json::Value) -> EventKind {
@@ -769,6 +771,7 @@ mod tests {
                 message: "not found".into(),
                 data: Some(serde_json::json!({ "uri": "note://gone" })),
             }),
+            audit_error: None,
         };
         assert!(rewrite_response_uris(&mut failed, "gh"));
         let uri = failed.error.as_ref().unwrap().data.as_ref().unwrap()["uri"]

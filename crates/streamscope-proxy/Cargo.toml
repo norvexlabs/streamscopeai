@@ -8,10 +8,18 @@ publish.workspace = true
 
 [features]
 pprof = ["dep:pprof"]
+# Bench builds only: the process's resident size as gauges, and /debug/alloc (runs `mi_collect`).
+alloc-stats = ["dep:libmimalloc-sys"]
+# Bench builds only: a heap profile by allocation site (replaces the allocator; slow).
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 mimalloc.workspace = true
 pprof = { version = "0.15", features = ["flamegraph"], optional = true }
+dhat = { version = "0.3", optional = true }
+# The same build of the allocator `mimalloc` links (kept on its version), with
+# the `extended` API that declares `mi_collect`.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true }
 streamscope-core = { path = "../streamscope-core" }
 streamscope-mcp-auth = { path = "../streamscope-mcp-auth" }
 streamscope-edge-api = { path = "../streamscope-edge-api" }

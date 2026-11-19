@@ -25,6 +25,15 @@ use crate::db::tenant::Scoped;
 /// surfaces can filter it out and the OIDC upsert can leave it sticky.
 pub const SERVICE_AUTH_SOURCE: &str = "service";
 
+/// Who a `users` row is for the member bucket, from its `auth_source`: the
+/// one reading of the service-account marker every member-limit resolution
+/// goes through (a workspace's default member limit never applies to a
+/// service account).
+pub fn member_kind(auth_source: Option<&str>) -> streamscope_core::auth::member_limits::MemberKind {
+    use streamscope_core::auth::member_limits::MemberKind;
+    if auth_source == Some(SERVICE_AUTH_SOURCE) { MemberKind::ServiceAccount } else { MemberKind::Person }
+}
+
 /// The built-in Inline AI service account — the principal external content
 /// analyzers (a gateway's in-line AI-traffic inspection calling
 /// `POST /v1/analyze`) authenticate as. Provisioned per tenant beside the
@@ -151,4 +160,18 @@ pub async fn ensure_workspace_membership_role(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod member_kind_tests {
+    use super::*;
+    use streamscope_core::auth::member_limits::MemberKind;
+
+    #[test]
+    fn only_the_service_marker_is_a_service_account() {
+        assert_eq!(member_kind(Some(SERVICE_AUTH_SOURCE)), MemberKind::ServiceAccount);
+        for person in [None, Some("oidc"), Some("header"), Some(""), Some("Service")] {
+            assert_eq!(member_kind(person), MemberKind::Person, "{person:?}");
+        }
+    }
 }

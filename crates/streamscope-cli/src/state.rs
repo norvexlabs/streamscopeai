@@ -1114,6 +1114,12 @@ pub struct ManagedClient {
     /// `ssai run` resolves the binary fully offline, without a profile
     /// round-trip. `None` for GUI/curl clients with no launch command.
     pub launch_command: Option<String>,
+    /// Its template's `usable_as_tool`, as the gateway last handed it: `ssai
+    /// run --sandbox` of another client of the same manifest and workspace
+    /// then reaches this client's config. A record written before the field
+    /// reads `false` until the next `sync` rewrites it.
+    #[serde(default)]
+    pub usable_as_tool: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

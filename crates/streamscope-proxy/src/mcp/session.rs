@@ -12,6 +12,7 @@
 //! version still lands on the row before it's queryable.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -35,6 +36,13 @@ pub struct SessionEntry {
     pub protocol_version: Option<String>,
 }
 
+/// How often a per-upstream session id's lookup records its use: once a
+/// minute, or a quarter of the idle TTL when that is shorter, so a recorded
+/// use is never old enough for the sweep to take an id in use.
+fn use_refresh() -> Duration {
+    Duration::from_secs(60).min(idle_ttl() / 4)
+}
+
 /// Resolve the idle-eviction window from settings (`MCP_SESSION_IDLE_TTL_SECS`,
 /// default 30 min). Keep in lockstep with the legacy-SSE map's window.
 fn idle_ttl() -> Duration {
@@ -44,6 +52,55 @@ fn idle_ttl() -> Duration {
 /// Resolve the entry cap from settings.
 fn max_entries() -> usize {
     crate::settings::proxy_settings().mcp_session_max_entries
+}
+
+/// The maps [`McpSessionMap`]'s entry cap bounds, each on its own: the cap is
+/// compared with each map's own length.
+#[derive(Debug, Clone, Copy)]
+pub enum CappedMap {
+    Sessions,
+    LogLevels,
+    UpstreamEras,
+    UpstreamHandshakes,
+}
+
+/// The handshake map holds a quarter of `MCP_SESSION_MAX_ENTRIES`: a handshake
+/// carries the upstream's capabilities and instructions (1.7–3.5 KB measured,
+/// against ~0.1–0.2 KB for an entry of the other maps), so a quarter keeps a
+/// full map near 30–60 MB at the default beside a 512 MiB gateway.
+const HANDSHAKE_CAP_DIVISOR: usize = 4;
+
+impl CappedMap {
+    pub const ALL: [Self; 4] = [Self::Sessions, Self::LogLevels, Self::UpstreamEras, Self::UpstreamHandshakes];
+
+    /// The `map` label of `streamscope_proxy_mcp_session_cap_drops_total`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::LogLevels => "log_levels",
+            Self::UpstreamEras => "upstream_eras",
+            Self::UpstreamHandshakes => "upstream_handshakes",
+        }
+    }
+}
+
+/// New entries refused at the cap, per map ([`CappedMap`] order): a
+/// CUMULATIVE count, and whether a refusal was logged since the last sweep —
+/// one warning per map per sweep interval, since a full map refuses on every
+/// request until a sweep frees room.
+#[derive(Debug, Default)]
+struct CapDrops {
+    dropped: [AtomicU64; 4],
+    warned: [AtomicBool; 4],
+}
+
+/// How many entries the maps hold now (scrape-time gauges).
+#[derive(Debug, Clone, Copy)]
+pub struct McpSessionCounts {
+    pub sessions: usize,
+    pub upstream_sessions: usize,
+    pub upstream_handshakes: usize,
+    pub upstream_eras: usize,
 }
 
 #[derive(Debug)]
@@ -61,7 +118,12 @@ pub struct McpSessionMap {
     /// would receive one upstream's session-id stamped onto requests
     /// destined for the other and be rejected with JSON-RPC
     /// `-32600 Session not found`.
-    upstream_sessions: DashMap<(Uuid, String, Uuid), String>,
+    ///
+    /// Each value carries its last use (set, or looked up — recorded at most
+    /// once per [`use_refresh`]): the sweep keeps it while its session is in
+    /// `map` or that use is recent, since a fan-out's parent need not be in
+    /// `map`.
+    upstream_sessions: DashMap<(Uuid, String, Uuid), (String, Instant)>,
     /// Gateway-owned upstream handshakes, for serving **modern** clients.
     ///
     /// A modern (`2026-07-28`) client sends no `initialize`, so there is
@@ -105,6 +167,15 @@ pub struct McpSessionMap {
     /// The `logging/setLevel` a legacy client last asked for, keyed on the
     /// authenticated `(tenant_id, user_id)` — see [`Self::set_log_level`].
     client_log_levels: DashMap<(Uuid, Uuid), (String, Instant)>,
+    /// The entry cap of each map above but `upstream_sessions`, a quarter of
+    /// it for `upstream_handshakes`; `None` reads `MCP_SESSION_MAX_ENTRIES`.
+    ///
+    /// `upstream_sessions` has no cap: one client session writes an id per
+    /// upstream it reaches, and a refused id would send its calls to another
+    /// upstream's session. The sweep keeps only the ids of held sessions and
+    /// those used within the idle TTL.
+    cap: Option<usize>,
+    drops: CapDrops,
 }
 
 /// What one probe learned about an upstream, plus the clock that expires it.
@@ -186,13 +257,82 @@ impl UpstreamHandshake {
 
 impl McpSessionMap {
     pub fn new() -> Arc<Self> {
+        Self::build(None)
+    }
+
+    /// A map capped at `cap` entries per map (the handshakes at a quarter),
+    /// whatever the setting says.
+    #[cfg(test)]
+    pub fn with_cap(cap: usize) -> Arc<Self> {
+        Self::build(Some(cap))
+    }
+
+    fn build(cap: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
             map: DashMap::new(),
             upstream_sessions: DashMap::new(),
             upstream_handshakes: DashMap::new(),
             upstream_eras: DashMap::new(),
             client_log_levels: DashMap::new(),
+            cap,
+            drops: CapDrops::default(),
         })
+    }
+
+    /// The cap `which` is held to: the setting, or a quarter of it for the
+    /// handshakes ([`HANDSHAKE_CAP_DIVISOR`]), never below one.
+    fn cap_of(&self, which: CappedMap) -> usize {
+        let cap = self.cap.unwrap_or_else(max_entries);
+        match which {
+            CappedMap::UpstreamHandshakes => (cap / HANDSHAKE_CAP_DIVISOR).max(1),
+            _ => cap,
+        }
+    }
+
+    /// Whether a write of a NEW key to a map holding `len` entries is refused
+    /// at the cap — counting and (once per sweep interval) logging the
+    /// refusal. A write to a key the map already holds is never refused: it
+    /// keeps a live entry alive or updates it, and refusing it would let the
+    /// sweeper reap an entry in use.
+    ///
+    /// A full map drops the new write rather than evict: evicting at random
+    /// would surprise some other in-flight caller, while a dropped write costs
+    /// only the fast path (a re-handshake, a re-probe, an unstamped version)
+    /// until a sweep frees room. `len` then the write is not atomic across
+    /// DashMap shards, so concurrent writers may pass the cap by at most their
+    /// number.
+    fn refuses_new(&self, which: CappedMap, len: usize, existing: impl FnOnce() -> bool, tenant_id: Uuid) -> bool {
+        let cap = self.cap_of(which);
+        if len < cap || existing() {
+            return false;
+        }
+        let i = which as usize;
+        self.drops.dropped[i].fetch_add(1, Ordering::Relaxed);
+        if !self.drops.warned[i].swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                cap,
+                map = which.label(),
+                "MCP session map at capacity; dropping new entries until a sweep frees room \
+                 (counted in streamscope_proxy_mcp_session_cap_drops_total)"
+            );
+        }
+        true
+    }
+
+    /// New entries each map refused at the cap since the process started.
+    pub fn cap_drops(&self) -> [(CappedMap, u64); 4] {
+        CappedMap::ALL.map(|m| (m, self.drops.dropped[m as usize].load(Ordering::Relaxed)))
+    }
+
+    /// How many entries the maps hold now.
+    pub fn counts(&self) -> McpSessionCounts {
+        McpSessionCounts {
+            sessions: self.map.len(),
+            upstream_sessions: self.upstream_sessions.len(),
+            upstream_handshakes: self.upstream_handshakes.len(),
+            upstream_eras: self.upstream_eras.len(),
+        }
     }
 
     /// Touch a session id so the sweeper doesn't reap it and a subsequent
@@ -202,16 +342,8 @@ impl McpSessionMap {
         if mcp_session_id.is_empty() {
             return;
         }
-        let cap = max_entries();
-        if self.map.len() >= cap {
-            // Eviction is best-effort; the next sweep removes idle entries.
-            // Until then, drop the new write rather than evict at random and
-            // surprise an in-flight session.
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                cap,
-                "MCP session map at capacity; dropping new entry"
-            );
+        let key = (tenant_id, mcp_session_id.to_string());
+        if self.refuses_new(CappedMap::Sessions, self.map.len(), || self.map.contains_key(&key), tenant_id) {
             return;
         }
         // Preserve any previously captured `protocol_version` — `upsert` is
@@ -221,7 +353,7 @@ impl McpSessionMap {
         // both branches, so a concurrent `set_protocol_version` on the same
         // key cannot interleave between read-old / write-new.
         self.map
-            .entry((tenant_id, mcp_session_id.to_string()))
+            .entry(key)
             .and_modify(|e| {
                 e.last_activity = Instant::now();
                 // protocol_version intentionally untouched — `set_protocol_version`
@@ -270,14 +402,13 @@ impl McpSessionMap {
         if level.is_empty() {
             return;
         }
-        let cap = max_entries();
         let key = (tenant_id, user_id);
-        if self.client_log_levels.len() >= cap && !self.client_log_levels.contains_key(&key) {
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                cap,
-                "MCP client log-level map at capacity; dropping new entry"
-            );
+        if self.refuses_new(
+            CappedMap::LogLevels,
+            self.client_log_levels.len(),
+            || self.client_log_levels.contains_key(&key),
+            tenant_id,
+        ) {
             return;
         }
         self.client_log_levels
@@ -334,12 +465,8 @@ impl McpSessionMap {
             return;
         }
         self.upstream_sessions.insert(
-            (
-                tenant_id,
-                downstream_session_id.to_string(),
-                upstream_id,
-            ),
-            upstream_session_id.to_string(),
+            (tenant_id, downstream_session_id.to_string(), upstream_id),
+            (upstream_session_id.to_string(), Instant::now()),
         );
     }
 
@@ -357,20 +484,16 @@ impl McpSessionMap {
         if downstream_session_id.is_empty() {
             return None;
         }
-        self.upstream_sessions
-            .get(&(tenant_id, downstream_session_id.to_string(), upstream_id))
-            .map(|v| v.clone())
-    }
-
-    /// Drop every per-upstream mapping for a downstream session. Called
-    /// when the session itself is evicted (sweep) so the upstream map
-    /// doesn't outlive its parent.
-    fn forget_upstreams(&self, tenant_id: Uuid, downstream_session_id: &str) {
-        if downstream_session_id.is_empty() {
-            return;
+        let key = (tenant_id, downstream_session_id.to_string(), upstream_id);
+        let (sid, used) = self.upstream_sessions.get(&key).map(|v| v.clone())?;
+        // A use is recorded at most once a minute: a lookup otherwise takes
+        // the shard's write lock on every call.
+        if used.elapsed() > use_refresh()
+            && let Some(mut entry) = self.upstream_sessions.get_mut(&key)
+        {
+            entry.1 = Instant::now();
         }
-        self.upstream_sessions
-            .retain(|k, _| !(k.0 == tenant_id && k.1 == *downstream_session_id));
+        Some(sid)
     }
 
     /// Remove every entry idle longer than the configured idle TTL
@@ -378,7 +501,12 @@ impl McpSessionMap {
     /// default 30 min). Run by the periodic sweeper; safe to call from
     /// anywhere because DashMap takes internal locks per shard.
     pub fn sweep(&self) -> usize {
-        let cutoff = Instant::now() - idle_ttl();
+        self.sweep_at(Instant::now())
+    }
+
+    /// [`Self::sweep`] as of `now`.
+    fn sweep_at(&self, now: Instant) -> usize {
+        let cutoff = now - idle_ttl();
         let stale: Vec<_> = self
             .map
             .iter()
@@ -387,7 +515,6 @@ impl McpSessionMap {
             .collect();
         let n = stale.len();
         for key in stale {
-            self.forget_upstreams(key.0, &key.1);
             self.map.remove(&key);
         }
         // Gateway-owned handshakes age on their own clock: they are keyed by
@@ -402,6 +529,16 @@ impl McpSessionMap {
         // without a restart.
         self.upstream_eras.retain(|_, v| v.resolved_at >= cutoff);
         self.client_log_levels.retain(|_, v| v.1 >= cutoff);
+        // A per-upstream session id is kept while its session is held or it
+        // was itself used within the TTL — one pass, after the sessions above
+        // were removed: an id of a session `map` refused at its cap, or of a
+        // fan-out `initialize` whose parent was never touched, has no parent.
+        self.upstream_sessions
+            .retain(|k, v| v.1 >= cutoff || self.map.contains_key(&(k.0, k.1.clone())));
+        // A map still full after this sweep warns once more.
+        for warned in &self.drops.warned {
+            warned.store(false, Ordering::Relaxed);
+        }
         n
     }
 
@@ -440,14 +577,13 @@ impl McpSessionMap {
         upstream_id: Uuid,
         support: UpstreamEraSupport,
     ) {
-        let cap = max_entries();
         let key = (tenant_id, upstream_id);
-        if self.upstream_eras.len() >= cap && !self.upstream_eras.contains_key(&key) {
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                cap,
-                "MCP upstream era map at capacity; dropping new entry"
-            );
+        if self.refuses_new(
+            CappedMap::UpstreamEras,
+            self.upstream_eras.len(),
+            || self.upstream_eras.contains_key(&key),
+            tenant_id,
+        ) {
             return;
         }
         self.upstream_eras.insert(
@@ -510,20 +646,19 @@ impl McpSessionMap {
         inputs: u64,
         handshake: UpstreamHandshake,
     ) -> UpstreamHandshake {
-        let cap = max_entries();
         // The era comes off the handshake itself, so a caller cannot file a
         // modern connection under the legacy slot.
         let key = (tenant_id, user_id, upstream_id, handshake.era.is_modern());
-        if self.upstream_handshakes.len() >= cap && !self.upstream_handshakes.contains_key(&key) {
+        if self.refuses_new(
+            CappedMap::UpstreamHandshakes,
+            self.upstream_handshakes.len(),
+            || self.upstream_handshakes.contains_key(&key),
+            tenant_id,
+        ) {
             // Dropping the write costs a re-handshake on the next request,
             // which is correct-but-slow. Evicting a live entry at random
             // would instead hand some other in-flight caller a stale session
             // id, which is correct-looking and wrong.
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                cap,
-                "MCP upstream handshake map at capacity; dropping new entry"
-            );
             return handshake;
         }
         self.upstream_handshakes.insert(key, (handshake.clone(), inputs));
@@ -764,17 +899,187 @@ mod tests {
         assert_eq!(m.upstream_session(tenant, "ds", up_a).as_deref(), Some("sid_a"));
     }
 
+    /// A minute ago: older than the cutoff of [`sweep_a_minute_later`], with
+    /// no need for a clock older than the idle TTL.
+    fn a_minute_ago() -> Instant {
+        Instant::now().checked_sub(Duration::from_secs(61)).expect("the clock is a minute old")
+    }
+
+    /// A sweep whose cutoff is a minute before now.
+    fn sweep_a_minute_later(m: &McpSessionMap) {
+        m.sweep_at(Instant::now() + idle_ttl() - Duration::from_secs(60));
+    }
+
+    /// An idle id goes with its session, and stays while the session is held.
     #[test]
     fn upstream_sessions_evicted_with_parent() {
-        // Forcing the sweeper to run requires Instant manipulation —
-        // exercise the helper directly instead.
         let m = McpSessionMap::new();
         let tenant = Uuid::new_v4();
         let up = Uuid::new_v4();
         m.upsert(tenant, "ds");
         m.set_upstream_session(tenant, "ds", up, "sid");
         assert!(m.upstream_session(tenant, "ds", up).is_some());
-        m.forget_upstreams(tenant, "ds");
-        assert!(m.upstream_session(tenant, "ds", up).is_none());
+        let old = a_minute_ago();
+        for mut e in m.upstream_sessions.iter_mut() {
+            e.value_mut().1 = old;
+        }
+        sweep_a_minute_later(&m);
+        assert!(m.upstream_session(tenant, "ds", up).is_some(), "kept while its session is held");
+        for mut e in m.upstream_sessions.iter_mut() {
+            e.value_mut().1 = old;
+        }
+        m.map.get_mut(&(tenant, "ds".to_string())).expect("held").last_activity = old;
+        sweep_a_minute_later(&m);
+        assert!(m.upstream_session(tenant, "ds", up).is_none(), "gone with its session");
+    }
+
+    /// A per-upstream session id whose parent is not in `map` (refused at
+    /// the cap, or a fan-out's) is swept once idle; one in use, or of a held
+    /// session, is kept.
+    #[test]
+    fn an_upstream_session_without_its_parent_is_swept_once_idle() {
+        let m = McpSessionMap::with_cap(3);
+        let tenant = Uuid::new_v4();
+        let up = Uuid::new_v4();
+        for sid in ["held", "a", "b"] {
+            m.upsert(tenant, sid);
+        }
+        m.upsert(tenant, "refused");
+        assert_eq!(dropped(&m, CappedMap::Sessions), 1, "the session map is full");
+        m.set_upstream_session(tenant, "refused", up, "idle");
+        m.set_upstream_session(tenant, "used", up, "live");
+        let old = a_minute_ago();
+        m.set_upstream_session(tenant, "held", up, "parented");
+        for mut e in m.upstream_sessions.iter_mut() {
+            e.value_mut().1 = old;
+        }
+        assert_eq!(m.upstream_session(tenant, "used", up).as_deref(), Some("live"), "a lookup is a use");
+        sweep_a_minute_later(&m);
+        assert!(m.upstream_session(tenant, "refused", up).is_none(), "the idle id is swept");
+        assert_eq!(m.upstream_session(tenant, "used", up).as_deref(), Some("live"));
+        assert_eq!(m.upstream_session(tenant, "held", up).as_deref(), Some("parented"), "an id of a held session is kept, used or not");
+    }
+
+    fn dropped(m: &McpSessionMap, which: CappedMap) -> u64 {
+        m.cap_drops()[which as usize].1
+    }
+
+    fn last_activity(m: &McpSessionMap, tenant: Uuid, sid: &str) -> Instant {
+        m.map.get(&(tenant, sid.to_string())).expect("the session is held").last_activity
+    }
+
+    /// At the cap a session the map already holds is still touched: its
+    /// activity moves, so the sweeper does not reap a session in use.
+    #[test]
+    fn a_live_session_at_the_cap_is_still_touched() {
+        let m = McpSessionMap::with_cap(3);
+        let tenant = Uuid::new_v4();
+        for sid in ["a", "b", "c"] {
+            m.upsert(tenant, sid);
+        }
+        let before = last_activity(&m, tenant, "a");
+        std::thread::sleep(Duration::from_millis(5));
+        m.upsert(tenant, "a");
+        assert!(last_activity(&m, tenant, "a") > before, "the touch at the cap landed");
+        m.set_protocol_version(tenant, "a", "2025-11-25");
+        assert_eq!(m.protocol_version(tenant, "a").as_deref(), Some("2025-11-25"));
+        assert_eq!(dropped(&m, CappedMap::Sessions), 0, "a touch is not a refusal");
+    }
+
+    /// One below the cap a new session is stored; at the cap a new one is
+    /// refused and counted, and nothing held is evicted for it.
+    #[test]
+    fn a_new_session_is_stored_below_the_cap_and_refused_and_counted_at_it() {
+        let m = McpSessionMap::with_cap(3);
+        let tenant = Uuid::new_v4();
+        m.upsert(tenant, "a");
+        m.upsert(tenant, "b");
+        m.upsert(tenant, "c");
+        assert_eq!(m.len(), 3, "the third (at cap - 1 held) is stored");
+        assert_eq!(dropped(&m, CappedMap::Sessions), 0);
+
+        m.upsert(tenant, "d");
+        m.upsert(tenant, "e");
+        assert_eq!(m.len(), 3);
+        assert!(m.lookup(tenant, "d").is_none());
+        for sid in ["a", "b", "c"] {
+            assert!(m.lookup(tenant, sid).is_some(), "{sid} is still held");
+        }
+        assert_eq!(dropped(&m, CappedMap::Sessions), 2, "each refused write is counted");
+        assert_eq!(dropped(&m, CappedMap::UpstreamHandshakes), 0, "per map");
+    }
+
+    /// The handshake map is held to a quarter of the cap: one below it a new
+    /// handshake is stored; at it an existing key is replaced in place and a
+    /// new one is refused, counted, and still returned for this one call.
+    #[test]
+    fn the_handshake_map_is_held_to_a_quarter_of_the_cap() {
+        let m = McpSessionMap::with_cap(12);
+        let tenant = Uuid::new_v4();
+        let user = Uuid::new_v4();
+        let upstreams: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+        let handshake =
+            |sid: &str| UpstreamHandshake::legacy(Some(sid.into()), serde_json::json!({}), "x".into(), None);
+
+        for (i, up) in upstreams[..3].iter().enumerate() {
+            m.set_handshake(tenant, user, *up, 0, handshake(&i.to_string()));
+        }
+        assert_eq!(m.handshake_len(), 3, "the third (at cap - 1 held) is stored");
+        assert_eq!(dropped(&m, CappedMap::UpstreamHandshakes), 0);
+
+        m.set_handshake(tenant, user, upstreams[0], 0, handshake("0b"));
+        assert_eq!(
+            m.handshake(tenant, user, upstreams[0], 0, UpstreamEra::Legacy).and_then(|h| h.session_id).as_deref(),
+            Some("0b")
+        );
+        let returned = m.set_handshake(tenant, user, upstreams[3], 0, handshake("3"));
+        assert_eq!(returned.session_id.as_deref(), Some("3"));
+        assert!(m.handshake(tenant, user, upstreams[3], 0, UpstreamEra::Legacy).is_none());
+        assert_eq!(m.handshake_len(), 3);
+        assert_eq!(dropped(&m, CappedMap::UpstreamHandshakes), 1);
+    }
+
+    /// The era and log-level maps: at the cap an existing key is replaced in
+    /// place, a new one is refused and counted; below it a new one is stored.
+    #[test]
+    fn the_other_capped_maps_replace_an_existing_key_and_refuse_a_new_one_at_the_cap() {
+        let m = McpSessionMap::with_cap(2);
+        let tenant = Uuid::new_v4();
+        let (u1, u2, u3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+
+        m.set_upstream_era_support(tenant, u1, UpstreamEraSupport::BOTH);
+        m.set_upstream_era_support(tenant, u2, UpstreamEraSupport::BOTH);
+        m.set_upstream_era_support(tenant, u1, UpstreamEraSupport::BOTH);
+        m.set_upstream_era_support(tenant, u3, UpstreamEraSupport::BOTH);
+        assert!(m.upstream_era_support(tenant, u2).is_some());
+        assert!(m.upstream_era_support(tenant, u3).is_none());
+        assert_eq!(dropped(&m, CappedMap::UpstreamEras), 1);
+
+        let (v1, v2, v3) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        m.set_log_level(tenant, v1, "info");
+        m.set_log_level(tenant, v2, "info");
+        m.set_log_level(tenant, v1, "debug");
+        m.set_log_level(tenant, v3, "info");
+        assert_eq!(m.log_level(tenant, v1).as_deref(), Some("debug"));
+        assert!(m.log_level(tenant, v3).is_none());
+        assert_eq!(dropped(&m, CappedMap::LogLevels), 1);
+    }
+
+    /// A full map warns once per sweep interval, not once per request; the
+    /// count goes on.
+    #[test]
+    fn a_full_map_warns_once_until_the_next_sweep() {
+        let m = McpSessionMap::with_cap(1);
+        let tenant = Uuid::new_v4();
+        let warned = |m: &McpSessionMap| m.drops.warned[CappedMap::Sessions as usize].load(Ordering::Relaxed);
+        m.upsert(tenant, "a");
+        assert!(!warned(&m));
+        m.upsert(tenant, "b");
+        assert!(warned(&m));
+        m.sweep();
+        assert!(!warned(&m), "the sweep re-arms the warning");
+        m.upsert(tenant, "c");
+        assert!(warned(&m), "a map still full warns again");
+        assert_eq!(dropped(&m, CappedMap::Sessions), 2);
     }
 }

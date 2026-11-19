@@ -45,7 +45,9 @@ pub async fn fetch_builtin(
     req: &FetchRequest,
     cap_bytes: u64,
 ) -> Result<(FetchResult, bytes::Bytes), WebError> {
-    let cap = req.max_bytes.unwrap_or(cap_bytes).min(cap_bytes);
+    // The administrator's cap on the whole body; what a caller asks for is a
+    // slice of the extracted text, cut after extraction.
+    let cap = cap_bytes;
 
     // Initial-URL guard: scheme is always enforced; an IP-literal internal is
     // refused unless listed, and IMDS always (the connector never hands a
@@ -160,6 +162,11 @@ pub async fn fetch_builtin(
             redirect_chain,
             extracted_size,
             raw_size,
+            // The whole text, until the service cuts the slice asked for.
+            start_index: 0,
+            total_length: 0,
+            next_start_index: None,
+            notice: None,
         },
         bytes,
     ))
@@ -401,7 +408,7 @@ mod tests {
     async fn the_metadata_literal_is_refused_with_every_private_address_listed() {
         list_every_private_address_for_web();
         for url in ["http://169.254.169.254/latest/meta-data", "http://[fd00:ec2::254]/"] {
-            let req = FetchRequest { url: url.to_string(), max_bytes: None };
+            let req = FetchRequest { url: url.to_string(), max_length: None, start_index: None };
             assert_matches!(fetch_builtin(&req, 1024).await, Err(WebError::SsrfRefused(_)), "{url}");
         }
     }

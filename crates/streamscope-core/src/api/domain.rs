@@ -779,11 +779,12 @@ pub enum DomainEvent {
         content: serde_json::Value,
     },
     /// Error result for a substitution-loop executor call. Carries the
-    /// failure reason; rendered as a protocol-native error block.
+    /// failure as a model is told it; rendered as a protocol-native error
+    /// block, each protocol mapping it into its own vocabulary.
     ServerToolError {
         index: usize,
         tool_use_id: String,
-        error_kind: String,
+        error_kind: crate::web::ModelErrorCode,
     },
 }
 

@@ -510,9 +510,12 @@ impl TenantConfig {
         workspace_id: uuid::Uuid,
         user_id: uuid::Uuid,
     ) -> Option<crate::auth::RateLimitConfig> {
+        // A spec-OAuth token is minted only for someone who signed in, and a
+        // service account is never a login identity: this is a person.
         crate::auth::member_limits::resolve_member_limit(
             self.member_limit_defaults.get(&workspace_id),
             self.member_limit_exceptions.get(&(workspace_id, user_id)),
+            crate::auth::member_limits::MemberKind::Person,
         )
     }
 

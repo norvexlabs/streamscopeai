@@ -219,13 +219,19 @@ shapes:
     # `k8s rollback` reads the schema as Docker's and the VM's do: with psql
     # from the postgres image, through the admin-api pod's migration URL.
     schema: { url_env: MIGRATION_DATABASE_URL, image: postgres }
+    # The chart's Ingress routes the console, the API and the gateway on their
+    # main ports, never the metrics ports: Prometheus scrapes those in-cluster
+    # (metrics.serviceMonitor, metrics.scrapeNamespaceSelector).
+    unserved: [metrics-api, metrics-gateway]
+    # The chart adds no authentication to its Ingress: in proxy-authenticated
+    # mode the operator's authenticator in front of both hosts strips the
+    # inbound identity headers and sets its own.
+    guarded: [console, api]
   kairos:
     base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
     kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556
     disk_formats: [raw, qcow2, ova, vhd, gce]
     cloud_publish: [aws, azure, gcp]
-    # Every release ships its disks, so `vm create` of it boots its own OS.
-    disks: always
     # `vm create` sizes a VM at the recommendation and refuses one under the
     # minimum. `disk` is the app's space: `vm create` adds what the OS systems take.
     size:

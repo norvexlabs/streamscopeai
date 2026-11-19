@@ -529,11 +529,15 @@
   // Every field is tri-state (Inherit · Unlimited · a value); `#lib/limits.js`
   // owns how each column encodes that, so nothing here reads null or 0.
   let poolRpm = $state<LimitState>({ kind: 'unlimited' });
+  let poolRpmMcp = $state<LimitState>({ kind: 'unlimited' });
+  let poolRpmA2a = $state<LimitState>({ kind: 'unlimited' });
   let poolTpm = $state<LimitState>({ kind: 'unlimited' });
   let poolDaily = $state<LimitState>({ kind: 'inherit' });
   let poolMonthly = $state<LimitState>({ kind: 'inherit' });
   let poolMode = $state<'enforce' | 'alert_only'>('enforce');
   let defRpm = $state<LimitState>({ kind: 'unlimited' });
+  let defRpmMcp = $state<LimitState>({ kind: 'unlimited' });
+  let defRpmA2a = $state<LimitState>({ kind: 'unlimited' });
   let defTpm = $state<LimitState>({ kind: 'unlimited' });
   let defDaily = $state<LimitState>({ kind: 'unlimited' });
   let defMonthly = $state<LimitState>({ kind: 'unlimited' });
@@ -543,11 +547,15 @@
 
   function seedLimitFields(l: LimitsOverview) {
     poolRpm = decodeLimit(l.pool.requests_per_minute, 'pool_rate');
+    poolRpmMcp = decodeLimit(l.pool.requests_per_minute_mcp, 'pool_rate');
+    poolRpmA2a = decodeLimit(l.pool.requests_per_minute_a2a, 'pool_rate');
     poolTpm = decodeLimit(l.pool.tokens_per_minute, 'pool_rate');
     poolDaily = decodeLimit(l.pool.daily_budget, 'pool_budget');
     poolMonthly = decodeLimit(l.pool.monthly_budget, 'pool_budget');
     poolMode = l.pool.budget_mode === 'alert_only' ? 'alert_only' : 'enforce';
     defRpm = decodeLimit(l.member_defaults.requests_per_minute, 'member_default');
+    defRpmMcp = decodeLimit(l.member_defaults.requests_per_minute_mcp, 'member_default');
+    defRpmA2a = decodeLimit(l.member_defaults.requests_per_minute_a2a, 'member_default');
     defTpm = decodeLimit(l.member_defaults.tokens_per_minute, 'member_default');
     defDaily = decodeLimit(l.member_defaults.daily_budget, 'member_default');
     defMonthly = decodeLimit(l.member_defaults.monthly_budget, 'member_default');
@@ -563,18 +571,22 @@
   // the exception modal's "the pool still applies" note.
   const poolCaps = $derived({
     rpm: effectiveCap(decodeLimit(limits?.pool.requests_per_minute, 'pool_rate'), null),
+    rpmMcp: effectiveCap(decodeLimit(limits?.pool.requests_per_minute_mcp, 'pool_rate'), null),
+    rpmA2a: effectiveCap(decodeLimit(limits?.pool.requests_per_minute_a2a, 'pool_rate'), null),
     tpm: effectiveCap(decodeLimit(limits?.pool.tokens_per_minute, 'pool_rate'), null),
     daily: effectiveCap(decodeLimit(limits?.pool.daily_budget, 'pool_budget'), limits?.tenant_default_daily_budget),
     monthly: effectiveCap(decodeLimit(limits?.pool.monthly_budget, 'pool_budget'), limits?.tenant_default_monthly_budget),
   });
 
   async function savePool() {
-    if (![poolRpm, poolTpm, poolDaily, poolMonthly].every(isValidLimit)) return;
+    if (![poolRpm, poolRpmMcp, poolRpmA2a, poolTpm, poolDaily, poolMonthly].every(isValidLimit)) return;
     savingPool = true;
     const { error } = await adminApi.PUT('/api/v1/admin/workspaces/{id}/rate-limits', {
       params: { path: { id } },
       body: {
         requests_per_minute: encodeLimit(poolRpm, 'pool_rate'),
+        requests_per_minute_mcp: encodeLimit(poolRpmMcp, 'pool_rate'),
+        requests_per_minute_a2a: encodeLimit(poolRpmA2a, 'pool_rate'),
         tokens_per_minute: encodeLimit(poolTpm, 'pool_rate'),
         daily_budget: encodeLimit(poolDaily, 'pool_budget'),
         monthly_budget: encodeLimit(poolMonthly, 'pool_budget'),
@@ -591,12 +603,14 @@
   }
 
   async function saveMemberDefaults() {
-    if (![defRpm, defTpm, defDaily, defMonthly].every(isValidLimit)) return;
+    if (![defRpm, defRpmMcp, defRpmA2a, defTpm, defDaily, defMonthly].every(isValidLimit)) return;
     savingDefaults = true;
     const { error } = await adminApi.PUT('/api/v1/admin/workspaces/{id}/member-defaults', {
       params: { path: { id } },
       body: {
         requests_per_minute: encodeLimit(defRpm, 'member_default'),
+        requests_per_minute_mcp: encodeLimit(defRpmMcp, 'member_default'),
+        requests_per_minute_a2a: encodeLimit(defRpmA2a, 'member_default'),
         tokens_per_minute: encodeLimit(defTpm, 'member_default'),
         daily_budget: encodeLimit(defDaily, 'member_default'),
         monthly_budget: encodeLimit(defMonthly, 'member_default'),
@@ -1009,7 +1023,9 @@
               <span class="text-xs text-(--text-secondary)">shared by all members</span>
             </div>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-3">
-              <LimitField label="Requests / minute" bind:limit={poolRpm} encoding="pool_rate" />
+              <LimitField label="LLM requests / minute" bind:limit={poolRpm} encoding="pool_rate" />
+              <LimitField label="MCP requests / minute" bind:limit={poolRpmMcp} encoding="pool_rate" />
+              <LimitField label="A2A requests / minute" bind:limit={poolRpmA2a} encoding="pool_rate" />
               <LimitField label="Tokens / minute" bind:limit={poolTpm} encoding="pool_rate" />
               <LimitField label="Daily budget ({accountingCurrency()})" bind:limit={poolDaily} encoding="pool_budget" step={0.01} inheritedLabel={`tenant default: ${tenantDefaultLabel(l.tenant_default_daily_budget)}`} />
               <LimitField label="Monthly budget ({accountingCurrency()})" bind:limit={poolMonthly} encoding="pool_budget" step={0.01} inheritedLabel={`tenant default: ${tenantDefaultLabel(l.tenant_default_monthly_budget)}`} />
@@ -1024,7 +1040,7 @@
                 <LimitMeter label="Monthly spend (fleet estimate)" used={detail.usage.monthly_spent} cap={poolCaps.monthly} fmt={money} />
               </div>
             {/if}
-            <button onclick={savePool} disabled={savingPool || ![poolRpm, poolTpm, poolDaily, poolMonthly].every(isValidLimit)} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingPool ? 'Saving…' : 'Save pool'}</button>
+            <button onclick={savePool} disabled={savingPool || ![poolRpm, poolRpmMcp, poolRpmA2a, poolTpm, poolDaily, poolMonthly].every(isValidLimit)} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingPool ? 'Saving…' : 'Save pool'}</button>
           </section>
 
           <!-- Each member: default -->
@@ -1039,7 +1055,9 @@
               </Callout>
             {:else}
               <div class="grid grid-cols-1 md:grid-cols-2 gap-x-4 gap-y-3">
-                <LimitField label="Requests / minute" bind:limit={defRpm} encoding="member_default" />
+                <LimitField label="LLM requests / minute" bind:limit={defRpm} encoding="member_default" />
+                <LimitField label="MCP requests / minute" bind:limit={defRpmMcp} encoding="member_default" />
+                <LimitField label="A2A requests / minute" bind:limit={defRpmA2a} encoding="member_default" />
                 <LimitField label="Tokens / minute" bind:limit={defTpm} encoding="member_default" />
                 <LimitField label="Daily budget ({accountingCurrency()})" bind:limit={defDaily} encoding="member_default" step={0.01} />
                 <LimitField label="Monthly budget ({accountingCurrency()})" bind:limit={defMonthly} encoding="member_default" step={0.01} />
@@ -1048,7 +1066,7 @@
                 <BudgetModeToggle bind:mode={defMode} />
               </FormField>
               <p class="text-xs text-(--text-secondary)">{l.member_count} member{l.member_count === 1 ? '' : 's'} · {l.exception_count} with an exception. A value above the pool changes nothing — the pool still applies.</p>
-              <button onclick={saveMemberDefaults} disabled={savingDefaults || ![defRpm, defTpm, defDaily, defMonthly].every(isValidLimit)} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingDefaults ? 'Saving…' : 'Save member default'}</button>
+              <button onclick={saveMemberDefaults} disabled={savingDefaults || ![defRpm, defRpmMcp, defRpmA2a, defTpm, defDaily, defMonthly].every(isValidLimit)} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingDefaults ? 'Saving…' : 'Save member default'}</button>
             {/if}
           </section>
 
@@ -1076,7 +1094,9 @@
                 <table class="w-full text-sm">
                   <thead><tr class="border-b border-(--border) bg-(--bg-primary)/30">
                     <th class="px-3 py-2 text-left text-xs text-(--text-secondary) uppercase tracking-wider">Member</th>
-                    <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">Req/min</th>
+                    <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">LLM req/min</th>
+                    <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">MCP req/min</th>
+                    <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">A2A req/min</th>
                     <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">Tokens/min</th>
                     <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">Daily</th>
                     <th class="px-3 py-2 text-right text-xs text-(--text-secondary) uppercase tracking-wider">Monthly</th>
@@ -1086,6 +1106,8 @@
                     {#each overrides as o (o.user_id)}
                       {@const cells = [
                         cell(o.requests_per_minute, l.member_defaults.requests_per_minute, count),
+                        cell(o.requests_per_minute_mcp, l.member_defaults.requests_per_minute_mcp, count),
+                        cell(o.requests_per_minute_a2a, l.member_defaults.requests_per_minute_a2a, count),
                         cell(o.tokens_per_minute, l.member_defaults.tokens_per_minute, formatTokens),
                         cell(o.daily_budget, l.member_defaults.daily_budget, money),
                         cell(o.monthly_budget, l.member_defaults.monthly_budget, money),

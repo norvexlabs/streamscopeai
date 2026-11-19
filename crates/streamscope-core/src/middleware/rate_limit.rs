@@ -36,6 +36,12 @@
 //!
 //! "Stricter wins": a request must pass every applicable bucket. A limit of 0
 //! means unlimited; exempt buckets are skipped.
+//!
+//! Requests per minute are counted per [`RateSurface`] — LLM (chat, media,
+//! `/v1/analyze`), MCP (the built-in Web server included) and A2A — each bucket
+//! carrying one cap per surface and each surface checking and accruing only its
+//! own counter, so a burst on one surface never throttles another. Tokens per
+//! minute and the budgets are not split.
 
 use crate::auth::member_limits::member_scope_id;
 use crate::auth::{RateLimitConfig, UserContext};
@@ -90,6 +96,56 @@ impl LimitBucket {
     }
 }
 
+/// Which surface a request is counted on for requests-per-minute: the typed
+/// `surface` of a 429 beside its `bucket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RateSurface {
+    /// Chat, media and `/v1/analyze`.
+    Llm,
+    /// MCP, the built-in Web server included.
+    Mcp,
+    /// A2A.
+    A2a,
+}
+
+impl RateSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Mcp => "mcp",
+            Self::A2a => "a2a",
+        }
+    }
+
+    /// The counter this surface's requests are accrued on.
+    fn metric(self) -> UsageMetric {
+        match self {
+            Self::Llm => UsageMetric::RequestsPerMinute,
+            Self::Mcp => UsageMetric::RequestsPerMinuteMcp,
+            Self::A2a => UsageMetric::RequestsPerMinuteA2a,
+        }
+    }
+
+    /// This surface's cap in a bucket (0 = unlimited).
+    fn cap(self, cfg: &RateLimitConfig) -> u32 {
+        match self {
+            Self::Llm => cfg.requests_per_minute,
+            Self::Mcp => cfg.requests_per_minute_mcp,
+            Self::A2a => cfg.requests_per_minute_a2a,
+        }
+    }
+
+    /// How the refusal message names the surface's requests.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Llm => "LLM",
+            Self::Mcp => "MCP",
+            Self::A2a => "A2A",
+        }
+    }
+}
+
 /// The rate-limit buckets that apply to this request, as fleet-counter scopes.
 /// Tenant bucket only when the tenant carries an org-total ceiling; workspace
 /// bucket always; member bucket only when a member limit was baked; per-key
@@ -117,30 +173,32 @@ fn buckets(user: &UserContext) -> Vec<(UsageScopeKind, Uuid, &RateLimitConfig)> 
     out
 }
 
-/// Approximate RPM check + increment. Rejects if *any* applicable bucket is at
-/// its limit; otherwise increments every checked bucket.
-pub fn check_rate_limit(user: &UserContext, usage: &UsageTracker) -> Result<(), AppError> {
+/// Approximate RPM check + increment on one surface. Rejects if *any*
+/// applicable bucket is at its cap for `surface`; otherwise increments every
+/// checked bucket's counter of that surface — never another surface's.
+pub fn check_rate_limit(user: &UserContext, usage: &UsageTracker, surface: RateSurface) -> Result<(), AppError> {
     let now_ms = crate::usage::now_ms();
 
     // Check all buckets first so a rejected request doesn't inflate the
     // buckets that were under their limit.
     let mut pending = Vec::new();
     for (scope_kind, scope_id, cfg) in buckets(user) {
-        if cfg.exempt || cfg.requests_per_minute == 0 {
+        let cap = surface.cap(cfg);
+        if cfg.exempt || cap == 0 {
             continue;
         }
         let scope = UsageScope {
             tenant_id: user.tenant_id,
             scope_kind,
             scope_id,
-            metric: UsageMetric::RequestsPerMinute,
+            metric: surface.metric(),
         };
-        if usage.estimate(scope, UsageWindowKind::Minute, now_ms) >= cfg.requests_per_minute as u64
-        {
+        if usage.estimate(scope, UsageWindowKind::Minute, now_ms) >= cap as u64 {
             let bucket = LimitBucket::of(scope_kind);
             return Err(AppError::RateLimited {
-                message: format!("{} requests-per-minute limit reached", bucket.owner()),
+                message: format!("{} {} requests-per-minute limit reached", bucket.owner(), surface.label()),
                 bucket: Some(bucket),
+                surface: Some(surface),
             });
         }
         pending.push(scope);
@@ -171,6 +229,7 @@ pub fn check_tpm_limit(user: &UserContext, usage: &UsageTracker) -> Result<(), A
             return Err(AppError::RateLimited {
                 message: format!("{} tokens-per-minute limit reached", bucket.owner()),
                 bucket: Some(bucket),
+                surface: None,
             });
         }
     }
@@ -217,6 +276,10 @@ pub fn check_budget(
             if limit_units == 0 {
                 continue;
             }
+            // Report the counter even before this edge accrues to it, so the
+            // edge learns a total it has not contributed to — the spend a
+            // newly set limit was seeded with — on the next usage answer.
+            usage.hold(scope, window, now_ms);
             if usage.estimate(scope, window, now_ms) >= limit_units {
                 let bucket = LimitBucket::of(scope_kind);
                 return Err(AppError::BudgetExceeded {
@@ -235,7 +298,9 @@ pub fn check_budget(
 /// cap: the float-to-integer cast saturates at 0 (and reads NaN as 0). An
 /// infinite amount is 0 as well: the cast would saturate `+inf` to `u64::MAX`,
 /// and one such cost would pin the counter above every cap for the window.
-fn to_budget_units(amount: f64) -> u64 {
+/// The one conversion: the edge's accrual, its checks and the admin's budget
+/// seed all call it.
+pub fn to_budget_units(amount: f64) -> u64 {
     if amount.is_infinite() {
         return 0;
     }
@@ -387,9 +452,9 @@ mod tests {
         let usage = UsageTracker::new();
         let u = ctx(Uuid::from_u128(1), Uuid::from_u128(2), rpm(2), None);
         // Two requests within the window pass, the third is rejected.
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        assert_matches!(check_rate_limit(&u, &usage), Err(AppError::RateLimited { .. }));
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        assert_matches!(check_rate_limit(&u, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. }));
     }
 
     #[test]
@@ -398,7 +463,7 @@ mod tests {
         // A workspace with no configured cap: unlimited() bucket → never rejects.
         let u = ctx(Uuid::from_u128(3), Uuid::from_u128(4), RateLimitConfig::unlimited(), None);
         for _ in 0..50 {
-            assert!(check_rate_limit(&u, &usage).is_ok());
+            assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
         }
     }
 
@@ -408,9 +473,9 @@ mod tests {
         // Workspace allows 10, but the member limit allows only 2 → the member
         // bucket binds first.
         let u = ctx(Uuid::from_u128(5), Uuid::from_u128(6), rpm(10), Some(rpm(2)));
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        assert_matches!(check_rate_limit(&u, &usage), Err(AppError::RateLimited { .. }));
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        assert_matches!(check_rate_limit(&u, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. }));
     }
 
     #[test]
@@ -423,13 +488,13 @@ mod tests {
         let ws_id = Uuid::from_u128(7);
         let user_id = Uuid::from_u128(8);
         let u = ctx(ws_id, user_id, rpm(1), Some(rpm(5)));
-        assert!(check_rate_limit(&u, &usage).is_ok()); // ws=1, member=1
-        assert_matches!(check_rate_limit(&u, &usage), Err(AppError::RateLimited { .. })); // ws over → reject
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok()); // ws=1, member=1
+        assert_matches!(check_rate_limit(&u, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. })); // ws over → reject
         let lifted = ctx(ws_id, user_id, RateLimitConfig::unlimited(), Some(rpm(5)));
         for _ in 0..4 {
-            assert!(check_rate_limit(&lifted, &usage).is_ok());
+            assert!(check_rate_limit(&lifted, &usage, RateSurface::Llm).is_ok());
         }
-        assert_matches!(check_rate_limit(&lifted, &usage), Err(AppError::RateLimited { .. }));
+        assert_matches!(check_rate_limit(&lifted, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. }));
     }
 
     /// A member's limit is per MEMBERSHIP: exhausting it in one workspace
@@ -440,12 +505,12 @@ mod tests {
         let user_id = Uuid::from_u128(30);
         let in_a = ctx(Uuid::from_u128(31), user_id, RateLimitConfig::unlimited(), Some(rpm(2)));
         let in_b = ctx(Uuid::from_u128(32), user_id, RateLimitConfig::unlimited(), Some(rpm(2)));
-        assert!(check_rate_limit(&in_a, &usage).is_ok());
-        assert!(check_rate_limit(&in_a, &usage).is_ok());
-        assert_matches!(check_rate_limit(&in_a, &usage), Err(AppError::RateLimited { .. }));
-        assert!(check_rate_limit(&in_b, &usage).is_ok());
-        assert!(check_rate_limit(&in_b, &usage).is_ok());
-        assert_matches!(check_rate_limit(&in_b, &usage), Err(AppError::RateLimited { .. }));
+        assert!(check_rate_limit(&in_a, &usage, RateSurface::Llm).is_ok());
+        assert!(check_rate_limit(&in_a, &usage, RateSurface::Llm).is_ok());
+        assert_matches!(check_rate_limit(&in_a, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. }));
+        assert!(check_rate_limit(&in_b, &usage, RateSurface::Llm).is_ok());
+        assert!(check_rate_limit(&in_b, &usage, RateSurface::Llm).is_ok());
+        assert_matches!(check_rate_limit(&in_b, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. }));
 
         // Budget and tokens follow the same key.
         update_budget_usage(Uuid::nil(), false, in_a.workspace_id, user_id, true, None, 3.0, &usage);
@@ -463,9 +528,9 @@ mod tests {
     fn a_raised_member_limit_never_lifts_the_pool() {
         let usage = UsageTracker::new();
         let u = ctx(Uuid::from_u128(40), Uuid::from_u128(41), rpm(2), Some(rpm(100)));
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        assert_matches!(check_rate_limit(&u, &usage), Err(AppError::RateLimited { .. }));
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        assert_matches!(check_rate_limit(&u, &usage, RateSurface::Llm), Err(AppError::RateLimited { .. }));
     }
 
     /// Both sides of a member budget cap: one micro under passes, the cap
@@ -812,13 +877,122 @@ mod tests {
         }
         let usage = UsageTracker::new();
         let u = ctx(Uuid::from_u128(72), Uuid::from_u128(73), RateLimitConfig::unlimited(), Some(rpm(1)));
-        assert!(check_rate_limit(&u, &usage).is_ok());
-        match check_rate_limit(&u, &usage) {
-            Err(AppError::RateLimited { message, bucket }) => {
+        assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+        match check_rate_limit(&u, &usage, RateSurface::Llm) {
+            Err(AppError::RateLimited { message, bucket, surface }) => {
                 assert_eq!(bucket, Some(LimitBucket::Member));
-                assert!(message.contains("your member"), "{message}");
+                assert_eq!(surface, Some(RateSurface::Llm));
+                assert!(message.contains("your member LLM"), "{message}");
             }
             other => panic!("expected a member refusal, got {other:?}"),
         }
+    }
+
+    const SURFACES: [RateSurface; 3] = [RateSurface::Llm, RateSurface::Mcp, RateSurface::A2a];
+
+    /// A bucket capping only `surface`, at `n` per minute.
+    fn surface_rpm(surface: RateSurface, n: u32) -> RateLimitConfig {
+        let mut c = RateLimitConfig::unlimited();
+        match surface {
+            RateSurface::Llm => c.requests_per_minute = n,
+            RateSurface::Mcp => c.requests_per_minute_mcp = n,
+            RateSurface::A2a => c.requests_per_minute_a2a = n,
+        }
+        c
+    }
+
+    /// Both sides of each surface's cap, on the workspace pool and the member
+    /// bucket: `n` requests pass, the next is refused naming the bucket and
+    /// the surface.
+    #[test]
+    fn each_surface_cap_passes_up_to_its_value_and_refuses_the_next() {
+        for surface in SURFACES {
+            for member in [false, true] {
+                let usage = UsageTracker::new();
+                let cap = surface_rpm(surface, 3);
+                let u = if member {
+                    ctx(Uuid::from_u128(80), Uuid::from_u128(81), RateLimitConfig::unlimited(), Some(cap))
+                } else {
+                    ctx(Uuid::from_u128(80), Uuid::from_u128(81), cap, None)
+                };
+                for i in 0..3 {
+                    assert!(check_rate_limit(&u, &usage, surface).is_ok(), "{surface:?} member={member} #{i}");
+                }
+                let bucket = if member { LimitBucket::Member } else { LimitBucket::Workspace };
+                assert_matches!(
+                    check_rate_limit(&u, &usage, surface),
+                    Err(AppError::RateLimited { bucket: Some(b), surface: Some(s), .. }) if b == bucket && s == surface
+                );
+            }
+        }
+    }
+
+    /// A burst that exhausts one surface's cap leaves every other surface's
+    /// requests served, in both directions, each still stopping at its own cap.
+    #[test]
+    fn a_burst_on_one_surface_never_throttles_another() {
+        for exhausted in SURFACES {
+            let usage = UsageTracker::new();
+            let mut cfg = RateLimitConfig::unlimited();
+            cfg.requests_per_minute = 2;
+            cfg.requests_per_minute_mcp = 2;
+            cfg.requests_per_minute_a2a = 2;
+            let u = ctx(Uuid::from_u128(90), Uuid::from_u128(91), RateLimitConfig::unlimited(), Some(cfg));
+            assert!(check_rate_limit(&u, &usage, exhausted).is_ok());
+            assert!(check_rate_limit(&u, &usage, exhausted).is_ok());
+            assert_matches!(check_rate_limit(&u, &usage, exhausted), Err(AppError::RateLimited { .. }));
+            for other in SURFACES.into_iter().filter(|s| *s != exhausted) {
+                assert!(check_rate_limit(&u, &usage, other).is_ok(), "{exhausted:?} throttled {other:?}");
+                assert!(check_rate_limit(&u, &usage, other).is_ok(), "{exhausted:?} throttled {other:?}");
+                assert_matches!(check_rate_limit(&u, &usage, other), Err(AppError::RateLimited { .. }));
+            }
+        }
+    }
+
+    /// A surface whose cap is unset is unlimited even while the bucket caps
+    /// another surface.
+    #[test]
+    fn an_uncapped_surface_is_unlimited_beside_a_capped_one() {
+        let usage = UsageTracker::new();
+        let u = ctx(Uuid::from_u128(92), Uuid::from_u128(93), surface_rpm(RateSurface::Mcp, 1), None);
+        for _ in 0..50 {
+            assert!(check_rate_limit(&u, &usage, RateSurface::Llm).is_ok());
+            assert!(check_rate_limit(&u, &usage, RateSurface::A2a).is_ok());
+        }
+        assert!(check_rate_limit(&u, &usage, RateSurface::Mcp).is_ok());
+        assert_matches!(check_rate_limit(&u, &usage, RateSurface::Mcp), Err(AppError::RateLimited { .. }));
+    }
+
+    /// Each surface counts on its own stored metric.
+    #[test]
+    fn each_surface_has_its_own_counter_and_wire_name() {
+        assert_eq!(RateSurface::Llm.metric().as_str(), "rpm");
+        assert_eq!(RateSurface::Mcp.metric().as_str(), "rpm_mcp");
+        assert_eq!(RateSurface::A2a.metric().as_str(), "rpm_a2a");
+        for s in SURFACES {
+            assert_eq!(serde_json::to_value(s).unwrap(), s.as_str());
+        }
+    }
+
+    /// An enforced budget bucket is held at the check, so the edge reports it
+    /// and learns the fleet total before it accrues anything to it — and a
+    /// refusal follows once that total reaches the cap.
+    #[test]
+    fn a_budget_check_holds_its_counter_and_refuses_on_the_learned_total() {
+        let usage = UsageTracker::new();
+        let key_id = Uuid::from_u128(94);
+        let u = key_budget_ctx(key_id, RateLimitConfig::budget_only(0.0, 2.0, false));
+        assert!(check_budget(&u, &usage, crate::pricing::Currency::USD).is_ok());
+        let report = usage.drain_report(crate::usage::now_ms());
+        let held = report
+            .iter()
+            .find(|r| r.key.scope_kind == UsageScopeKind::Key && r.key.window_kind == UsageWindowKind::Monthly)
+            .expect("the key's monthly counter is reported before any spend");
+        assert_eq!(held.cumulative, 0);
+        usage.answered(&held.key, 0, Some(2_000_000));
+        assert_matches!(
+            check_budget(&u, &usage, crate::pricing::Currency::USD),
+            Err(AppError::BudgetExceeded { bucket: LimitBucket::Key, .. })
+        );
     }
 }

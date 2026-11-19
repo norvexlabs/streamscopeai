@@ -46,11 +46,76 @@ pub struct JsonRpcResponse {
     pub result: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
+    /// The failure a RESULT reports to the model (`isError: true`) — a tool
+    /// the gateway ran, a call it refused, or an upstream tool's own reported
+    /// failure — the error the audit row records, as it would a JSON-RPC
+    /// error. Never on the wire.
+    #[serde(skip)]
+    pub audit_error: Option<JsonRpcError>,
+}
+
+/// The audit category of a recorded error: a tool's own reported failure
+/// ([`MCP_TOOL_EXECUTION_ERROR`]) is `tool_error`, so a dashboard can tell it
+/// from a call that failed in the protocol (`rpc_error`). Append-only.
+pub fn audit_error_category(code: i32) -> &'static str {
+    if code == MCP_TOOL_EXECUTION_ERROR { "tool_error" } else { "rpc_error" }
+}
+
+/// A `tools/call` result's own failure (`isError: true`), as the audit
+/// records it: the text of its text blocks, one per line, or a fixed phrase
+/// when it carries none (an image, say). `None` for a result that is no
+/// failure. Read before any wire stamp: the upstream's result as it came.
+pub fn tool_failure_text(result: &serde_json::Value) -> Option<String> {
+    if result.get("isError").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let blocks = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str));
+    // The record keeps no more than the redaction reads
+    // (`REDACT_INPUT_BOUND`), so the joined text stops there, at a character
+    // boundary: a huge failure is never copied whole.
+    let mut text = String::new();
+    for (i, block) in blocks.enumerate() {
+        if text.len() >= super::upstream::REDACT_INPUT_BOUND {
+            break;
+        }
+        if i > 0 {
+            text.push('\n');
+        }
+        let room = super::upstream::REDACT_INPUT_BOUND.saturating_sub(text.len());
+        text.push_str(&block[..block.floor_char_boundary(block.len().min(room))]);
+    }
+    Some(if text.trim().is_empty() { "the tool reported an error and no text".to_string() } else { text })
 }
 
 impl JsonRpcResponse {
     pub fn ok(id: RpcId, result: serde_json::Value) -> Self {
-        Self { jsonrpc: "2.0".into(), id, result: Some(result), error: None }
+        Self { jsonrpc: "2.0".into(), id, result: Some(result), error: None, audit_error: None }
+    }
+    /// The error the audit records: the JSON-RPC error, else the failure the
+    /// result reported ([`Self::audit_error`]).
+    pub fn audited_error(&self) -> Option<&JsonRpcError> {
+        self.error.as_ref().or(self.audit_error.as_ref())
+    }
+    /// A `tools/call` answered as a tool execution error (MCP § Tools, Error
+    /// Handling): a result with `isError` whose one text block is what the
+    /// model is told, so it can adapt, and `audited` the error the audit row
+    /// records — never sent.
+    pub fn tool_execution_error(id: RpcId, model_text: impl Into<String>, audited: JsonRpcError) -> Self {
+        let mut resp = Self::ok(
+            id,
+            serde_json::json!({
+                "content": [ { "type": "text", "text": model_text.into() } ],
+                "isError": true
+            }),
+        );
+        resp.audit_error = Some(audited);
+        resp
     }
     pub fn err(id: RpcId, code: i32, message: impl Into<String>) -> Self {
         Self {
@@ -58,6 +123,7 @@ impl JsonRpcResponse {
             id,
             result: None,
             error: Some(JsonRpcError { code, message: message.into(), data: None }),
+            audit_error: None,
         }
     }
     /// An error carrying the typed `data` payload a client branches on.
@@ -81,6 +147,7 @@ impl JsonRpcResponse {
                 message: message.into(),
                 data: Some(data),
             }),
+            audit_error: None,
         }
     }
 }
@@ -106,9 +173,6 @@ pub const INTERNAL_ERROR: i32 = -32603;
 pub const ROUTE_NOT_FOUND: i32 = -32001;
 /// Upstream returned a non-200 response or a transport error.
 pub const UPSTREAM_ERROR: i32 = -32003;
-/// `tools/call` referenced a tool that didn't resolve to any upstream after
-/// namespace stripping.
-pub const TOOL_NOT_FOUND: i32 = -32004;
 /// Unauthenticated / wrong-family / wrong-virtual-server / wrong-forward-auth
 /// bearer. Mirrors HTTP 401 in the JSON-RPC body for clients that don't read
 /// the HTTP status (per MCP spec recommendation for auth errors).
@@ -180,6 +244,11 @@ pub const MCP_UPSTREAM_CONFIG_UNSUPPORTED: i32 = -32508;
 /// because the two need different responses from an operator: this one is a
 /// gateway limitation with a name, not an upstream that is misbehaving.
 pub const MCP_UPSTREAM_INPUT_UNSUPPORTED: i32 = -32509;
+/// **Audit-only, never on the wire**: a `tools/call` whose tool ran and whose
+/// result reported `isError: true` — the upstream's tool failed, and said so
+/// to the model as a tool execution error. The row records it as an error
+/// (category [`audit_error_category`] `tool_error`) with the result's text.
+pub const MCP_TOOL_EXECUTION_ERROR: i32 = -32510;
 
 /// Classification of an inbound POST body. Streamable HTTP allows three
 /// shapes on the wire:
@@ -433,5 +502,54 @@ mod tests {
             classify_server_initiated("notifications/tools/list_changed"),
             ServerInitiated::Other
         );
+    }
+
+    /// A result reporting `isError: true` is a failure, recorded with its
+    /// text blocks' text; one with `isError` false or absent is none
+    /// (positive controls), and a failure with no text names itself.
+    #[test]
+    fn a_tool_result_reporting_is_error_is_a_failure_with_its_text() {
+        use serde_json::json;
+        let failed = json!({"content": [
+            {"type": "text", "text": "file not found"},
+            {"type": "image", "data": "AA==", "mimeType": "image/png"},
+            {"type": "text", "text": "try another path"}
+        ], "isError": true});
+        assert_eq!(tool_failure_text(&failed).as_deref(), Some("file not found\ntry another path"));
+        for ok in [json!({"content": [{"type": "text", "text": "fine"}], "isError": false}),
+                   json!({"content": [{"type": "text", "text": "fine"}]}),
+                   json!({"isError": "true"})] {
+            assert_eq!(tool_failure_text(&ok), None, "{ok}");
+        }
+        let blank = json!({"content": [{"type": "image", "data": "AA==", "mimeType": "image/png"}], "isError": true});
+        assert!(tool_failure_text(&blank).is_some_and(|t| !t.is_empty()));
+        // A huge failure is collected only up to what the redaction reads, at
+        // a character boundary, its first blocks kept whole.
+        let bound = super::super::upstream::REDACT_INPUT_BOUND;
+        let huge = json!({"content": [
+            {"type": "text", "text": "head"},
+            {"type": "text", "text": "é".repeat(bound)},
+            {"type": "text", "text": "tail"}
+        ], "isError": true});
+        let text = tool_failure_text(&huge).expect("a failure");
+        assert!(text.len() <= bound && text.len() >= bound - 1, "{}", text.len());
+        assert!(text.starts_with("head\né") && !text.contains("tail"));
+        assert_eq!(audit_error_category(MCP_TOOL_EXECUTION_ERROR), "tool_error");
+        assert_eq!(audit_error_category(MCP_BLOCKED_BY_POLICY), "rpc_error");
+    }
+
+    /// A tool execution error is a result — `isError`, the model's text —
+    /// with the audited error beside it, never serialized.
+    #[test]
+    fn a_tool_execution_error_is_a_result_the_audit_records_as_an_error() {
+        let resp = JsonRpcResponse::tool_execution_error(
+            RpcId::Number(7.into()),
+            "blocked: no shell",
+            JsonRpcError { code: MCP_BLOCKED_BY_POLICY, message: "blocked: no shell".into(), data: None },
+        );
+        let wire = serde_json::to_value(&resp).unwrap();
+        assert_eq!(wire, serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {
+            "content": [{"type": "text", "text": "blocked: no shell"}], "isError": true}}));
+        assert_eq!(resp.audited_error().map(|e| e.code), Some(MCP_BLOCKED_BY_POLICY));
     }
 }

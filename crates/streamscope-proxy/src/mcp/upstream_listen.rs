@@ -362,7 +362,7 @@ impl UpstreamListenerMap {
         self.listeners.clear();
     }
 
-    #[cfg(test)]
+    /// The listeners held now.
     pub fn len(&self) -> usize {
         self.listeners.len()
     }

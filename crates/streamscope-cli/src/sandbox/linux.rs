@@ -68,6 +68,11 @@ fn build_policy_in(home: &Path, spec: &LaunchSpec, scratch: &Path) -> Result<San
     if let Some(agent) = profiles::agent_for(&spec.command) {
         rw.extend(granted_dirs(home, agent.state_dirs, &deny));
     }
+    // A client the agent may run as a tool reads (and writes) its own state
+    // as the launched client does: the same grant, filtered the same way.
+    for tool in &spec.tool_clients {
+        rw.extend(granted_dirs(home, tool.profile.state_dirs, &deny));
+    }
     // Every package cache, whatever the client's own runtime: an `npx` or
     // `uvx` child inherits this domain.
     // Re-judged here: a cache made a link since it was created is not granted.
@@ -850,6 +855,7 @@ mod learn_tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         };
         let policy = build_policy_in(&home, &spec, &scratch).unwrap();
         // `fs_rw` is applied with `AccessFs::from_all`: write AND execute.
@@ -928,6 +934,7 @@ mod learn_tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         };
         let agent = profiles::agent_for(&spec.command).unwrap();
         create_state_dirs(&home, agent.state_dirs, &secret_deny(&home), Create::Dir);
@@ -941,6 +948,68 @@ mod learn_tests {
         // the client writes itself, and `~/.opencode` is the client's to make.
         assert!(!home.join(".opencode.json").exists());
         assert!(!home.join(".opencode").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A client the agent may run as a tool is granted its state directories
+    /// as the launched client is (positive: Open Code Review's under an
+    /// OpenCode run; negative: the same run without it), filtered the same
+    /// way: a tool's directory holding a secret is not granted, its other
+    /// one is.
+    #[test]
+    fn a_tool_client_is_granted_its_state_dirs_except_where_a_secret_is() {
+        static REVIEWER: profiles::AgentProfile = profiles::AgentProfile {
+            names: &["reviewer"],
+            state_dirs: &["~/.config/gh", "~/.reviewer"],
+            env: &[],
+            engine: None,
+            config_dir_env: None,
+            npm_package: None,
+            windows_config: &[],
+            windows_args: &[],
+            windows_seed: &[],
+        };
+        let home = std::env::temp_dir().join(format!("ss-tool-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        for dir in ["proj", ".opencodereview", ".config/gh", ".reviewer"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::fs::write(home.join(".opencodereview/config.json"), "{}").unwrap();
+        std::fs::write(home.join(".config/gh/hosts.yml"), "oauth_token: t").unwrap();
+        let tool = |profile: &'static profiles::AgentProfile| crate::sandbox::ToolClient {
+            client_id: profile.names[0].to_string(),
+            profile,
+            files: vec![],
+        };
+        let spec = |tool_clients| LaunchSpec {
+            command: "opencode".into(),
+            args: vec![],
+            project_root: home.join("proj"),
+            cwd: home.join("proj"),
+            proxy_origins: vec![],
+            destinations: Default::default(),
+            network: None,
+            default_image: None,
+            env: vec![],
+            ca_files: vec![],
+            ca_bundle: None,
+            home_files: vec![],
+            client_files: vec![],
+            private_project: false,
+            opencode: None,
+            tool_clients,
+        };
+        let scratch = home.join(".cache/streamscopeai/tmp/run");
+        // Grants under this home only: the fixture's home is under `/tmp`, granted to every run.
+        let covered = |policy: &SandboxPolicy, p: &Path| policy.fs_rw.iter().any(|g| g.starts_with(&home) && p.starts_with(g));
+        let ocr = home.join(".opencodereview");
+        let policy = build_policy_in(&home, &spec(vec![tool(profiles::agent_for("open-code-review").unwrap())]), &scratch).unwrap();
+        assert!(policy.fs_rw.contains(&ocr), "{:?}", policy.fs_rw);
+        let policy = build_policy_in(&home, &spec(vec![]), &scratch).unwrap();
+        assert!(!covered(&policy, &ocr), "{:?}", policy.fs_rw);
+        let policy = build_policy_in(&home, &spec(vec![tool(&REVIEWER)]), &scratch).unwrap();
+        assert!(policy.fs_rw.contains(&home.join(".reviewer")), "{:?}", policy.fs_rw);
+        assert!(!covered(&policy, &home.join(".config/gh/hosts.yml")), "{:?}", policy.fs_rw);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -982,6 +1051,7 @@ mod learn_tests {
                 client_files: vec![],
                 private_project: false,
                 opencode: None,
+                tool_clients: Vec::new(),
             };
             let policy = build_policy_in(&home, &spec, &home.join(".cache/streamscopeai/tmp/run")).unwrap();
             for dir in [home.join(".npm"), home.join(".cache/uv"), home.join(".local/share/uv/tools")] {
@@ -1039,6 +1109,7 @@ mod learn_tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         };
         let policy = build_policy_in(&home, &spec(&home), &home.join("scratch")).unwrap();
         let pythons = home.join(".local/share/uv/python");
@@ -1094,6 +1165,7 @@ mod learn_tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         };
         let policy = build_policy_in(&home, &spec, &home.join(".cache/streamscopeai/tmp/run")).unwrap();
         for dir in [

@@ -606,7 +606,9 @@ struct FileMounts {
 
 /// Every file (or directory) the run's CA list names — its CA bundles and
 /// the paths `-e KEY=/path` names — at a path of its own; and a home-scoped
-/// client's provisioned files, at their place under the container's home.
+/// client's provisioned files, and those of each client it may run as a tool,
+/// at their place under the container's home, whose folders the agent is
+/// given (a tool writes its state beside its config).
 fn file_mounts(spec: &LaunchSpec, home: &str, host_home: Option<&Path>) -> Result<FileMounts> {
     let mut out = FileMounts::default();
     let FileMounts { mounts, rebased, home_dirs } = &mut out;
@@ -627,7 +629,8 @@ fn file_mounts(spec: &LaunchSpec, home: &str, host_home: Option<&Path>) -> Resul
         rebased.push((shown, to));
     }
     let home = home.trim_end_matches('/');
-    for file in &spec.home_files {
+    let tool_files = spec.tool_clients.iter().flat_map(|t| &t.files);
+    for file in spec.home_files.iter().chain(tool_files) {
         let rel = host_home.and_then(|h| file.strip_prefix(h).ok());
         // Plain components only: a `..` would place the mount, and the
         // directories init gives the agent, outside the home.
@@ -986,6 +989,7 @@ mod tests {
             client_files: vec![],
             private_project: false,
             opencode: None,
+            tool_clients: Vec::new(),
         }
     }
 
@@ -1041,6 +1045,29 @@ mod tests {
         // No host home: nothing under it to mount.
         let none = file_mounts(&spec(vec![host.join(".codex.toml")]), "/home/vscode", None).unwrap();
         assert!(none.mounts.is_empty() && none.home_dirs.is_empty());
+        let _ = std::fs::remove_dir_all(&host);
+    }
+
+    /// A client the agent may run as a tool has its home files mounted like
+    /// the launched client's, and its folder given to the agent (it writes
+    /// its sessions there); a run without it mounts nothing of it.
+    #[test]
+    fn a_tool_clients_home_file_is_mounted_and_its_folder_goes_to_the_agent() {
+        let host = std::env::temp_dir().join(format!("ssai-tool-mounts-{}", std::process::id()));
+        std::fs::create_dir_all(host.join(".opencodereview")).unwrap();
+        let config = host.join(".opencodereview/config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let without = file_mounts(&spec(vec![]), "/home/vscode", Some(&host)).unwrap();
+        assert!(without.mounts.is_empty() && without.home_dirs.is_empty());
+        let mut with = spec(vec![]);
+        with.tool_clients.push(crate::sandbox::ToolClient {
+            client_id: "open-code-review".into(),
+            profile: crate::sandbox::profiles::agent_for("open-code-review").unwrap(),
+            files: vec![config.clone()],
+        });
+        let m = file_mounts(&with, "/home/vscode", Some(&host)).unwrap();
+        assert_eq!(m.mounts, [(config, "/home/vscode/.opencodereview/config.json".to_string())]);
+        assert_eq!(m.home_dirs, ["/home/vscode/.opencodereview"]);
         let _ = std::fs::remove_dir_all(&host);
     }
 

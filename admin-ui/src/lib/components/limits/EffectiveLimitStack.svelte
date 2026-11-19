@@ -60,6 +60,8 @@
         </div>
         <div class="grid grid-cols-1 {compact ? '' : 'sm:grid-cols-2'} gap-x-4 gap-y-2">
           {#if layer.requests_per_minute.cap != null}<LimitMeter label={m.limits_rpm()} used={layer.requests_per_minute.used} cap={layer.requests_per_minute.cap} fmt={count} note={inheritedNote(layer, layer.requests_per_minute)} />{/if}
+          {#if layer.requests_per_minute_mcp.cap != null}<LimitMeter label={m.limits_rpm_mcp()} used={layer.requests_per_minute_mcp.used} cap={layer.requests_per_minute_mcp.cap} fmt={count} note={inheritedNote(layer, layer.requests_per_minute_mcp)} />{/if}
+          {#if layer.requests_per_minute_a2a.cap != null}<LimitMeter label={m.limits_rpm_a2a()} used={layer.requests_per_minute_a2a.used} cap={layer.requests_per_minute_a2a.cap} fmt={count} note={inheritedNote(layer, layer.requests_per_minute_a2a)} />{/if}
           {#if layer.tokens_per_minute.cap != null}<LimitMeter label={m.limits_tpm()} used={layer.tokens_per_minute.used} cap={layer.tokens_per_minute.cap} fmt={formatTokens} note={inheritedNote(layer, layer.tokens_per_minute)} />{/if}
           {#if layer.daily_budget.cap != null}<LimitMeter label={m.limits_daily_short()} used={layer.daily_budget.used} cap={layer.daily_budget.cap} fmt={money} note={inheritedNote(layer, layer.daily_budget)} />{/if}
           {#if layer.monthly_budget.cap != null}<LimitMeter label={m.limits_monthly_short()} used={layer.monthly_budget.used} cap={layer.monthly_budget.cap} fmt={money} note={inheritedNote(layer, layer.monthly_budget)} />{/if}

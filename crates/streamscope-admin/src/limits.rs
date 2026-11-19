@@ -80,6 +80,8 @@ async fn read_settings(
 #[derive(Debug, Clone, Default, PartialEq, sqlx::FromRow)]
 pub struct PoolRow {
     pub requests_per_minute: Option<i32>,
+    pub requests_per_minute_mcp: Option<i32>,
+    pub requests_per_minute_a2a: Option<i32>,
     pub tokens_per_minute: Option<i32>,
     pub daily_budget: Option<f64>,
     pub monthly_budget: Option<f64>,
@@ -97,6 +99,8 @@ pub fn resolve_pool(row: Option<&PoolRow>, default: TenantBudgetDefault) -> Rate
     let r = |v: Option<i32>| v.map(|n| n.max(0) as u32).unwrap_or(0);
     RateLimitConfig {
         requests_per_minute: row.map_or(0, |p| r(p.requests_per_minute)),
+        requests_per_minute_mcp: row.map_or(0, |p| r(p.requests_per_minute_mcp)),
+        requests_per_minute_a2a: row.map_or(0, |p| r(p.requests_per_minute_a2a)),
         tokens_per_minute: row.map_or(0, |p| r(p.tokens_per_minute)),
         daily_budget: row.and_then(|p| p.daily_budget).unwrap_or(default.daily).max(0.0),
         monthly_budget: row.and_then(|p| p.monthly_budget).unwrap_or(default.monthly).max(0.0),
@@ -106,7 +110,12 @@ pub fn resolve_pool(row: Option<&PoolRow>, default: TenantBudgetDefault) -> Rate
 }
 
 fn is_unlimited(c: &RateLimitConfig) -> bool {
-    c.requests_per_minute == 0 && c.tokens_per_minute == 0 && c.daily_budget <= 0.0 && c.monthly_budget <= 0.0
+    c.requests_per_minute == 0
+        && c.requests_per_minute_mcp == 0
+        && c.requests_per_minute_a2a == 0
+        && c.tokens_per_minute == 0
+        && c.daily_budget <= 0.0
+        && c.monthly_budget <= 0.0
 }
 
 /// Every workspace's effective pool, keyed by workspace id. A workspace whose
@@ -122,9 +131,10 @@ pub async fn load_pools_with_default(
     conn: &mut Scoped,
     default: TenantBudgetDefault,
 ) -> Result<HashMap<Uuid, RateLimitConfig>, sqlx::Error> {
-    type Row = (Uuid, Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<String>);
+    type Row = (Uuid, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<String>);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT w.id, r.requests_per_minute, r.tokens_per_minute, r.daily_budget, r.monthly_budget, r.budget_mode \
+        "SELECT w.id, r.requests_per_minute, r.requests_per_minute_mcp, r.requests_per_minute_a2a, \
+                r.tokens_per_minute, r.daily_budget, r.monthly_budget, r.budget_mode \
            FROM workspaces w \
            LEFT JOIN workspace_rate_limits r ON r.workspace_id = w.id",
     )
@@ -132,9 +142,11 @@ pub async fn load_pools_with_default(
     .await?;
     Ok(rows
         .into_iter()
-        .filter_map(|(ws, rpm, tpm, daily, monthly, mode)| {
+        .filter_map(|(ws, rpm, rpm_mcp, rpm_a2a, tpm, daily, monthly, mode)| {
             let row = mode.map(|budget_mode| PoolRow {
                 requests_per_minute: rpm,
+                requests_per_minute_mcp: rpm_mcp,
+                requests_per_minute_a2a: rpm_a2a,
                 tokens_per_minute: tpm,
                 daily_budget: daily,
                 monthly_budget: monthly,
@@ -162,15 +174,17 @@ async fn load_defaults_where(
     conn: &mut Scoped,
     workspace: Option<Uuid>,
 ) -> Result<HashMap<Uuid, MemberLimits>, sqlx::Error> {
-    type Row = (Uuid, Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<String>);
+    type Row = (Uuid, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<f64>, Option<f64>, Option<String>);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT r.workspace_id, r.member_requests_per_minute, r.member_tokens_per_minute, \
+        "SELECT r.workspace_id, r.member_requests_per_minute, r.member_requests_per_minute_mcp, \
+                r.member_requests_per_minute_a2a, r.member_tokens_per_minute, \
                 r.member_daily_budget, r.member_monthly_budget, r.member_budget_mode \
            FROM workspace_rate_limits r \
            JOIN workspaces w ON w.id = r.workspace_id \
           WHERE w.role NOT IN ('agent', 'inline') \
             AND ($1::uuid IS NULL OR r.workspace_id = $1) \
-            AND (r.member_requests_per_minute IS NOT NULL OR r.member_tokens_per_minute IS NOT NULL \
+            AND (r.member_requests_per_minute IS NOT NULL OR r.member_requests_per_minute_mcp IS NOT NULL \
+                 OR r.member_requests_per_minute_a2a IS NOT NULL OR r.member_tokens_per_minute IS NOT NULL \
                  OR r.member_daily_budget IS NOT NULL OR r.member_monthly_budget IS NOT NULL)",
     )
     .bind(workspace)
@@ -178,11 +192,13 @@ async fn load_defaults_where(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(ws, rpm, tpm, daily, monthly, mode)| {
+        .map(|(ws, rpm, rpm_mcp, rpm_a2a, tpm, daily, monthly, mode)| {
             (
                 ws,
                 MemberLimits {
                     requests_per_minute: rate(rpm),
+                    requests_per_minute_mcp: rate(rpm_mcp),
+                    requests_per_minute_a2a: rate(rpm_a2a),
                     tokens_per_minute: rate(tpm),
                     daily_budget: budget(daily),
                     monthly_budget: budget(monthly),
@@ -207,10 +223,10 @@ async fn load_exceptions_where(
     workspace: Option<Uuid>,
     user: Option<Uuid>,
 ) -> Result<HashMap<(Uuid, Uuid), MemberLimits>, sqlx::Error> {
-    type Row = (Uuid, Uuid, Option<i32>, Option<i32>, Option<f64>, Option<f64>, String);
+    type Row = (Uuid, Uuid, Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<f64>, Option<f64>, String);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT workspace_id, user_id, requests_per_minute, tokens_per_minute, \
-                daily_budget, monthly_budget, budget_mode \
+        "SELECT workspace_id, user_id, requests_per_minute, requests_per_minute_mcp, requests_per_minute_a2a, \
+                tokens_per_minute, daily_budget, monthly_budget, budget_mode \
            FROM workspace_user_rate_limit_overrides \
           WHERE ($1::uuid IS NULL OR workspace_id = $1) AND ($2::uuid IS NULL OR user_id = $2)",
     )
@@ -220,11 +236,13 @@ async fn load_exceptions_where(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(ws, uid, rpm, tpm, daily, monthly, mode)| {
+        .map(|(ws, uid, rpm, rpm_mcp, rpm_a2a, tpm, daily, monthly, mode)| {
             (
                 (ws, uid),
                 MemberLimits {
                     requests_per_minute: rate(rpm),
+                    requests_per_minute_mcp: rate(rpm_mcp),
+                    requests_per_minute_a2a: rate(rpm_a2a),
                     tokens_per_minute: rate(tpm),
                     daily_budget: budget(daily),
                     monthly_budget: budget(monthly),
@@ -238,14 +256,16 @@ async fn load_exceptions_where(
 /// The resolved member bucket of every membership something limits — each
 /// member of a workspace with a default, plus every member with an exception.
 /// Keyed by `(workspace_id, user_id)`; `workspace_filter` narrows to one
-/// workspace. Only memberships that still exist are returned, so a stale
-/// exception row never reports a limit for someone who left.
+/// workspace, `user_filter` to one user's memberships. Only memberships that
+/// still exist are returned, so a stale exception row never reports a limit
+/// for someone who left.
 pub async fn load_member_buckets(
     conn: &mut Scoped,
     workspace_filter: Option<Uuid>,
+    user_filter: Option<Uuid>,
 ) -> Result<HashMap<(Uuid, Uuid), RateLimitConfig>, sqlx::Error> {
     let defaults = load_defaults_where(&mut *conn, workspace_filter).await?;
-    let exceptions = load_exceptions_where(&mut *conn, workspace_filter, None).await?;
+    let exceptions = load_exceptions_where(&mut *conn, workspace_filter, user_filter).await?;
     let limited_workspaces: Vec<Uuid> = defaults
         .keys()
         .copied()
@@ -255,18 +275,22 @@ pub async fn load_member_buckets(
     if limited_workspaces.is_empty() {
         return Ok(HashMap::new());
     }
-    let members: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT workspace_id, user_id FROM workspace_members WHERE workspace_id = ANY($1)",
+    let members: Vec<(Uuid, Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT m.workspace_id, m.user_id, u.auth_source FROM workspace_members m \
+           JOIN users u ON u.id = m.user_id \
+          WHERE m.workspace_id = ANY($1) AND ($2::uuid IS NULL OR m.user_id = $2)",
     )
     .bind(&limited_workspaces)
+    .bind(user_filter)
     .fetch_all(&mut *conn)
     .await?;
     Ok(members
         .into_iter()
-        .filter_map(|(ws, uid)| {
+        .filter_map(|(ws, uid, auth_source)| {
             streamscope_core::auth::member_limits::resolve_member_limit(
                 defaults.get(&ws),
                 exceptions.get(&(ws, uid)),
+                crate::service_account::member_kind(auth_source.as_deref()),
             )
             .map(|bucket| ((ws, uid), bucket))
         })
@@ -300,7 +324,12 @@ pub struct LimitLayer {
     pub key_id: Option<Uuid>,
     pub key_name: Option<String>,
     pub key_prefix: Option<String>,
+    /// LLM requests per minute (chat, media, `/v1/analyze`).
     pub requests_per_minute: LimitMeter,
+    /// MCP requests per minute, the built-in Web server included.
+    pub requests_per_minute_mcp: LimitMeter,
+    /// A2A requests per minute.
+    pub requests_per_minute_a2a: LimitMeter,
     pub tokens_per_minute: LimitMeter,
     pub daily_budget: LimitMeter,
     pub monthly_budget: LimitMeter,
@@ -333,16 +362,22 @@ pub struct EffectiveLimitStack {
     pub currency: String,
 }
 
+/// How many meters a layer carries, in the order every per-metric array uses:
+/// `[rpm, rpm_mcp, rpm_a2a, tpm, daily, monthly]`.
+const METERS: usize = 6;
+
 fn meter(cap: f64, used: f64, inherited: bool) -> LimitMeter {
     let cap = (cap > 0.0).then_some(cap);
     LimitMeter { inherited: inherited && cap.is_some(), cap, used: Some(used) }
 }
 
-/// Which of `[rpm, tpm, daily, monthly]` a workspace pool takes from the
-/// tenant default: a budget its row leaves unset (or that has no row). There
-/// is no tenant default rate.
-fn pool_inherits(row: Option<&PoolRow>) -> [bool; 4] {
+/// Which of the [`METERS`] a workspace pool takes from the tenant default: a
+/// budget its row leaves unset (or that has no row). There is no tenant
+/// default rate.
+fn pool_inherits(row: Option<&PoolRow>) -> [bool; METERS] {
     [
+        false,
+        false,
         false,
         false,
         row.is_none_or(|r| r.daily_budget.is_none()),
@@ -350,13 +385,15 @@ fn pool_inherits(row: Option<&PoolRow>) -> [bool; 4] {
     ]
 }
 
-/// Which of `[rpm, tpm, daily, monthly]` a member bucket takes from the
-/// workspace default: every metric without an exception, and each metric the
-/// exception leaves unset with one.
-fn member_inherits(exception: Option<&MemberLimits>) -> [bool; 4] {
-    exception.map_or([true; 4], |e| {
+/// Which of the [`METERS`] a member bucket takes from the workspace default:
+/// every metric without an exception, and each metric the exception leaves
+/// unset with one.
+fn member_inherits(exception: Option<&MemberLimits>) -> [bool; METERS] {
+    exception.map_or([true; METERS], |e| {
         [
             e.requests_per_minute.is_none(),
+            e.requests_per_minute_mcp.is_none(),
+            e.requests_per_minute_a2a.is_none(),
             e.tokens_per_minute.is_none(),
             e.daily_budget.is_none(),
             e.monthly_budget.is_none(),
@@ -368,8 +405,8 @@ impl LimitLayer {
     fn from_config(
         bucket: LimitBucket,
         c: &RateLimitConfig,
-        used: [f64; 4],
-        inherited: [bool; 4],
+        used: [f64; METERS],
+        inherited: [bool; METERS],
         source: &str,
     ) -> Self {
         Self {
@@ -378,17 +415,26 @@ impl LimitLayer {
             key_name: None,
             key_prefix: None,
             requests_per_minute: meter(c.requests_per_minute as f64, used[0], inherited[0]),
-            tokens_per_minute: meter(c.tokens_per_minute as f64, used[1], inherited[1]),
-            daily_budget: meter(c.daily_budget, used[2], inherited[2]),
-            monthly_budget: meter(c.monthly_budget, used[3], inherited[3]),
+            requests_per_minute_mcp: meter(c.requests_per_minute_mcp as f64, used[1], inherited[1]),
+            requests_per_minute_a2a: meter(c.requests_per_minute_a2a as f64, used[2], inherited[2]),
+            tokens_per_minute: meter(c.tokens_per_minute as f64, used[3], inherited[3]),
+            daily_budget: meter(c.daily_budget, used[4], inherited[4]),
+            monthly_budget: meter(c.monthly_budget, used[5], inherited[5]),
             budget_mode: if c.budget_alert_only { "alert_only" } else { "enforce" }.to_string(),
             source: source.to_string(),
             binding: false,
         }
     }
 
-    fn meters(&self) -> [&LimitMeter; 4] {
-        [&self.requests_per_minute, &self.tokens_per_minute, &self.daily_budget, &self.monthly_budget]
+    fn meters(&self) -> [&LimitMeter; METERS] {
+        [
+            &self.requests_per_minute,
+            &self.requests_per_minute_mcp,
+            &self.requests_per_minute_a2a,
+            &self.tokens_per_minute,
+            &self.daily_budget,
+            &self.monthly_budget,
+        ]
     }
 
     /// Whether every capped metric of this layer comes from its default.
@@ -396,11 +442,18 @@ impl LimitLayer {
         self.meters().into_iter().all(|m| m.cap.is_none() || m.inherited)
     }
 
-    fn meters_mut(&mut self) -> [&mut LimitMeter; 4] {
-        [&mut self.requests_per_minute, &mut self.tokens_per_minute, &mut self.daily_budget, &mut self.monthly_budget]
+    fn meters_mut(&mut self) -> [&mut LimitMeter; METERS] {
+        [
+            &mut self.requests_per_minute,
+            &mut self.requests_per_minute_mcp,
+            &mut self.requests_per_minute_a2a,
+            &mut self.tokens_per_minute,
+            &mut self.daily_budget,
+            &mut self.monthly_budget,
+        ]
     }
 
-    fn set_use(&mut self, used: [f64; 4]) {
+    fn set_use(&mut self, used: [f64; METERS]) {
         for (m, u) in self.meters_mut().into_iter().zip(used) {
             m.used = Some(u);
         }
@@ -469,14 +522,14 @@ fn binding_layer(layers: &[LimitLayer]) -> Option<usize> {
     best.map(|(i, _)| i)
 }
 
-/// Current-window use of each counter scope, `[rpm, tpm, daily, monthly]`
-/// per `(scope_kind, scope_id)`, the budgets converted from millionths to
-/// whole units — one read for every layer of a stack.
+/// Current-window use of each counter scope, one value per [`METERS`] per
+/// `(scope_kind, scope_id)`, the budgets converted from millionths to whole
+/// units — one read for every layer of a stack.
 async fn scopes_use(
     conn: &mut Scoped,
     tenant_id: Uuid,
     scopes: &[(&'static str, Uuid)],
-) -> Result<HashMap<(String, Uuid), [f64; 4]>, sqlx::Error> {
+) -> Result<HashMap<(String, Uuid), [f64; METERS]>, sqlx::Error> {
     use streamscope_core::usage::UsageWindowKind as W;
     let now = streamscope_core::usage::now_ms();
     let at = |w: W| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(w.window_start_ms(now) as i64);
@@ -498,7 +551,7 @@ async fn scopes_use(
     .bind(at(W::Monthly))
     .fetch_all(&mut *conn)
     .await?;
-    let mut used: HashMap<(String, Uuid), [f64; 4]> = HashMap::new();
+    let mut used: HashMap<(String, Uuid), [f64; METERS]> = HashMap::new();
     for (kind, id, metric, window, total) in rows {
         if let Some((slot, value)) = use_slot(&metric, &window, total) {
             used.entry((kind, id)).or_default()[slot] = value;
@@ -516,19 +569,20 @@ pub(crate) async fn workspace_spend(
     workspace_id: Uuid,
 ) -> Result<(f64, f64), sqlx::Error> {
     let used = scopes_use(conn, tenant_id, &[("workspace", workspace_id)]).await?;
-    let [_, _, daily, monthly] = used.get(&("workspace".to_string(), workspace_id)).copied().unwrap_or_default();
+    let [_, _, _, _, daily, monthly] = used.get(&("workspace".to_string(), workspace_id)).copied().unwrap_or_default();
     Ok((daily, monthly))
 }
 
-/// Where a counter row lands in `[rpm, tpm, daily, monthly]`, and its value
-/// there — budgets converted from millionths to whole units. `None` for a row
-/// no meter shows.
+/// Where a counter row lands in the [`METERS`], and its value there — budgets
+/// converted from millionths to whole units. `None` for a row no meter shows.
 fn use_slot(metric: &str, window: &str, total: i64) -> Option<(usize, f64)> {
     match (metric, window) {
         ("rpm", "minute") => Some((0, total as f64)),
-        ("tpm", "minute") => Some((1, total as f64)),
-        ("budget_micros", "daily") => Some((2, total as f64 / 1_000_000.0)),
-        ("budget_micros", "monthly") => Some((3, total as f64 / 1_000_000.0)),
+        ("rpm_mcp", "minute") => Some((1, total as f64)),
+        ("rpm_a2a", "minute") => Some((2, total as f64)),
+        ("tpm", "minute") => Some((3, total as f64)),
+        ("budget_micros", "daily") => Some((4, total as f64 / 1_000_000.0)),
+        ("budget_micros", "monthly") => Some((5, total as f64 / 1_000_000.0)),
         _ => None,
     }
 }
@@ -558,13 +612,14 @@ pub async fn effective_stack(
     let settings = load_tenant_budget_settings(&mut *conn).await?;
     if counts_toward_tenant && (settings.org_daily > 0.0 || settings.org_monthly > 0.0) {
         let c = RateLimitConfig::budget_only(settings.org_daily, settings.org_monthly, settings.org_alert_only);
-        let layer = LimitLayer::from_config(LimitBucket::Organisation, &c, [0.0; 4], [false; 4], "own");
+        let layer = LimitLayer::from_config(LimitBucket::Organisation, &c, [0.0; METERS], [false; METERS], "own");
         layers.push((layer, ("tenant", tenant_id)));
     }
 
     let default = settings.default;
     let row: Option<PoolRow> = sqlx::query_as(
-        "SELECT requests_per_minute, tokens_per_minute, daily_budget, monthly_budget, budget_mode \
+        "SELECT requests_per_minute, requests_per_minute_mcp, requests_per_minute_a2a, \
+                tokens_per_minute, daily_budget, monthly_budget, budget_mode \
            FROM workspace_rate_limits WHERE workspace_id = $1",
     )
     .bind(workspace_id)
@@ -572,7 +627,7 @@ pub async fn effective_stack(
     .await?;
     let pool = resolve_pool(row.as_ref(), default);
     if !is_unlimited(&pool) {
-        let mut layer = LimitLayer::from_config(LimitBucket::Workspace, &pool, [0.0; 4], pool_inherits(row.as_ref()), "own");
+        let mut layer = LimitLayer::from_config(LimitBucket::Workspace, &pool, [0.0; METERS], pool_inherits(row.as_ref()), "own");
         if layer.all_inherited() {
             layer.source = "tenant_default".to_string();
         }
@@ -582,13 +637,19 @@ pub async fn effective_stack(
     let defaults = load_defaults_where(&mut *conn, Some(workspace_id)).await?;
     let exceptions = load_exceptions_where(&mut *conn, Some(workspace_id), Some(user_id)).await?;
     let exception = exceptions.get(&(workspace_id, user_id));
+    let auth_source: Option<String> = sqlx::query_scalar("SELECT auth_source FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
+    let member = crate::service_account::member_kind(auth_source.as_deref());
     if let Some(bucket) =
-        streamscope_core::auth::member_limits::resolve_member_limit(defaults.get(&workspace_id), exception)
+        streamscope_core::auth::member_limits::resolve_member_limit(defaults.get(&workspace_id), exception, member)
     {
         let layer = LimitLayer::from_config(
             LimitBucket::Member,
             &bucket,
-            [0.0; 4],
+            [0.0; METERS],
             member_inherits(exception),
             if exception.is_some() { "exception" } else { "member_default" },
         );
@@ -612,7 +673,7 @@ pub async fn effective_stack(
     .await?;
     for (key_id, name, prefix, daily, monthly, mode) in keys {
         let c = RateLimitConfig::budget_only(daily.unwrap_or(0.0), monthly.unwrap_or(0.0), mode == "alert_only");
-        let mut layer = LimitLayer::from_config(LimitBucket::Key, &c, [0.0; 4], [false; 4], "own");
+        let mut layer = LimitLayer::from_config(LimitBucket::Key, &c, [0.0; METERS], [false; METERS], "own");
         layer.key_id = Some(key_id);
         layer.key_name = name;
         layer.key_prefix = Some(prefix);
@@ -660,7 +721,7 @@ mod tests {
         assert_eq!((none.daily_budget, none.monthly_budget), (10.0, 100.0));
         assert_eq!((blank.daily_budget, blank.monthly_budget), (10.0, 100.0));
         // No tenant default rate: an unset rate is unlimited either way.
-        assert_eq!((none.requests_per_minute, none.tokens_per_minute), (0, 0));
+        assert_eq!((none.requests_per_minute, none.requests_per_minute_mcp, none.requests_per_minute_a2a, none.tokens_per_minute), (0, 0, 0, 0));
     }
 
     #[test]
@@ -673,7 +734,7 @@ mod tests {
 
     fn layer(bucket: LimitBucket, used: f64, cap: f64) -> LimitLayer {
         let c = RateLimitConfig::budget_only(cap, 0.0, false);
-        LimitLayer::from_config(bucket, &c, [0.0, 0.0, used, 0.0], [false; 4], "own")
+        LimitLayer::from_config(bucket, &c, [0.0, 0.0, 0.0, 0.0, used, 0.0], [false; METERS], "own")
     }
 
     /// Each metric names its own provenance: a pool that sets its daily
@@ -684,26 +745,31 @@ mod tests {
     fn provenance_is_per_metric() {
         let row = PoolRow { requests_per_minute: Some(60), daily_budget: Some(5.0), budget_mode: "enforce".into(), ..Default::default() };
         let pool = resolve_pool(Some(&row), DEFAULT);
-        let l = LimitLayer::from_config(LimitBucket::Workspace, &pool, [0.0; 4], pool_inherits(Some(&row)), "own");
-        let flags = |l: &LimitLayer| {
-            [&l.requests_per_minute, &l.tokens_per_minute, &l.daily_budget, &l.monthly_budget].map(|m| m.inherited)
-        };
-        assert_eq!(flags(&l), [false, false, false, true]);
+        let l = LimitLayer::from_config(LimitBucket::Workspace, &pool, [0.0; METERS], pool_inherits(Some(&row)), "own");
+        let flags = |l: &LimitLayer| l.meters().map(|m| m.inherited);
+        assert_eq!(flags(&l), [false, false, false, false, false, true]);
         assert!(!l.all_inherited());
-        assert_eq!(pool_inherits(None), [false, false, true, true]);
+        assert_eq!(pool_inherits(None), [false, false, false, false, true, true]);
         let none = resolve_pool(None, DEFAULT);
-        assert!(LimitLayer::from_config(LimitBucket::Workspace, &none, [0.0; 4], pool_inherits(None), "own").all_inherited());
+        assert!(LimitLayer::from_config(LimitBucket::Workspace, &none, [0.0; METERS], pool_inherits(None), "own").all_inherited());
 
-        use streamscope_core::auth::member_limits::resolve_member_limit;
+        use streamscope_core::auth::member_limits::{resolve_member_limit, MemberKind};
         let default = MemberLimits { requests_per_minute: Some(10), daily_budget: Some(2.0), ..Default::default() };
         let exception = MemberLimits { requests_per_minute: Some(100), ..Default::default() };
-        let bucket = resolve_member_limit(Some(&default), Some(&exception)).unwrap();
-        let l = LimitLayer::from_config(LimitBucket::Member, &bucket, [0.0; 4], member_inherits(Some(&exception)), "exception");
-        // tpm and monthly carry no cap, so nothing is inherited there.
-        assert_eq!(flags(&l), [false, false, true, false]);
-        let bucket = resolve_member_limit(Some(&default), None).unwrap();
-        let l = LimitLayer::from_config(LimitBucket::Member, &bucket, [0.0; 4], member_inherits(None), "member_default");
-        assert_eq!(flags(&l), [true, false, true, false]);
+        let bucket = resolve_member_limit(Some(&default), Some(&exception), MemberKind::Person).unwrap();
+        let l = LimitLayer::from_config(LimitBucket::Member, &bucket, [0.0; METERS], member_inherits(Some(&exception)), "exception");
+        // The other rates, tpm and monthly carry no cap, so nothing is
+        // inherited there.
+        assert_eq!(flags(&l), [false, false, false, false, true, false]);
+        let bucket = resolve_member_limit(Some(&default), None, MemberKind::Person).unwrap();
+        let l = LimitLayer::from_config(LimitBucket::Member, &bucket, [0.0; METERS], member_inherits(None), "member_default");
+        assert_eq!(flags(&l), [true, false, false, false, true, false]);
+        // A surface rate the exception leaves unset is the default's.
+        let default = MemberLimits { requests_per_minute_mcp: Some(300), ..Default::default() };
+        let exception = MemberLimits { requests_per_minute_a2a: Some(5), ..Default::default() };
+        let bucket = resolve_member_limit(Some(&default), Some(&exception), MemberKind::Person).unwrap();
+        let l = LimitLayer::from_config(LimitBucket::Member, &bucket, [0.0; METERS], member_inherits(Some(&exception)), "exception");
+        assert_eq!(flags(&l), [false, true, false, false, false, false]);
     }
 
     /// Every viewer × bucket cell: an administrator sees all use; nobody
@@ -731,15 +797,19 @@ mod tests {
     /// no meter shows (another window, another metric) lands nowhere.
     #[test]
     fn each_counter_row_lands_on_its_meter() {
-        assert_eq!(use_slot("rpm", "minute", 7), Some((0, 7.0)));
-        assert_eq!(use_slot("tpm", "minute", 900), Some((1, 900.0)));
-        assert_eq!(use_slot("budget_micros", "daily", 2_500_000), Some((2, 2.5)));
-        assert_eq!(use_slot("budget_micros", "monthly", 40_000_000), Some((3, 40.0)));
+        use streamscope_core::usage::UsageMetric;
+        assert_eq!(use_slot(UsageMetric::RequestsPerMinute.as_str(), "minute", 7), Some((0, 7.0)));
+        assert_eq!(use_slot(UsageMetric::RequestsPerMinuteMcp.as_str(), "minute", 8), Some((1, 8.0)));
+        assert_eq!(use_slot(UsageMetric::RequestsPerMinuteA2a.as_str(), "minute", 9), Some((2, 9.0)));
+        assert_eq!(use_slot(UsageMetric::TokensPerMinute.as_str(), "minute", 900), Some((3, 900.0)));
+        assert_eq!(use_slot(UsageMetric::BudgetMicros.as_str(), "daily", 2_500_000), Some((4, 2.5)));
+        assert_eq!(use_slot(UsageMetric::BudgetMicros.as_str(), "monthly", 40_000_000), Some((5, 40.0)));
         assert_eq!(use_slot("budget_micros", "minute", 1), None);
+        assert_eq!(use_slot("rpm_mcp", "daily", 1), None);
         assert_eq!(use_slot("unknown_metric", "daily", 1), None);
         let mut l = layer(LimitBucket::Member, 0.0, 10.0);
-        l.set_use([1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(l.meters().map(|m| m.used), [Some(1.0), Some(2.0), Some(3.0), Some(4.0)]);
+        l.set_use([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(l.meters().map(|m| m.used), [Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(5.0), Some(6.0)]);
     }
 
     /// A hidden use never makes a layer bind: the binding is named before
@@ -797,6 +867,8 @@ mod tests {
         assert!(is_unlimited(&none));
         for capped in [
             RateLimitConfig { requests_per_minute: 1, ..none.clone() },
+            RateLimitConfig { requests_per_minute_mcp: 1, ..none.clone() },
+            RateLimitConfig { requests_per_minute_a2a: 1, ..none.clone() },
             RateLimitConfig { tokens_per_minute: 1, ..none.clone() },
             RateLimitConfig::budget_only(0.01, 0.0, false),
             RateLimitConfig::budget_only(0.0, 0.01, false),

@@ -7,8 +7,16 @@
 //! and buffers while admin-api is unreachable. Config and session state are
 //! persisted to disk for crash recovery and cold start.
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Bench builds only: every allocation recorded, written to `dhat-heap.json`
+/// in the temporary directory when the server stops (what is still live at
+/// the end, and at the peak, by allocation site).
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -69,11 +77,17 @@ const PPROF_MAX_SECS: u64 = 120;
 const PPROF_FREQUENCY: i32 = 99;
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let heap_profile = dhat::Profiler::builder().file_name(std::env::temp_dir().join("dhat-heap.json")).build();
     // Size the Tokio runtime canonically (cgroup-aware in K8s; on a shared host
     // the proxy takes nearly all cores, leaving headroom for the control plane).
     // Built before tracing exists, so the chosen size is logged inside `run()`.
-    streamscope_core::runtime::build_runtime(streamscope_core::runtime::Role::DataPlane)?
-        .block_on(run())
+    let runtime = streamscope_core::runtime::build_runtime(streamscope_core::runtime::Role::DataPlane)?;
+    let result = runtime.block_on(run());
+    // Written before the runtime is torn down, which may wait on blocking work.
+    #[cfg(feature = "dhat-heap")]
+    drop(heap_profile);
+    result
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -548,6 +562,7 @@ async fn run() -> anyhow::Result<()> {
         ),
     );
 
+    let mcp_app_state = mcp_state.mcp.clone();
     #[allow(unused_mut)]
     let mut app = build_app(state.clone(), mcp_state, a2a_state, metadata_limiter);
 
@@ -581,6 +596,12 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!("pprof profiling endpoint enabled at /debug/pprof");
     }
 
+    #[cfg(feature = "alloc-stats")]
+    {
+        app = app.route("/debug/alloc", get(alloc_handler));
+        tracing::info!("allocator endpoint enabled at /debug/alloc");
+    }
+
     // Opt-in outbox introspection (default off). Merged after the CORS/panic
     // layers like the pprof route; carries the outbox sink as its own state
     // so it reports the cumulative durable-record counters.
@@ -597,14 +618,12 @@ async fn run() -> anyhow::Result<()> {
     // unauthenticated, so the scrape surface must never mount there. Bound on
     // the startup path — a misconfigured port fails boot loudly.
     if s.metrics_port > 0 {
-        let metrics_router = Router::new()
-            .route("/metrics", get(metrics_handler))
-            .with_state((
-                proxy_stats.clone(),
-                outbox.clone(),
-                state.response_cache.clone(),
-                state.dispatch_gate.clone(),
-            ));
+        let metrics_router = metrics_router(MetricsState {
+            stats: proxy_stats.clone(),
+            outbox: outbox.clone(),
+            app: state.clone(),
+            mcp: mcp_app_state,
+        });
         let metrics_listener =
             streamscope_core::metrics::bind_metrics_listener(s.metrics_port).await?;
         tracing::info!("metrics listener on 0.0.0.0:{}", s.metrics_port);
@@ -758,20 +777,47 @@ async fn buffered_audit_debug_handler(
 /// itself, so both are appended here rather than inside `render_prometheus`.
 /// What the metrics listener reads from: every subsystem that owns series of
 /// its own.
-type MetricsState = (
-    Arc<stats::ProxyStats>,
-    Arc<outbox_v2::OutboxV2>,
-    Arc<streamscope_core::proxy::response_cache::ResponseCache>,
-    Arc<streamscope_core::proxy::dispatch_gate::DispatchGate>,
-);
+#[derive(Clone)]
+struct MetricsState {
+    stats: Arc<stats::ProxyStats>,
+    outbox: Arc<outbox_v2::OutboxV2>,
+    app: Arc<AppState>,
+    mcp: Arc<mcp::McpAppState>,
+}
+
+/// The `METRICS_PORT` listener's router — never merged into [`build_app`].
+fn metrics_router(state: MetricsState) -> Router {
+    Router::new().route("/metrics", get(metrics_handler)).with_state(state)
+}
 
 async fn metrics_handler(
-    axum::extract::State((stats, outbox, cache, gate)): axum::extract::State<MetricsState>,
+    axum::extract::State(m): axum::extract::State<MetricsState>,
 ) -> axum::response::Response {
     let mut buf = streamscope_core::metrics::PromBuf::new();
-    stats.render_prometheus(&mut buf);
-    stats::render_cache_prometheus(&mut buf, &cache.stats());
-    stats::render_gate_prometheus(&mut buf, &gate.stats());
+    m.stats.render_prometheus(&mut buf);
+    stats::render_cache_prometheus(&mut buf, &m.app.response_cache.stats());
+    stats::render_gate_prometheus(&mut buf, &m.app.dispatch_gate.stats());
+    let detector = &m.app.session_detector;
+    let (cumulative, reported, authoritative) = m.app.usage.counter_counts();
+    let mcp = m.mcp.session_map.counts();
+    stats::render_state_prometheus(
+        &mut buf,
+        &stats::StateGauges {
+            detector_held_bytes: detector.held_bytes() as u64,
+            detector_turns: detector.entries() as u64,
+            detector_users: detector.users() as u64,
+            usage_counters: (cumulative as u64, reported as u64, authoritative as u64),
+            mcp_sessions: mcp.sessions as u64,
+            mcp_upstream_sessions: mcp.upstream_sessions as u64,
+            mcp_upstream_handshakes: mcp.upstream_handshakes as u64,
+            mcp_upstream_eras: mcp.upstream_eras as u64,
+            mcp_upstream_listeners: m.mcp.listeners.len() as u64,
+            mcp_cap_drops: m.mcp.session_map.cap_drops().iter().map(|(map, n)| (map.label(), *n)).collect(),
+        },
+    );
+    #[cfg(feature = "alloc-stats")]
+    render_alloc_prometheus(&mut buf);
+    let outbox = &m.outbox;
     buf.family(
         "streamscope_proxy_pending_audit_records",
         "gauge",
@@ -785,6 +831,65 @@ async fn metrics_handler(
     axum::response::IntoResponse::into_response(streamscope_core::metrics::metrics_response(
         buf.finish(),
     ))
+}
+
+/// The process's resident set now and its high-water mark, in bytes, as the
+/// kernel counts them (`VmRSS`, `VmHWM`). Not mimalloc's own figures: a
+/// release build of mimalloc keeps no live commit count, so its process info
+/// reports the peak for every field.
+#[cfg(feature = "alloc-stats")]
+fn alloc_info() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kib = |field: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(field))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    };
+    (kib("VmRSS:"), kib("VmHWM:"))
+}
+
+/// The resident set beside the cgroup's figures: what `/debug/alloc?collect=1`
+/// moves is allocator retention.
+#[cfg(feature = "alloc-stats")]
+fn render_alloc_prometheus(buf: &mut streamscope_core::metrics::PromBuf) {
+    let (rss, peak_rss) = alloc_info();
+    for (name, help, value) in [
+        ("streamscope_proxy_process_rss_bytes", "The process's resident set now.", rss),
+        ("streamscope_proxy_process_peak_rss_bytes", "The largest resident set the process has had.", peak_rss),
+    ] {
+        buf.family(name, "gauge", help);
+        buf.sample_u64(name, &[], value);
+    }
+}
+
+/// Allocator endpoint: GET /debug/alloc → the resident set (now and peak);
+/// with `collect=1` it first forces mimalloc to return what it retains
+/// (`mi_collect(true)`) — the serving thread's heap and abandoned segments
+/// only, not the other workers' heaps: what drops is allocator retention, what
+/// stays is live state plus the other threads' retention (an upper bound).
+#[cfg(feature = "alloc-stats")]
+async fn alloc_handler(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let before = alloc_info();
+    let collected = params.get("collect").is_some_and(|v| v == "1");
+    if collected {
+        // SAFETY: `mi_collect` takes no pointers; forcing a collection is
+        // valid from any thread at any time.
+        unsafe { libmimalloc_sys::mi_collect(true) };
+    }
+    let after = alloc_info();
+    axum::Json(serde_json::json!({
+        "collected": collected,
+        "before": { "rss_bytes": before.0, "peak_rss_bytes": before.1 },
+        "after": { "rss_bytes": after.0, "peak_rss_bytes": after.1 },
+    }))
+    .into_response()
 }
 
 /// CPU profiling endpoint: GET /debug/pprof?seconds=10 → flamegraph SVG.
