@@ -11,6 +11,7 @@ use super::filters::{
     A2A_AUDIT_WINDOW, AUDIT_LOG_JOIN, AUDIT_LOG_WINDOW, MCP_AUDIT_WINDOW, WEB_AUDIT_WINDOW, since_sql, until_sql,
 };
 use super::scope::AuditScope;
+use crate::routes::client_access_profiles::AUDIT_SESSION_ALERTS_SHOWN;
 use super::search::{SearchRows, SearchWalk};
 use crate::sql_pattern::{contains_pattern, search_pattern};
 use crate::db::tenant::Scoped;
@@ -285,11 +286,18 @@ fn llm_list_sql(
          LEFT JOIN workspaces ws ON ws.id = g.workspace_id \
          LEFT JOIN conversation_turns ct ON ct.request_id = a.request_id AND ct.timestamp = a.timestamp{} \
          LEFT JOIN LATERAL (SELECT COALESCE(ct.session_id, g.session_id) AS session_id OFFSET 0) sk ON true \
-         LEFT JOIN sessions sa ON sa.session_id = sk.session_id \
+         LEFT JOIN sessions sa ON sa.session_id = sk.session_id{} \
          WHERE 1=1{}",
-        filters.turn_window, filters.sql
+        filters.turn_window, session_alert_shown(scope), filters.sql
     );
     (sql, filters)
+}
+
+/// The condition on the row's session `sa` under which its alert is read: a
+/// confined (portal) scope reads it only where the profile of the session's
+/// own workspace shows alerts; any other scope always.
+fn session_alert_shown(scope: &AuditScope) -> String {
+    if scope.confined() { format!(" AND {AUDIT_SESSION_ALERTS_SHOWN}") } else { String::new() }
 }
 
 /// [`list_audit_logs_llm`] for any [`ArmRead`]; an [`AuditLogEntry`] row is

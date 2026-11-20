@@ -760,10 +760,16 @@ async fn analyze_request(
             transform_diff.messages_after_count = transform_diff.messages_original_count;
         }
         Some(ContentMeta {
-            request_messages_json: pre_content.messages_json,
+            // As on the proxied path: a request whose media the finalize pass
+            // rewrites carries every message.
+            request_messages_json: crate::proxy::known_bodies::capture(
+                pre_content.messages_json,
+                (!pre_content.media_scan_needed).then_some(ctx.user.tenant_id),
+                pre_content.opening,
+            ),
             media_scan_needed: pre_content.media_scan_needed,
-            request_tools: pre_content.tools,
-            effective_tools,
+            request_tools: crate::proxy::known_bodies::capture_tools(pre_content.tools, Some(ctx.user.tenant_id)),
+            effective_tools: crate::proxy::known_bodies::capture_tools(effective_tools, Some(ctx.user.tenant_id)),
             request_params: pre_content.params,
             system_prompt: pre_content.system_prompt,
             transform_diff: serde_json::to_value(&transform_diff).ok(),

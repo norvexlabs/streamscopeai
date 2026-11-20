@@ -3,10 +3,16 @@
 //! The rows a member may read are decided by `PortalDataScope` alone; this
 //! module decides which FIELDS of those rows reach them. Two rules:
 //!
-//! - [`MemberView`], for every member: the experts' findings on a session (its
-//!   alert level, the experts that raised it and their note, and the
-//!   `session_alert` badge an audit row folds them into) are withheld. Session
-//!   linkage is not a finding and stays.
+//! - [`MemberView`], for every member. The experts' findings on a session (its
+//!   alert level, the experts that raised it and their note, its sub-agents'
+//!   alert on it, and the `session_alert` badge an audit row folds them into)
+//!   are NOT decided here: the store reads them for a portal scope only where
+//!   the profile of that session's own workspace shows alerts
+//!   (`client_access_profiles::SESSION_ALERTS_SHOWN` and its siblings), per
+//!   row, so one workspace's choice is never overruled by another the member
+//!   belongs to. A `session_alert` badge on a non-LLM row is never the
+//!   session's (only the LLM row reads it) and is dropped. Session linkage is
+//!   not a finding and stays.
 //! - [`WithoutContent`], for a member whose conversation content is hidden
 //!   (`HiddenPages::content_hidden`): a request-list row keeps its metadata —
 //!   when, who, which model, server, tool or agent, how much, how long, what
@@ -21,9 +27,11 @@
 //! [`ConversationResponse`], a [`LinkedSessions`], an [`AuditLogRow`], a
 //! [`WebAuditLogEntry`] or a [`TraceResponse`] passes it through
 //! [`MemberView::for_member`] before it is serialised: clearing the
-//! fields in the UI alone would still ship them in the JSON. A filter, a text
-//! search or an order on a withheld field is ignored by the handler, never
-//! applied, so the rows returned cannot reveal it either.
+//! fields in the UI alone would still ship them in the JSON. A filter or a
+//! text search on content [`WithoutContent`] withholds is ignored by the
+//! handler, never applied, so the rows returned cannot reveal it either; the
+//! alert filter and order are applied by the store to the alert as it masks
+//! it for the scope, so a hidden alert neither matches nor ranks.
 
 use streamscope_core::audit::AuditBadge;
 
@@ -38,20 +46,16 @@ pub(crate) trait MemberView: Sized {
     fn for_member(self) -> Self;
 }
 
+/// Its alert was masked by the store, per the session's workspace.
 impl MemberView for SessionSummary {
-    fn for_member(mut self) -> Self {
-        self.alert_level = None;
-        self.alert_expert_axis = None;
-        self.alert_note = None;
+    fn for_member(self) -> Self {
         self
     }
 }
 
+/// Its alert was masked by the store, per the session's workspace.
 impl MemberView for ConversationResponse {
-    fn for_member(mut self) -> Self {
-        self.alert_level = None;
-        self.alert_expert_axis = None;
-        self.alert_note = None;
+    fn for_member(self) -> Self {
         self
     }
 }
@@ -71,11 +75,8 @@ fn drop_session_alert(badges: &mut Vec<AuditBadge>) {
 impl MemberView for AuditLogRow {
     fn for_member(mut self) -> Self {
         match &mut self {
-            AuditLogRow::Llm { entry } => {
-                entry.session_alert_level = None;
-                entry.session_alert_axis = None;
-                drop_session_alert(&mut entry.badges.0);
-            }
+            // Its session's alert, badge included, was masked by the store.
+            AuditLogRow::Llm { .. } => {}
             AuditLogRow::Mcp { entry } => drop_session_alert(&mut entry.badges.0),
             AuditLogRow::Web { entry } => drop_session_alert(&mut entry.badges.0),
             AuditLogRow::A2a { entry } => drop_session_alert(&mut entry.badges.0),

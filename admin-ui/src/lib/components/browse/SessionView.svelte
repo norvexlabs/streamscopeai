@@ -3,8 +3,9 @@
   // the portal's render this one component through `plane`
   // (`#lib/browse/planes.js`). The portal reads within the workspace named by
   // `?workspace_id` (a teammate's session in a sharing workspace); the server
-  // re-checks sharing and membership, and withholds expert findings from
-  // members — the alert chips and banner below then render nothing.
+  // re-checks sharing and membership, and sends a member a session's expert
+  // findings only where its workspace's profile shows them — otherwise the
+  // alert chips and banner below render nothing.
   import { onMount, untrack } from 'svelte';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';

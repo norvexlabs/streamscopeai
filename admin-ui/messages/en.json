@@ -284,7 +284,6 @@
   "limits_exception_replaces": "An exception replaces the workspace default for this member — higher or lower. A field left on Inherit keeps the default.",
   "limits_exception_title_edit": "Exception — {email}",
   "limits_exception_title_new": "Add member exception",
-  "limits_fleet_estimate": "fleet estimate",
   "limits_invalid_value": "Enter a number above 0",
   "limits_lowered": "lowered",
   "limits_member": "Member",
@@ -401,7 +400,7 @@
   "portal_comp_copy_with_key": "Copy with key",
   "portal_comp_create": "Create",
   "portal_comp_creating": "Creating…",
-  "portal_comp_current_spend": "Current spend (fleet estimate)",
+  "portal_comp_current_spend": "Current spend",
   "portal_comp_daily": "Daily",
   "portal_comp_daily_label": "Daily:",
   "portal_comp_disabled": "Disabled",
@@ -574,7 +573,7 @@
   "portal_qs_cli_intro_post": "CLI provisions your installed AI tools in one go: it logs in through your browser, mints one workspace key, and merges the gateway config into each tool's own config file — your other settings are kept.",
   "portal_qs_cli_intro_pre": "The",
   "portal_qs_cli_login_instructions": "Opens your browser to approve this device — works with password and SSO logins alike.",
-  "portal_qs_cli_provision_instructions": "Detects your installed tools, mints one gateway key, and writes each config. Re-run any time; `ssai sync --watch` keeps configs converged.",
+  "portal_qs_cli_provision_instructions": "Detects your installed tools, mints one gateway key, and writes each config. Re-run any time; `ssai sync --watch` keeps configs up to date.",
   "portal_qs_cli_run_instructions": "`ssai run <client>` launches a provisioned tool in a sandbox — `<client>` is its id, as `ssai status` lists it, or the command that starts it.",
   "portal_qs_run_help_summary": "How the sandbox works — modes and options",
   "portal_qs_run_help_intro": "ssai run starts a tool inside a sandbox. The tool reaches this gateway, and only what your administrator allows besides it.",
@@ -1115,5 +1114,8 @@
   "conv_link_evidence_agent_high": "expert, high",
   "conv_link_evidence_agent_medium": "expert, medium",
   "session_row_continued_in": "Continued in",
-  "browse_session_continued_in": "Continued in a later session"
+  "browse_session_continued_in": "Continued in a later session",
+  "browse_subagent_alert": "Sub-agent alert: {level}",
+  "browse_subagents_more": "{count} more — open the session to see them all",
+  "browse_subagents_loading": "Loading sub-agents…"
 }

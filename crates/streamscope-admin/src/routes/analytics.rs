@@ -637,6 +637,7 @@ pub async fn list_apps(
 // ── Tool Inventory ───────────────────────────────────────────────────────
 
 // Re-export shared matching from streamscope-core.
+use streamscope_core::config::tool_names::{McpToolNames, ToolNameRoute};
 use streamscope_core::config::tool_rules::{classify_tool_call, FieldProfileSet, Rule};
 
 /// Load field profiles from system_settings — parallel to `load_risk_rules`.
@@ -650,6 +651,42 @@ pub(crate) async fn load_field_profiles(executor: &mut Scoped) -> FieldProfileSe
         Err(e) => {
             tracing::warn!("failed to query tool_field_profiles: {e}");
             FieldProfileSet::default()
+        }
+    }
+}
+
+/// The tenant's virtual servers indexed for reading a tool name's MCP server
+/// (`resolve_tool_name`), from the same rows and with the same enabled filter
+/// as the proxy's snapshot (`McpConfig::from_rows_with_credentials`): an
+/// enabled route of an enabled virtual server onto an enabled upstream. RLS
+/// confines the read to the executor's tenant. Empty on a read error — names
+/// then resolve as the client wrote them.
+pub(crate) async fn load_mcp_tool_names(executor: &mut Scoped) -> McpToolNames {
+    let rows = sqlx::query_as::<_, (String, String, String, uuid::Uuid)>(
+        r#"SELECT vs.slug, r.prefix, u.name, r.id
+           FROM mcp_virtual_routes r
+           JOIN mcp_virtual_servers vs
+             ON vs.tenant_id = r.tenant_id AND vs.id = r.virtual_server_id
+           JOIN mcp_upstream_servers u
+             ON u.tenant_id = r.tenant_id AND u.id = r.upstream_server_id
+           WHERE r.enabled AND vs.enabled AND u.enabled"#,
+    )
+    .fetch_all(&mut *executor)
+    .await;
+    match rows {
+        Ok(rows) => McpToolNames::new(
+            rows.into_iter()
+                .map(|(virtual_server_slug, prefix, upstream_name, route_id)| ToolNameRoute {
+                    virtual_server_slug,
+                    prefix,
+                    upstream_name,
+                    route_id,
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            tracing::warn!("failed to query MCP virtual routes: {e}");
+            McpToolNames::default()
         }
     }
 }
@@ -1321,6 +1358,7 @@ async fn collect_tool_invocations(
 
     let risk_rules = load_risk_rules(db.conn()).await;
     let field_profiles = load_field_profiles(db.conn()).await;
+    let mcp_names = load_mcp_tool_names(db.conn()).await;
     let tool_name_filter = query.tool_name.as_ref().map(|s| s.to_ascii_lowercase());
     let outcome_filter = query.outcome;
     // The term the SQL binds, folded like ILIKE folds, so what the SQL
@@ -1668,6 +1706,7 @@ async fn collect_tool_invocations(
                     None,
                     r.app_id.as_deref(),
                     Some(&field_profiles),
+                    Some(&mcp_names),
                     name,
                     Some(arguments),
                 );

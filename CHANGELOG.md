@@ -5,6 +5,135 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.71]
+
+### Added
+
+- **Sub-agents nest under their parent in the Sessions list**, in the console and the portal. The
+  list shows top-level sessions; a parent's sub-agent badge opens its sub-agents in place (up to 25,
+  then a link to the session), and the parent shows when one of its sub-agents carries an expert
+  alert. A continuation stays a row of its own. A search, an alert filter or a **Linked** choice
+  shows the flat list, where a sub-agent's row names its parent. A sub-agent whose parent is not on the list (no longer
+  kept, excluded by your filters, or one a portal member cannot see) stays a row of its own.
+  The API lists sessions flat unless asked for `linked=top_level`.
+- **Show expert alerts** — a Portal & clients profile's Portal pages setting. Each session's
+  alerts reach its user in the portal as its own workspace's profile decides.
+
+### Changed
+
+- **BREAKING (portal) — members now see their sessions' expert alerts by default**: the alert and
+  its note, the alert badge on a request, a sub-agent's alert on its parent, and the alert filter.
+  Turn **Show expert alerts** off in a workspace's Portal & clients profile to keep them
+  console-only, as before. The portal sessions API now applies `alert_level` and `sort=alerts`
+  (to the alerts the member is shown) instead of ignoring them, and refuses `sort=alerts` with a
+  search term, as the console's does.
+- Deep pages of the Sessions list load faster.
+
+## [2026.11.70]
+
+### Changed
+
+- **BREAKING (audit) — a gateway whose audit trail cannot keep up now holds new requests rather
+  than dropping their records.** `AUDIT_FAIL_MODE` defaults to `closed`: a gateway producing audit
+  records faster than it can store them on its own disk serves at the rate it stores them, the
+  Inline AI analysis endpoint included, rather than dropping them. Set `open` (**Settings →
+  Advanced**, applied when each gateway restarts) to keep serving at full speed and drop those
+  records instead. An unreachable or upgrading console holds no request in either mode: the gateway
+  keeps buffering its records on its own disk, up to its outbox cap.
+- The limit meters in the portal and the console no longer carry a "fleet estimate" note.
+
+## [2026.11.69]
+
+### Changed
+
+- **BREAKING (tool rules) — a tool rule filtered on an MCP server applies to the model's calls to
+  that server's tools.** Before, a rule with an MCP server filter acted only on the MCP gateway:
+  when a model called the tool through the LLM gateway the rule never blocked, rewrote or classified
+  anything there, although the console's risk classification showed it matching. It now applies to
+  the tool's definition, the model's call (streamed or not) and the tool's result — for a tool the
+  client runs or the gateway serves, not a provider's own MCP connector. The server is a gateway
+  virtual server's upstream, or, for a server the developer runs themselves (a local MCP server),
+  the `<server>` of a tool the client names `mcp__<server>__<tool>` (Claude Code, Codex, Qwen Code);
+  `-` and `_` match each other, as Codex writes a server's `-` as `_`. A rule you wrote with a
+  server filter may therefore start acting on model traffic it ignored before. The rule sandbox now
+  tests the server filter too.
+
+## [2026.11.68]
+
+### Changed
+
+- **BREAKING (audit) — what a gateway does when its audit trail cannot keep up is a setting,
+  `AUDIT_FAIL_MODE`.**
+  Before, a gateway serving faster than it could store its audit records slowed down and grew in
+  memory until it was restarted.
+  - **`open` (the new default)** keeps serving and drops the records it cannot queue. Each is
+    counted in `streamscope_proxy_audit_dropped_records_total`, with an error logged at most once a
+    minute; a dropped request leaves no audit row.
+  - **`closed`** holds each new request until the audit trail has room, so no request's record is
+    lost and the gateway slows down instead.
+
+  An unreachable console does not by itself trigger either: the gateway keeps buffering on its own
+  disk. What fills the queue is a gateway producing records faster than it can store them. The
+  records queued in memory per kind fall from 10,000 to 1,000 (`AUDIT_CHANNEL_CAPACITY`).
+
+### Fixed
+
+- **A gateway under a burst of long agent sessions no longer runs out of memory recording them.**
+  Each turn of a conversation re-sends its whole history and tool list. The gateway recorded all of
+  it on every turn, and held it until the audit trail had taken it in. A few hundred agents working
+  without pause on long sessions could exhaust a 2 GB gateway in seconds. Three changes fix this:
+  - A turn now records only the messages and tool list the audit trail does not already hold, and
+    names the others. Requests carrying images, documents or audio still record their whole history.
+  - An MCP call's arguments and answer are held as text while they wait to be recorded.
+  - Requests no longer pile up in memory waiting, with their records, for room in the audit trail
+    (see `AUDIT_FAIL_MODE` above).
+
+  New gauges show the content the gateway knows the audit trail holds, and how often a turn's
+  messages are found there.
+
+- **One organisation can no longer crowd others out of the MCP gateway's session records.** Each
+  organisation holds at most half of each record the gateway keeps of MCP client sessions, upstream
+  protocol eras, client log levels and the upstream connections it opens itself. Those connections
+  are now limited by the memory they take, not their number: an upstream server answering its
+  handshake with large instructions takes the room of several, and one answering with more than
+  64 KB is used for its request but not kept.
+- **Windows sandbox: no error dialog when security software blocks the Task Scheduler.** On a
+  computer whose security software stops the sandbox account from using the Task Scheduler, a run
+  no longer shows an error dialog before and after it. The tasks it could not check are reported as
+  a warning.
+- **Windows sandbox: shared skills are readable.** Skills installed for several clients, kept once
+  in `.agents\skills`, are readable by the sandboxed client.
+
+## [2026.11.67]
+
+### Changed
+
+- **BREAKING (field profiles) — tool rules recognise a gateway MCP server's tools under every
+  client's naming.** Each coding client shows a virtual server's tools to its model under a name of
+  its own — `mcp__web__web_fetch` in Claude Code and Codex, `mcp_web_web_fetch` in Gemini CLI and
+  Crush, `web_web_fetch` in OpenCode. Tool rules and field profiles now read each of these as the
+  tool of the MCP upstream server behind the virtual server, the server the MCP gateway itself
+  names, on the request, on the answer (streamed or not), in tool-result redaction and in the
+  console's risk classification, tool inventory, field discovery and rule sandbox. Before, a call to
+  the built-in Web tools missed their own field profile under every client and was caught only by a
+  generic one, and OpenCode's and Gemini CLI's calls to any virtual server's tools were not
+  recognised at all. A field profile scoped to an MCP server now matches by the upstream server's
+  name: one keyed on a virtual server's slug instead stops matching a model's calls — rename it to
+  the upstream's name. A client's own tool whose name only starts like a slug (OpenCode's
+  `web_search` beside the `web` virtual server) stays the client's. A Web substitute rule rewrites
+  only the client's own web tool, never a virtual server's tool, which the gateway already serves.
+
+### Fixed
+
+- **Codex's MCP tools reach every model.** Codex declares each MCP server's tools as a Responses
+  `namespace` group. On a route to a Chat Completions, Anthropic or Gemini model the gateway dropped
+  the whole group, so the model saw none of the tools; it now offers each tool to the model as
+  `<namespace>__<tool>` (`mcp__web__web_fetch`) and hands the model's calls back to Codex as the
+  member of its namespace, streamed or not. A Responses model is sent the group as Codex declared
+  it. Tool rules and field profiles read these calls as the MCP server's tools on every route. A
+  request whose namespace member would reach the model under the same name as another of its tools
+  is refused with a 400.
+
 ## [2026.11.66]
 
 ### Changed

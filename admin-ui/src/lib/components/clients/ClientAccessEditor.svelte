@@ -139,6 +139,12 @@
     void update({ hidden_pages: pages }, hide ? 'Hidden in the portal' : 'Shown in the portal');
   }
 
+  /** Show or hide the experts' alerts on this profile's workspaces' sessions. */
+  function setAlertsShown(shown: boolean) {
+    if (!content) return;
+    void update({ alerts_shown: shown }, shown ? 'Alerts shown in the portal' : 'Alerts hidden in the portal');
+  }
+
   /** Offer every client, or none, in one save. */
   function setAll(on: boolean) {
     if (!content) return;
@@ -246,6 +252,19 @@
             />
           </div>
         {/each}
+      </div>
+      <div class="px-5 py-3 text-xs text-(--text-secondary) border-t border-(--border)">
+        Unlike the switches above, decided per session, by the profile of <strong>that session's</strong>
+        workspace: a member who also belongs to a workspace that shows alerts never sees one this profile hides.
+      </div>
+      <div class="px-5" data-testid="client-access-alerts">
+        <ToggleSetting
+          label="Show expert alerts"
+          description="A session's expert alert and its note, the alert badge on its requests, a sub-agent's alert on its parent, and the alert filter."
+          value={content.alerts_shown}
+          disabled={saving}
+          onValueChange={(v: boolean) => setAlertsShown(v)}
+        />
       </div>
     </div>
   {:else}

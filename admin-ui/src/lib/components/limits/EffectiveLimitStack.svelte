@@ -68,6 +68,5 @@
         </div>
       </div>
     {/each}
-    <p class="text-[10px] text-(--text-secondary)">{m.limits_fleet_estimate()}</p>
   {/if}
 </div>

@@ -234,7 +234,7 @@
     {/if}
     {#if scopeKind === 'mcp'}
       <div class="mt-2"><TextInput bind:value={mcpServer} placeholder="e.g. filesystem | postgres | github" mono /></div>
-      <p class="text-[10px] text-(--text-secondary) mt-1">Server identity from <code>mcp__&lt;server&gt;__&lt;tool&gt;</code> namespace.</p>
+      <p class="text-[10px] text-(--text-secondary) mt-1">For a gateway virtual server's tool, the upstream server behind it; for a server the client runs itself, the <code>&lt;server&gt;</code> of <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.</p>
     {/if}
     {#if scopeKind === 'server'}
       <div class="mt-2"><TextInput list="fp-server-type-list" bind:value={serverType} placeholder="e.g. web_search_preview" mono /></div>

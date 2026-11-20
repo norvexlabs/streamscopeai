@@ -118,6 +118,12 @@ pub struct ClientAccessResponse {
     /// and every conversation's content, `requests` the Requests page. Hidden
     /// for a member only when every workspace they belong to hides it.
     pub hidden_pages: Vec<PortalPage>,
+    /// Whether the portal shows the experts' alerts on the sessions of the
+    /// workspaces on this profile: a session's alert, its requests'
+    /// `session_alert` badge and, on its parent, its alert as a sub-agent.
+    /// Decided per session, by the profile of the session's own workspace —
+    /// never by the viewer's other workspaces. Shown by default.
+    pub alerts_shown: bool,
 }
 
 /// `PATCH /api/v1/admin/profiles/{id}/client-access`. Each section absent =
@@ -137,6 +143,10 @@ pub struct UpdateClientAccessRequest {
     /// (422) and nothing is written.
     #[serde(default)]
     pub hidden_pages: Option<Vec<PortalPage>>,
+    /// Whether the portal shows the experts' alerts on the sessions of the
+    /// profile's workspaces.
+    #[serde(default)]
+    pub alerts_shown: Option<bool>,
 }
 
 /// The sandbox settings to change; a field absent is unchanged.
@@ -240,8 +250,8 @@ pub async fn get_profile_client_access(
     security(("bearer_auth" = []))
 )]
 /// Replace the sections sent — the clients offered, the destination lists, the
-/// sandbox settings, the hidden portal pages — and leave the others as they
-/// are.
+/// sandbox settings, the hidden portal pages, whether the portal shows expert
+/// alerts — and leave the others as they are.
 pub async fn update_profile_client_access(
     mut db: TenantConn,
     axum::Extension(audit_sink): axum::Extension<AuditDiffSink>,
@@ -372,6 +382,20 @@ pub async fn update_profile_client_access(
         .await
         .map_err(write_failed("write hidden pages"))?;
     }
+    // Its own column, written alone: a concurrent save of the pages above
+    // never undoes it, nor it them.
+    if let Some(shown) = body.alerts_shown {
+        sqlx::query(
+            "INSERT INTO client_access_portal (tenant_id, profile_id, hide_alerts) VALUES ($1, $2, $3) \
+             ON CONFLICT (tenant_id, profile_id) DO UPDATE SET hide_alerts = EXCLUDED.hide_alerts, updated_at = now()",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(!shown)
+        .execute(&mut *tx)
+        .await
+        .map_err(write_failed("write alert visibility"))?;
+    }
     // Read before the commit: the audited "after" is what this request wrote,
     // not what a later writer left.
     let after = load_content(&mut tx, id, is_default).await?;
@@ -465,6 +489,32 @@ macro_rules! resolved_profile_sql {
         )
     };
 }
+
+/// Whether the experts' alerts on a session of the workspace `$workspace` (a
+/// SQL expression for its id) reach a portal member, as a SQL condition: the
+/// profile that workspace resolves to does not hide them. The session's OWN
+/// workspace decides, never the viewer's other workspaces, so a workspace that
+/// hides them is never overruled by another the viewer belongs to; an
+/// unattributed session follows the Default. A profile without a row shows
+/// them.
+macro_rules! alerts_shown_sql {
+    ($workspace:literal) => {
+        concat!(
+            "NOT EXISTS (SELECT 1 FROM client_access_portal hp WHERE hp.hide_alerts AND hp.profile_id = ",
+            resolved_profile_sql!($workspace),
+            ")"
+        )
+    };
+}
+
+/// [`alerts_shown_sql`] for the listed session `s`.
+pub(crate) const SESSION_ALERTS_SHOWN: &str = alerts_shown_sql!("s.workspace_id");
+/// [`alerts_shown_sql`] for a sub-agent `cs` of the listed session.
+pub(crate) const CHILD_ALERTS_SHOWN: &str = alerts_shown_sql!("cs.workspace_id");
+/// [`alerts_shown_sql`] for the parent `ps` of a listed sub-agent.
+pub(crate) const PARENT_ALERTS_SHOWN: &str = alerts_shown_sql!("ps.workspace_id");
+/// [`alerts_shown_sql`] for the session `sa` an audit row belongs to.
+pub(crate) const AUDIT_SESSION_ALERTS_SHOWN: &str = alerts_shown_sql!("sa.workspace_id");
 
 /// The profile workspace `$1` resolves to.
 const RESOLVE_PROFILE_SQL: &str = concat!("SELECT ", resolved_profile_sql!("$1"));
@@ -666,6 +716,7 @@ async fn load_content(conn: &mut Scoped, id: Uuid, is_default: bool) -> Result<C
     .fetch_all(&mut *conn)
     .await
     .map_err(read_failed("load client-access destinations"))?;
+    let portal = load_portal(conn, id).await?;
     Ok(ClientAccessResponse {
         is_default,
         clients: clients
@@ -679,20 +730,30 @@ async fn load_content(conn: &mut Scoped, id: Uuid, is_default: bool) -> Result<C
             })
             .collect(),
         settings: load_settings(conn, id).await?,
-        hidden_pages: load_hidden_pages(conn, id).await?,
+        hidden_pages: portal.hidden_pages,
+        alerts_shown: portal.alerts_shown,
     })
 }
 
-/// What `profile_id` hides, `sessions` before `requests`.
-async fn load_hidden_pages(conn: &mut Scoped, profile_id: Uuid) -> Result<Vec<PortalPage>, ApiError> {
-    let row: Option<(bool, bool)> =
-        sqlx::query_as("SELECT hide_sessions, hide_requests FROM client_access_portal WHERE profile_id = $1")
-            .bind(profile_id)
-            .fetch_optional(&mut *conn)
-            .await
-            .map_err(read_failed("load hidden portal pages"))?;
-    let (sessions, requests) = row.unwrap_or_default();
-    Ok(HiddenPages::new(sessions, requests).into_vec())
+/// What `profile_id` hides in the portal, `sessions` before `requests`, and
+/// whether it shows the experts' alerts. A profile without a row hides
+/// nothing.
+async fn load_portal(conn: &mut Scoped, profile_id: Uuid) -> Result<PortalSwitches, ApiError> {
+    let row: Option<(bool, bool, bool)> = sqlx::query_as(
+        "SELECT hide_sessions, hide_requests, hide_alerts FROM client_access_portal WHERE profile_id = $1",
+    )
+    .bind(profile_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(read_failed("load hidden portal pages"))?;
+    let (sessions, requests, hide_alerts) = row.unwrap_or_default();
+    Ok(PortalSwitches { hidden_pages: HiddenPages::new(sessions, requests).into_vec(), alerts_shown: !hide_alerts })
+}
+
+/// A profile's portal switches, as [`ClientAccessResponse`] states them.
+struct PortalSwitches {
+    hidden_pages: Vec<PortalPage>,
+    alerts_shown: bool,
 }
 
 /// Seed a profile's content: every live client offered, the sandbox open
@@ -775,8 +836,8 @@ pub(crate) async fn copy_content(
            JOIN destination_lists l ON l.tenant_id = d.tenant_id AND l.id = d.list_id AND NOT l.suppressed \
            WHERE d.tenant_id = $1 AND d.profile_id = $2), \
          hidden AS ( \
-           INSERT INTO client_access_portal (tenant_id, profile_id, hide_sessions, hide_requests) \
-           SELECT $1, $3, hide_sessions, hide_requests FROM client_access_portal \
+           INSERT INTO client_access_portal (tenant_id, profile_id, hide_sessions, hide_requests, hide_alerts) \
+           SELECT $1, $3, hide_sessions, hide_requests, hide_alerts FROM client_access_portal \
            WHERE tenant_id = $1 AND profile_id = $2) \
          INSERT INTO client_access_sandbox (tenant_id, profile_id, require_sandbox, docker_tier, network_posture, \
            default_image, default_docker, default_memory, default_cpus) \

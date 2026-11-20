@@ -363,22 +363,10 @@ pub struct McpConfig {
     ///   operator has dropped keeps verifying until a fresh snapshot arrives —
     ///   which is why admin-api re-pushes every tenant when its ring changes.
     pub jwks: Vec<streamscope_mcp_auth::metadata::JsonWebKey>,
-    /// `prefix → upstream_server_name` index built from
-    /// `routes_by_virtual_server`. Surfaces every non-empty namespace prefix
-    /// the tenant has wired up so the LLM proxy can recognise a virtual-prefixed
-    /// tool a client DECLARES on a request (`gh__create_issue`) and resolve it
-    /// through the field-profile registry as if it had arrived through the MCP
-    /// path. Model-emitted tool calls do not consult it.
-    ///
-    /// Empty prefixes (routes without namespacing) are excluded — they'd
-    /// collide with bare upstream tool names.
-    ///
-    /// Ambiguity policy: when two routes share a prefix (across virtual
-    /// servers, with different upstream names), we keep the lowest-id
-    /// route's upstream — the LLM proxy is best-effort here, the MCP path is
-    /// the authoritative resolution. Operators who care should keep prefixes
-    /// unique within a tenant.
-    pub virtual_prefix_index: HashMap<String, String>,
+    /// The tenant's virtual servers indexed for reading the tool names an LLM
+    /// sees (`crate::config::tool_names::resolve_tool_name`). Shared, so the
+    /// answer's policy holds it without copying the snapshot.
+    pub tool_names: std::sync::Arc<crate::config::tool_names::McpToolNames>,
 }
 
 /// The route prefixes a virtual server accepts: empty, or at most 16 of
@@ -502,40 +490,22 @@ impl McpConfig {
             .map(|c| ((c.user_id, c.upstream_server_id), c))
             .collect();
 
-        // Collect non-empty prefix → upstream-name pairs, ordered
-        // by route id so collisions resolve deterministically.
-        let mut prefix_pairs: Vec<(String, String, Uuid)> = Vec::new();
-        for routes in routes_by_virtual_server.values() {
-            for r in routes {
-                if r.prefix.is_empty() {
-                    continue;
-                }
-                let Some(upstream) = upstream_servers.get(&r.upstream_server_id) else {
-                    continue;
-                };
-                prefix_pairs.push((r.prefix.clone(), upstream.name.clone(), r.id));
-            }
-        }
-        prefix_pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-        let mut virtual_prefix_index: HashMap<String, String> = HashMap::new();
-        for (prefix, name, route_id) in prefix_pairs {
-            match virtual_prefix_index.entry(prefix.clone()) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(name);
-                }
-                std::collections::hash_map::Entry::Occupied(existing) => {
-                    if existing.get() != &name {
-                        tracing::warn!(
-                            prefix = %prefix,
-                            kept_upstream = %existing.get(),
-                            ignored_upstream = %name,
-                            ignored_route_id = %route_id,
-                            "MCP virtual prefix collision — multiple routes share the same prefix; LLM-side resolution is best-effort and picks the lowest route id. Make prefixes unique within a tenant for deterministic LLM-path routing."
-                        );
-                    }
-                }
-            }
-        }
+        let tool_names = std::sync::Arc::new(crate::config::tool_names::McpToolNames::new(
+            routes_by_virtual_server
+                .iter()
+                .filter_map(|(vs_id, routes)| Some((virtual_servers.get(vs_id)?, routes)))
+                .flat_map(|(vs, routes)| {
+                    routes.iter().filter_map(|r| {
+                        Some(crate::config::tool_names::ToolNameRoute {
+                            virtual_server_slug: vs.slug.clone(),
+                            prefix: r.prefix.clone(),
+                            upstream_name: upstream_servers.get(&r.upstream_server_id)?.name.clone(),
+                            route_id: r.id,
+                        })
+                    })
+                })
+                .collect(),
+        ));
 
         Self {
             upstream_servers,
@@ -546,29 +516,8 @@ impl McpConfig {
             user_inputs: HashMap::new(),
             revoked_jtis: std::collections::HashSet::new(),
             jwks: Vec::new(),
-            virtual_prefix_index,
+            tool_names,
         }
-    }
-
-    /// Recognise a tool a client DECLARES on an LLM request under a tenant-
-    /// configured virtual server prefix. Returns `(local_name, mcp_server)`
-    /// when `<name>` splits as `<prefix>__<local>` ([`split_route_prefix`])
-    /// and `<prefix>` is in the index. The mcp_server return value is the
-    /// upstream's `name`, suitable to feed straight into
-    /// [`crate::config::tool_rules::FieldProfileSet`] for `tool_id` resolution.
-    ///
-    /// Returns `None` for un-prefixed names AND for names whose prefix isn't
-    /// configured. Callers try [`crate::config::tool_rules::parse_mcp_namespace`]
-    /// (the `mcp__<server>__<local>` convention) first, then this; model-emitted
-    /// tool calls and tool results consult only the former.
-    pub fn parse_virtual_namespace<'a>(
-        &self,
-        tool_name: &'a str,
-    ) -> Option<(&'a str, &str)> {
-        let (prefix, local) =
-            split_route_prefix(tool_name, |p| self.virtual_prefix_index.contains_key(p))?;
-        let upstream_name = self.virtual_prefix_index.get(prefix)?;
-        Some((local, upstream_name.as_str()))
     }
 
     /// Lookup a user's credential for a given upstream. Returns `None` when

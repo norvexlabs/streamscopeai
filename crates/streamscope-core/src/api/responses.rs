@@ -53,6 +53,12 @@ pub struct ResponsesRequest {
     /// Forward-compat: capture unknown fields.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    /// The client's `namespace` tools, read flat at ingress
+    /// ([`crate::api::namespaces::flatten`]): `tools` and the history hold
+    /// their members as plain tools, and every body sent upstream nests them
+    /// again ([`crate::api::ApiRequest::serialize`]). Never on the wire.
+    #[serde(skip)]
+    pub namespaced: crate::api::namespaces::NamespacedTools,
 }
 
 /// A Responses message part's text: an `output_text`'s `text`, a `refusal`

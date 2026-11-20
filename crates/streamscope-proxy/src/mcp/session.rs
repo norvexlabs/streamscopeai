@@ -11,11 +11,13 @@
 //! ingest time, so a sibling miss only loses the fast-path stamp — the
 //! version still lands on the row before it's queryable.
 
+use std::hash::Hash;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use uuid::Uuid;
 
 use super::modern::{UpstreamEra, UpstreamEraSupport};
@@ -64,11 +66,25 @@ pub enum CappedMap {
     UpstreamHandshakes,
 }
 
-/// The handshake map holds a quarter of `MCP_SESSION_MAX_ENTRIES`: a handshake
-/// carries the upstream's capabilities and instructions (1.7–3.5 KB measured,
-/// against ~0.1–0.2 KB for an entry of the other maps), so a quarter keeps a
-/// full map near 30–60 MB at the default beside a 512 MiB gateway.
+/// The handshake map holds a quarter of `MCP_SESSION_MAX_ENTRIES` entries'
+/// worth of bytes: a handshake carries the upstream's capabilities and
+/// instructions (1.7–3.5 KB measured, against ~0.1–0.2 KB for an entry of the
+/// other maps), so a quarter of the default at [`HANDSHAKE_UNIT`] each is
+/// 64 MiB beside a 512 MiB gateway.
 const HANDSHAKE_CAP_DIVISOR: usize = 4;
+
+/// What a handshake weighs at least, in bytes: the measured size rounded up.
+/// A handshake larger than that weighs what it holds, so an upstream answering
+/// with large `instructions` fills the map in bytes, not entries.
+const HANDSHAKE_UNIT: usize = 4096;
+
+/// The largest handshake kept, in bytes: one larger is used for its request
+/// and not kept (the next request handshakes again).
+const HANDSHAKE_ENTRY_MAX: usize = 64 * 1024;
+
+/// The share of each capped map one tenant may hold: a half. One tenant
+/// filling a map cannot refuse every other tenant's entries.
+const TENANT_SHARE_DIVISOR: usize = 2;
 
 impl CappedMap {
     pub const ALL: [Self; 4] = [Self::Sessions, Self::LogLevels, Self::UpstreamEras, Self::UpstreamHandshakes];
@@ -94,6 +110,174 @@ struct CapDrops {
     warned: [AtomicBool; 4],
 }
 
+/// The tenant a capped map's key leads with.
+trait TenantKeyed {
+    fn tenant(&self) -> Uuid;
+}
+
+impl TenantKeyed for (Uuid, String) {
+    fn tenant(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl TenantKeyed for (Uuid, Uuid) {
+    fn tenant(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl TenantKeyed for (Uuid, Uuid, Uuid, bool) {
+    fn tenant(&self) -> Uuid {
+        self.0
+    }
+}
+
+/// A capped map's entries with what each weighs (an entry, or for the
+/// handshakes its bytes), and the weight held in all and per tenant.
+///
+/// Invariant to preserve: **every write and removal goes through these
+/// methods**, which keep the weights equal to the sum over the entries; the
+/// inner map is never reached otherwise. A write through [`Self::with_mut`]
+/// must not change what its entry weighs (the session map's, which weigh one
+/// each).
+#[derive(Debug)]
+struct Held<K: Eq + Hash, V> {
+    entries: DashMap<K, (V, usize)>,
+    tenants: DashMap<Uuid, usize>,
+    total: AtomicUsize,
+}
+
+impl<K: Eq + Hash + TenantKeyed, V> Held<K, V> {
+    fn new() -> Self {
+        Self { entries: DashMap::new(), tenants: DashMap::new(), total: AtomicUsize::new(0) }
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn contains_key(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// What `key`'s entry weighs now, if the map holds it.
+    fn weight_of(&self, key: &K) -> Option<usize> {
+        self.entries.get(key).map(|e| e.1)
+    }
+
+    fn tenant_weight(&self, tenant: Uuid) -> usize {
+        self.tenants.get(&tenant).map_or(0, |w| *w)
+    }
+
+    fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    fn add(&self, tenant: Uuid, weight: usize) {
+        self.total.fetch_add(weight, Ordering::Relaxed);
+        *self.tenants.entry(tenant).or_insert(0) += weight;
+    }
+
+    fn sub(&self, tenant: Uuid, weight: usize) {
+        // Never below zero: `add` of the same weight always came first.
+        let _ = self.total.try_update(Ordering::Relaxed, Ordering::Relaxed, |t| Some(t.saturating_sub(weight)));
+        let emptied = self.tenants.get_mut(&tenant).is_some_and(|mut w| {
+            *w = w.saturating_sub(weight);
+            *w == 0
+        });
+        if emptied {
+            self.tenants.remove_if(&tenant, |_, w| *w == 0);
+        }
+    }
+
+    fn with<R>(&self, key: &K, f: impl FnOnce(&V) -> R) -> Option<R> {
+        self.entries.get(key).map(|e| f(&e.0))
+    }
+
+    /// A change to `key`'s entry that leaves its weight as it is.
+    fn with_mut<R>(&self, key: &K, f: impl FnOnce(&mut V) -> R) -> Option<R> {
+        self.entries.get_mut(key).map(|mut e| f(&mut e.0))
+    }
+
+    fn insert(&self, key: K, value: V, weight: usize) {
+        let tenant = key.tenant();
+        self.add(tenant, weight);
+        if let Some((_, old)) = self.entries.insert(key, (value, weight)) {
+            self.sub(tenant, old);
+        }
+    }
+
+    /// Update `key`'s entry with `modify`, or insert `insert()` weighing `weight`.
+    fn upsert(&self, key: K, modify: impl FnOnce(&mut V), insert: impl FnOnce() -> V, weight: usize) {
+        let tenant = key.tenant();
+        match self.entries.entry(key) {
+            Entry::Occupied(mut held) => modify(&mut held.get_mut().0),
+            Entry::Vacant(free) => {
+                self.add(tenant, weight);
+                free.insert((insert(), weight));
+            }
+        }
+    }
+
+    /// Remove `key`'s entry only if `stale` says so of it.
+    fn remove_if(&self, key: &K, stale: impl FnOnce(&V) -> bool) {
+        if let Some((k, (_, w))) = self.entries.remove_if(key, |_, (v, _)| stale(v)) {
+            self.sub(k.tenant(), w);
+        }
+    }
+
+    fn remove(&self, key: &K) -> Option<V> {
+        self.entries.remove(key).map(|(k, (v, w))| {
+            self.sub(k.tenant(), w);
+            v
+        })
+    }
+
+    /// Keep the entries `keep` says to; returns how many went.
+    fn retain(&self, mut keep: impl FnMut(&K, &V) -> bool) -> usize {
+        let mut gone = 0;
+        self.entries.retain(|k, (v, w)| {
+            let kept = keep(k, v);
+            if !kept {
+                self.sub(k.tenant(), *w);
+                gone += 1;
+            }
+            kept
+        });
+        gone
+    }
+}
+
+/// What a handshake weighs: the bytes it holds, at least [`HANDSHAKE_UNIT`].
+/// `capabilities` is held as a tree, so it weighs what the tree occupies
+/// ([`tree_bytes`]), not its text: many small nested objects take far more
+/// memory than they serialise to.
+fn handshake_weight(h: &UpstreamHandshake) -> usize {
+    let held = tree_bytes(&h.capabilities)
+        + h.instructions.as_ref().map_or(0, String::len)
+        + h.session_id.as_ref().map_or(0, String::len)
+        + h.protocol_version.len();
+    held.max(HANDSHAKE_UNIT)
+}
+
+/// What a `serde_json::Value` tree occupies, roughly: a value slot per node,
+/// an object's B-tree node (measured ~630 B for a small map) and its keys,
+/// an array's buffer, a string's bytes. An upper estimate is the safe side.
+fn tree_bytes(value: &serde_json::Value) -> usize {
+    const SLOT: usize = 32;
+    const MAP_NODE: usize = 640;
+    SLOT + match value {
+        serde_json::Value::Object(map) => {
+            MAP_NODE * map.len().div_ceil(11).max(1)
+                + map.iter().map(|(k, v)| k.len() + SLOT + tree_bytes(v)).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(tree_bytes).sum(),
+        serde_json::Value::String(text) => text.len(),
+        _ => 0,
+    }
+}
+
 /// How many entries the maps hold now (scrape-time gauges).
 #[derive(Debug, Clone, Copy)]
 pub struct McpSessionCounts {
@@ -105,7 +289,7 @@ pub struct McpSessionCounts {
 
 #[derive(Debug)]
 pub struct McpSessionMap {
-    map: DashMap<(Uuid, String), SessionEntry>,
+    map: Held<(Uuid, String), SessionEntry>,
     /// Per-upstream `Mcp-Session-Id` map.
     ///
     /// Key: `(tenant_id, downstream_session_id, upstream_server_id)` —
@@ -148,7 +332,7 @@ pub struct McpSessionMap {
     /// under another one misses, and the next handshake replaces the entry —
     /// one entry per `(tenant, user, upstream, era)`, never a caller riding a
     /// session another credential opened.
-    upstream_handshakes: DashMap<(Uuid, Uuid, Uuid, bool), (UpstreamHandshake, u64)>,
+    upstream_handshakes: Held<(Uuid, Uuid, Uuid, bool), (UpstreamHandshake, u64)>,
     /// Which protocol eras each upstream implements. Key is `(tenant_id,
     /// upstream_server_id)` — **not** the user.
     ///
@@ -163,18 +347,21 @@ pub struct McpSessionMap {
     /// creates a handshake — it owns its own. Folding the two would make the
     /// common legacy-to-legacy path pay for a gateway-owned `initialize` it
     /// has no use for, on top of the one the client already sent.
-    upstream_eras: DashMap<(Uuid, Uuid), UpstreamEraEntry>,
+    upstream_eras: Held<(Uuid, Uuid), UpstreamEraEntry>,
     /// The `logging/setLevel` a legacy client last asked for, keyed on the
     /// authenticated `(tenant_id, user_id)` — see [`Self::set_log_level`].
-    client_log_levels: DashMap<(Uuid, Uuid), (String, Instant)>,
-    /// The entry cap of each map above but `upstream_sessions`, a quarter of
-    /// it for `upstream_handshakes`; `None` reads `MCP_SESSION_MAX_ENTRIES`.
+    client_log_levels: Held<(Uuid, Uuid), (String, Instant)>,
+    /// The entry cap of each map above but `upstream_sessions` (for
+    /// `upstream_handshakes`, a quarter of it in [`HANDSHAKE_UNIT`]s of
+    /// bytes); `None` reads `MCP_SESSION_MAX_ENTRIES`. One tenant holds at most
+    /// `1 / tenant_share` of each.
     ///
     /// `upstream_sessions` has no cap: one client session writes an id per
     /// upstream it reaches, and a refused id would send its calls to another
     /// upstream's session. The sweep keeps only the ids of held sessions and
     /// those used within the idle TTL.
     cap: Option<usize>,
+    tenant_share: usize,
     drops: CapDrops,
 }
 
@@ -257,65 +444,110 @@ impl UpstreamHandshake {
 
 impl McpSessionMap {
     pub fn new() -> Arc<Self> {
-        Self::build(None)
+        Self::build(None, TENANT_SHARE_DIVISOR)
     }
 
     /// A map capped at `cap` entries per map (the handshakes at a quarter),
-    /// whatever the setting says.
+    /// whatever the setting says, any one tenant holding all of it.
     #[cfg(test)]
     pub fn with_cap(cap: usize) -> Arc<Self> {
-        Self::build(Some(cap))
+        Self::build(Some(cap), 1)
     }
 
-    fn build(cap: Option<usize>) -> Arc<Self> {
+    /// [`Self::with_cap`], one tenant holding at most half of each map.
+    #[cfg(test)]
+    pub fn with_cap_shared(cap: usize) -> Arc<Self> {
+        Self::build(Some(cap), TENANT_SHARE_DIVISOR)
+    }
+
+    fn build(cap: Option<usize>, tenant_share: usize) -> Arc<Self> {
         Arc::new(Self {
-            map: DashMap::new(),
+            map: Held::new(),
             upstream_sessions: DashMap::new(),
-            upstream_handshakes: DashMap::new(),
-            upstream_eras: DashMap::new(),
-            client_log_levels: DashMap::new(),
+            upstream_handshakes: Held::new(),
+            upstream_eras: Held::new(),
+            client_log_levels: Held::new(),
             cap,
+            tenant_share,
             drops: CapDrops::default(),
         })
     }
 
-    /// The cap `which` is held to: the setting, or a quarter of it for the
-    /// handshakes ([`HANDSHAKE_CAP_DIVISOR`]), never below one.
+    /// What one entry of `which` weighs at least: one, or for the handshakes
+    /// [`HANDSHAKE_UNIT`] bytes.
+    fn unit_of(which: CappedMap) -> usize {
+        match which {
+            CappedMap::UpstreamHandshakes => HANDSHAKE_UNIT,
+            _ => 1,
+        }
+    }
+
+    /// The weight `which` is held to: the setting in entries, or for the
+    /// handshakes a quarter of it ([`HANDSHAKE_CAP_DIVISOR`], never below one)
+    /// in [`HANDSHAKE_UNIT`]s of bytes.
     fn cap_of(&self, which: CappedMap) -> usize {
         let cap = self.cap.unwrap_or_else(max_entries);
         match which {
-            CappedMap::UpstreamHandshakes => (cap / HANDSHAKE_CAP_DIVISOR).max(1),
+            CappedMap::UpstreamHandshakes => (cap / HANDSHAKE_CAP_DIVISOR).max(1) * HANDSHAKE_UNIT,
             _ => cap,
         }
     }
 
-    /// Whether a write of a NEW key to a map holding `len` entries is refused
-    /// at the cap — counting and (once per sweep interval) logging the
-    /// refusal. A write to a key the map already holds is never refused: it
-    /// keeps a live entry alive or updates it, and refusing it would let the
-    /// sweeper reap an entry in use.
+    /// What one tenant may hold of `which`: its share of the cap, never below
+    /// one entry.
+    fn tenant_cap_of(&self, which: CappedMap) -> usize {
+        (self.cap_of(which) / self.tenant_share.max(1)).max(Self::unit_of(which))
+    }
+
+    /// Whether a write to `key` weighing `weight` is refused: it adds weight
+    /// (a new key, or a handshake replaced by a larger one) past the map's
+    /// cap or past its tenant's share of it, or it is larger than one entry
+    /// may be — counting and (once per sweep interval) logging the refusal.
+    /// A write that adds no weight (a touch or an update of an entry already
+    /// held) is never refused: it keeps a live entry alive, and refusing it
+    /// would let the sweeper reap an entry in use.
     ///
     /// A full map drops the new write rather than evict: evicting at random
     /// would surprise some other in-flight caller, while a dropped write costs
     /// only the fast path (a re-handshake, a re-probe, an unstamped version)
-    /// until a sweep frees room. `len` then the write is not atomic across
-    /// DashMap shards, so concurrent writers may pass the cap by at most their
-    /// number.
-    fn refuses_new(&self, which: CappedMap, len: usize, existing: impl FnOnce() -> bool, tenant_id: Uuid) -> bool {
-        let cap = self.cap_of(which);
-        if len < cap || existing() {
+    /// until a sweep frees room. The weights then the write are not atomic
+    /// across DashMap shards, so concurrent writers may pass a cap by at most
+    /// their number of entries.
+    fn refuses<K: Eq + Hash + TenantKeyed, V>(&self, which: CappedMap, held: &Held<K, V>, key: &K, weight: usize) -> bool {
+        let adds = weight.saturating_sub(held.weight_of(key).unwrap_or(0));
+        if adds == 0 {
+            return false;
+        }
+        let tenant_id = key.tenant();
+        let (cap, tenant_cap) = (self.cap_of(which), self.tenant_cap_of(which));
+        let too_large = matches!(which, CappedMap::UpstreamHandshakes) && weight > HANDSHAKE_ENTRY_MAX;
+        if !too_large && held.total() + adds <= cap && held.tenant_weight(tenant_id) + adds <= tenant_cap {
             return false;
         }
         let i = which as usize;
         self.drops.dropped[i].fetch_add(1, Ordering::Relaxed);
+        // One warning per map per sweep interval, naming the cause.
         if !self.drops.warned[i].swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                tenant_id = %tenant_id,
-                cap,
-                map = which.label(),
-                "MCP session map at capacity; dropping new entries until a sweep frees room \
-                 (counted in streamscope_proxy_mcp_session_cap_drops_total)"
-            );
+            if too_large {
+                // One upstream's answer, not the map's room: raising the cap
+                // changes nothing.
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    bytes = weight,
+                    limit = HANDSHAKE_ENTRY_MAX,
+                    "an upstream MCP server's handshake is too large to keep; it is used for its request and made \
+                     again on the next (counted in streamscope_proxy_mcp_session_cap_drops_total)"
+                );
+            } else {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    cap,
+                    tenant_cap,
+                    map = which.label(),
+                    "MCP session map at capacity, or this tenant at its share of it; dropping new entries until a \
+                     sweep frees room (counted in streamscope_proxy_mcp_session_cap_drops_total)"
+                );
+            }
         }
         true
     }
@@ -343,26 +575,25 @@ impl McpSessionMap {
             return;
         }
         let key = (tenant_id, mcp_session_id.to_string());
-        if self.refuses_new(CappedMap::Sessions, self.map.len(), || self.map.contains_key(&key), tenant_id) {
+        if self.refuses(CappedMap::Sessions, &self.map, &key, 1) {
             return;
         }
         // Preserve any previously captured `protocol_version` — `upsert` is
         // called on every dispatch but `initialize` only fires once per
         // session, so non-initialize callers must not blank the field.
-        // The DashMap `entry` API holds the shard guard for the duration of
-        // both branches, so a concurrent `set_protocol_version` on the same
-        // key cannot interleave between read-old / write-new.
-        self.map
-            .entry(key)
-            .and_modify(|e| {
+        // The `entry` API holds the shard guard for the duration of both
+        // branches, so a concurrent `set_protocol_version` on the same key
+        // cannot interleave between read-old / write-new.
+        self.map.upsert(
+            key,
+            |e| {
                 e.last_activity = Instant::now();
                 // protocol_version intentionally untouched — `set_protocol_version`
                 // is the only writer for that field.
-            })
-            .or_insert_with(|| SessionEntry {
-                last_activity: Instant::now(),
-                protocol_version: None,
-            });
+            },
+            || SessionEntry { last_activity: Instant::now(), protocol_version: None },
+            1,
+        );
     }
 
     /// Stamp the negotiated `protocolVersion` on an existing session entry.
@@ -378,12 +609,9 @@ impl McpSessionMap {
         if mcp_session_id.is_empty() || version.is_empty() {
             return;
         }
-        if let Some(mut entry) = self
-            .map
-            .get_mut(&(tenant_id, mcp_session_id.to_string()))
-        {
+        self.map.with_mut(&(tenant_id, mcp_session_id.to_string()), |entry| {
             entry.protocol_version = Some(version.to_string());
-        }
+        });
     }
 
     // ── Client log level ─────────────────────────────────────────────────
@@ -403,28 +631,21 @@ impl McpSessionMap {
             return;
         }
         let key = (tenant_id, user_id);
-        if self.refuses_new(
-            CappedMap::LogLevels,
-            self.client_log_levels.len(),
-            || self.client_log_levels.contains_key(&key),
-            tenant_id,
-        ) {
+        if self.refuses(CappedMap::LogLevels, &self.client_log_levels, &key, 1) {
             return;
         }
-        self.client_log_levels
-            .insert(key, (level.to_string(), Instant::now()));
+        self.client_log_levels.insert(key, (level.to_string(), Instant::now()), 1);
     }
 
     /// The level this caller last asked for, if it has not gone idle.
     pub fn log_level(&self, tenant_id: Uuid, user_id: Uuid) -> Option<String> {
         let key = (tenant_id, user_id);
-        let entry = self.client_log_levels.get(&key)?;
-        if entry.1.elapsed() > idle_ttl() {
-            drop(entry);
+        let (level, set_at) = self.client_log_levels.with(&key, |e| e.clone())?;
+        if set_at.elapsed() > idle_ttl() {
             self.client_log_levels.remove(&key);
             return None;
         }
-        Some(entry.0.clone())
+        Some(level)
     }
 
     /// Convenience: look up the protocol version captured for this session.
@@ -435,8 +656,8 @@ impl McpSessionMap {
             return None;
         }
         self.map
-            .get(&(tenant_id, mcp_session_id.to_string()))
-            .and_then(|e| e.protocol_version.clone())
+            .with(&(tenant_id, mcp_session_id.to_string()), |e| e.protocol_version.clone())
+            .flatten()
     }
 
     /// Test-only lookup — structural assertion that `upsert` writes the value
@@ -445,9 +666,10 @@ impl McpSessionMap {
     #[cfg(test)]
     pub fn lookup(&self, tenant_id: Uuid, mcp_session_id: &str) -> Option<SessionEntry> {
         let key = (tenant_id, mcp_session_id.to_string());
-        let mut entry = self.map.get_mut(&key)?;
-        entry.last_activity = Instant::now();
-        Some(entry.clone())
+        self.map.with_mut(&key, |entry| {
+            entry.last_activity = Instant::now();
+            entry.clone()
+        })
     }
 
     /// Record the upstream-side `Mcp-Session-Id` returned from a specific
@@ -507,22 +729,12 @@ impl McpSessionMap {
     /// [`Self::sweep`] as of `now`.
     fn sweep_at(&self, now: Instant) -> usize {
         let cutoff = now - idle_ttl();
-        let stale: Vec<_> = self
-            .map
-            .iter()
-            .filter(|kv| kv.value().last_activity < cutoff)
-            .map(|kv| kv.key().clone())
-            .collect();
-        let n = stale.len();
-        for key in stale {
-            self.map.remove(&key);
-        }
+        let n = self.map.retain(|_, v| v.last_activity >= cutoff);
         // Gateway-owned handshakes age on their own clock: they are keyed by
         // `(tenant, user, upstream)` and never appear in `map`, so the loop
         // above cannot reach them. Missing this is a pure leak — one entry
         // per user per upstream, held for the process's lifetime.
-        self.upstream_handshakes
-            .retain(|_, v| v.0.established_at >= cutoff);
+        self.upstream_handshakes.retain(|_, v| v.0.established_at >= cutoff);
         // Same reasoning for the era map, on the same clock: it is keyed by
         // `(tenant, upstream)` and never appears in `map` either. Expiring it
         // is also what lets an upstream upgraded in place be re-probed
@@ -556,7 +768,7 @@ impl McpSessionMap {
         upstream_id: Uuid,
     ) -> Option<UpstreamEraSupport> {
         let key = (tenant_id, upstream_id);
-        let entry = *self.upstream_eras.get(&key)?;
+        let entry = self.upstream_eras.with(&key, |e| *e)?;
         if entry.resolved_at.elapsed() > idle_ttl() {
             self.upstream_eras.remove(&key);
             return None;
@@ -578,21 +790,10 @@ impl McpSessionMap {
         support: UpstreamEraSupport,
     ) {
         let key = (tenant_id, upstream_id);
-        if self.refuses_new(
-            CappedMap::UpstreamEras,
-            self.upstream_eras.len(),
-            || self.upstream_eras.contains_key(&key),
-            tenant_id,
-        ) {
+        if self.refuses(CappedMap::UpstreamEras, &self.upstream_eras, &key, 1) {
             return;
         }
-        self.upstream_eras.insert(
-            key,
-            UpstreamEraEntry {
-                support,
-                resolved_at: Instant::now(),
-            },
-        );
+        self.upstream_eras.insert(key, UpstreamEraEntry { support, resolved_at: Instant::now() }, 1);
     }
 
     /// Forget a resolved era so the next call re-probes. Called when a cached
@@ -620,10 +821,8 @@ impl McpSessionMap {
         era: UpstreamEra,
     ) -> Option<UpstreamHandshake> {
         let key = (tenant_id, user_id, upstream_id, era.is_modern());
-        let (stale, same_inputs) = {
-            let entry = self.upstream_handshakes.get(&key)?;
-            (entry.0.established_at.elapsed() > idle_ttl(), entry.1 == inputs)
-        };
+        let (stale, same_inputs) =
+            self.upstream_handshakes.with(&key, |e| (e.0.established_at.elapsed() > idle_ttl(), e.1 == inputs))?;
         if stale {
             self.upstream_handshakes.remove(&key);
             return None;
@@ -631,7 +830,7 @@ impl McpSessionMap {
         if !same_inputs {
             return None;
         }
-        self.upstream_handshakes.get(&key).map(|e| e.0.clone())
+        self.upstream_handshakes.with(&key, |e| e.0.clone())
     }
 
     /// Record a completed gateway-owned handshake.
@@ -649,19 +848,19 @@ impl McpSessionMap {
         // The era comes off the handshake itself, so a caller cannot file a
         // modern connection under the legacy slot.
         let key = (tenant_id, user_id, upstream_id, handshake.era.is_modern());
-        if self.refuses_new(
-            CappedMap::UpstreamHandshakes,
-            self.upstream_handshakes.len(),
-            || self.upstream_handshakes.contains_key(&key),
-            tenant_id,
-        ) {
+        let weight = handshake_weight(&handshake);
+        if self.refuses(CappedMap::UpstreamHandshakes, &self.upstream_handshakes, &key, weight) {
             // Dropping the write costs a re-handshake on the next request,
             // which is correct-but-slow. Evicting a live entry at random
             // would instead hand some other in-flight caller a stale session
-            // id, which is correct-looking and wrong.
+            // id, which is correct-looking and wrong. An entry this one would
+            // have replaced that was opened under other inputs is stale, so it
+            // goes; one opened under the same inputs (a concurrent request's
+            // handshake, or the same answer again) stays usable.
+            self.upstream_handshakes.remove_if(&key, |(_, held_inputs)| *held_inputs != inputs);
             return handshake;
         }
-        self.upstream_handshakes.insert(key, (handshake.clone(), inputs));
+        self.upstream_handshakes.insert(key, (handshake.clone(), inputs), weight);
         handshake
     }
 
@@ -928,7 +1127,7 @@ mod tests {
         for mut e in m.upstream_sessions.iter_mut() {
             e.value_mut().1 = old;
         }
-        m.map.get_mut(&(tenant, "ds".to_string())).expect("held").last_activity = old;
+        m.map.with_mut(&(tenant, "ds".to_string()), |e| e.last_activity = old).expect("held");
         sweep_a_minute_later(&m);
         assert!(m.upstream_session(tenant, "ds", up).is_none(), "gone with its session");
     }
@@ -965,7 +1164,7 @@ mod tests {
     }
 
     fn last_activity(m: &McpSessionMap, tenant: Uuid, sid: &str) -> Instant {
-        m.map.get(&(tenant, sid.to_string())).expect("the session is held").last_activity
+        m.map.with(&(tenant, sid.to_string()), |e| e.last_activity).expect("the session is held")
     }
 
     /// At the cap a session the map already holds is still touched: its
@@ -1063,6 +1262,110 @@ mod tests {
         assert_eq!(m.log_level(tenant, v1).as_deref(), Some("debug"));
         assert!(m.log_level(tenant, v3).is_none());
         assert_eq!(dropped(&m, CappedMap::LogLevels), 1);
+    }
+
+    /// One tenant holds at most half of a map: its next new entry is refused
+    /// and counted while another tenant's is still stored; an entry it
+    /// already holds is still touched.
+    #[test]
+    fn one_tenant_holds_at_most_its_share_of_a_map() {
+        let m = McpSessionMap::with_cap_shared(4);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        m.upsert(a, "a1");
+        m.upsert(a, "a2");
+        m.upsert(a, "a3");
+        assert!(m.lookup(a, "a3").is_none(), "past its share");
+        assert_eq!(dropped(&m, CappedMap::Sessions), 1);
+        m.upsert(a, "a1");
+        assert_eq!(dropped(&m, CappedMap::Sessions), 1, "a touch is not a refusal");
+        m.upsert(b, "b1");
+        m.upsert(b, "b2");
+        assert!(m.lookup(b, "b2").is_some(), "the other tenant's share is whole");
+        assert_eq!(m.len(), 4);
+    }
+
+    fn handshake_with(instructions: usize) -> UpstreamHandshake {
+        UpstreamHandshake::legacy(None, serde_json::json!({}), "x".into(), Some("i".repeat(instructions)))
+    }
+
+    /// The handshake map is held in bytes: a large handshake takes the room
+    /// of several, one past the entry limit is not kept, and one replaced by
+    /// a handshake too large for the room left goes rather than stay stale.
+    #[test]
+    fn the_handshake_map_is_held_in_bytes() {
+        // A quarter of 8 entries: two units of bytes.
+        let m = McpSessionMap::with_cap(8);
+        let (tenant, user) = (Uuid::new_v4(), Uuid::new_v4());
+        let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
+        m.set_handshake(tenant, user, u1, 0, handshake_with(HANDSHAKE_UNIT + 100));
+        assert!(m.handshake(tenant, user, u1, 0, UpstreamEra::Legacy).is_some());
+        let returned = m.set_handshake(tenant, user, u2, 0, handshake_with(10));
+        assert!(returned.instructions.is_some(), "a refused handshake is still handed back");
+        assert!(m.handshake(tenant, user, u2, 0, UpstreamEra::Legacy).is_none(), "no room left in bytes");
+        assert_eq!(dropped(&m, CappedMap::UpstreamHandshakes), 1);
+        // Replaced, under the same inputs, by one larger than the room: the
+        // entry held stays (a concurrent request's handshake is not stale).
+        m.set_handshake(tenant, user, u1, 0, handshake_with(3 * HANDSHAKE_UNIT));
+        assert!(m.handshake(tenant, user, u1, 0, UpstreamEra::Legacy).is_some());
+        // Under other inputs (another credential): the stale entry goes.
+        m.set_handshake(tenant, user, u1, 1, handshake_with(3 * HANDSHAKE_UNIT));
+        assert!(m.handshake(tenant, user, u1, 0, UpstreamEra::Legacy).is_none());
+        assert_eq!(m.handshake_len(), 0);
+        // Positive control: the room it held is free again.
+        m.set_handshake(tenant, user, u2, 0, handshake_with(10));
+        assert!(m.handshake(tenant, user, u2, 0, UpstreamEra::Legacy).is_some());
+
+        let roomy = McpSessionMap::with_cap(1 << 20);
+        roomy.set_handshake(tenant, user, u1, 0, handshake_with(HANDSHAKE_ENTRY_MAX + 1));
+        assert!(roomy.handshake(tenant, user, u1, 0, UpstreamEra::Legacy).is_none(), "past the entry limit");
+        roomy.set_handshake(tenant, user, u1, 0, handshake_with(HANDSHAKE_ENTRY_MAX - 1024));
+        assert!(roomy.handshake(tenant, user, u1, 0, UpstreamEra::Legacy).is_some(), "just under it");
+    }
+
+    /// Capabilities weigh what their tree occupies, not their text: many
+    /// small nested objects serialise to little and take a node each.
+    #[test]
+    fn capabilities_weigh_their_tree_not_their_text() {
+        let nested: serde_json::Map<String, serde_json::Value> =
+            (0..400).map(|i| (format!("k{i}"), serde_json::json!({"x": 1}))).collect();
+        let caps = serde_json::Value::Object(nested);
+        let text = serde_json::to_vec(&caps).unwrap().len();
+        let h = UpstreamHandshake::legacy(None, caps, "x".into(), None);
+        assert!(handshake_weight(&h) > 20 * text, "{} for {text} bytes of text", handshake_weight(&h));
+        // Positive control: a flat string weighs about its length.
+        let flat = UpstreamHandshake::legacy(None, serde_json::json!({"s": "y".repeat(20_000)}), "x".into(), None);
+        assert!(handshake_weight(&flat) < 21_000);
+    }
+
+    /// Every way an entry leaves gives back what it weighed, in all and for
+    /// its tenant: weights that drifted up would refuse entries forever.
+    #[test]
+    fn every_removal_gives_back_its_weight() {
+        let m = McpSessionMap::with_cap_shared(64);
+        let (t, user, up) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        m.upsert(t, "s");
+        m.upsert(t, "s");
+        m.set_protocol_version(t, "s", "2025-11-25");
+        m.set_log_level(t, user, "info");
+        m.set_log_level(t, user, "debug");
+        m.set_upstream_era_support(t, up, UpstreamEraSupport::BOTH);
+        m.set_handshake(t, user, up, 0, handshake_with(5000));
+        m.set_handshake(t, user, up, 1, handshake_with(100));
+        assert_eq!(m.map.total(), 1);
+        assert_eq!(m.client_log_levels.total(), 1, "a replaced level weighs once");
+        assert_eq!(m.upstream_handshakes.total(), HANDSHAKE_UNIT, "a replaced handshake weighs what replaced it");
+        m.forget_upstream_era(t, up);
+        m.forget_handshake(t, user, up, UpstreamEra::Legacy);
+        m.sweep_at(Instant::now() + idle_ttl() + Duration::from_secs(1));
+        for (name, total, tenant) in [
+            ("sessions", m.map.total(), m.map.tenant_weight(t)),
+            ("log levels", m.client_log_levels.total(), m.client_log_levels.tenant_weight(t)),
+            ("eras", m.upstream_eras.total(), m.upstream_eras.tenant_weight(t)),
+            ("handshakes", m.upstream_handshakes.total(), m.upstream_handshakes.tenant_weight(t)),
+        ] {
+            assert_eq!((total, tenant), (0, 0), "{name}");
+        }
+        assert!(m.map.tenants.is_empty() && m.upstream_handshakes.tenants.is_empty(), "no tenant row is left");
     }
 
     /// A full map warns once per sweep interval, not once per request; the

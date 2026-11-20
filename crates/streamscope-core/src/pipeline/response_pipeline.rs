@@ -1311,7 +1311,8 @@ impl ResponsePipeline {
                 heal_tool_args,
                 upstream_api_version,
             )
-            .withheld_tools(self.meta.withheld_tools.clone());
+            .withheld_tools(self.meta.withheld_tools.clone())
+            .mcp_tool_names(self.tenant_config.mcp.tool_names.clone());
             Some(accumulator)
         } else {
             None
@@ -3130,6 +3131,7 @@ impl ResponsePipeline {
                     p.police(
                         &sub_tool_rules,
                         &self.tenant_config.tool_field_profiles,
+                        &self.tenant_config.mcp.tool_names,
                         sub_model.as_deref(),
                         self.meta.app_id.as_deref(),
                         &self.meta.withheld_tools,
@@ -3157,6 +3159,7 @@ impl ResponsePipeline {
                         bindings,
                         &sub_tool_rules,
                         &self.tenant_config.tool_field_profiles,
+                        &self.tenant_config.mcp.tool_names,
                         sub_model.as_deref(),
                         self.meta.app_id.as_deref(),
                         &self.meta.withheld_tools,
@@ -4237,6 +4240,7 @@ impl ResponsePipeline {
                         self.upstream_api_version,
                         &effective_tool_rules,
                         &self.tenant_config.tool_field_profiles,
+                        &self.tenant_config.mcp.tool_names,
                         model.as_deref(),
                         app_id_for_policy,
                         &self.meta.withheld_tools,
@@ -4364,7 +4368,7 @@ impl ResponsePipeline {
             if transform_state.answer_cited {
                 transform_state.badges.add_not_carried(crate::api::chat::answer_parts_not_carried(["citation"]));
             }
-            translate_non_streaming(
+            let mut translated = translate_non_streaming(
                 &response_json,
                 self.client_api_version,
                 self.upstream_api_version,
@@ -4374,7 +4378,13 @@ impl ResponsePipeline {
                 self.context_window,
                 self.client_context_window,
                 self.max_output_tokens,
-            )
+            );
+            // A call to a namespace's member reaches a Responses client named
+            // as the member of its namespace, as it declared it.
+            if self.client_api_version == ApiVersion::Responses {
+                crate::api::namespaces::split_calls_in_response(&mut translated, &self.client_tools.namespaced);
+            }
+            translated
         };
 
         // Visible-mode injection runs in the *client* protocol shape. The
@@ -4586,8 +4596,17 @@ impl EventEmitter {
     /// tools (`ClientToolFacts`): a Chat client's custom tools are answered
     /// in the Chat custom-call form.
     pub fn with_client_tools(mut self, facts: &crate::api::domain_request::ClientToolFacts) -> Self {
-        if let Self::ChatCompletions(builder) = self {
-            self = Self::ChatCompletions(builder.with_freeform_tools(facts.freeform.clone()));
+        match self {
+            Self::ChatCompletions(builder) => {
+                self = Self::ChatCompletions(builder.with_freeform_tools(facts.freeform.clone()));
+            }
+            Self::Responses(builder) => {
+                self = Self::Responses(builder.with_namespaced_tools(facts.namespaced.clone()));
+            }
+            Self::Passthrough { api_version: ApiVersion::Responses, ref mut position, .. } => {
+                position.responses_namespaced = facts.namespaced.clone();
+            }
+            _ => {}
         }
         self
     }
@@ -5346,8 +5365,9 @@ pub async fn finalize_audit(
     // - Blob storage ON: strip base64 from JSONB, store as blobs, populate summary
     // - Blob storage OFF: scan-only for summary (keep raw base64 in JSONB for inline display)
     //
-    // The capture path stores messages as pre-serialised JSON strings and no
-    // `Value` tree; the tree is rebuilt here ONLY when the capture-time typed
+    // The capture holds messages as JSON strings (or, for one the content
+    // store holds, its key) and no `Value` tree; the tree is rebuilt here
+    // ONLY when the capture-time typed
     // probe (`media_scan_needed`) saw a media-shaped content part — text-only
     // requests skip the parse + scan entirely.
     if tenant_config.content_logging_enabled && audit.request_messages_json.is_some() {
@@ -5355,9 +5375,10 @@ pub async fn finalize_audit(
         let scan_needed = meta.content.as_ref().is_some_and(|c| c.media_scan_needed);
         if scan_needed && let Some(json_msgs) = audit.request_messages_json.as_ref() {
             let mut msgs = serde_json::Value::Array(
+                // Every message of such a request is carried (`known_bodies::capture`).
                 json_msgs
                     .iter()
-                    .map(|s| serde_json::from_str(s).unwrap_or(serde_json::Value::Null))
+                    .map(|m| m.body().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(serde_json::Value::Null))
                     .collect(),
             );
             let max_bytes = tenant_config.media_blob_max_size_mb as usize * 1024 * 1024;
@@ -5493,6 +5514,7 @@ fn police_replayed_answer(
         upstream_api_version,
         &tool_rules,
         &tenant_config.tool_field_profiles,
+        &tenant_config.mcp.tool_names,
         model,
         app_id,
         &meta.withheld_tools,
@@ -7316,6 +7338,10 @@ fn normalize_finish_reason_in_json(
 /// emitter passed on update it.
 #[derive(Default)]
 pub struct PassthroughPosition {
+    /// Responses: the client's `namespace` tools — a call item the gateway
+    /// writes itself names a member as the member of its namespace
+    /// (`api::namespaces`); the upstream's own frames already do.
+    responses_namespaced: std::sync::Arc<crate::api::namespaces::NamespacedTools>,
     /// Chat Completions: the client's index for each call (see
     /// [`translate::ChatWireIndexes`]). The upstream's frames and the frames
     /// the gateway writes (a policy rewrite) are written in this one index
@@ -8694,11 +8720,14 @@ fn synthesize_responses_frames(
                 let item_id = format!("ctc_{}", uuid::Uuid::new_v4().simple());
                 let name = function_name.clone().unwrap_or_default();
                 let input = crate::api::domain_request::freeform_whole_text(arguments_delta);
+                let namespaced = pos.responses_namespaced.clone();
                 let item = |status: &str, input: &str| {
-                    serde_json::json!({
+                    let mut item = serde_json::json!({
                         "id": item_id, "type": "custom_tool_call", "call_id": call_id,
                         "name": name, "input": input, "status": status
-                    })
+                    });
+                    namespaced.split_item(&mut item);
+                    item
                 };
                 push(pos, "response.output_item.added", serde_json::json!({
                     "type": "response.output_item.added",
@@ -8731,11 +8760,14 @@ fn synthesize_responses_frames(
                 let call_id = id.clone().unwrap_or_default();
                 let item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
                 let name = function_name.clone().unwrap_or_default();
+                let namespaced = pos.responses_namespaced.clone();
                 let item = |status: &str, arguments: &str| {
-                    serde_json::json!({
+                    let mut item = serde_json::json!({
                         "id": item_id, "type": "function_call", "call_id": call_id,
                         "name": name, "arguments": arguments, "status": status
-                    })
+                    });
+                    namespaced.split_item(&mut item);
+                    item
                 };
                 push(pos, "response.output_item.added", serde_json::json!({
                     "type": "response.output_item.added",
@@ -9020,7 +9052,9 @@ fn turn_fingerprints(state: &TransformState, content: Option<&ContentMeta>) -> T
     let opening = content
         .opening
         .filter(|_| content.session_info.parent_request_id.is_none())
+        // The opening is always carried (`known_bodies::capture`).
         .and_then(|i| content.request_messages_json.get(i))
+        .and_then(|message| message.body())
         .map(|message| fingerprint::json_segments(message, fingerprint::OPENING_MAX))
         .unwrap_or_default();
     let mut budget = fingerprint::ARGUMENT_SEGMENTS_MAX;
@@ -9131,39 +9165,35 @@ pub fn assemble_audit_record(
     // modified the tools array).
     let tenant_id_str = meta.tenant_id.to_string();
     let mut tool_definitions_to_buffer: Vec<crate::audit::ToolDefinitionBlobEntry> = Vec::new();
-    let request_tools_value = meta.content.as_mut().and_then(|c| c.request_tools.take());
-    let tools_available_hash = request_tools_value.as_ref().map(|v| {
-        let hash = crate::proxy::content::hash_tools_blob(v);
-        let definition_json = serde_json::to_string(v).unwrap_or_default();
-        let content_size = definition_json.len();
-        tool_definitions_to_buffer.push(crate::audit::ToolDefinitionBlobEntry {
-            hash: hash.clone(),
-            tenant_id: tenant_id_str.clone(),
-            definition_json,
-            content_size,
-        });
-        hash
+    // A set the content store holds travels as its hash alone
+    // (`known_bodies::capture_tools`): named, not buffered again.
+    let mut buffer = |tools: &mut crate::proxy::known_bodies::CapturedTools| {
+        if let Some(definition_json) = tools.json.take() {
+            tool_definitions_to_buffer.push(crate::audit::ToolDefinitionBlobEntry {
+                hash: tools.hash.clone(),
+                tenant_id: tenant_id_str.clone(),
+                content_size: definition_json.len(),
+                definition_json,
+            });
+        }
+    };
+    let mut request_tools = meta.content.as_mut().and_then(|c| c.request_tools.take());
+    let tools_available_hash = request_tools.as_mut().map(|t| {
+        buffer(t);
+        t.hash.clone()
     });
-    let effective_tools_value = meta.content.as_mut().and_then(|c| c.effective_tools.take());
+    let mut effective_tools = meta.content.as_mut().and_then(|c| c.effective_tools.take());
     // Only persist `tools_effective_hash` when it differs from
     // `tools_available_hash` — equal hashes are noise on the row and would
     // double-count in the `tools_dedup.total_tool_set_refs` rollup. A
     // transform that flagged `tools_modified = true` but produced an
     // identical byte sequence collapses to None here.
-    let tools_effective_hash = effective_tools_value.as_ref().and_then(|v| {
-        let hash = crate::proxy::content::hash_tools_blob(v);
-        if Some(&hash) == tools_available_hash.as_ref() {
+    let tools_effective_hash = effective_tools.as_mut().and_then(|t| {
+        if Some(&t.hash) == tools_available_hash.as_ref() {
             return None;
         }
-        let definition_json = serde_json::to_string(v).unwrap_or_default();
-        let content_size = definition_json.len();
-        tool_definitions_to_buffer.push(crate::audit::ToolDefinitionBlobEntry {
-            hash: hash.clone(),
-            tenant_id: tenant_id_str.clone(),
-            definition_json,
-            content_size,
-        });
-        Some(hash)
+        buffer(t);
+        Some(t.hash.clone())
     });
 
     let fingerprints = turn_fingerprints(state, meta.content.as_ref());
@@ -9225,7 +9255,6 @@ pub fn assemble_audit_record(
             .content
             .as_mut()
             .map(|c| std::mem::take(&mut c.request_messages_json)),
-        request_tools: request_tools_value,
         tools_available_hash,
         tools_effective_hash,
         tool_definitions_to_buffer,
@@ -9483,7 +9512,7 @@ mod tests {
 
         fn meta(parent: Option<uuid::Uuid>) -> ContentMeta {
             ContentMeta {
-                request_messages_json: vec![OPENING.to_string()],
+                request_messages_json: vec![crate::proxy::known_bodies::CapturedMessage::Body(OPENING.to_string())],
                 media_scan_needed: false,
                 request_tools: None,
                 effective_tools: None,

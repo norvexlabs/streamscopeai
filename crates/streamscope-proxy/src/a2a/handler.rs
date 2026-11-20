@@ -1243,7 +1243,7 @@ async fn stream_response(
             record.error_detail = Some(detail.clone());
             record.error_message = Some(detail);
         }
-        if let Err(e) = audit_tx.try_send(record) {
+        if let Err(e) = audit_tx.deliver(record).await {
             tracing::warn!("a2a streaming audit channel send failed: {e}");
         }
     });
@@ -1320,8 +1320,8 @@ impl AuditDraft<'_> {
         }
     }
 
-    fn emit(&self, record: A2aAuditRecord) {
-        if let Err(e) = self.state.a2a_audit_tx.try_send(record) {
+    async fn emit(&self, record: A2aAuditRecord) {
+        if let Err(e) = self.state.a2a_audit_tx.deliver(record).await {
             tracing::warn!(request_id = %self.request_id, "a2a audit channel send failed: {e}");
         }
     }
@@ -1335,7 +1335,7 @@ impl AuditDraft<'_> {
         record.error_category = Some(category.to_string());
         record.error_detail = Some(detail);
         record.limit_bucket = err.limit_bucket().map(|b| b.as_str().to_string());
-        self.emit(record);
+        self.emit(record).await;
     }
 
     /// `original_envelope` is the agent's reply as it arrived, when the
@@ -1421,7 +1421,7 @@ impl AuditDraft<'_> {
         record.error_detail = error_message;
         record.upstream_latency_ms = upstream_ms;
         record.response_bytes = Some(body.len() as i32);
-        self.emit(record);
+        self.emit(record).await;
 
         Response::builder()
             .status(status)

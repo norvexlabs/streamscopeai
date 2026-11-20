@@ -476,10 +476,12 @@ pub struct TransformDiff {
 /// framework-injected volatile text, so no canonicalization beyond
 /// serialization is applied.
 pub fn hash_tools_blob(value: &serde_json::Value) -> String {
-    let mut hasher = Sha256::new();
-    let json = serde_json::to_string(value).unwrap_or_default();
-    hasher.update(json.as_bytes());
-    hex::encode(hasher.finalize())
+    hash_tools_json(&serde_json::to_string(value).unwrap_or_default())
+}
+
+/// [`hash_tools_blob`] of the set whose serialisation is `json`.
+pub fn hash_tools_json(json: &str) -> String {
+    hex::encode(Sha256::digest(json.as_bytes()))
 }
 
 /// Hash a Message for content-addressed dedup.
@@ -3293,6 +3295,7 @@ mod tests {
             previous_response_id: None,
             metadata: None,
             extra: Default::default(),
+            namespaced: Default::default(),
         };
 
         let content = extract_request_content(&ApiRequest::Responses(req), 256);
@@ -3337,6 +3340,7 @@ mod tests {
                 previous_response_id: None,
                 metadata: None,
                 extra: Default::default(),
+                namespaced: Default::default(),
             }
         }
 
@@ -3421,6 +3425,7 @@ mod tests {
             previous_response_id: None,
             metadata: None,
             extra: Default::default(),
+            namespaced: Default::default(),
         };
 
         let c_text = extract_request_content(

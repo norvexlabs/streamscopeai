@@ -584,6 +584,42 @@ pub fn render_state_prometheus(buf: &mut PromBuf, g: &StateGauges) {
     for &(map, value) in &g.mcp_cap_drops {
         buf.sample_u64("streamscope_proxy_mcp_session_cap_drops_total", &[("map", map)], value);
     }
+
+    // The process-wide record of what the content store holds is read where
+    // it lives, not carried through the gauges.
+    let known = streamscope_core::proxy::known_bodies::stats();
+    buf.family(
+        "streamscope_proxy_known_bodies",
+        "gauge",
+        "Conversation messages and tool sets this gateway knows the content store holds: named by key in an audit record, not carried again.",
+    );
+    buf.sample_u64("streamscope_proxy_known_bodies", &[], known.entries);
+    buf.family(
+        "streamscope_proxy_known_body_lookups_total",
+        "counter",
+        "Captured history messages and tool sets looked up among the known bodies, by result.",
+    );
+    buf.sample_u64("streamscope_proxy_known_body_lookups_total", &[("result", "hit")], known.hits);
+    buf.sample_u64("streamscope_proxy_known_body_lookups_total", &[("result", "miss")], known.misses);
+    buf.family(
+        "streamscope_proxy_known_bodies_removed_total",
+        "counter",
+        "Known bodies removed because the outbox or admin-api no longer holds them.",
+    );
+    buf.sample_u64("streamscope_proxy_known_bodies_removed_total", &[], known.removed);
+
+    buf.family(
+        "streamscope_proxy_audit_held_requests_total",
+        "counter",
+        "Requests held before admission until the audit pipeline had room for their record (AUDIT_FAIL_MODE=closed).",
+    );
+    buf.sample_u64("streamscope_proxy_audit_held_requests_total", &[], crate::audit_room::held_total());
+    buf.family(
+        "streamscope_proxy_audit_dropped_records_total",
+        "counter",
+        "Audit records dropped because their channel was full: a request's under AUDIT_FAIL_MODE=open, an upstream MCP event's in either mode.",
+    );
+    buf.sample_u64("streamscope_proxy_audit_dropped_records_total", &[], streamscope_core::audit::dropped_records());
 }
 
 /// Append the response-cache series. Separate from

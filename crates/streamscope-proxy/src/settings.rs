@@ -225,7 +225,8 @@ pub struct ProxySettings {
     pub mcp_session_idle_ttl_secs: u64,
     /// Entry cap of each MCP session map (sessions, upstream eras, client log
     /// levels), each on its own; the upstream-handshake map holds a quarter of
-    /// it. Env: `MCP_SESSION_MAX_ENTRIES`.
+    /// it in 4 KiB units of bytes. One tenant holds at most half of each.
+    /// Env: `MCP_SESSION_MAX_ENTRIES`.
     /// Default: 65536.
     pub mcp_session_max_entries: usize,
     /// Legacy-SSE pending-request abandoned-id TTL.

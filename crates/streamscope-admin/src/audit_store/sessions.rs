@@ -16,10 +16,12 @@ use crate::db::tenant::Scoped;
 use crate::routes::{ApiError, SpendTotal, spend_total};
 use streamscope_core::pricing::Currency;
 use crate::routes::audit::{
-    LinkedCounts, LinkedSessions, SessionLink, SessionLinkEvidence, SessionLinkKind, SessionLinkage,
+    LINKED_SESSIONS_MAX_LIMIT, LinkedCounts, LinkedSessions, LinkedSessionsQuery, SessionLink, SessionLinkEvidence, SessionLinkKind, SessionLinkage,
     SessionListQuery, SessionSort, SessionSummary, SpawnAnchor,
 };
+use crate::routes::client_access_profiles::{CHILD_ALERTS_SHOWN, PARENT_ALERTS_SHOWN, SESSION_ALERTS_SHOWN};
 use crate::routes::portal::PortalDataScope;
+use streamscope_core::audit::AlertLevel;
 
 /// The page size of a session list that names none.
 pub(crate) const SESSIONS_DEFAULT_LIMIT: i64 = 50;
@@ -32,16 +34,28 @@ pub(crate) const SESSIONS_DEFAULT_LIMIT: i64 = 50;
 /// are not counted. Session links are written per tenant (the ingest's quote
 /// links, the agent's expert path), so without this a portal row would say
 /// that another member's session exists and how it is linked.
+///
+/// A confined (portal) view also masks the experts' findings: a session's
+/// alert, and a sub-agent's alert on its parent, are read only where the
+/// profile of THAT session's workspace shows them
+/// ([`SESSION_ALERTS_SHOWN`], [`CHILD_ALERTS_SHOWN`]).
 #[derive(Clone, Copy)]
 struct LinkedView {
     user: u32,
     workspaces: u32,
+    confined: bool,
 }
 
 impl LinkedView {
+    /// The view of `scope`, its user and workspaces bound at `user` /
+    /// `workspaces` from [`AuditScope::linked_view`].
+    fn at(user: u32, workspaces: u32, scope: &AuditScope) -> Self {
+        Self { user, workspaces, confined: scope.confined() }
+    }
+
     /// Admits the `sessions` row aliased `alias`.
     fn admits_row(self, alias: &'static str) -> String {
-        let Self { user: u, workspaces: w } = self;
+        let Self { user: u, workspaces: w, .. } = self;
         format!(
             "(${u}::uuid IS NULL OR {alias}.user_id = ${u}) \
              AND (${w}::uuid[] IS NULL OR {alias}.workspace_id = ANY(${w}))"
@@ -51,7 +65,7 @@ impl LinkedView {
     /// Admits the linked session whose id is `id` (a column of the linkage
     /// subquery). A tenant-wide view names it without reading its row.
     fn admits(self, id: &'static str) -> String {
-        let Self { user: u, workspaces: w } = self;
+        let Self { user: u, workspaces: w, .. } = self;
         format!(
             "((${u}::uuid IS NULL AND ${w}::uuid[] IS NULL) \
               OR EXISTS (SELECT 1 FROM sessions ls WHERE ls.session_id = {id} AND {row}))",
@@ -75,6 +89,13 @@ impl LinkedView {
         )
     }
 
+    /// Whether `s`'s own alert is shown to this view, as a SQL condition:
+    /// always to a tenant-wide view, to a confined one where `s`'s workspace
+    /// shows it.
+    fn alerts_shown(self) -> &'static str {
+        if self.confined { SESSION_ALERTS_SHOWN } else { "true" }
+    }
+
     /// The lateral joins carrying session `s`'s links, read once per row:
     /// - `lk`, its own link ([`Self::as_linked`]): the session it is linked
     ///   to, the link's kind, its confidence as stored (`'content'` for a link
@@ -83,10 +104,16 @@ impl LinkedView {
     ///   the tool-call id of the call in the parent a child was spawned from
     ///   (NULL for every other link);
     /// - `lf`, the sessions linked to it ([`Self::linked_from`]): how many
-    ///   children, and the first continuation.
+    ///   children, and the first continuation;
+    /// - `la`, the most severe alert among its sub-agents the view admits,
+    ///   each only where its own workspace shows it (a confined view);
+    /// - `av`, whether `s`'s own alert is shown: always to a tenant-wide view,
+    ///   to a confined one where `s`'s workspace shows it.
     ///
-    /// Every read of [`LINKAGE_COLUMNS`] joins it after `sessions s`.
+    /// Every read of [`LINKAGE_COLUMNS`] or [`ALERT_COLUMNS`] joins it after
+    /// `sessions s`.
     fn join(self) -> String {
+        let (shown, child_shown) = (self.alerts_shown(), if self.confined { CHILD_ALERTS_SHOWN } else { "true" });
         format!(
             "LEFT JOIN LATERAL (SELECT pm.session_id AS parent_session_id, r.kind AS linkage_kind, \
                r.confidence AS linkage_confidence, r.spawn_turn AS linkage_spawn_turn, \
@@ -95,9 +122,17 @@ impl LinkedView {
              LEFT JOIN LATERAL (SELECT COUNT(*) FILTER (WHERE r.kind = 'linkage')::bigint AS sub_agents, \
                (array_agg(cm.session_id ORDER BY r.created_at, r.id) \
                   FILTER (WHERE r.kind = 'continuation'))[1] AS continued_in \
-               {linked_from}) lf ON true",
+               {linked_from}) lf ON true \
+             LEFT JOIN LATERAL (SELECT (array_agg(cs.alert_level ORDER BY {ALERT_RANK_CS}))[1] AS sub_agent_alert \
+               FROM cross_session_relation_members m \
+               JOIN cross_session_relation_members cm ON cm.relation_id = m.relation_id AND cm.role = 'child' \
+               JOIN cross_session_relations r ON r.id = m.relation_id AND r.kind = 'linkage' \
+               JOIN sessions cs ON cs.session_id = cm.session_id AND cs.alert_level IN {ALERT_LEVELS} \
+               WHERE m.session_id = s.session_id AND m.role = 'parent' AND {admits} AND {child_shown}) la ON true \
+             CROSS JOIN LATERAL (SELECT {shown} AS alerts_shown) av",
             linked = self.as_linked("s.session_id"),
             linked_from = self.linked_from(),
+            admits = self.admits_row("cs"),
         )
     }
 
@@ -115,6 +150,17 @@ impl LinkedView {
     }
 }
 
+/// The alert levels a session stores, and their order, most severe first, for
+/// the sub-agent `cs`.
+const ALERT_LEVELS: &str = "('major', 'minor', 'info')";
+const ALERT_RANK_CS: &str = "CASE cs.alert_level WHEN 'major' THEN 0 WHEN 'minor' THEN 1 ELSE 2 END";
+
+/// A session's own alert as [`LinkedView::join`]'s `av` admits it, named as
+/// [`SessionSummary`]'s fields.
+const ALERT_COLUMNS: &str = "CASE WHEN av.alerts_shown THEN s.alert_level END AS alert_level, \
+     CASE WHEN av.alerts_shown THEN s.alert_expert_axis END AS alert_expert_axis, \
+     CASE WHEN av.alerts_shown THEN s.alert_note END AS alert_note";
+
 /// The relation kinds that link one session to another; `issue` groups.
 const LINK_KINDS: &str = "('linkage', 'continuation')";
 /// The role of the session a link starts from, in each kind.
@@ -125,17 +171,13 @@ const OTHER_ROLE: &str = "(CASE cm.role WHEN 'child' THEN 'parent' ELSE 'predece
 /// raced past each other's guard: a child link first, then the oldest.
 const UPWARD_ORDER: &str = "(cm.role <> 'child'), r.created_at, r.id";
 
-/// The view of a read whose one own parameter is `$1`: the view's user and
-/// workspaces are bound at `$2` / `$3`, right after it.
-const LINKED_AT_2: LinkedView = LinkedView { user: 2, workspaces: 3 };
-
 /// A session's links as [`LinkColumns`] decodes them, read from
 /// [`LinkedView::join`]'s `lk` and `lf`.
 const LINKAGE_COLUMNS: &str = "lk.parent_session_id AS link_session_id, lk.linkage_kind AS link_kind, \
      lk.linkage_confidence AS link_confidence, lk.linkage_spawn_turn AS link_spawn_turn, \
      lk.linkage_spawn_tool_call_id AS link_spawn_tool_call_id, \
      lf.sub_agents AS links_sub_agents, \
-     lf.continued_in AS links_continued_in";
+     lf.continued_in AS links_continued_in, la.sub_agent_alert AS links_sub_agent_alert";
 
 /// A session's links as [`LINKAGE_COLUMNS`] reads them: its own link and the
 /// sessions linked to it, in the store's vocabulary until [`Self::link`] and
@@ -149,6 +191,7 @@ pub(crate) struct LinkColumns {
     link_spawn_tool_call_id: Option<String>,
     links_sub_agents: Option<i64>,
     links_continued_in: Option<Uuid>,
+    links_sub_agent_alert: Option<String>,
 }
 
 impl LinkColumns {
@@ -176,6 +219,7 @@ impl LinkColumns {
         let counts = LinkedCounts {
             sub_agents: self.links_sub_agents.unwrap_or(0),
             continued_in: self.links_continued_in,
+            sub_agent_alert: self.links_sub_agent_alert.as_deref().and_then(AlertLevel::parse),
         };
         (counts.sub_agents > 0 || counts.continued_in.is_some()).then_some(counts)
     }
@@ -279,7 +323,7 @@ fn summary_columns() -> &'static str {
              s.total_cache_creation_tokens, s.total_cache_read_tokens, s.total_reasoning_tokens, \
              s.total_cost, s.cost_currency, s.cost_currency_count, s.created_at AS first_timestamp, s.updated_at AS last_timestamp, \
              s.last_latency_ms, s.model_used, s.user_id, s.user_email, s.key_id, s.app_id, \
-             s.alert_level, s.alert_expert_axis, s.alert_note, s.first_user_prompt, \
+             {ALERT_COLUMNS}, s.first_user_prompt, \
              {LINKAGE_COLUMNS}"
         )
     });
@@ -293,8 +337,9 @@ pub(crate) async fn linked_sessions_in_portal_scope(
     conn: &mut Scoped,
     session_id: Uuid,
     scope: &PortalDataScope,
+    which: LinkedSessionsQuery,
 ) -> Result<LinkedSessions, ApiError> {
-    linked_sessions(conn, session_id, &AuditScope::portal(scope)).await
+    linked_sessions(conn, session_id, &AuditScope::portal(scope), which).await
 }
 
 /// A session's linked parent and children across the whole tenant — the
@@ -302,8 +347,9 @@ pub(crate) async fn linked_sessions_in_portal_scope(
 pub(crate) async fn linked_sessions_tenant_wide(
     conn: &mut Scoped,
     session_id: Uuid,
+    which: LinkedSessionsQuery,
 ) -> Result<LinkedSessions, ApiError> {
-    linked_sessions(conn, session_id, &AuditScope::tenant(None, None)).await
+    linked_sessions(conn, session_id, &AuditScope::tenant(None, None), which).await
 }
 
 /// The linked-session reads, confined by `scope`'s [`AuditScope::linked_view`]:
@@ -313,12 +359,23 @@ async fn linked_sessions(
     conn: &mut Scoped,
     session_id: Uuid,
     scope: &AuditScope,
+    which: LinkedSessionsQuery,
 ) -> Result<LinkedSessions, ApiError> {
     let (view_user, view_workspaces) = scope.linked_view();
+    // The kind as its link is stored, a literal; the limit clamped, NULL = all.
+    let kind = match which.kind {
+        Some(SessionLinkKind::SubAgent) => " AND lk.linkage_kind = 'linkage'",
+        Some(SessionLinkKind::Continuation) => " AND lk.linkage_kind = 'continuation'",
+        None => "",
+    };
+    let limit = which.limit.map(|l| l.clamp(1, LINKED_SESSIONS_MAX_LIMIT));
+    // The view at `$2` / `$3`, after the session at `$1`.
+    let linked = LinkedView::at(2, 3, scope);
 
     // The session it is linked to (its parent, the conversation it
-    // continues), only when the view admits it.
-    let parent = sqlx::query_as::<_, SessionSummaryRow>(sqlx::AssertSqlSafe(&*format!(
+    // continues), only when the view admits it. A read narrowed to one kind
+    // (a list row's expand) wants the linked sessions alone.
+    let parent = if which.kind.is_some() { None } else { sqlx::query_as::<_, SessionSummaryRow>(sqlx::AssertSqlSafe(&*format!(
         "SELECT {summary}, \
          NULL::text AS model_requested, \
          NULL::text AS workspace_name, NULL::text AS provider, \
@@ -326,8 +383,8 @@ async fn linked_sessions(
          FROM sessions s {join} \
          WHERE s.session_id = (SELECT pm.session_id {linked} ORDER BY {UPWARD_ORDER} LIMIT 1)",
         summary = summary_columns(),
-        join = LINKED_AT_2.join(),
-        linked = LINKED_AT_2.as_linked("$1"),
+        join = linked.join(),
+        linked = linked.as_linked("$1"),
     )))
     .bind(session_id)
     .bind(view_user)
@@ -337,30 +394,35 @@ async fn linked_sessions(
     .map_err(|e| {
         tracing::error!("get_session_linked parent query: {e}");
         ApiError::internal("Failed to query linked parent session")
-    })?;
+    })? };
 
     // The sessions linked to this one (its children, its continuation) the
     // view admits, each naming its link. Only a sub-agent anchors
-    // to a spawn point.
+    // to a spawn point. Each carries the columns of a list row, as a list
+    // shows it nested under its parent. The keys are chosen first — each
+    // linked session's own link (`lk`), the view, the kind, the order and the
+    // limit — so the per-session joins run for the rows returned alone.
     let children = sqlx::query_as::<_, SessionSummaryRow>(sqlx::AssertSqlSafe(&*format!(
-        "SELECT {summary}, \
-         NULL::text AS model_requested, \
-         NULL::text AS workspace_name, NULL::text AS provider, \
-         NULL::text AS key_name, NULL::text AS key_prefix \
-         FROM sessions s {join} \
-         WHERE s.session_id IN (SELECT cm.session_id FROM cross_session_relation_members pm \
-                JOIN cross_session_relation_members cm ON cm.relation_id = pm.relation_id \
-                  AND cm.role IN {UPWARD_ROLES} AND pm.role = {OTHER_ROLE} \
-                WHERE pm.session_id = $1) \
-         AND lk.parent_session_id = $1 AND {admits} \
-         ORDER BY s.created_at",
-        summary = summary_columns(),
-        join = LINKED_AT_2.join(),
-        admits = LINKED_AT_2.admits_row("s"),
+        "WITH page AS MATERIALIZED (SELECT s.session_id, s.created_at FROM sessions s \
+           LEFT JOIN LATERAL (SELECT pm.session_id AS parent_session_id, r.kind AS linkage_kind \
+             {own_link} ORDER BY {UPWARD_ORDER} LIMIT 1) lk ON true \
+           WHERE s.session_id IN (SELECT cm.session_id FROM cross_session_relation_members pm \
+                  JOIN cross_session_relation_members cm ON cm.relation_id = pm.relation_id \
+                    AND cm.role IN {UPWARD_ROLES} AND pm.role = {OTHER_ROLE} \
+                  WHERE pm.session_id = $1) \
+           AND lk.parent_session_id = $1 AND {admits}{kind} \
+           ORDER BY s.created_at, s.session_id LIMIT $4) \
+         SELECT {cols} FROM page p JOIN sessions s ON s.session_id = p.session_id \
+         {join} {MODEL_REQUESTED_JOIN} {WORKSPACE_JOIN} ORDER BY p.created_at, p.session_id",
+        own_link = linked.as_linked("s.session_id"),
+        cols = session_cols(),
+        join = linked.join(),
+        admits = linked.admits_row("s"),
     )))
     .bind(session_id)
     .bind(view_user)
     .bind(view_workspaces)
+    .bind(limit)
     .fetch_all(&mut *conn)
     .await
     .map_err(|e| {
@@ -405,10 +467,11 @@ pub(crate) async fn conversation_session(
     scope: &AuditScope,
 ) -> sqlx::Result<Option<ConversationSessionRow>> {
     let (view_user, view_workspaces) = scope.linked_view();
+    let linked = LinkedView::at(2, 3, scope);
     let row = sqlx::query_as::<_, ConversationSessionColumns>(sqlx::AssertSqlSafe(&*format!(
-        "SELECT s.alert_level, s.alert_expert_axis, s.alert_note, {LINKAGE_COLUMNS}, s.app_id \
+        "SELECT {ALERT_COLUMNS}, {LINKAGE_COLUMNS}, s.app_id \
          FROM sessions s {join} WHERE s.session_id = $1",
-        join = LINKED_AT_2.join(),
+        join = linked.join(),
     )))
     .bind(session_id)
     .bind(view_user)
@@ -586,6 +649,7 @@ pub(crate) async fn list_sessions_landed(
     // filters after it. The position is a condition only when it is set, so the
     // index range starts there under a generic plan too. No linkage filter is
     // set, so the view the filters are handed binds nothing.
+    let linked = LinkedView::at(2, 3, scope);
     let mut sql = "SELECT s.session_id, s.landed_xid FROM sessions s WHERE s.landed_xid < $1".to_string();
     let first_filter = if after.is_some() {
         sql.push_str(" AND (s.landed_xid, s.session_id) > ($2, $3)");
@@ -593,7 +657,7 @@ pub(crate) async fn list_sessions_landed(
     } else {
         2
     };
-    let (limit_idx, _) = push_session_filters(&mut sql, &query, scope, LINKED_AT_2, first_filter);
+    let (limit_idx, _) = push_session_filters(&mut sql, &query, scope, linked, first_filter);
     sql.push_str(&format!(" ORDER BY s.landed_xid, s.session_id LIMIT ${limit_idx}"));
     let mut first = sqlx::query_as::<_, (Uuid, i64)>(sqlx::AssertSqlSafe(&*sql)).bind(bound);
     if let Some(after) = after {
@@ -613,7 +677,7 @@ pub(crate) async fn list_sessions_landed(
         "SELECT {cols} FROM unnest($1::uuid[]) AS k(sid) \
          JOIN sessions s ON s.session_id = k.sid {join} {MODEL_REQUESTED_JOIN} {WORKSPACE_JOIN}",
         cols = session_cols(),
-        join = LINKED_AT_2.join(),
+        join = linked.join(),
     );
     let ids: Vec<Uuid> = keys.iter().map(|k| k.0).collect();
     let rows: Vec<SessionSummaryRow> = sqlx::query_as(sqlx::AssertSqlSafe(&*sql))
@@ -636,8 +700,10 @@ pub(crate) async fn list_sessions_landed(
 /// Callers are responsible for clamping `query.limit` to an acceptable maximum
 /// before invoking — this function trusts the passed-through value so handlers
 /// can overfetch by +1 without the clamp silently stripping it — and for
-/// refusing `sort=alerts` with a search term ([`SessionSort::check_with_search`]),
-/// which is read here as `newest`.
+/// refusing `sort=alerts` ([`SessionSort::check_with_search`], read here as
+/// `newest`) and `linked=top_level` ([`SessionLinkage::check_with_search`],
+/// whose fold here would not know whether a parent matches the search) with a
+/// search term.
 ///
 /// A search walks `search_sessions` (001_init.sql) with [`SearchWalk`]: the
 /// function answers the text match — the session's model and first prompt, a
@@ -666,20 +732,41 @@ pub(crate) async fn list_sessions_impl(
     let workspace_join = WORKSPACE_JOIN;
 
     let Some(pattern) = search else {
-        // The view at `$1` / `$2`, the filters after it.
-        let linked = LinkedView { user: 1, workspaces: 2 };
+        // The view at `$1` / `$2`, the filters after it. The page's keys are
+        // chosen on the bare session rows — filters, order, offset and limit —
+        // so the per-session joins run for the page's rows alone, never for
+        // the rows an offset skips or a filter drops.
+        let linked = LinkedView::at(1, 2, scope);
+        // The alert as the reader is shown it, so a confined view ranks no
+        // hidden one; 0 for every row under the other orders.
+        let rank = match sort {
+            SessionSort::Alerts => format!(
+                "CASE WHEN s.alert_level IS NULL OR NOT ({shown}) THEN 2 WHEN s.alert_level = 'major' THEN 0 \
+                 WHEN s.alert_level = 'minor' THEN 1 ELSE 2 END",
+                shown = linked.alerts_shown(),
+            ),
+            SessionSort::Oldest | SessionSort::Newest => "0".to_string(),
+        };
         let mut sql = format!(
-            "SELECT {cols} FROM sessions s {join} {model_req_join} {workspace_join} WHERE 1=1",
-            cols = session_cols(),
-            join = linked.join(),
+            "WITH page AS MATERIALIZED (SELECT s.session_id, s.updated_at, {rank} AS rank FROM sessions s WHERE 1=1"
         );
         let (bind_idx, _) = push_session_filters(&mut sql, &query, scope, linked, 3);
-        let order_clause = match sort {
-            SessionSort::Alerts => "ORDER BY CASE WHEN s.alert_level = 'major' THEN 0 WHEN s.alert_level = 'minor' THEN 1 ELSE 2 END, s.updated_at DESC, s.session_id DESC",
-            SessionSort::Oldest => "ORDER BY s.updated_at ASC, s.session_id ASC",
-            SessionSort::Newest => "ORDER BY s.updated_at DESC, s.session_id DESC",
+        let (inner_order, outer_order) = match sort {
+            SessionSort::Alerts => (
+                "ORDER BY rank, s.updated_at DESC, s.session_id DESC".to_string(),
+                "ORDER BY p.rank, p.updated_at DESC, p.session_id DESC",
+            ),
+            SessionSort::Oldest => ("ORDER BY s.updated_at ASC, s.session_id ASC".to_string(), "ORDER BY p.updated_at ASC, p.session_id ASC"),
+            SessionSort::Newest => ("ORDER BY s.updated_at DESC, s.session_id DESC".to_string(), "ORDER BY p.updated_at DESC, p.session_id DESC"),
         };
-        sql.push_str(&format!(" {order_clause} LIMIT ${bind_idx} OFFSET ${}", bind_idx + 1));
+        sql.push_str(&format!(
+            " {inner_order} LIMIT ${bind_idx} OFFSET ${off}) \
+             SELECT {cols} FROM page p JOIN sessions s ON s.session_id = p.session_id \
+             {join} {model_req_join} {workspace_join} {outer_order}",
+            off = bind_idx + 1,
+            cols = session_cols(),
+            join = linked.join(),
+        ));
         let first = sqlx::query_as(sqlx::AssertSqlSafe(&*sql)).bind(view_user).bind(view_workspaces);
         let rows: Vec<SessionSummaryRow> = bind_session_filters(first, &query, scope)
             .bind(limit)
@@ -699,13 +786,14 @@ pub(crate) async fn list_sessions_impl(
          JOIN sessions s ON s.session_id = k.sid WHERE 1=1"
         .to_string();
     // The keys at `$1`, the view at `$2` / `$3`, the filters after it.
-    let (limit_idx, post_filtered) = push_session_filters(&mut sql, &query, scope, LINKED_AT_2, 4);
+    let linked = LinkedView::at(2, 3, scope);
+    let (limit_idx, post_filtered) = push_session_filters(&mut sql, &query, scope, linked, 4);
     sql.push_str(&format!(
         " ORDER BY k.ord LIMIT ${limit_idx}) \
          SELECT {cols} FROM page p JOIN sessions s ON s.session_id = p.session_id \
          {join} {model_req_join} {workspace_join} ORDER BY p.ord",
         cols = session_cols(),
-        join = LINKED_AT_2.join(),
+        join = linked.join(),
     ));
 
     // The search's own window: the tightest of the two bounds each side.
@@ -783,53 +871,65 @@ fn push_session_filters(
     mut bind_idx: u32,
 ) -> (u32, bool) {
     let mut post_filtered = false;
+    // Every row filter, stated for the row `s` and again, on the same bind,
+    // for a parent `ps`: `top_level` hides a sub-agent only when its parent is
+    // a row of this same list.
+    let mut parent = String::new();
+    let mut both = |sql: &mut String, cond: &dyn Fn(&'static str) -> String| {
+        sql.push_str(&format!(" AND {}", cond("s")));
+        parent.push_str(&format!(" AND {}", cond("ps")));
+    };
     if scope.user_id().is_some() {
-        sql.push_str(&format!(" AND s.user_id = ${bind_idx}"));
+        both(sql, &|a| format!("{a}.user_id = ${bind_idx}"));
         bind_idx += 1;
     }
     if query.model.is_some() {
-        sql.push_str(&format!(" AND s.model_used ILIKE ${bind_idx}"));
+        both(sql, &|a| format!("{a}.model_used ILIKE ${bind_idx}"));
         bind_idx += 1;
         post_filtered = true;
     }
     if query.start.is_some() {
-        sql.push_str(&format!(" AND s.updated_at >= ${bind_idx}"));
+        both(sql, &|a| format!("{a}.updated_at >= ${bind_idx}"));
         bind_idx += 1;
     }
     if query.end.is_some() {
-        sql.push_str(&format!(" AND s.updated_at < ${bind_idx}"));
+        both(sql, &|a| format!("{a}.updated_at < ${bind_idx}"));
         bind_idx += 1;
     }
     if query.alert_level.is_some() {
-        sql.push_str(&format!(" AND s.alert_level = ${bind_idx}"));
+        // A confined view matches only an alert it is shown, as its rows read it.
+        let (own, parents) = if view.confined {
+            (format!(" AND {SESSION_ALERTS_SHOWN}"), format!(" AND {PARENT_ALERTS_SHOWN}"))
+        } else {
+            (String::new(), String::new())
+        };
+        both(sql, &|a| format!("{a}.alert_level = ${bind_idx}{}", if a == "s" { &own } else { &parents }));
         bind_idx += 1;
         post_filtered = true;
     }
     if query.updated_since.is_some() {
         // Exclusive, where the search's lower bound is inclusive: it narrows
         // the search's keys afterwards.
-        sql.push_str(&format!(" AND s.updated_at > ${bind_idx}"));
+        both(sql, &|a| format!("{a}.updated_at > ${bind_idx}"));
         bind_idx += 1;
         post_filtered = true;
     }
     if query.updated_before.is_some() {
-        sql.push_str(&format!(" AND s.updated_at < ${bind_idx}"));
+        both(sql, &|a| format!("{a}.updated_at < ${bind_idx}"));
         bind_idx += 1;
     }
     if query.app_id.is_some() {
-        sql.push_str(&format!(" AND s.app_id = ${bind_idx}"));
+        both(sql, &|a| format!("{a}.app_id = ${bind_idx}"));
         bind_idx += 1;
         post_filtered = true;
     }
     if query.exclude_user.is_some() {
-        sql.push_str(&format!(
-            " AND (s.user_email IS NULL OR s.user_email != ${bind_idx})"
-        ));
+        both(sql, &|a| format!("({a}.user_email IS NULL OR {a}.user_email != ${bind_idx})"));
         bind_idx += 1;
         post_filtered = true;
     }
     if query.user_email.is_some() {
-        sql.push_str(&format!(" AND s.user_email ILIKE ${bind_idx}"));
+        both(sql, &|a| format!("{a}.user_email ILIKE ${bind_idx}"));
         bind_idx += 1;
         post_filtered = true;
     }
@@ -838,11 +938,11 @@ fn push_session_filters(
     if query.parent_session_id.is_some() {
         // The sessions linked to the given one: each is the linked member of a
         // relation whose other member is the queried session.
-        sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM cross_session_relation_members cm \
+        both(sql, &|a| format!(
+            "EXISTS (SELECT 1 FROM cross_session_relation_members cm \
                 JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = {OTHER_ROLE} \
                 JOIN cross_session_relations r ON r.id = cm.relation_id AND r.kind IN {LINK_KINDS} \
-                WHERE cm.session_id = s.session_id AND cm.role IN {UPWARD_ROLES} AND pm.session_id = ${bind_idx})"
+                WHERE cm.session_id = {a}.session_id AND cm.role IN {UPWARD_ROLES} AND pm.session_id = ${bind_idx})"
         ));
         bind_idx += 1;
         post_filtered = true;
@@ -852,14 +952,15 @@ fn push_session_filters(
         // authenticated by a spec-OAuth token carries that token's jti in
         // `key_id` rather than an `api_keys` id, and the console always sends
         // an explicit workspace set.
-        let unattributed = if scope.include_keyless() {
-            "s.workspace_id = '00000000-0000-0000-0000-000000000000'::uuid OR "
-        } else {
-            ""
-        };
-        sql.push_str(&format!(
-            " AND ({unattributed}s.workspace_id = ANY(${bind_idx}))"
-        ));
+        let keyless = scope.include_keyless();
+        both(sql, &|a| {
+            let unattributed = if keyless {
+                format!("{a}.workspace_id = '00000000-0000-0000-0000-000000000000'::uuid OR ")
+            } else {
+                String::new()
+            };
+            format!("({unattributed}{a}.workspace_id = ANY(${bind_idx}))")
+        });
         bind_idx += 1;
     }
     // Linkage as the row states it through the view: a linked session the
@@ -868,10 +969,39 @@ fn push_session_filters(
     // link here, so the filter never says one exists.
     let has_children = format!("EXISTS (SELECT 1 {linked})", linked = view.linked_from());
     let has_parent = format!("EXISTS (SELECT 1 {linked})", linked = view.as_linked("s.session_id"));
+    // Two sessions can each be the other's parent (the ingest and the expert
+    // link independently): folding both would drop them from the list, so
+    // the one with the smallest id stays a row. Only `s` and its parent `ps`
+    // — a row of this list — are read, so the check says nothing of a session
+    // outside the view. A longer cycle (it needs an expert link: ingest links
+    // run older to newer) folds whole.
+    let cycle_root = "EXISTS (SELECT 1 FROM cross_session_relation_members c2 \
+           JOIN cross_session_relation_members p2 ON p2.relation_id = c2.relation_id AND p2.role = 'parent' \
+           WHERE c2.session_id = ps.session_id AND c2.role = 'child' AND p2.session_id = s.session_id \
+             AND ps.session_id > s.session_id)";
+    // A sub-agent whose parent is a row of this list — its `sessions` row
+    // exists (a link names a session by value, so a purged or never-landed
+    // parent leaves an orphan), the view admits it, and it passes every
+    // filter above. Continuations are not folded: a successor is the live
+    // part of its conversation. The role and kind are literals, so the
+    // one-parent index serves the probe. `OFFSET 0` fences the subquery so it
+    // stays a probe per listed row under any plan: unfenced, a generic plan (a
+    // prepared statement's, from its sixth run) drove a bare `NOT EXISTS` of it
+    // from every parent the filters admit.
+    let folded = format!(
+        "(EXISTS (SELECT 1 FROM cross_session_relation_members cm \
+           JOIN cross_session_relations r ON r.id = cm.relation_id AND r.kind = 'linkage' \
+           JOIN cross_session_relation_members pm ON pm.relation_id = cm.relation_id AND pm.role = 'parent' \
+           JOIN sessions ps ON ps.session_id = pm.session_id \
+           WHERE cm.session_id = s.session_id AND cm.role = 'child' AND {admits}{parent} \
+             AND NOT {cycle_root} OFFSET 0))",
+        admits = view.admits_row("ps"),
+    );
     match query.linked {
         Some(SessionLinkage::HasChildren) => sql.push_str(&format!(" AND {has_children}")),
         Some(SessionLinkage::HasParent) => sql.push_str(&format!(" AND {has_parent}")),
         Some(SessionLinkage::Unlinked) => sql.push_str(&format!(" AND NOT {has_children} AND NOT {has_parent}")),
+        Some(SessionLinkage::TopLevel) => sql.push_str(&format!(" AND NOT {folded}")),
         None => {}
     }
     (bind_idx, post_filtered || query.linked.is_some())
@@ -1019,9 +1149,14 @@ mod link_tests {
         let continued = LinkColumns { links_continued_in: Some(Uuid::nil()), ..zero };
         assert_eq!(
             continued.links(),
-            Some(LinkedCounts { sub_agents: 0, continued_in: Some(Uuid::nil()) })
+            Some(LinkedCounts { sub_agents: 0, continued_in: Some(Uuid::nil()), sub_agent_alert: None })
         );
         let sub = LinkColumns { links_sub_agents: Some(2), ..LinkColumns::default() };
         assert_eq!(sub.links().map(|c| c.sub_agents), Some(2));
+        // A sub-agent's alert as stored; a value no writer stores is none.
+        for (stored, expect) in [("major", Some(AlertLevel::Major)), ("info", Some(AlertLevel::Info)), ("bogus", None)] {
+            let alerted = LinkColumns { links_sub_agents: Some(1), links_sub_agent_alert: Some(stored.to_string()), ..LinkColumns::default() };
+            assert_eq!(alerted.links().and_then(|c| c.sub_agent_alert), expect, "{stored}");
+        }
     }
 }

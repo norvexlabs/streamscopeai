@@ -58,7 +58,7 @@ fn fired_rule(command: &str) -> Option<String> {
     assert_eq!(rules.len(), 1, "{RULE} is not in the shipped ruleset exactly once");
     let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
     let args = json!({ "command": command });
-    let result = classify_tool_call(&rules, None, APP, Some(&profiles), "Bash", Some(&args));
+    let result = classify_tool_call(&rules, None, APP, Some(&profiles), None, "Bash", Some(&args));
     // The profile must resolve, or every assertion below passes vacuously.
     assert_eq!(
         result.tool_id.as_deref(),

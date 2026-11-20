@@ -53,6 +53,41 @@ pub fn resolve_setting(overrides: &HashMap<String, String>, token: &str) -> Opti
         .or_else(|| std::env::var(token).ok())
 }
 
+
+/// What a gateway does when its audit pipeline is behind (an audit channel
+/// full: the outbox writer slower than the records arriving).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditFailMode {
+    /// Keep serving: a record that finds its channel full is dropped, counted
+    /// and logged; an audit trail that cannot keep up never slows the gateway.
+    Open,
+    /// Hold each new request until every audit channel has room: no record is
+    /// dropped, and the gateway serves at the rate its audit trail takes in.
+    /// The default. The channels sit in front of the gateway's own outbox on
+    /// disk, so an unreachable admin-api never holds a request.
+    Closed,
+}
+
+impl std::str::FromStr for AuditFailMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, ()> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" => Ok(Self::Open),
+            "closed" => Ok(Self::Closed),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for AuditFailMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Open => "open",
+            Self::Closed => "closed",
+        })
+    }
+}
+
 /// Core settings shared between proxy and admin-api.
 pub struct CoreSettings {
     // -- Runtime --
@@ -99,8 +134,13 @@ pub struct CoreSettings {
     pub custom_ca_bundle: Option<String>,
 
     // -- Audit pipeline --
-    /// MPSC channel capacity — backpressure threshold. Env: `AUDIT_CHANNEL_CAPACITY`.
+    /// Records each audit channel holds in front of the outbox writer; a
+    /// gateway admits a request only while every channel has room (the
+    /// backpressure threshold). The outbox on disk is the buffer, the channel
+    /// only smooths bursts. Env: `AUDIT_CHANNEL_CAPACITY`.
     pub audit_channel_capacity: usize,
+    /// What a gateway does when an audit channel is full. Env: `AUDIT_FAIL_MODE`.
+    pub audit_fail_mode: AuditFailMode,
     /// Max records per batch drain. Env: `AUDIT_BATCH_SIZE`.
     pub audit_batch_size: usize,
     /// Batch collection deadline (ms). Env: `AUDIT_BATCH_DEADLINE_MS`.
@@ -151,7 +191,8 @@ impl Default for CoreSettings {
             upstream_retry_backoff_ms: 500,
             upstream_probe_timeout: Duration::from_secs(10),
             custom_ca_bundle: None,
-            audit_channel_capacity: 10_000,
+            audit_channel_capacity: 1_000,
+            audit_fail_mode: AuditFailMode::Closed,
             audit_batch_size: 500,
             audit_batch_deadline_ms: 100,
             edge_blob_max_mb: 32,
@@ -223,6 +264,28 @@ impl CoreSettings {
             }
         }
         parse_setting!("AUDIT_CHANNEL_CAPACITY", cfg.audit_channel_capacity);
+        // Parsed by hand: a misspelt value must say so, not silently fail open.
+        if let Some(raw) = resolve_setting(&overrides, "AUDIT_FAIL_MODE") {
+            match raw.parse::<AuditFailMode>() {
+                Ok(mode) => {
+                    cfg.audit_fail_mode = mode;
+                    if overrides.contains_key("AUDIT_FAIL_MODE") {
+                        loaded.insert("AUDIT_FAIL_MODE".to_string(), raw);
+                    }
+                }
+                Err(()) => {
+                    // An unreadable value is read as `closed`, the default:
+                    // a typo must not weaken the audit trail.
+                    cfg.audit_fail_mode = AuditFailMode::Closed;
+                    if overrides.contains_key("AUDIT_FAIL_MODE") {
+                        loaded.insert("AUDIT_FAIL_MODE".to_string(), raw.clone());
+                    }
+                    // Also on stderr: settings may load before logging is set up.
+                    eprintln!("AUDIT_FAIL_MODE={raw:?} must be `open` or `closed`: read as `closed`");
+                    tracing::error!(value = %raw, "AUDIT_FAIL_MODE must be `open` or `closed` — read as `closed`");
+                }
+            }
+        }
         parse_setting!("AUDIT_BATCH_SIZE", cfg.audit_batch_size);
         parse_setting!("AUDIT_BATCH_DEADLINE_MS", cfg.audit_batch_deadline_ms);
         parse_setting!("EDGE_BLOB_MAX_MB", cfg.edge_blob_max_mb);
@@ -276,6 +339,7 @@ impl CoreSettings {
                 self.custom_ca_bundle.clone().unwrap_or_default(),
             ),
             ("AUDIT_CHANNEL_CAPACITY".to_string(), self.audit_channel_capacity.to_string()),
+            ("AUDIT_FAIL_MODE".to_string(), self.audit_fail_mode.to_string()),
             ("AUDIT_BATCH_SIZE".to_string(), self.audit_batch_size.to_string()),
             ("AUDIT_BATCH_DEADLINE_MS".to_string(), self.audit_batch_deadline_ms.to_string()),
             ("EDGE_BLOB_MAX_MB".to_string(), self.edge_blob_max_mb.to_string()),
@@ -309,6 +373,13 @@ mod tests {
     use super::*;
     use crate::settings_catalog::{SETTINGS_CATALOG, SettingGroup};
     use std::collections::HashSet;
+
+    /// A gateway whose audit trail falls behind holds requests rather than
+    /// dropping their records unless an operator chose `open`.
+    #[test]
+    fn the_audit_fail_mode_defaults_to_closed() {
+        assert_eq!(CoreSettings::default().audit_fail_mode, AuditFailMode::Closed);
+    }
 
     #[test]
     fn catalog_matches_core_settings() {

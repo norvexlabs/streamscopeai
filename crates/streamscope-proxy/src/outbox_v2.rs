@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
 use streamscope_core::audit::BlobType;
+use streamscope_core::proxy::known_bodies;
 use streamscope_edge_api::ingest::{
     BlobContent, BlobRef, Content, ContentKey, MessageContent, Record, RecordKind, SHARE_BUDGET_BYTES, ShareOutcome,
     TenantShare,
@@ -570,6 +571,7 @@ impl OutboxV2 {
     /// holds: one dropped here (logged) is not among them. A transaction that
     /// fails loses its records only: the error carries the ones the others hold.
     pub async fn enqueue(&self, tenant: uuid::Uuid, records: &[Enqueued], content: &Content) -> Result<Vec<usize>, EnqueueError> {
+        let tenant_id = tenant;
         let tenant = tenant.to_string();
         let now = chrono::Utc::now().timestamp_millis();
         // Everything is fitted before any transaction: the writer is held for
@@ -673,8 +675,10 @@ impl OutboxV2 {
             let written: Result<(), anyhow::Error> = async {
                 let mut w = self.writer.acquire().await?;
                 let mut tx = sqlx::Connection::begin(&mut *w).await?;
-                // The content rows this transaction adds.
+                // The content rows this transaction adds, and those of them
+                // no ref named, deleted again.
                 let mut added: Vec<&(String, String)> = Vec::new();
+                let mut unkept: BTreeSet<&(String, String)> = BTreeSet::new();
                 for &key in &names {
                     let Some(body) = bodies.get(key) else { continue };
                     if written_bodies.contains(key) {
@@ -733,18 +737,36 @@ impl OutboxV2 {
                 }
                 // A body added for a record that was already buffered (kept as
                 // it was) is named by no ref: not kept.
-                for (kind, hash) in added {
-                    sqlx::query(
+                for key in added {
+                    let gone = sqlx::query(
                         "DELETE FROM content WHERE tenant_id = ?1 AND kind = ?2 AND hash = ?3 \
                            AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = ?1 AND r.kind = ?2 AND r.hash = ?3)",
                     )
                     .bind(&tenant)
-                    .bind(kind)
-                    .bind(hash)
+                    .bind(&key.0)
+                    .bind(&key.1)
                     .execute(&mut *tx)
                     .await?;
+                    if gone.rows_affected() > 0 {
+                        unkept.insert(key);
+                    }
                 }
                 tx.commit().await?;
+                // Every body the transaction left in a content row is held by
+                // a record naming it (a row exists only while a ref names it):
+                // the capture may name it by key. Added while this task still
+                // holds the one writer connection (`w`), so no eviction or
+                // refused share — each deletes through the writer, then
+                // forgets what it deleted — can run between the commit and the
+                // add and be undone by it.
+                known_bodies::add(
+                    tenant_id,
+                    names
+                        .iter()
+                        .filter(|k| !unkept.contains(*k))
+                        .filter_map(|k| Some((known_bodies::Kind::of_outbox_kind(&k.0)?, k.1.as_str()))),
+                );
+                drop(w);
                 Ok(())
             }
             .await;
@@ -1008,7 +1030,7 @@ impl OutboxV2 {
                     }
                     Some(Ok(_)) => {}
                 }
-                self.delete_ids(&unreadable).await?;
+                self.delete_ids(&unreadable, false).await?;
                 let blob: Result<BlobContent, String> = match self.content_body(tenant, kind, hash).await? {
                     Some(cbody) => read_stored(&cbody),
                     None => Err("gone".to_string()),
@@ -1116,10 +1138,16 @@ impl OutboxV2 {
                 }
             }
         }
-        self.delete_ids(&unreadable).await?;
+        self.delete_ids(&unreadable, false).await?;
         if record_ids.is_empty() {
             return Ok(None);
         }
+        // A body named unavailable is held nowhere this edge knows of: the
+        // capture names it by key no longer.
+        known_bodies::remove(
+            tenant_id,
+            unavailable.iter().filter_map(|(kind, hash)| Some((known_bodies::Kind::of_outbox_kind(kind)?, hash.as_str()))),
+        );
         share.unavailable = unavailable
             .into_iter()
             .filter_map(|(kind, hash)| ContentRef::from_key(&kind, hash).map(ContentRef::content_key))
@@ -1153,7 +1181,7 @@ impl OutboxV2 {
                     ),
                     _ => {}
                 }
-                self.delete_ids(&pending.record_ids).await?;
+                self.delete_ids(&pending.record_ids, matches!(outcome, ShareOutcome::Committed)).await?;
                 // Only a share admin-api stored whole is an ack: one it
                 // refused part of may not hold what the share carried. An ack
                 // only saves a resend, so failing to write one is no reason
@@ -1167,7 +1195,7 @@ impl OutboxV2 {
                     if pending.ships.is_some() {
                         return Err(e);
                     }
-                    tracing::warn!(%tenant, "recording what admin-api holds failed — those bodies are carried again: {e}");
+                    tracing::warn!(%tenant, "recording what admin-api holds failed — those bodies are carried again by the records still holding them: {e}");
                 }
                 // Their content went with them (`delete_ids`); a blob that went
                 // up by itself stays while a record still names it.
@@ -1176,6 +1204,9 @@ impl OutboxV2 {
             ShareOutcome::TenantDeleted => {
                 tracing::info!(%tenant, "tenant deleted on admin-api — its buffered records are dropped");
                 self.drop_tenant(&tenant).await?;
+                // After its rows are gone: an enqueue that raced the drop
+                // added keys for rows the drop then took.
+                known_bodies::remove_tenant(pending.share.tenant);
                 Ok(Applied::Deleted)
             }
             ShareOutcome::Retry { missing } => {
@@ -1188,6 +1219,12 @@ impl OutboxV2 {
                 let mut w = self.writer.acquire().await?;
                 let mut tx = sqlx::Connection::begin(&mut *w).await?;
                 let mut forgotten = 0;
+                // Admin-api holds none of these: the capture names them by key no longer.
+                let missing_keys: Vec<(String, String)> = missing.iter().map(row_key).collect();
+                known_bodies::remove(
+                    pending.share.tenant,
+                    missing_keys.iter().filter_map(|(kind, hash)| Some((known_bodies::Kind::of_outbox_kind(kind)?, hash.as_str()))),
+                );
                 for key in missing {
                     let (kind, hash) = row_key(key);
                     forgotten += sqlx::query("DELETE FROM acked WHERE tenant_id = ? AND kind = ? AND hash = ?")
@@ -1235,7 +1272,7 @@ impl OutboxV2 {
         }
         .await;
         if forgotten > 0 {
-            tracing::warn!(forgotten, cap_bytes, "edge outbox over its size cap — every ack forgotten; the bodies they named are carried again once");
+            tracing::warn!(forgotten, cap_bytes, "edge outbox over its size cap — every ack forgotten; a body a buffered record still holds is carried again once");
         }
         swept?;
         // Counted as each eviction commits, and named whatever ends the loop:
@@ -1282,8 +1319,9 @@ impl OutboxV2 {
         if ids.is_empty() {
             return Ok(0);
         }
-        delete_records(&mut tx, &ids).await?;
+        let deleted = delete_records(&mut tx, &ids).await?;
         tx.commit().await?;
+        forget_known(&deleted);
         Ok(ids.len() as u64)
     }
 
@@ -1315,15 +1353,20 @@ impl OutboxV2 {
     }
 
     /// Delete records by id with the content only they named, in one
-    /// transaction ([`delete_records`]).
-    async fn delete_ids(&self, ids: &[i64]) -> Result<(), anyhow::Error> {
+    /// transaction ([`delete_records`]). `admin_holds`: admin-api stored what
+    /// they carried (a committed share); otherwise the deleted bodies leave
+    /// the known set ([`forget_known`]).
+    async fn delete_ids(&self, ids: &[i64], admin_holds: bool) -> Result<(), anyhow::Error> {
         if ids.is_empty() {
             return Ok(());
         }
         let mut w = self.writer.acquire().await?;
         let mut tx = sqlx::Connection::begin(&mut *w).await?;
-        delete_records(&mut tx, ids).await?;
+        let deleted = delete_records(&mut tx, ids).await?;
         tx.commit().await?;
+        if !admin_holds {
+            forget_known(&deleted);
+        }
         Ok(())
     }
 
@@ -1390,21 +1433,34 @@ impl OutboxV2 {
 /// cascade, and a body no remaining ref names goes in the same transaction
 /// (`tx`) — content leaves with its last record, never before it and never
 /// after (an orphan no share would name again).
-async fn delete_records(tx: &mut sqlx::SqliteConnection, ids: &[i64]) -> Result<(), anyhow::Error> {
+/// Returns the `(tenant, kind, hash)` of each content row deleted.
+async fn delete_records(tx: &mut sqlx::SqliteConnection, ids: &[i64]) -> Result<Vec<(String, String, String)>, anyhow::Error> {
     let ids = serde_json::to_string(ids)?;
     // The bodies these records name that no other record names, before their
     // refs cascade away.
-    sqlx::query(
+    let deleted: Vec<(String, String, String)> = sqlx::query_as(
         "DELETE FROM content WHERE (tenant_id, kind, hash) IN \
            (SELECT f.tenant_id, f.kind, f.hash FROM refs f WHERE f.record_id IN (SELECT value FROM json_each(?1))) \
          AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.tenant_id = content.tenant_id AND r.kind = content.kind \
-           AND r.hash = content.hash AND r.record_id NOT IN (SELECT value FROM json_each(?1)))",
+           AND r.hash = content.hash AND r.record_id NOT IN (SELECT value FROM json_each(?1))) \
+         RETURNING tenant_id, kind, hash",
     )
     .bind(&ids)
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM records WHERE id IN (SELECT value FROM json_each(?))").bind(&ids).execute(&mut *tx).await?;
-    Ok(())
+    Ok(deleted)
+}
+
+/// These content rows are gone and admin-api may not hold them (their records
+/// were evicted, refused or unreadable): the capture names them by key no
+/// longer, or a later turn would name a body held nowhere.
+fn forget_known(deleted: &[(String, String, String)]) {
+    for (tenant, kind, hash) in deleted {
+        if let (Ok(tenant), Some(kind)) = (uuid::Uuid::parse_str(tenant), known_bodies::Kind::of_outbox_kind(kind)) {
+            known_bodies::remove(tenant, [(kind, hash.as_str())]);
+        }
+    }
 }
 
 /// Replace a buffered credential rotation with `body` when `expires_at` is
@@ -1534,7 +1590,17 @@ fn stripped_record(record: &Record, reason: &str, max: usize, depth: usize) -> O
         .then_some(json)
     };
     let badge = serde_json::to_value(streamscope_core::audit::AuditBadge::RecordStripped { reason: reason.into() }).ok()?;
-    let mut framed = serde_json::to_value(record).ok()?;
+    // A stripped record keeps no payload: an MCP record's are JSON text
+    // (`JsonText`), which `to_value` would parse again — at any depth they
+    // have — only for `retain` below to drop them.
+    let mut framed = match record {
+        Record::McpAudit(r) => {
+            let mut bare = r.as_ref().clone();
+            (bare.params, bare.result) = (None, None);
+            serde_json::to_value(Record::McpAudit(Box::new(bare))).ok()?
+        }
+        _ => serde_json::to_value(record).ok()?,
+    };
     let body = framed.get_mut("body")?.as_object_mut()?;
     body.retain(|key, v| key == "badges" || KEPT_STRUCTURE.contains(&key.as_str()) || !(v.is_array() || v.is_object()));
     let badged = match body.get_mut("badges") {
@@ -1831,6 +1897,7 @@ fn share_size(share: &TenantShare) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
     use streamscope_core::audit::McpAuditRecord;
     use streamscope_core::config::mcp::McpUserCredential;
     use streamscope_core::mcp::sse_events::McpSseEventRecord;
@@ -2192,7 +2259,7 @@ mod tests {
                 "badges": [{"code": "mcp_legacy_sse"}], "error_message": "why".repeat(200),
             }))
             .unwrap();
-            r.params = Some(params);
+            r.params = Some(streamscope_core::audit::mcp::JsonText::of(&params));
             Record::McpAudit(Box::new(r))
         };
         let mut large = mcp(0, serde_json::json!([1]));
@@ -2216,7 +2283,7 @@ mod tests {
         let Record::McpAudit(r) = &records[0] else { unreachable!() };
         assert!(r.error_detail.as_deref().unwrap().starts_with("[not stored:"), "the largest string became a note");
         assert!(!r.badges.iter().any(|b| b.code() == "record_stripped"), "shrunk, not stripped");
-        assert!(matches!(&records[2], Record::McpAudit(r) if r.params == Some(serde_json::json!([1]))), "a record that fits is untouched");
+        assert_matches!(&records[2], Record::McpAudit(r) if r.params.as_ref().map(|p| p.value()) == Some(serde_json::json!([1])), "a record that fits is untouched");
         for (record, seq, reason) in [(&records[1], 1, "too_deep"), (&records[3], 3, "oversized")] {
             let Record::McpAudit(r) = record else { unreachable!() };
             assert_eq!(r.request_id, uuid::Uuid::from_u128(seq), "its identity is kept");
@@ -2326,11 +2393,11 @@ mod tests {
             "virtual_server_id": t, "method": "tools/call",
         }))
         .unwrap();
-        r.params = Some(params.clone());
+        r.params = Some(streamscope_core::audit::mcp::JsonText::of(&params));
         o.enqueue(t, &[with(Record::McpAudit(Box::new(r)))], &Content::default()).await.unwrap();
         let shares = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap();
         assert_eq!(shares.len(), 1, "read back, not dropped");
-        assert!(matches!(&shares[0].share.records[0], Record::McpAudit(r) if r.params == Some(params)));
+        assert_matches!(&shares[0].share.records[0], Record::McpAudit(r) if r.params.as_ref().map(|p| p.value()) == Some(params.clone()));
     }
 
     #[tokio::test]
@@ -2961,6 +3028,95 @@ mod tests {
         let refs = hashes.iter().map(|h| h.as_str()).collect::<Vec<_>>();
         let content = Content { messages: hashes.iter().map(|h| message(h)).collect(), ..Default::default() };
         o.enqueue(t, &[with(turn(t, n as u128, &refs))], &content).await.unwrap();
+    }
+
+    /// A stored key as the capture computes one: 64 hex digits.
+    fn hex_key(n: u32) -> String {
+        format!("{n:064x}")
+    }
+
+    #[tokio::test]
+    async fn a_body_is_known_once_committed_with_a_record_that_names_it() {
+        use streamscope_core::proxy::known_bodies::Kind;
+        let holds = |t, key: &str| streamscope_core::proxy::known_bodies::holds(t, Kind::Message, key);
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        let (named, unnamed, late) = (hex_key(1), hex_key(2), hex_key(3));
+        let content = Content { messages: vec![message(&named), message(&unnamed)], ..Default::default() };
+        let first = turn(t, 1, &[named.as_str()]);
+        o.enqueue(t, &[with(first.clone())], &content).await.unwrap();
+        assert!(holds(t, &named), "committed with the record naming it");
+        assert!(!holds(t, &unnamed), "a body no record of the call names is not kept");
+        // The same record again (held under its natural key, kept as it was)
+        // with a body it did not bring the first time: not kept either.
+        let again = Content { messages: vec![message(&late)], ..Default::default() };
+        let Record::LlmAudit(mut same) = first else { unreachable!() };
+        same.message_hashes = Some(vec![named.clone(), late.clone()]);
+        o.enqueue(t, &[with(Record::LlmAudit(same))], &again).await.unwrap();
+        assert!(!holds(t, &late), "a record already held brings no body");
+        assert!(!holds(uuid::Uuid::new_v4(), &named), "known to its own tenant alone");
+        // A tool set is known the same way, in its own store.
+        let tools = hex_key(4);
+        let Record::LlmAudit(mut with_tools) = turn(t, 5, &[]) else { unreachable!() };
+        with_tools.tools_available_hash = Some(tools.clone());
+        let set = streamscope_edge_api::ingest::ToolDefinitionContent { hash: tools.clone(), definition: serde_json::json!([]), content_size: 2 };
+        o.enqueue(t, &[with(Record::LlmAudit(with_tools))], &Content { tool_definitions: vec![set], ..Default::default() })
+            .await
+            .unwrap();
+        assert!(streamscope_core::proxy::known_bodies::holds(t, Kind::ToolDefinition, &tools));
+        assert!(!holds(t, &tools), "not as a message");
+    }
+
+    #[tokio::test]
+    async fn a_known_body_held_nowhere_is_forgotten() {
+        use streamscope_core::proxy::known_bodies::{Kind, add};
+        let holds = |t, key: &str| streamscope_core::proxy::known_bodies::holds(t, Kind::Message, key);
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        // Named unavailable in a share: the edge holds neither a row nor an ack.
+        let lost = hex_key(10);
+        add(t, [(Kind::Message, lost.as_str())]);
+        o.enqueue(t, &[with(turn(t, 1, &[lost.as_str()]))], &Content::default()).await.unwrap();
+        let share = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap().remove(0);
+        assert_eq!(share.share.unavailable, vec![ContentKey::Message { hash: lost.clone() }]);
+        assert!(!holds(t, &lost));
+        o.apply(&share, &ShareOutcome::Committed).await.unwrap();
+        // Admin-api asks for one again: it holds it no longer.
+        let purged = hex_key(11);
+        o.enqueue(t, &[with(turn(t, 2, &[purged.as_str()]))], &Content { messages: vec![message(&purged)], ..Default::default() })
+            .await
+            .unwrap();
+        assert!(holds(t, &purged), "positive control: committed, so known");
+        let share = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap().remove(0);
+        let missing = vec![ContentKey::Message { hash: purged.clone() }];
+        o.apply(&share, &ShareOutcome::Retry { missing }).await.unwrap();
+        assert!(!holds(t, &purged));
+        // The tenant is deleted: none of its bodies is held.
+        let gone = hex_key(12);
+        o.enqueue(t, &[with(turn(t, 3, &[gone.as_str()]))], &Content { messages: vec![message(&gone)], ..Default::default() })
+            .await
+            .unwrap();
+        assert!(holds(t, &gone));
+        let share = o.assemble(usize::MAX, &Uploads::idle()).await.unwrap().remove(0);
+        o.apply(&share, &ShareOutcome::TenantDeleted).await.unwrap();
+        assert!(!holds(t, &gone));
+    }
+
+    /// A body evicted at the outbox's cap with the records that brought it is
+    /// held nowhere (admin-api never had it): it is known no longer.
+    #[tokio::test]
+    async fn a_body_evicted_at_the_cap_is_forgotten() {
+        use streamscope_core::proxy::known_bodies::Kind;
+        let holds = |t, key: &str| streamscope_core::proxy::known_bodies::holds(t, Kind::Message, key);
+        let o = outbox().await;
+        let t = uuid::Uuid::new_v4();
+        let evicted = hex_key(20);
+        o.enqueue(t, &[with(turn(t, 1, &[evicted.as_str()]))], &Content { messages: vec![message(&evicted)], ..Default::default() })
+            .await
+            .unwrap();
+        assert!(holds(t, &evicted), "known once buffered");
+        assert!(o.enforce_cap(1).await.unwrap() > 0, "the record is evicted");
+        assert!(!holds(t, &evicted));
     }
 
     #[tokio::test]

@@ -158,6 +158,13 @@ pub async fn end(account: std::sync::Arc<super::launch::Account>, account_sid: S
 #[cfg(windows)]
 pub fn host_main(account_sid: &str) -> anyhow::Result<i32> {
     use anyhow::bail;
+    use windows_sys::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SEM_NOOPENFILEERRORBOX, SetErrorMode};
+    // A library the loader refuses (the Task Scheduler's, which an endpoint
+    // agent may deny this account) comes back as an error the report
+    // carries, never as a dialog: this process has no window anyone watches,
+    // and a dialog would hold it, and the run, until someone clicks.
+    // SAFETY: plain call; it sets this process's error mode only.
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX) };
     let me = crate::win_acl::current_user_sid()?;
     let name = std::env::var("USERNAME").unwrap_or_default();
     if me != account_sid || !super::account::is_account_name(&name) {

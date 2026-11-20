@@ -14,7 +14,7 @@
     daily: number | null | undefined;
     monthly: number | null | undefined;
     mode: string | null | undefined;
-    /** Current fleet-estimate spend, in the accounting currency, shown vs cap. */
+    /** Current spend, in the accounting currency, shown vs cap. */
     dailySpent?: number | null;
     monthlySpent?: number | null;
     /** Persist the new budget. A `null` budget clears the per-key cap. */

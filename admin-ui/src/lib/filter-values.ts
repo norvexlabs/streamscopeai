@@ -19,7 +19,10 @@ function members<T extends string>(all: Record<T, true>): readonly T[] {
   return Object.keys(all) as T[];
 }
 
-export const SESSION_LINKAGE = members<SessionLinkage>({ has_children: true, has_parent: true, unlinked: true });
+export const SESSION_LINKAGE = members<SessionLinkage>({ has_children: true, has_parent: true, unlinked: true, top_level: true });
+/** The linkage a viewer picks in the Linked filter. `top_level` is not one:
+ *  the session list sends it itself while it shows the list as a tree. */
+export const LINKAGE_CHOICES = SESSION_LINKAGE.filter((l) => l !== 'top_level');
 export const ALERT_LEVELS = members<AlertLevel>({ major: true, minor: true, info: true });
 export const TOOL_CALL_OUTCOMES = members<ToolCallOutcome>({ ok: true, blocked: true, not_applied: true, redacted: true, args_modified: true });
 

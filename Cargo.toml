@@ -83,7 +83,7 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 subtle = "2"
 
 # Cache
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 # Concurrent collections
 dashmap = { version = "6", features = ["serde"] }

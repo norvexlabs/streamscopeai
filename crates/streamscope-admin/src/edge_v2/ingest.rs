@@ -741,7 +741,11 @@ async fn write_share_alone(
 fn record_value(record: &Record) -> Result<serde_json::Value, serde_json::Error> {
     match record {
         Record::LlmAudit(r) => serde_json::to_value(r),
-        Record::McpAudit(r) => serde_json::to_value(r),
+        // Its payloads are JSON text (`JsonText`): read from the record's text
+        // under the edge wire's nesting bound, as the share itself was —
+        // `to_value` would parse them again under the default depth.
+        Record::McpAudit(r) => streamscope_core::edge_wire::from_str_bounded(&serde_json::to_string(r)?)
+            .map_err(|e| <serde_json::Error as serde::de::Error>::custom(e.to_string())),
         Record::A2aAudit(r) => serde_json::to_value(r),
         Record::WebAudit(r) => serde_json::to_value(r),
         Record::McpSseEvent(r) => serde_json::to_value(r),

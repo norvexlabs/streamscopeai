@@ -319,7 +319,9 @@ pub struct FunctionCall {
 /// A custom (freeform) call's free text is given as the domain reads it,
 /// `{"input": <text>}`, so a rule keyed on a field reaches both kinds alike.
 pub struct ToolCallItem<'a> {
-    pub name: &'a str,
+    /// The tool's name as the gateway reads it — a Responses call to a
+    /// namespace's member as `<namespace>__<name>` (`api::namespaces`).
+    pub name: std::borrow::Cow<'a, str>,
     /// Chat's `id`; Responses' `call_id`, or the item's `id` where it names none.
     pub call_id: Option<&'a str>,
     /// The call's arguments as a JSON string.
@@ -479,7 +481,7 @@ pub fn tool_call_item(item: &Value) -> Option<ToolCallItem<'_>> {
     // Chat Completions: the definition sits under its kind.
     if let Some(f) = item.get("function").filter(|f| f.is_object()) {
         return Some(ToolCallItem {
-            name: str_of(f, "name").unwrap_or_default(),
+            name: str_of(f, "name").unwrap_or_default().into(),
             call_id: str_of(item, "id"),
             arguments: str_of(f, "arguments").unwrap_or_default().to_string(),
             custom: false,
@@ -488,7 +490,7 @@ pub fn tool_call_item(item: &Value) -> Option<ToolCallItem<'_>> {
     }
     if let Some(c) = item.get("custom").filter(|c| c.is_object()) {
         return Some(ToolCallItem {
-            name: str_of(c, "name").unwrap_or_default(),
+            name: str_of(c, "name").unwrap_or_default().into(),
             call_id: str_of(item, "id"),
             arguments: freeform(str_of(c, "input")),
             custom: true,
@@ -499,7 +501,7 @@ pub fn tool_call_item(item: &Value) -> Option<ToolCallItem<'_>> {
     // the item's payload.
     if let Some(builtin) = ClientBuiltin::of_item(item) {
         return Some(ToolCallItem {
-            name: builtin.tool_name(),
+            name: builtin.tool_name().into(),
             call_id: str_of(item, "call_id").or_else(|| str_of(item, "id")),
             arguments: builtin.arguments(item),
             custom: false,
@@ -514,7 +516,7 @@ pub fn tool_call_item(item: &Value) -> Option<ToolCallItem<'_>> {
         _ => return None,
     };
     Some(ToolCallItem {
-        name: str_of(item, "name").unwrap_or_default(),
+        name: crate::api::namespaces::call_item_name(item).unwrap_or_default(),
         call_id: str_of(item, "call_id").or_else(|| str_of(item, "id")),
         arguments: if custom {
             freeform(str_of(item, "input"))

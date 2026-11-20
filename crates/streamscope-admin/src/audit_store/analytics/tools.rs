@@ -24,7 +24,7 @@ use crate::routes::analytics::{
     AttentionGuardrail, AttentionResponse, AttentionUpstreams, CrossAttentionQuery,
     ProfileCoverage, ToolEntry, ToolInventoryResponse, ToolRiskFilter, ToolSummary,
     TransformStatEntry, TransformStatsResponse, UnprofiledTool, evaluate_budget_scopes,
-    load_field_profiles, load_risk_rules,
+    load_field_profiles, load_mcp_tool_names, load_risk_rules,
 };
 
 /// Core tool inventory logic — callable from both HTTP handler and agent code.
@@ -62,6 +62,7 @@ pub(crate) async fn tool_inventory_impl(
     // unclassified when none matches.
     let risk_rules = load_risk_rules(&mut *conn).await;
     let field_profiles = load_field_profiles(&mut *conn).await;
+    let mcp_names = load_mcp_tool_names(&mut *conn).await;
 
     // Classify each individual call with arguments, then aggregate per tool name.
     struct ToolAgg {
@@ -177,7 +178,7 @@ pub(crate) async fn tool_inventory_impl(
                 &risk_rules,
                 None,
                 row.app_id,
-                Some(&field_profiles),
+                Some(&field_profiles), Some(&mcp_names),
                 &name,
                 Some(&row.arguments),
             );

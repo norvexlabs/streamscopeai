@@ -284,7 +284,6 @@
   "limits_exception_replaces": "Une exception remplace la valeur par défaut de l'espace pour ce membre — à la hausse comme à la baisse. Un champ laissé sur Hériter garde la valeur par défaut.",
   "limits_exception_title_edit": "Exception — {email}",
   "limits_exception_title_new": "Ajouter une exception de membre",
-  "limits_fleet_estimate": "estimation de la flotte",
   "limits_invalid_value": "Saisissez un nombre supérieur à 0",
   "limits_lowered": "abaissée",
   "limits_member": "Membre",
@@ -401,7 +400,7 @@
   "portal_comp_copy_with_key": "Copier avec la clé",
   "portal_comp_create": "Créer",
   "portal_comp_creating": "Création…",
-  "portal_comp_current_spend": "Dépense actuelle (estimation de la flotte)",
+  "portal_comp_current_spend": "Dépense actuelle",
   "portal_comp_daily": "Journalier",
   "portal_comp_daily_label": "Journalier :",
   "portal_comp_disabled": "Désactivé",
@@ -1115,5 +1114,8 @@
   "conv_link_evidence_agent_high": "expert, élevée",
   "conv_link_evidence_agent_medium": "expert, moyenne",
   "session_row_continued_in": "Suite dans",
-  "browse_session_continued_in": "Suite dans une session ultérieure"
+  "browse_session_continued_in": "Suite dans une session ultérieure",
+  "browse_subagent_alert": "Alerte de sous-agent : {level}",
+  "browse_subagents_more": "{count} de plus — ouvrez la session pour tous les voir",
+  "browse_subagents_loading": "Chargement des sous-agents…"
 }

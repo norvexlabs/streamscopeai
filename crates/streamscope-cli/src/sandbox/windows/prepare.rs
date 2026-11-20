@@ -47,7 +47,8 @@ pub struct Host<'a> {
 ///   and every repository under the root, a submodule's checkout included
 ///   (`safe.directory`, appended after any `GIT_CONFIG_COUNT` the run sets);
 /// - `tools`: the folder of `ssai` and of the client's program (and the
-///   folder it resolves to, when another); `files`: the CA files and the
+///   folder it resolves to, when another), and the cross-agent skills store
+///   when it exists; `files`: the CA files and the
 ///   files the client was provisioned with (readable by the developer alone,
 ///   so the grant on their folder misses them). Each only
 ///   inside the profile: outside it, only an administrator could grant one,
@@ -102,7 +103,13 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
         .into_iter()
         .chain(host.program.into_iter().flat_map(program_dirs))
         .chain(host.program.into_iter().flat_map(|p| tool_environments(p, host)));
-    for dir in found {
+    // The cross-agent skills store, read by every client: the skills CLI
+    // keeps a skill installed for several clients there once, and links each
+    // client's own skills folder entry to it (a junction the grant on that
+    // folder does not follow). Granted as it is on disk, and only when it
+    // exists and lies inside the profile.
+    let skills = dunce::canonicalize(host.profile.join(SHARED_SKILLS)).ok().filter(|d| d.is_dir());
+    for dir in found.chain(skills) {
         if under(&dir, host.profile) && !dirs.tools.contains(&dir) {
             dirs.tools.push(dir);
         }
@@ -126,6 +133,10 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
     }
     Ok(dirs)
 }
+
+/// The cross-agent skills store, below the profile; the Linux sandbox reads
+/// the same folder (`profiles::BASE_READ`).
+const SHARED_SKILLS: &str = ".agents/skills";
 
 /// The client id whose endpoint [`ocr_env`] carries.
 const OCR_CLIENT_ID: &str = "open-code-review";
@@ -1012,6 +1023,28 @@ mod tests {
         for dir in [profile, outside] {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// The cross-agent skills store is read by the account when it exists
+    /// inside the profile, as it is on disk; absent, or linked out of the
+    /// profile, it is not granted.
+    #[test]
+    fn the_shared_skills_store_is_granted_only_when_it_exists_inside_the_profile() {
+        let (profile, mut spec) = setup("skills", "claude", &[]);
+        let skills = profile.join(".agents/skills");
+        assert!(!run(&mut spec, &profile).tools.contains(&skills), "absent: nothing granted");
+        std::fs::create_dir_all(skills.join("writing-guidelines")).unwrap();
+        assert!(run(&mut spec, &profile).tools.contains(&skills));
+        #[cfg(unix)]
+        {
+            let outside = scratch("skills-outside");
+            std::fs::remove_dir_all(&skills).unwrap();
+            std::os::unix::fs::symlink(&outside, &skills).unwrap();
+            let dirs = run(&mut spec, &profile);
+            assert!(!dirs.tools.iter().any(|d| d == &skills || d == &outside), "{:?}", dirs.tools);
+            let _ = std::fs::remove_dir_all(outside);
+        }
+        let _ = std::fs::remove_dir_all(&profile);
     }
 
     #[cfg(unix)]

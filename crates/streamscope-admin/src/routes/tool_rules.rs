@@ -161,10 +161,13 @@ pub struct CreateToolRule {
     /// rule to specific clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_filter: Option<String>,
-    /// Optional pipe-separated glob over the MCP upstream server name. Scopes
-    /// the rule to specific upstreams; only meaningful for
-    /// `(request, resource_reads | prompt_invocations)` and MCP-gateway
-    /// `(response, tool_calls)` paths.
+    /// Optional pipe-separated glob over the MCP server name (`-` and `_`
+    /// match each other). Scopes the rule to the calls, results and
+    /// definitions of matching servers: on the MCP gateway the upstream a
+    /// request reaches; on a model's tool call the server its tool name
+    /// resolves to — a gateway virtual server's upstream, or `<server>` in a
+    /// client-run tool named `mcp__<server>__<tool>`. A tool of no MCP server
+    /// never matches a rule that sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_filter: Option<String>,
     /// Optional pipe-separated glob over the A2A upstream agent slug. Scopes the
@@ -1067,6 +1070,7 @@ pub async fn test_tool_rule(
     // matches for cross-field rules.
     let field_profiles =
         crate::routes::analytics::load_field_profiles(&mut *db.conn()).await;
+    let mcp_names = crate::routes::analytics::load_mcp_tool_names(&mut *db.conn()).await;
 
     let mut matches = Vec::with_capacity(body.sample_tool_names.len());
     for name in &body.sample_tool_names {
@@ -1074,19 +1078,22 @@ pub async fn test_tool_rule(
         // so operators can test rules against named samples without having
         // to declare a profile first. Real evaluation always resolves
         // tool_id from the field-profile registry.
-        let (effective_name, mcp_server) = match tool_rules::parse_mcp_namespace(name) {
-            Some((srv, local)) => (local.to_string(), Some(srv.to_string())),
-            None => (name.clone(), None),
-        };
-        let synthetic_tool_id = effective_name.clone();
+        let streamscope_core::config::tool_names::ToolName { local: effective_name, mcp_server, .. } =
+            streamscope_core::config::tool_names::resolve_tool_name(
+                name,
+                None,
+                Some(&mcp_names),
+                Some(&field_profiles),
+            );
+        let synthetic_tool_id = effective_name.to_string();
         let hit = match (rule.phase, rule.scope) {
             (Phase::Response, Scope::ToolCalls) => {
                 let resolver = tool_rules::ToolCallResolver {
-                    name: &effective_name,
+                    name: effective_name,
                     arguments: sample_args,
                     field_profiles: Some(&field_profiles),
                     app_id: None,
-                    mcp_server: mcp_server.as_deref(),
+                    mcp_server,
                     tool_id: Some(&synthetic_tool_id),
                 };
                 // A shell call that only applies a patch also meets a block
@@ -1102,12 +1109,12 @@ pub async fn test_tool_rule(
             }
             (Phase::Request, Scope::ToolResults) => {
                 let resolver = tool_rules::ToolResultResolver {
-                    name: &effective_name,
+                    name: effective_name,
                     arguments: sample_args,
                     content: body.sample_content.as_deref().unwrap_or(""),
                     field_profiles: Some(&field_profiles),
                     app_id: None,
-                    mcp_server: mcp_server.as_deref(),
+                    mcp_server,
                     tool_id: Some(&synthetic_tool_id),
                 };
                 tool_rules::evaluate(&rule, &resolver)
@@ -1125,11 +1132,15 @@ pub async fn test_tool_rule(
             (Some(_), None) => false,
             (Some(filter), Some(m)) => tool_rules::matches_glob(m, filter),
         };
-        let matched = hit && model_ok;
+        // The server filter, tested per tool as enforcement tests it.
+        let server_ok = tool_rules::applies_to_server(&rule, mcp_server);
+        let matched = hit && model_ok && server_ok;
         let reason = if matched {
             "all conditions matched".to_string()
         } else if !model_ok {
             "model_filter excluded the sample".to_string()
+        } else if hit && !server_ok {
+            "mcp_server_filter excluded the sample".to_string()
         } else {
             "one or more conditions did not match".to_string()
         };
@@ -1713,6 +1724,7 @@ async fn compute_rule_activity(
     // ── Source 1: classify rules via the same path the inventory uses ────
     let risk_rules = crate::routes::analytics::load_risk_rules(&mut *conn).await;
     let field_profiles = crate::routes::analytics::load_field_profiles(&mut *conn).await;
+    let mcp_names = crate::routes::analytics::load_mcp_tool_names(&mut *conn).await;
 
     // Streamed: each turn is classified as it arrives, so what is held is one
     // turn plus the buckets, whatever the window.
@@ -1754,7 +1766,7 @@ async fn compute_rule_activity(
                 &risk_rules,
                 None,
                 row.app_id.as_deref(),
-                Some(&field_profiles),
+                Some(&field_profiles), Some(&mcp_names),
                 &name,
                 Some(&arguments),
             );

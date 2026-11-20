@@ -12,6 +12,7 @@ pub mod endpoints;
 pub mod qos;
 pub mod mcp;
 pub mod model_map;
+pub mod tool_names;
 pub mod tool_rules;
 pub mod tool_rules_detectors;
 pub mod tool_rules_normalize;

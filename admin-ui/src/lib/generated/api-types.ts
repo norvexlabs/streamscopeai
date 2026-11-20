@@ -6576,7 +6576,7 @@ export interface components {
          *     never on the message.
          * @enum {string}
          */
-        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden" | "sandbox_default_image_invalid";
+        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden" | "sandbox_default_image_invalid" | "top_level_unsupported_with_search";
         /** @description Structured error response body matching the proxy's `ErrorResponse` format. */
         ApiErrorResponse: {
             error: components["schemas"]["ApiErrorBody"];
@@ -9118,6 +9118,14 @@ export interface components {
         };
         /** @description `GET /api/v1/admin/profiles/{id}/client-access`. */
         ClientAccessResponse: {
+            /**
+             * @description Whether the portal shows the experts' alerts on the sessions of the
+             *     workspaces on this profile: a session's alert, its requests'
+             *     `session_alert` badge and, on its parent, its alert as a sub-agent.
+             *     Decided per session, by the profile of the session's own workspace —
+             *     never by the viewer's other workspaces. Shown by default.
+             */
+            alerts_shown: boolean;
             /** @description Every live client profile, offered or not. */
             clients: components["schemas"]["ClientAccessClient"][];
             destinations: components["schemas"]["AttachedDestinationList"][];
@@ -9895,8 +9903,9 @@ export interface components {
             field: string;
             id?: string | null;
             /**
-             * @description Optional MCP server identifier (matches `mcp__<server>__<tool>`).
-             *     Mutually exclusive with `app_filter`.
+             * @description Optional MCP server identifier: the upstream server behind a virtual
+             *     server's route, or the `<server>` of `mcp__<server>__<tool>` for a
+             *     server the client runs itself. Mutually exclusive with `app_filter`.
              */
             mcp_server?: string | null;
             normalizer: components["schemas"]["Normalizer"];
@@ -10431,10 +10440,13 @@ export interface components {
             id?: string | null;
             match?: components["schemas"]["MatchCondition"][];
             /**
-             * @description Optional pipe-separated glob over the MCP upstream server name. Scopes
-             *     the rule to specific upstreams; only meaningful for
-             *     `(request, resource_reads | prompt_invocations)` and MCP-gateway
-             *     `(response, tool_calls)` paths.
+             * @description Optional pipe-separated glob over the MCP server name (`-` and `_`
+             *     match each other). Scopes the rule to the calls, results and
+             *     definitions of matching servers: on the MCP gateway the upstream a
+             *     request reaches; on a model's tool call the server its tool name
+             *     resolves to — a gateway virtual server's upstream, or `<server>` in a
+             *     client-run tool named `mcp__<server>__<tool>`. A tool of no MCP server
+             *     never matches a rule that sets it.
              */
             mcp_server_filter?: string | null;
             model_filter?: string | null;
@@ -10788,8 +10800,10 @@ export interface components {
             already_covered: boolean;
             field: string;
             /**
-             * @description MCP server identity if the tool name parses as `mcp__<server>__<local>`.
-             *     Surfaced so the UI can display "via MCP server foo" alongside the row.
+             * @description The MCP server the tool belongs to, read from its name as the gateway
+             *     reads it: for a gateway virtual server's tool, the upstream behind its
+             *     route (what an MCP-scoped field profile names). Surfaced so the UI can
+             *     display "via MCP server foo" alongside the row.
              */
             mcp_server?: string | null;
             /**
@@ -12095,10 +12109,11 @@ export interface components {
              */
             is_builtin?: boolean;
             /**
-             * @description Optional MCP server identifier. When set, this profile only matches
-             *     when the wire tool name is `mcp__<server>__<local>` and `<server>`
-             *     equals (case-insensitively) this value, OR when the engine was given
-             *     an out-of-band `mcp_server` hint matching this value.
+             * @description Optional MCP server identifier. When set, this profile only matches a
+             *     tool of that server (case-insensitively), as the gateway reads it from
+             *     the tool's name: for a tool of a gateway virtual server, the upstream
+             *     server behind its route; for one the client runs itself, the `<server>`
+             *     of `mcp__<server>__<local>`.
              */
             mcp_server?: string | null;
             /**
@@ -13109,6 +13124,7 @@ export interface components {
              * @description The session that continues it after a compaction.
              */
             continued_in?: string | null;
+            sub_agent_alert?: components["schemas"]["AlertLevel"] | null;
             /**
              * Format: int64
              * @description Sub-agents it spawned.
@@ -15330,10 +15346,11 @@ export interface components {
                  */
                 is_builtin?: boolean;
                 /**
-                 * @description Optional MCP server identifier. When set, this profile only matches
-                 *     when the wire tool name is `mcp__<server>__<local>` and `<server>`
-                 *     equals (case-insensitively) this value, OR when the engine was given
-                 *     an out-of-band `mcp_server` hint matching this value.
+                 * @description Optional MCP server identifier. When set, this profile only matches a
+                 *     tool of that server (case-insensitively), as the gateway reads it from
+                 *     the tool's name: for a tool of a gateway virtual server, the upstream
+                 *     server behind its route; for one the client runs itself, the `<server>`
+                 *     of `mcp__<server>__<local>`.
                  */
                 mcp_server?: string | null;
                 /**
@@ -16587,14 +16604,13 @@ export interface components {
                 /** @description AND-of-conditions. Empty means "every item in scope" (catch-all). */
                 match?: components["schemas"]["MatchCondition"][];
                 /**
-                 * @description Optional pipe-separated glob over the MCP upstream server name
-                 *     (`mcp_upstream_servers.name`, e.g. `notion-prod`, `internal-*`).
-                 *     When set, the rule only fires for matching upstreams; `None` means
-                 *     "any upstream". Non-MCP traffic (LLM tool calls without an MCP
-                 *     namespace) never matches a rule with this filter set — pairs
-                 *     naturally with `(request, resource_reads | prompt_invocations)`
-                 *     rules. Use this to keep per-upstream policies (and per-test rules)
-                 *     from spilling onto other servers in the same tenant.
+                 * @description Optional pipe-separated glob over the MCP server of the tool a rule
+                 *     reads (e.g. `notion-prod`, `internal-*`; `-` and `_` match each other,
+                 *     [`applies_to_server`]): on the MCP gateway the upstream a request
+                 *     reaches; on a model's tool call the server its name resolves to — a
+                 *     gateway virtual server's upstream, or `<server>` in a client-run tool
+                 *     named `mcp__<server>__<tool>`. `None` means any server; a tool of no
+                 *     MCP server never matches a rule with this filter set.
                  */
                 mcp_server_filter?: string | null;
                 /** @description Optional pipe-separated glob over the resolved upstream model name. */
@@ -19139,14 +19155,13 @@ export interface components {
             /** @description AND-of-conditions. Empty means "every item in scope" (catch-all). */
             match?: components["schemas"]["MatchCondition"][];
             /**
-             * @description Optional pipe-separated glob over the MCP upstream server name
-             *     (`mcp_upstream_servers.name`, e.g. `notion-prod`, `internal-*`).
-             *     When set, the rule only fires for matching upstreams; `None` means
-             *     "any upstream". Non-MCP traffic (LLM tool calls without an MCP
-             *     namespace) never matches a rule with this filter set — pairs
-             *     naturally with `(request, resource_reads | prompt_invocations)`
-             *     rules. Use this to keep per-upstream policies (and per-test rules)
-             *     from spilling onto other servers in the same tenant.
+             * @description Optional pipe-separated glob over the MCP server of the tool a rule
+             *     reads (e.g. `notion-prod`, `internal-*`; `-` and `_` match each other,
+             *     [`applies_to_server`]): on the MCP gateway the upstream a request
+             *     reaches; on a model's tool call the server its name resolves to — a
+             *     gateway virtual server's upstream, or `<server>` in a client-run tool
+             *     named `mcp__<server>__<tool>`. `None` means any server; a tool of no
+             *     MCP server never matches a rule with this filter set.
              */
             mcp_server_filter?: string | null;
             /** @description Optional pipe-separated glob over the resolved upstream model name. */
@@ -20001,7 +20016,7 @@ export interface components {
          * @description How a session sits in a cross-session relation.
          * @enum {string}
          */
-        SessionLinkage: "has_children" | "has_parent" | "unlinked";
+        SessionLinkage: "has_children" | "has_parent" | "unlinked" | "top_level";
         /**
          * @description The order of a session list. A text search pages through its matches by
          *     `updated_at`, so under a search term only `newest` and `oldest` exist.
@@ -21373,14 +21388,13 @@ export interface components {
             /** @description AND-of-conditions. Empty means "every item in scope" (catch-all). */
             match?: components["schemas"]["MatchCondition"][];
             /**
-             * @description Optional pipe-separated glob over the MCP upstream server name
-             *     (`mcp_upstream_servers.name`, e.g. `notion-prod`, `internal-*`).
-             *     When set, the rule only fires for matching upstreams; `None` means
-             *     "any upstream". Non-MCP traffic (LLM tool calls without an MCP
-             *     namespace) never matches a rule with this filter set — pairs
-             *     naturally with `(request, resource_reads | prompt_invocations)`
-             *     rules. Use this to keep per-upstream policies (and per-test rules)
-             *     from spilling onto other servers in the same tenant.
+             * @description Optional pipe-separated glob over the MCP server of the tool a rule
+             *     reads (e.g. `notion-prod`, `internal-*`; `-` and `_` match each other,
+             *     [`applies_to_server`]): on the MCP gateway the upstream a request
+             *     reaches; on a model's tool call the server its name resolves to — a
+             *     gateway virtual server's upstream, or `<server>` in a client-run tool
+             *     named `mcp__<server>__<tool>`. `None` means any server; a tool of no
+             *     MCP server never matches a rule with this filter set.
              */
             mcp_server_filter?: string | null;
             /** @description Optional pipe-separated glob over the resolved upstream model name. */
@@ -23266,6 +23280,11 @@ export interface components {
          *     unchanged; a section present replaces it whole.
          */
         UpdateClientAccessRequest: {
+            /**
+             * @description Whether the portal shows the experts' alerts on the sessions of the
+             *     profile's workspaces.
+             */
+            alerts_shown?: boolean | null;
             /** @description The ids of the client profiles offered. */
             clients?: string[] | null;
             /** @description The destination lists the sandbox attaches, each once. */
@@ -38049,7 +38068,7 @@ export interface operations {
                     "application/json": components["schemas"]["OffsetPage_SessionSummary"];
                 };
             };
-            /** @description `start` is not before `end`, a search term under 3 characters, or `sort=alerts` with a search term */
+            /** @description `start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -38178,7 +38197,15 @@ export interface operations {
     };
     get_session_linked: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Only the linked sessions of this kind (`sub_agent`: the children a
+                 *     session list expands). Absent = every kind.
+                 */
+                kind?: components["schemas"]["SessionLinkKind"];
+                /** @description At most this many, oldest first (1–100). Absent = all of them. */
+                limit?: number;
+            };
             header?: never;
             path: {
                 /** @description Session ID */
@@ -46041,13 +46068,14 @@ export interface operations {
                 start?: string;
                 end?: string;
                 /**
-                 * @description Default `newest`. While expert findings are withheld from members,
-                 *     `alerts` is read as `newest`.
+                 * @description Default `newest`. `alerts` ranks only the alerts the member is shown
+                 *     (each session's workspace profile decides), and is refused with a
+                 *     `search` term (`sort_unsupported_with_search`).
                  */
                 sort?: components["schemas"]["SessionSort"];
                 /**
-                 * @description Sessions whose alert is exactly this level. Ignored while expert
-                 *     findings are withheld from members.
+                 * @description Sessions whose alert is exactly this level, among the alerts the member
+                 *     is shown: a session whose workspace profile hides alerts never matches.
                  */
                 alert_level?: components["schemas"]["AlertLevel"];
                 /** @description Filter by app_id (agent type, e.g. "opencode", "claude-code"). */
@@ -46074,7 +46102,7 @@ export interface operations {
                     "application/json": components["schemas"]["OffsetPage_SessionSummary"];
                 };
             };
-            /** @description `start` is not before `end`, or a search term under 3 characters */
+            /** @description `start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -46176,6 +46204,13 @@ export interface operations {
                  *     when it shares with its members. Absent = your own rows only.
                  */
                 workspace_id?: string;
+                /**
+                 * @description Only the linked sessions of this kind (`sub_agent`: the children a
+                 *     session list expands). Absent = every kind.
+                 */
+                kind?: components["schemas"]["SessionLinkKind"];
+                /** @description At most this many, oldest first (1–100). Absent = all of them. */
+                limit?: number;
             };
             header?: never;
             path: {

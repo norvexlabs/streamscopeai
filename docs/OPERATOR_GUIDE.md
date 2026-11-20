@@ -1234,9 +1234,12 @@ session-tracking capacity above),
 connections behind them, what each upstream server speaks, and the notification streams held
 open). The client sessions, the
 upstream eras and the clients' log levels each hold at most `MCP_SESSION_MAX_ENTRIES` entries
-(65,536 by default, a few hundred bytes each), and the upstream connections the gateway opens
-itself, which take 2–4 KB each, a quarter of it (16,384 by default, at most ~60 MB); a new entry
-past a limit is refused and counted in `streamscope_proxy_mcp_session_cap_drops_total{map}`. The
+(65,536 by default, a few hundred bytes each). The upstream connections the gateway opens itself,
+which take 2–4 KB each, are held to 64 MB by default: a quarter of the setting, counted in 4 KB
+units, and a server that answers with more than 4 KB takes the room of several. One answering with
+more than 64 KB is used for its request but not kept. One organisation holds at most half of each
+limit, so one that fills a map does not refuse the others. A new entry past a limit, or past its
+organisation's half, is refused and counted in `streamscope_proxy_mcp_session_cap_drops_total{map}`. The
 upstream sessions behind a client session (about 230 bytes each, one per upstream it reaches) have
 no limit of their own: they are kept while their client session is held or in use. The
 notification streams have a limit of their own, logged when reached. Past a limit the calls still
@@ -1246,6 +1249,27 @@ serves more MCP users within that window than the cap allows: raise it in **Sett
 each gateway reads the new value when it restarts.
 `streamscope_proxy_outbox_shipped_records_total` counts the audit records the console has answered
 for; beside `streamscope_proxy_pending_audit_records` it shows whether the backlog is draining.
+
+**When a gateway records audit faster than it can store it.** Each gateway writes its audit records
+to a buffer on its own disk before sending them to the console. An unreachable console does not slow
+this down: the buffer keeps filling (see the database outage note below). A gateway serving more
+requests than its own disk writes can take in, for example hundreds of agents working without pause,
+fills the few records it queues in memory in front of the buffer (`AUDIT_CHANNEL_CAPACITY`, 1,000 per
+kind of record). `AUDIT_FAIL_MODE` (**Settings → Advanced**, read by each gateway when it restarts)
+decides what happens then (an unreadable value is read as `closed`):
+- `closed` (the default): the gateway holds each new request until the queue has room. No request's
+  record is dropped in front of the buffer, and the gateway serves at the rate its audit trail
+  takes in (`streamscope_proxy_audit_held_requests_total` counts the requests held). A gateway
+  whose disk stops answering stops serving.
+- `open`: the gateway keeps serving at full speed and drops the records that find the queue full.
+  Each is counted in `streamscope_proxy_audit_dropped_records_total`, and an error is logged at
+  most once a minute.
+
+An event an MCP server sends on its own over a long-lived stream holds up no request, so in either
+mode one that finds the queue full is dropped and counted. The buffer itself is capped in either
+mode (`EDGE_OUTBOX_MAX_MB`; past it the oldest records go, see the database outage note). Set
+`open` where serving at full speed matters more than a complete audit trail; a rising held count
+under `closed`, or drop count under `open`, says the gateway needs more CPU or another replica.
 
 **A gateway that cannot reach the console keeps serving** the configuration it last received. A
 gateway restarted during the outage starts from the copy it saved on disk and logs that it does —

@@ -141,7 +141,7 @@ pub async fn transform_request(
     //    surface for "model was offered tool X"). The answer refuses a call
     //    to any tool this step names (`TransformResult::withheld_tools`): a
     //    client can run a tool it does not declare.
-    let def_rules = tool_rules::extract_for(
+    let def_rules = tool_rules::extract_for_each_tool(
         tool_rules,
         tool_rules::Phase::Request,
         Scope::ToolDefinitions,
@@ -162,33 +162,27 @@ pub async fn transform_request(
         // with no profile resolve to `None` and skip every tool_id rule —
         // the operator sees them as "unclassified" elsewhere.
         let field_profiles = field_profiles_arg;
-        let resolve_tool_id = |name: &str| -> Option<String> {
-            // Strip MCP namespace before resolving so `mcp__filesystem__read_file`
-            // routes to the filesystem-server profile when the operator
-            // declared one. Also try the tenant's virtual-prefix
-            // index — when a declared tool is `gh__create_issue` and `gh` is
-            // configured as an MCP virtual server prefix, resolve through
-            // the upstream's profiles as if the call had arrived via MCP.
-            let (effective, mcp_server) = match tool_rules::parse_mcp_namespace(name) {
-                Some((srv, local)) => (local, Some(srv)),
-                None => match mcp_config.and_then(|cfg| cfg.parse_virtual_namespace(name)) {
-                    Some((local, srv)) => (local, Some(srv)),
-                    None => (name, None),
-                },
-            };
-            field_profiles
-                .and_then(|set| set.resolve_tool_id(effective, app_id, mcp_server))
-                .map(|s| s.to_string())
-        };
         let find_block_rule = |name: &str| -> Option<&Rule> {
-            let tool_id = resolve_tool_id(name);
+            // Split the client's MCP naming off the name so a gateway tool
+            // resolves through its upstream's profiles, and meets its
+            // upstream's server filter, as it does on the MCP path
+            // (`resolve_tool_name`).
+            let crate::config::tool_names::ToolName { local: effective, mcp_server, .. } =
+                crate::config::tool_names::resolve_tool_name(
+                    name,
+                    app_id,
+                    mcp_config.map(|cfg| &*cfg.tool_names),
+                    field_profiles,
+                );
+            let tool_id = field_profiles
+                .and_then(|set| set.resolve_tool_id(effective, app_id, mcp_server))
+                .map(|s| s.to_string());
             let resolver = ToolDefinitionResolver {
                 tool_id: tool_id.as_deref(),
             };
-            blocking_def_rules
-                .iter()
-                .copied()
-                .find(|r| tool_rules::evaluate(r, &resolver))
+            blocking_def_rules.iter().copied().find(|r| {
+                tool_rules::applies_to_server(r, mcp_server) && tool_rules::evaluate(r, &resolver)
+            })
         };
         // Each name's matching rule, recorded as the removal decides it, so the
         // notice and the audit below name the rule that removed it.
@@ -293,7 +287,8 @@ pub async fn transform_request(
     //
     //         At runtime: scoping (`model_filter`, `app_filter`,
     //         `is_builtin`, `enabled`) is enforced exactly like every other
-    //         tool-policy rule via `extract_for`. Predicates evaluate
+    //         tool-policy rule via `extract_for_each_tool`, and
+    //         `mcp_server_filter` per tool (`applies_to_server`). Predicates evaluate
     //         against the per-tool resolved `tool_id` from the field-profile
     //         registry, so a single seed rule covers every client variant
     //         (Claude Code `WebFetch` and Cursor `web_fetch` and Cline
@@ -312,29 +307,39 @@ pub async fn transform_request(
         // ServerType tier, while function-tools fall back through Mcp / App /
         // Generic. Captured once and reused by the substitute + intercept_only
         // passes below.
-        let resolve_for = |name: &str, server_type: Option<&str>| -> Option<String> {
-            let (effective, mcp_server) = match tool_rules::parse_mcp_namespace(name) {
-                Some((srv, local)) => (local, Some(srv)),
-                None => match mcp_config.and_then(|cfg| cfg.parse_virtual_namespace(name)) {
-                    Some((local, srv)) => (local, Some(srv)),
-                    None => (name, None),
-                },
-            };
-            field_profiles_arg
+        //
+        // A tool of one of the tenant's virtual servers is never rewritten:
+        // the gateway already serves it, and replacing it would put a second
+        // definition under the substitute's name beside the client's own tool.
+        // `Some` carries the tool's `tool_id` and the MCP server its name
+        // resolves to, which a rule's server filter is tested against.
+        let resolve_for = |name: &str, server_type: Option<&str>| -> Option<(Option<String>, Option<String>)> {
+            let crate::config::tool_names::ToolName { local: effective, mcp_server, gateway } =
+                crate::config::tool_names::resolve_tool_name(
+                    name,
+                    app_id,
+                    mcp_config.map(|cfg| &*cfg.tool_names),
+                    field_profiles_arg,
+                );
+            if gateway {
+                return None;
+            }
+            let tool_id = field_profiles_arg
                 .and_then(|set| {
                     set.resolve_tool_id_for_definition(effective, app_id, mcp_server, server_type)
                 })
-                .map(|m| m.tool_id)
+                .map(|m| m.tool_id);
+            Some((tool_id, mcp_server.map(str::to_string)))
         };
         let find_rewrite_rule = |name: &str, server_type: Option<&str>| -> Option<&Rule> {
-            let tool_id = resolve_for(name, server_type);
+            let (tool_id, mcp_server) = resolve_for(name, server_type)?;
             let resolver = ToolDefinitionResolver {
                 tool_id: tool_id.as_deref(),
             };
-            rewrite_rules
-                .iter()
-                .copied()
-                .find(|r| tool_rules::evaluate(r, &resolver))
+            rewrite_rules.iter().copied().find(|r| {
+                tool_rules::applies_to_server(r, mcp_server.as_deref())
+                    && tool_rules::evaluate(r, &resolver)
+            })
         };
 
         let tool_defs = request.tool_definitions_with_server_type();
@@ -462,9 +467,12 @@ pub async fn transform_request(
             && !client_declared.is_empty()
         {
             for name in req.deferred_tool_names() {
-                let tool_id = resolve_for(&name, None);
+                let (tool_id, mcp_server) = resolve_for(&name, None).unwrap_or_default();
                 let resolver = ToolDefinitionResolver { tool_id: tool_id.as_deref() };
-                if blocking_def_rules.iter().any(|r| tool_rules::evaluate(r, &resolver)) {
+                if blocking_def_rules.iter().any(|r| {
+                    tool_rules::applies_to_server(r, mcp_server.as_deref())
+                        && tool_rules::evaluate(r, &resolver)
+                }) {
                     continue;
                 }
                 let Some(rule) = find_rewrite_rule(&name, None) else { continue };
@@ -518,7 +526,7 @@ pub async fn transform_request(
     // `(tool_name, tool_use_id, content_text)` triples that drive the
     // resolver — same code path for all four inbound protocols including
     // Gemini (no longer a silent no-op).
-    let result_rules = tool_rules::extract_for(
+    let result_rules = tool_rules::extract_for_each_tool(
         tool_rules,
         tool_rules::Phase::Request,
         Scope::ToolResults,
@@ -539,14 +547,20 @@ pub async fn transform_request(
             // Try each rule in order — stop at the first hit that produces
             // an actual rewrite (regex non-match returns None and lets a
             // later rule have a shot).
-            let (effective_name, mcp_server) = match tool_rules::parse_mcp_namespace(name_hint) {
-                Some((srv, local)) => (local, Some(srv)),
-                None => (name_hint, None),
-            };
+            let crate::config::tool_names::ToolName { local: effective_name, mcp_server, .. } =
+                crate::config::tool_names::resolve_tool_name(
+                    name_hint,
+                    app_id,
+                    mcp_config.map(|cfg| &*cfg.tool_names),
+                    field_profiles_arg,
+                );
             let tool_id = field_profiles_arg
                 .and_then(|set| set.resolve_tool_id(effective_name, app_id, mcp_server))
                 .map(|s| s.to_string());
             for rule in &rules_for_walk {
+                if !tool_rules::applies_to_server(rule, mcp_server) {
+                    continue;
+                }
                 let resolver = ToolResultResolver {
                     name: effective_name,
                     arguments: args,
@@ -2970,7 +2984,11 @@ mod tests {
     }
 
     fn web_fetch_profiles() -> tool_rules::FieldProfileSet {
-        tool_rules::FieldProfileSet::new(vec![tool_rules::FieldProfile {
+        tool_rules::FieldProfileSet::new(vec![web_fetch_profile()])
+    }
+
+    fn web_fetch_profile() -> tool_rules::FieldProfile {
+        tool_rules::FieldProfile {
             id: Some("TFP-claude-WebFetch".into()),
             description: None,
             source: None,
@@ -2984,7 +3002,7 @@ mod tests {
             normalizer: crate::config::tool_rules_normalize::Normalizer::Raw,
             priority: 100,
             is_builtin: true,
-        }])
+        }
     }
 
     fn web_fetch_rule(action: serde_json::Value) -> Rule {
@@ -3037,6 +3055,146 @@ mod tests {
             .filter(|b| b.field == "tool_reference")
             .map(|b| (b.action.clone(), b.content.clone()))
             .collect()
+    }
+
+    /// A Web substitute rule rewrites the client's own fetch tool and never the
+    /// gateway's Web virtual server's: that one the gateway already serves, and
+    /// rewriting it too would declare two tools under the substitute's name.
+    #[tokio::test]
+    async fn a_substitute_rule_leaves_a_virtual_servers_tool_alone() {
+        let json = serde_json::json!({
+            "model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "fetch"}],
+            "tools": [
+                {"name": "WebFetch", "input_schema": {"type": "object"}},
+                {"name": "mcp__web__web_fetch", "input_schema": {"type": "object"}}
+            ]
+        });
+        let mut request =
+            ApiRequest::parse(crate::api::sse::ApiVersion::AnthropicMessages, &Bytes::from(json.to_string())).unwrap();
+        let profiles = tool_rules::FieldProfileSet::new(vec![web_fetch_profile(), tool_rules::FieldProfile {
+            id: Some("TFP-web-fetch".into()),
+            description: None,
+            source: None,
+            tool_id: "web_fetch".into(),
+            tool_pattern: "web_fetch".into(),
+            app_filter: None,
+            mcp_server: Some("builtin-web".into()),
+            server_type: None,
+            field: "url".into(),
+            wire_field: None,
+            normalizer: crate::config::tool_rules_normalize::Normalizer::Raw,
+            priority: 100,
+            is_builtin: true,
+        }]);
+        let mcp = crate::config::mcp::McpConfig {
+            tool_names: std::sync::Arc::new(crate::config::tool_names::McpToolNames::new(vec![
+                crate::config::tool_names::ToolNameRoute {
+                    virtual_server_slug: "web".into(),
+                    prefix: String::new(),
+                    upstream_name: "builtin-web".into(),
+                    route_id: uuid::Uuid::new_v4(),
+                },
+            ])),
+            ..Default::default()
+        };
+        let user = make_user_context_with_map(ModelMap::default());
+        let engine = ScriptEngine::new();
+        let result = transform_request(
+            &mut request, &user, &engine, &[], Some("claude-code"), None, None, false, true,
+            &[web_fetch_rule(substitute_web_fetch())], Some(&profiles), Some(&mcp), true, ScriptFailMode::Open,
+        )
+        .await
+        .unwrap();
+        let originals: Vec<_> = result.intercept_bindings.iter().map(|b| b.original_name.as_str()).collect();
+        assert_eq!(originals, ["WebFetch"], "only the client's own tool is substituted");
+        let mut names = request.tool_names();
+        names.sort_unstable();
+        assert_eq!(names, ["mcp__web__web_fetch", "web_fetch"]);
+    }
+
+    /// A rule filtered on an MCP server meets a request's tools of that server
+    /// — a gateway tool by its upstream, a client-run server by the name its
+    /// `mcp__` form carries — and no tool of another server or of none: on the
+    /// declarations a block removes, and on the results a rewrite redacts.
+    #[tokio::test]
+    async fn a_server_filtered_rule_meets_the_requests_tools_of_its_server() {
+        let names = ["mcp__web__web_fetch", "mcp__local-fs__web_fetch", "mcp__docs__web_fetch", "web_fetch"];
+        let tools: Vec<_> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "input_schema": {"type": "object"}}))
+            .collect();
+        let calls: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| serde_json::json!({"type": "tool_use", "id": format!("t{i}"), "name": n, "input": {"url": "https://example.com"}}))
+            .collect();
+        let results: Vec<_> = (0..names.len())
+            .map(|i| serde_json::json!({"type": "tool_result", "tool_use_id": format!("t{i}"), "content": "secret"}))
+            .collect();
+        let json = serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "fetch"},
+                {"role": "assistant", "content": calls},
+                {"role": "user", "content": results}
+            ],
+            "tools": tools
+        });
+        let mut request =
+            ApiRequest::parse(crate::api::sse::ApiVersion::AnthropicMessages, &Bytes::from(json.to_string())).unwrap();
+        let profiles = tool_rules::FieldProfileSet::new(vec![tool_rules::FieldProfile {
+            id: Some("TFP-web-fetch".into()),
+            description: None,
+            source: None,
+            tool_id: "web_fetch".into(),
+            tool_pattern: "web_fetch".into(),
+            app_filter: None,
+            mcp_server: None,
+            server_type: None,
+            field: "url".into(),
+            wire_field: None,
+            normalizer: crate::config::tool_rules_normalize::Normalizer::Raw,
+            priority: 100,
+            is_builtin: true,
+        }]);
+        let mcp = crate::config::mcp::McpConfig {
+            tool_names: std::sync::Arc::new(crate::config::tool_names::McpToolNames::new(vec![
+                crate::config::tool_names::ToolNameRoute {
+                    virtual_server_slug: "web".into(),
+                    prefix: String::new(),
+                    upstream_name: "builtin-web".into(),
+                    route_id: uuid::Uuid::new_v4(),
+                },
+            ])),
+            ..Default::default()
+        };
+        let rule = |id: &str, scope: &str, action: serde_json::Value| {
+            rule_from_json(serde_json::json!({
+                "id": id, "phase": "request", "scope": scope, "risk": "caution",
+                "mcp_server_filter": "builtin-web|local-*",
+                "match": [{"target": "tool_id", "op": "equals", "value": "web_fetch"}],
+                "action": action,
+            }))
+        };
+        let rules = [
+            rule("R-BLOCK", "tool_definitions", serde_json::json!({"kind": "block"})),
+            rule("R-REDACT", "tool_results", serde_json::json!({"kind": "replace", "with": "[redacted]"})),
+        ];
+        let user = make_user_context_with_map(ModelMap::default());
+        let engine = ScriptEngine::new();
+        let result = transform_request(
+            &mut request, &user, &engine, &[], None, None, None, false, true,
+            &rules, Some(&profiles), Some(&mcp), true, ScriptFailMode::Open,
+        )
+        .await
+        .unwrap();
+
+        let mut kept = request.tool_names();
+        kept.sort_unstable();
+        assert_eq!(kept, ["mcp__docs__web_fetch", "web_fetch"]);
+        let mut redacted: Vec<_> = result.redacted_tool_results.iter().map(|r| r.tool_use_id.as_str()).collect();
+        redacted.sort_unstable();
+        assert_eq!(redacted, ["t0", "t1"]);
     }
 
     /// A substituted tool's references follow it to its new name, so the API

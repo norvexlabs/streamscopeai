@@ -21,6 +21,7 @@ pub mod google_sa;
 pub mod health;
 pub mod inline_exchange;
 pub mod json_merge;
+pub mod known_bodies;
 pub mod qos_dialect;
 pub mod qos_metrics;
 pub mod media;
@@ -90,26 +91,30 @@ impl std::fmt::Debug for ForwardAuthContext {
     }
 }
 
-/// Send an audit record to the audit channel, waiting for capacity (backpressure).
-///
-/// Audit is mandatory — records are never dropped. If the channel is full,
-/// this will block the request handler until space is available, applying
-/// natural backpressure to the proxy when the audit pipeline is saturated.
+/// Send an audit record to the audit channel as `AUDIT_FAIL_MODE` says
+/// ([`crate::audit::AuditSender::deliver`]): `closed` waits for room (the
+/// request was admitted only once there was some), `open` drops a record its
+/// full channel refuses and counts it.
 pub async fn send_audit(
     audit_tx: &crate::audit::AuditSender<AuditRecord>,
     record: AuditRecord,
     request_id: &str,
 ) {
     use std::sync::atomic::Ordering;
-    if audit_tx.send(record).await.is_err() {
-        crate::audit::EMISSION_STATS
-            .channel_lost
-            .fetch_add(1, Ordering::Relaxed);
-        tracing::error!(request_id = %request_id, "audit channel closed — record lost");
-    } else {
-        crate::audit::EMISSION_STATS
-            .channel_sent
-            .fetch_add(1, Ordering::Relaxed);
+    match audit_tx.deliver(record).await {
+        Err(_) => {
+            crate::audit::EMISSION_STATS
+                .channel_lost
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::error!(request_id = %request_id, "audit channel closed — record lost");
+        }
+        // Counted where it is dropped (`audit::dropped_records`), never as sent.
+        Ok(crate::audit::Delivered::Dropped) => {}
+        Ok(crate::audit::Delivered::Sent) => {
+            crate::audit::EMISSION_STATS
+                .channel_sent
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -245,19 +250,22 @@ pub use crate::auth::TenantRequestCtx;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ContentMeta {
-    /// Per-message JSON strings, aligned 1:1 with `link_hashes` — the
-    /// primary capture of the request messages (no `Value` tree is built on
-    /// the capture path). Consumed by the edge SQLite buffer as-is.
-    pub request_messages_json: Vec<String>,
+    /// The request's messages, aligned 1:1 with `link_hashes`: each the JSON
+    /// serialised at capture, or — one the content store already holds — its
+    /// stored key ([`known_bodies::capture`]). Consumed by the edge SQLite
+    /// buffer as-is.
+    pub request_messages_json: Vec<known_bodies::CapturedMessage>,
     /// True when the typed request carried a content part the finalize-time
     /// media strip/scan could match — gates the parse of
     /// `request_messages_json` back into a tree in `finalize_audit`.
     pub media_scan_needed: bool,
-    pub request_tools: Option<serde_json::Value>,
+    /// The client-sent tool blob: its key, and its JSON unless the content
+    /// store holds it ([`known_bodies::capture_tools`]).
+    pub request_tools: Option<known_bodies::CapturedTools>,
     /// Post-policy effective tool blob, set only when transforms modified the
-    /// tools array. Hashed + buffered + referenced via the audit row's
-    /// `tools_effective_hash` column at the finalize site. Transient.
-    pub effective_tools: Option<serde_json::Value>,
+    /// tools array, captured the same way. Buffered + referenced via the
+    /// audit row's `tools_effective_hash` column at the finalize site. Transient.
+    pub effective_tools: Option<known_bodies::CapturedTools>,
     pub request_params: Option<serde_json::Value>,
     pub system_prompt: Option<String>,
     pub transform_diff: Option<serde_json::Value>,
@@ -1574,10 +1582,16 @@ async fn proxy_handler_inner(
             Vec::new(), // telemetry_dropped — populated post-forward (see below)
         );
         Some(ContentMeta {
-            request_messages_json: pre_content.messages_json,
+            // A request whose media the finalize pass rewrites carries every
+            // message: the pass reads and summarises the whole history.
+            request_messages_json: known_bodies::capture(
+                pre_content.messages_json,
+                (!pre_content.media_scan_needed).then_some(ctx.user.tenant_id),
+                pre_content.opening,
+            ),
             media_scan_needed: pre_content.media_scan_needed,
-            request_tools: pre_content.tools,
-            effective_tools,
+            request_tools: known_bodies::capture_tools(pre_content.tools, Some(ctx.user.tenant_id)),
+            effective_tools: known_bodies::capture_tools(effective_tools, Some(ctx.user.tenant_id)),
             request_params: pre_content.params,
             system_prompt: pre_content.system_prompt,
             transform_diff: serde_json::to_value(&transform_diff).ok(),

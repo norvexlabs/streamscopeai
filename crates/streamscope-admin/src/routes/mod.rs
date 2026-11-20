@@ -904,6 +904,10 @@ pub enum ApiErrorCode {
     /// reference from a registry, or its memory or CPU limit is out of range.
     /// Append-only.
     SandboxDefaultImageInvalid,
+    /// `linked=top_level` with a search term: the search's matches are listed
+    /// as they are, so a match inside a sub-agent is never folded under a
+    /// parent the search did not return. Append-only.
+    TopLevelUnsupportedWithSearch,
 }
 
 /// Structured error response body matching the proxy's `ErrorResponse` format.

@@ -273,7 +273,7 @@ proptest! {
         for wire in WIRES {
             let mut response = response_for(wire, &mask, tool_claim);
             let (blocked, _, _) = apply_response_policy_json(
-                &mut response, wire, &block_rule(), &profiles(), None, None, &[],
+                &mut response, wire, &block_rule(), &profiles(), &Default::default(), None, None, &[],
             );
 
             let expected_blocked = mask.iter().filter(|b| **b).count();

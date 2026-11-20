@@ -2336,7 +2336,14 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
 - **Risk Rules tab** — review/edit rules. A rule can **classify** (tag risk), **block**
   (strip a tool before the model sees it, or refuse a call), or **replace** (rewrite
   matched arguments). A rule targets a tool by its logical identity, so one rule covers
-  every client of the same conceptual tool, plus optional argument patterns.
+  every client of the same conceptual tool, plus optional argument patterns. A rule with an
+  **MCP server filter** applies only to the tools of matching servers — on the MCP gateway and
+  on the model's calls alike (a gateway virtual server's tool by its upstream server, a local
+  server's by the `<server>` of its `mcp__<server>__…` name, which the developer's client chooses,
+  so such a rule is no stronger than the client). A rewrite of a call to a gateway
+  virtual server's tool is applied twice — to the model's call, then again by the MCP gateway
+  when the client sends the call there — so write it to give the same result when applied to
+  its own output (rewrite a value to a fixed one, rather than wrapping it).
 - **Agent calls** — a rule on the **agent calls** scope governs what your agents may send to
   a *remote A2A agent*, and what those agents may send back. There is no tool to name here (an
   agent call is a message, not a tool invocation), so such a rule matches on the message's
@@ -2436,6 +2443,16 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
   canonical fields so argument rules can match them. An argument holding a whole patch takes the
   **patch** normaliser, which reads the files it names as paths. A discovery panel surfaces
   `(tool_name, field)` pairs seen in recent traffic with one-click register.
+- **Tools of a virtual server, seen by the model** — each coding client shows a virtual
+  server's tools to its model under a name of its own (`mcp__web__web_fetch` in Claude Code and
+  Codex, `mcp_web_web_fetch` in Gemini CLI and Crush, `web_web_fetch` in OpenCode). Tool rules and
+  field profiles read every one of these as the tool of the **MCP upstream server** behind the
+  virtual server — the server the MCP gateway names on its own calls — so a field profile scoped
+  to an MCP server names the upstream (`builtin-web` for the built-in Web tools), not the virtual
+  server's slug, and applies under every provisioned client. A client's own tool whose name merely
+  starts like a slug (OpenCode's `web_search` beside the `web` virtual server) stays the client's
+  tool. A substitute rule (the Web tools via the gateway) rewrites only the client's own tool,
+  never a virtual server's, which the gateway already serves.
 
 ### 8. Experts, transforms & settings
 
@@ -2695,7 +2712,7 @@ admin-console only (read-only accounts see them too).
   and a file or an image the detail it was sent with. An answer that is the model's refusal shows the refusal after
   any text it wrote and carries the **Refusal** badge. A program the model ran (OpenAI programmatic tool calling) shows as a tool
   call with its code, its output as the call's result, and a client's request to compact the
-  conversation as **Compaction requested by the client**, apart from a compaction that happened. A session shows each message once: a turn that starts afresh — a compaction requested by the client, a rewritten or cut history — shows a marker with its message count, and the messages the session has not shown yet; its full request is in the turn's trace. Each system prompt shows the first time it appears, and a turn's **Request Params** panel loads that turn's tools when you open it. Each conversation an agent runs is a session of its own, even when the client sends one session id for several. Sessions are **linked** when a new conversation opens by quoting a recent one of the same user: a sub-agent that starts with the prompt its parent's tool call gave it is shown as a **child**, its card placed at that call; a conversation that starts from the summary of an earlier answer (a compaction) **continues** it. A single line two conversations share links nothing, and a side call such as a title stays a session of its own. A session list row counts a session's sub-agents, and a compacted conversation shows **Continued in** with a link to the session that continues it. Each link shows what it was read from: **quoted** for a link the gateway read from the conversation itself, **expert** with the expert's confidence for one the **session_linkage** expert made. A client's parent session header never links two sessions, and the **session_linkage** expert links what no quote did. Severity
+  conversation as **Compaction requested by the client**, apart from a compaction that happened. A session shows each message once: a turn that starts afresh — a compaction requested by the client, a rewritten or cut history — shows a marker with its message count, and the messages the session has not shown yet; its full request is in the turn's trace. Each system prompt shows the first time it appears, and a turn's **Request Params** panel loads that turn's tools when you open it. Each conversation an agent runs is a session of its own, even when the client sends one session id for several. Sessions are **linked** when a new conversation opens by quoting a recent one of the same user: a sub-agent that starts with the prompt its parent's tool call gave it is shown as a **child**, its card placed at that call; a conversation that starts from the summary of an earlier answer (a compaction) **continues** it. A single line two conversations share links nothing, and a side call such as a title stays a session of its own. The **Sessions** list is a tree: a sub-agent is not a row of its own while its parent is on the list — the parent's **N sub-agents** badge opens them under it (up to 25; past that the row says how many more, and the session itself lists them all), and a sub-agent's own sub-agents open the same way, three levels deep. A sub-agent whose parent the list leaves out — another user's, a parent no longer kept, one your filters exclude — stays a row, with a **→ Parent** link. A search, an **Alert** filter or a **Linked** choice lists every matching session flat, each sub-agent with its **→ Parent** link. A parent shows the most severe alert among its sub-agents (**Sub-agent alert: Major**) and keeps its place in the order. A compacted conversation stays a row of its own and shows **Continued in** with a link to the session that continues it. Each link shows what it was read from: **quoted** for a link the gateway read from the conversation itself, **expert** with the expert's confidence for one the **session_linkage** expert made. A client's parent session header never links two sessions, and the **session_linkage** expert links what no quote did. Severity
   **badges** flag sessions the experts found noteworthy.
 - **Tool Calls** (`/tool-calls`) — every tool invocation (LLM and MCP) with the policy rule that
   classified, blocked, or rewrote it shown inline — the fastest way to audit what agents are doing.
@@ -2889,7 +2906,8 @@ Open a profile to edit it:
   settings apply to the workspaces on this profile. `ssai` enforces these on the developer's machine: a guard against an agent's mistakes and
   injected instructions, not against a developer who edits their own machine. Traffic to an allowed
   destination does not pass the gateway, so it is not in the gateway's audit.
-- **Portal pages** — two switches for what members see of their own activity in the portal:
+- **Portal pages** — two switches for what members see of their own activity in the portal, and
+  whether they see the experts' alerts:
   - **Hide conversations** — the Sessions page and all conversation content: a request's details,
     its media and its tool definitions.
   - **Hide the Requests page** — the list of requests (model, tokens, cost, status).
@@ -2904,7 +2922,7 @@ Open a profile to edit it:
   What is hidden is withheld by the gateway, not only left out of the page: opened by its address a
   hidden page says it is not available, and a script or an automation key asking for the same data is
   refused. Three things to know:
-  - **Every workspace decides.** Each switch applies to a member only when *every* workspace they
+  - **Every workspace decides.** Each page switch applies to a member only when *every* workspace they
     belong to is on a profile that has it on. Someone in Finance (hidden) and Platform (shown) keeps
     it — and sees there what they could see before, Finance's shared activity included. A member of no
     workspace follows the Default. To hide something from everyone, hide it on the Default and on
@@ -2918,6 +2936,13 @@ Open a profile to edit it:
   It takes effect at the member's next request: a page they have open gives way at its next refresh,
   and comes back the same way when you show it again. An automation key follows the workspace it is
   bound to.
+
+  **Show expert alerts** (on by default) decides whether members see the experts' alerts on the
+  sessions of the workspaces on this profile: a session's alert and its note, the alert badge on its
+  requests, a sub-agent's alert on its parent, and the alert filter and order. Unlike the page
+  switches it is decided **per session, by the profile of that session's own workspace**: a member of
+  Finance (alerts hidden) and Platform (shown) sees the alerts on Platform's sessions and none on
+  Finance's, whichever view they open. A session with no workspace follows the Default.
 
 The developers' CLI picks a change up on its next `ssai sync`, or on its next `ssai run` once its
 copy is an hour old. A CLI that has never received the settings and cannot reach the gateway runs
@@ -2991,10 +3016,12 @@ them at the console host's root, `/` (or `/portal/login/{slug}`). There they:
     message.
   - Every field the console shows is shown, the upstream server and endpoint that answered a
     model call included.
-  - **Expert alerts are not shown to members**: a session's alert, its note and the experts that
-    raised it stay in the console, and the portal ignores the alert filter and order. The
-    cross-session issues an expert finds are console-only too, since they name other people's
-    sessions.
+  - **Expert alerts** show as in the console — a session's alert and its note, the alert filter
+    and order — on the sessions whose workspace's profile shows them (**Show expert alerts**,
+    on by default); on the others none is shown, filtered or ranked. The cross-session issues an
+    expert finds are console-only, since they name other people's sessions.
+  - The list is the console's tree: a sub-agent opens under its parent, and only a parent the
+    member may see folds one — another member's session never does.
 - **Members & limits** (`/portal/team`, in the menu for managers only) — managers see the roster
   and per-member usage, provision on behalf of members, and manage member limit exceptions.
 - **Sign-ins** (`/portal/mcp/connections`) — connect your **own** account to the MCP servers

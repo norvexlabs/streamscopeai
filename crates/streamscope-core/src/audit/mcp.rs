@@ -69,10 +69,14 @@ pub struct McpAuditRecord {
     pub prompt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_uri: Option<String>,
+    /// The JSON-RPC `params`, as JSON text: a record waits in the audit
+    /// channel and the outbox writer's batch, where a parsed tree would weigh
+    /// several times its text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
+    pub params: Option<JsonText>,
+    /// The JSON-RPC `result`, as JSON text (see `params`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
+    pub result: Option<JsonText>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +99,51 @@ pub struct McpAuditRecord {
     /// no rule fired).
     #[serde(default = "default_empty_object")]
     pub transform_diff: serde_json::Value,
+}
+
+/// A JSON value held as its text. It serialises as the value itself, so the
+/// wire is the same as a `serde_json::Value`'s, and it deserialises through a
+/// `Value`, so any deserializer reads it, a buffering one included (a record
+/// read back from a sorted re-serialisation, where `body` comes before `kind`).
+#[derive(Debug, Clone)]
+pub struct JsonText(Box<serde_json::value::RawValue>);
+
+impl PartialEq for JsonText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl JsonText {
+    /// The text of `value`: serialised once, never parsed again to be held
+    /// (any depth the value has).
+    pub fn of(value: &serde_json::Value) -> Self {
+        // A `Value` always serialises.
+        Self(serde_json::value::to_raw_value(value).unwrap_or_else(|_| {
+            serde_json::value::RawValue::from_string("null".into()).expect("null is JSON")
+        }))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.get()
+    }
+
+    /// The value, parsed again under the edge wire's nesting bound.
+    pub fn value(&self) -> serde_json::Value {
+        crate::edge_wire::from_str_bounded(self.as_str()).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl serde::Serialize for JsonText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for JsonText {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        serde_json::Value::deserialize(deserializer).map(|v| Self::of(&v))
+    }
 }
 
 fn default_empty_object() -> serde_json::Value {
@@ -221,5 +270,33 @@ pub async fn mcp_audit_writer_task(
             tracing::info!("mcp audit writer task: draining complete, exiting");
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A payload held as text is on the wire as the value itself, and reads
+    /// back through any deserializer: a buffering one included, as a record
+    /// re-read from a sorted re-serialisation is.
+    #[test]
+    fn a_json_text_is_the_value_on_the_wire_and_reads_back_anywhere() {
+        let value = serde_json::json!({"name": "read", "arguments": {"path": "/a", "n": [1, 2.5, null]}});
+        let text = JsonText::of(&value);
+        assert_eq!(serde_json::to_value(&text).unwrap(), value, "serialised as the value");
+        assert_eq!(serde_json::to_string(&text).unwrap(), value.to_string());
+        let from_value: JsonText = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(from_value, text, "read from a tree");
+        // An adjacently tagged frame whose content comes first is buffered.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", content = "body")]
+        enum Framed {
+            #[serde(rename = "mcp")]
+            Mcp { params: JsonText },
+        }
+        let buffered = format!(r#"{{"body":{{"params":{value}}},"kind":"mcp"}}"#);
+        let Framed::Mcp { params } = serde_json::from_str(&buffered).unwrap();
+        assert_eq!(params.value(), value);
     }
 }

@@ -905,6 +905,12 @@ async fn the_metrics_listener_serves_every_series() {
         "streamscope_proxy_mcp_session_cap_drops_total{map=\"log_levels\"} ",
         "streamscope_proxy_mcp_session_cap_drops_total{map=\"upstream_eras\"} ",
         "streamscope_proxy_mcp_session_cap_drops_total{map=\"upstream_handshakes\"} ",
+        "streamscope_proxy_known_bodies ",
+        "streamscope_proxy_known_body_lookups_total{result=\"hit\"} ",
+        "streamscope_proxy_known_body_lookups_total{result=\"miss\"} ",
+        "streamscope_proxy_known_bodies_removed_total ",
+        "streamscope_proxy_audit_held_requests_total ",
+        "streamscope_proxy_audit_dropped_records_total ",
     ] {
         assert!(text.lines().any(|l| l.starts_with(series)), "{series}missing from:\n{text}");
     }

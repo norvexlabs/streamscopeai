@@ -72,8 +72,9 @@ pub struct CreateFieldProfile {
     /// exclusive with `mcp_server`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_filter: Option<String>,
-    /// Optional MCP server identifier (matches `mcp__<server>__<tool>`).
-    /// Mutually exclusive with `app_filter`.
+    /// Optional MCP server identifier: the upstream server behind a virtual
+    /// server's route, or the `<server>` of `mcp__<server>__<tool>` for a
+    /// server the client runs itself. Mutually exclusive with `app_filter`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<String>,
     /// Optional server-tool discriminator (Anthropic `web_search_20250305`,
@@ -155,8 +156,10 @@ pub struct DiscoveredField {
     /// otherwise. Future layers (`heuristic`, `llm`) are deferred.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestion_source: Option<String>,
-    /// MCP server identity if the tool name parses as `mcp__<server>__<local>`.
-    /// Surfaced so the UI can display "via MCP server foo" alongside the row.
+    /// The MCP server the tool belongs to, read from its name as the gateway
+    /// reads it: for a gateway virtual server's tool, the upstream behind its
+    /// route (what an MCP-scoped field profile names). Surfaced so the UI can
+    /// display "via MCP server foo" alongside the row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<String>,
 }
@@ -770,6 +773,7 @@ pub(crate) async fn aggregate_field_coverage(
     // hard-map (the only Stage C classifier) finds a match.
     let profiles = load_profiles(&mut *conn, tenant_id).await?;
     let profile_set = tool_rules::FieldProfileSet::new(profiles.clone());
+    let mcp_names = crate::routes::analytics::load_mcp_tool_names(&mut *conn).await;
     let mut fields: Vec<DiscoveredField> = counts
         .into_iter()
         .map(|((tool_name, field), occurrences)| {
@@ -783,16 +787,20 @@ pub(crate) async fn aggregate_field_coverage(
                 let effective_field = p.wire_field.as_deref().unwrap_or(p.field.as_str());
                 effective_field == field && tool_rules::matches_glob(&tool_name, &p.tool_pattern)
             });
-            // Layer 1 classifier: parse MCP namespace. If the tool name is
-            // `mcp__<server>__<local>` and a registered MCP-server profile
-            // resolves the local name, suggest its `tool_id`.
-            let (effective, mcp_server) = match tool_rules::parse_mcp_namespace(&tool_name) {
-                Some((srv, local)) => (local.to_string(), Some(srv.to_string())),
-                None => (tool_name.clone(), None),
-            };
+            // Layer 1 classifier: the tool's MCP server, read from its name
+            // as the gateway reads it (`resolve_tool_name`). When an MCP-server
+            // profile resolves the local name, suggest its `tool_id`.
+            let streamscope_core::config::tool_names::ToolName { local: effective, mcp_server, .. } =
+                streamscope_core::config::tool_names::resolve_tool_name(
+                    &tool_name,
+                    None,
+                    Some(&mcp_names),
+                    Some(&profile_set),
+                );
+            let mcp_server = mcp_server.map(str::to_string);
             let suggested_tool_id = if !already_covered && mcp_server.is_some() {
                 profile_set
-                    .resolve_tool_id(&effective, None, mcp_server.as_deref())
+                    .resolve_tool_id(effective, None, mcp_server.as_deref())
                     .map(|s| s.to_string())
             } else {
                 None

@@ -41,6 +41,7 @@ use streamscope_core::proxy::{self, AppState};
 mod log_level;
 
 mod a2a;
+mod audit_room;
 mod config_snapshot;
 mod config_sync;
 mod edge_link;
@@ -1119,6 +1120,17 @@ fn build_app(
     // route — each group below carries the layer for its protocol — never from
     // the request. The remaining routes speak the OpenAI grammar, which is
     // `AppError`'s own rendering, so they carry none.
+    // Every route that ends in an audit record is admitted only once the audit
+    // pipeline has room for it (`audit_room`); the probes and the metadata
+    // documents are not held.
+    let audit_room = audit_room::AuditRoom {
+        llm: state.audit_tx.clone(),
+        mcp: mcp_state.mcp.mcp_audit_tx.clone(),
+        a2a: a2a_state.a2a_audit_tx.clone(),
+        web: mcp_state.mcp.web_audit_tx.clone(),
+    };
+    let hold = || axum::middleware::from_fn_with_state(audit_room.clone(), audit_room::hold_for_audit_room);
+
     let anthropic_routes = Router::new()
         .route("/v1/messages", post(proxy::proxy_handler))
         .route(
@@ -1212,6 +1224,7 @@ fn build_app(
         .merge(model_list_routes)
         .route_layer(deadline(core.request_body_deadline))
         .merge(media_routes)
+        .route_layer(hold())
         .route("/health", get(proxy::health_check))
         .route("/ready", get(proxy::readiness_check))
         .with_state(state.clone());
@@ -1238,12 +1251,14 @@ fn build_app(
                 .delete(mcp::mcp_fwd_delete_handler),
         )
         .route_layer(deadline(core.request_body_deadline))
+        .route_layer(hold())
         .with_state(mcp_state);
 
     let a2a_router = Router::new()
         // POST: the A2A JSON-RPC 2.0 binding.
         .route("/a2a/{slug}", post(a2a::a2a_handler))
         .route_layer(deadline(core.request_body_deadline))
+        .route_layer(hold())
         .with_state(a2a_state.clone());
 
     // The unauthenticated discovery documents, mounted apart from the routers

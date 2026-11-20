@@ -1036,8 +1036,8 @@
             </FormField>
             {#if detail?.usage && (poolCaps.daily != null || poolCaps.monthly != null)}
               <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <LimitMeter label="Daily spend (fleet estimate)" used={detail.usage.daily_spent} cap={poolCaps.daily} fmt={money} />
-                <LimitMeter label="Monthly spend (fleet estimate)" used={detail.usage.monthly_spent} cap={poolCaps.monthly} fmt={money} />
+                <LimitMeter label="Daily spend" used={detail.usage.daily_spent} cap={poolCaps.daily} fmt={money} />
+                <LimitMeter label="Monthly spend" used={detail.usage.monthly_spent} cap={poolCaps.monthly} fmt={money} />
               </div>
             {/if}
             <button onclick={savePool} disabled={savingPool || ![poolRpm, poolRpmMcp, poolRpmA2a, poolTpm, poolDaily, poolMonthly].every(isValidLimit)} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingPool ? 'Saving…' : 'Save pool'}</button>

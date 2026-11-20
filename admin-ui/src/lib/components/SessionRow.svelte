@@ -16,12 +16,20 @@
     /** Member self-view: the row is always the caller's own, so the redundant
      *  user identity is hidden. Default (admin) shows it. */
     selfScoped?: boolean;
+    /** Shown under its parent in a tree: the indent names the parent, so a
+     *  sub-agent's parent chip is dropped. */
+    nested?: boolean;
+    /** The sub-agents badge as a toggle that shows them under the row (a tree
+     *  only). */
+    expand?: { open: boolean; toggle: () => void };
   }
 
   let {
     session,
     appName = (id: string | null) => id || '',
     selfScoped = false,
+    nested = false,
+    expand,
   }: Props = $props();
 
   // The plane comes from the pathname; on the portal the workspace whose
@@ -31,6 +39,21 @@
 
   const alertLines = $derived(parseAlertLines(session.alert_note, session.alert_level));
   const topAlert = $derived(alertLines[0]);
+  const subAgentAlert = $derived(session.links?.sub_agent_alert);
+  const parentChip = $derived(session.link && !(nested && session.link.kind === 'sub_agent') ? session.link : undefined);
+  // Each metadata item is preceded by a separator only when an item is shown
+  // before it (the user is hidden in a member's self-view).
+  const keyShown = $derived(!!(session.key_name || session.key_prefix));
+  const beforeKey = $derived(!selfScoped);
+  const beforeApp = $derived(beforeKey || keyShown);
+  const beforeWorkspace = $derived(beforeApp || !!session.app_id);
+  const beforeModel = $derived(beforeWorkspace || !!session.workspace_name);
+
+  function toggle(e: Event) {
+    e.preventDefault();
+    e.stopPropagation();
+    expand?.toggle();
+  }
 </script>
 
 <a
@@ -70,27 +93,27 @@
         </span>
       {/if}
       <!-- Key -->
-      {#if session.key_name || session.key_prefix}
-        <span class="text-[10px] text-(--text-secondary)">&middot;</span>
+      {#if keyShown}
+        {#if beforeKey}<span class="text-[10px] text-(--text-secondary)">&middot;</span>{/if}
         <span class="text-[10px] text-(--text-secondary) font-mono truncate">{session.key_name || ''}{#if session.key_prefix} <code class="bg-(--bg-secondary) px-0.5 rounded-sm">{session.key_prefix}...</code>{/if}</span>
       {/if}
       <!-- Client app -->
       {#if session.app_id}
-        <span class="text-[10px] text-(--text-secondary)">&middot;</span>
+        {#if beforeApp}<span class="text-[10px] text-(--text-secondary)">&middot;</span>{/if}
         <span class="text-[10px] text-(--accent)" title={session.app_id}>
           {appName(session.app_id)}
         </span>
       {/if}
       <!-- Workspace -->
       {#if session.workspace_name}
-        <span class="text-[10px] text-(--text-secondary)">&middot;</span>
+        {#if beforeWorkspace}<span class="text-[10px] text-(--text-secondary)">&middot;</span>{/if}
         <span class="inline-flex items-center gap-1">
           <Icon name="building" size="sm" tone="neutral" />
           <span class="text-[10px] text-(--text-secondary) truncate">{session.workspace_name}</span>
         </span>
       {/if}
       <!-- Model -->
-      <span class="text-[10px] text-(--text-secondary)">&middot;</span>
+      {#if beforeModel}<span class="text-[10px] text-(--text-secondary)">&middot;</span>{/if}
       <span class="text-xs text-(--text-secondary) font-mono truncate">
         {session.model_used || session.model_requested || '--'}
       </span>
@@ -109,8 +132,28 @@
         <span class="text-[10px] px-1 py-0.5 rounded-sm {line.level === 'major' ? 'bg-(--error-bg) text-(--error)/80' : line.level === 'minor' ? 'bg-(--warning-bg) text-(--warning)/80' : 'bg-(--tag-neutral-bg) text-(--tag-neutral-text)'}">{line.axis}</span>
       {/each}
       {#if session.links && session.links.sub_agents > 0}
-        <span class="text-[10px] px-1.5 py-0.5 rounded-sm bg-(--accent)/15 text-(--accent) border border-(--accent)">
-          {session.links.sub_agents} {session.links.sub_agents === 1 ? m.session_row_child() : m.session_row_children()}
+        {@const label = `${session.links.sub_agents} ${session.links.sub_agents === 1 ? m.session_row_child() : m.session_row_children()}`}
+        {#if expand}
+          <span
+            role="button"
+            tabindex="0"
+            aria-expanded={expand.open}
+            onclick={toggle}
+            onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') toggle(e); }}
+            class="inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded-sm bg-(--accent)/15 text-(--accent) border border-(--accent) hover:bg-(--accent)/25 transition-colors cursor-pointer"
+          >
+            {label}
+            <Icon name={expand.open ? 'chevronDown' : 'chevronRight'} size="xs" tone="info" />
+          </span>
+        {:else}
+          <span class="text-[10px] px-1.5 py-0.5 rounded-sm bg-(--accent)/15 text-(--accent) border border-(--accent)">
+            {label}
+          </span>
+        {/if}
+      {/if}
+      {#if subAgentAlert}
+        <span class="text-[10px] px-1.5 py-0.5 rounded-sm {subAgentAlert === 'major' ? 'bg-(--error-bg) text-(--error)/80' : subAgentAlert === 'minor' ? 'bg-(--warning-bg) text-(--warning)/80' : 'bg-(--tag-neutral-bg) text-(--tag-neutral-text)'}">
+          {m.browse_subagent_alert({ level: subAgentAlert === 'major' ? m.browse_alert_major() : subAgentAlert === 'minor' ? m.browse_alert_minor() : m.browse_alert_info() })}
         </span>
       {/if}
       {#if session.links?.continued_in}
@@ -125,8 +168,8 @@
           {m.session_row_continued_in()} &rarr;
         </span>
       {/if}
-      {#if session.link}
-        {@const link = session.link}
+      {#if parentChip}
+        {@const link = parentChip}
         <span
           role="link"
           tabindex="0"

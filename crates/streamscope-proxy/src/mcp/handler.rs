@@ -41,6 +41,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use streamscope_core::audit::McpAuditRecord;
+use streamscope_core::audit::mcp::JsonText;
 use streamscope_core::auth::{TenantRequestCtx, UserContext};
 use streamscope_core::config::mcp::McpVirtualServer;
 use streamscope_core::error::{AppError, AuthError};
@@ -4264,7 +4265,7 @@ fn stream_method_response(
             badges: build_mcp_audit_badges(policy_classification.as_ref(), rpc_err_code),
             transform_diff,
         };
-        if let Err(e) = state_for_task.mcp.mcp_audit_tx.send(record).await {
+        if let Err(e) = state_for_task.mcp.mcp_audit_tx.deliver(record).await {
             tracing::error!("mcp audit channel send failed (stream): {e}");
         }
         let _ = slug_for_task;
@@ -4402,7 +4403,7 @@ async fn emit_server_initiated_audit_to(
         badges: Vec::new(),
         transform_diff: serde_json::Value::Object(diff),
     };
-    if let Err(e) = audit_tx.send(record).await {
+    if let Err(e) = audit_tx.deliver(record).await {
         tracing::error!("mcp audit channel send failed (server-initiated): {e}");
     }
 }
@@ -4576,7 +4577,7 @@ async fn emit_sampling_intercept_audit(
         badges: vec![AuditBadge::McpSamplingIntercepted],
         transform_diff: serde_json::Value::Object(diff),
     };
-    if let Err(e) = state.mcp.mcp_audit_tx.send(record).await {
+    if let Err(e) = state.mcp.mcp_audit_tx.deliver(record).await {
         tracing::error!("mcp audit channel send failed (sampling intercept): {e}");
     }
 }
@@ -4681,7 +4682,7 @@ async fn emit_list_changed_audit_to(
         badges: Vec::new(),
         transform_diff: serde_json::Value::Object(diff),
     };
-    if let Err(e) = audit_tx.send(record).await {
+    if let Err(e) = audit_tx.deliver(record).await {
         tracing::error!("mcp audit channel send failed (list_changed): {e}");
     }
 }
@@ -4777,7 +4778,7 @@ async fn emit_elicitation_complete_audit_to(
         badges: Vec::new(),
         transform_diff: serde_json::Value::Object(diff),
     };
-    if let Err(e) = audit_tx.send(record).await {
+    if let Err(e) = audit_tx.deliver(record).await {
         tracing::error!("mcp audit channel send failed (elicitation_complete): {e}");
     }
 }
@@ -8825,6 +8826,9 @@ impl super::legacy_sse::UpstreamEventSink for BusAuditEventSink {
         if let Some(record) = record_opt
             && let Err(e) = self.audit_tx.try_send(record)
         {
+            if matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
+                streamscope_core::audit::record_dropped();
+            }
             tracing::warn!(error = %e, "legacy SSE audit drop (channel full or closed)");
         }
     }
@@ -9094,7 +9098,7 @@ async fn emit_unauthenticated_audit(
         badges: build_mcp_audit_badges(None, Some(AUTH_REQUIRED)),
         transform_diff: serde_json::Value::Object(Default::default()),
     };
-    if let Err(e) = state.mcp.mcp_audit_tx.send(record).await {
+    if let Err(e) = state.mcp.mcp_audit_tx.deliver(record).await {
         tracing::error!("mcp audit channel send failed (auth path): {e}");
     }
 }
@@ -9183,22 +9187,20 @@ async fn rate_limited_response(
 /// marker (mirrors the "Nothing is silently discarded" pattern used by
 /// the media-blob extractor: never blank the field, always leave a
 /// breadcrumb).
-fn cap_audit_payload(value: Option<serde_json::Value>) -> Option<serde_json::Value> {
+fn cap_audit_payload(value: Option<serde_json::Value>) -> Option<JsonText> {
     let v = value?;
     let max = crate::settings::proxy_settings().mcp_audit_payload_max_bytes;
-    let serialised = match serde_json::to_vec(&v) {
-        Ok(b) => b,
-        Err(_) => return Some(v),
-    };
-    if serialised.len() <= max {
-        return Some(v);
+    // The tree is serialised once and dropped: the record keeps the text.
+    let serialised = JsonText::of(&v);
+    if serialised.as_str().len() <= max {
+        return Some(serialised);
     }
-    Some(serde_json::json!({
+    Some(JsonText::of(&serde_json::json!({
         "_stripped": true,
-        "size_bytes": serialised.len(),
+        "size_bytes": serialised.as_str().len(),
         "reason": "oversized",
         "limit_bytes": max,
-    }))
+    })))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9435,7 +9437,7 @@ async fn emit_audit_with_policy(
         limit_bucket: limit_bucket.map(|b| b.as_str().to_string()),
     };
 
-    if let Err(e) = state.mcp.mcp_audit_tx.send(record).await {
+    if let Err(e) = state.mcp.mcp_audit_tx.deliver(record).await {
         tracing::error!("mcp audit channel send failed: {e}");
     }
 }

@@ -528,6 +528,9 @@ struct ResponsesOutputItemInner {
     /// Used by mcp_call items (falls back from `id`)
     id: Option<String>,
     name: Option<String>,
+    /// The `namespace` a function or custom call's tool belongs to: the call
+    /// is read under `<namespace>__<name>` (`api::namespaces`).
+    namespace: Option<String>,
     /// MCP server label — tool name may be prefixed with `{server_label}.`
     server_label: Option<String>,
     /// A function or MCP call's arguments, as far as the item states them.
@@ -1250,9 +1253,14 @@ fn parse_responses_event(event: &SseEvent, facts: &mut FrameFacts) -> Vec<Domain
                     return vec![];
                 }
             };
-            let Some(inner) = item.item else {
+            let Some(mut inner) = item.item else {
                 return vec![];
             };
+            // A call to a namespace's member is read by its flat name, as the
+            // request declared it (`api::namespaces`).
+            if let (Some(ns), Some(name)) = (inner.namespace.as_deref().filter(|ns| !ns.is_empty()), inner.name.as_deref()) {
+                inner.name = Some(crate::api::namespaces::flat_name(ns, name));
+            }
             // A call item opens a call: the client's (`function_call`,
             // `custom_tool_call`, or a built-in tool's the client runs — a
             // shell command, a patch, a computer action), or one on a remote
@@ -3062,7 +3070,7 @@ mod tests {
             assert!(forms.iter().all(|f| *f == CallArguments::ClientBuiltin(builtin)), "{forms:?}");
             // The non-streaming reader reads the same call.
             let call = crate::api::domain::tool_call_item(&item).expect("read as a call");
-            assert_eq!((call.name, call.builtin), (builtin.tool_name(), Some(builtin)));
+            assert_eq!((call.name.as_ref(), call.builtin), (builtin.tool_name(), Some(builtin)));
         }
         let mut parser = StreamParser::new(ApiVersion::Responses);
         let web = serde_json::json!({"output_index": 0, "item": {"type": "web_search_call", "id": "ws_1", "status": "completed"}});

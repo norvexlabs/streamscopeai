@@ -21,6 +21,7 @@ pub mod gemini;
 pub mod media;
 pub mod messages;
 pub mod mistral;
+pub mod namespaces;
 pub mod responses;
 pub mod sse;
 pub mod tool_choice;
@@ -758,7 +759,7 @@ impl ApiRequest {
     pub fn wire_value(&self) -> Option<Value> {
         match self {
             Self::ChatCompletions(r) => serde_json::to_value(r),
-            Self::Responses(r) => serde_json::to_value(r),
+            Self::Responses(r) => responses_wire(r),
             Self::AnthropicMessages(r) => serde_json::to_value(r),
             Self::GoogleGemini(r) => serde_json::to_value(r),
         }
@@ -786,8 +787,17 @@ impl ApiRequest {
                 Ok(Self::ChatCompletions(req))
             }
             ApiVersion::Responses => {
-                let req: ResponsesRequest = serde_json::from_slice(body).map_err(|e| {
+                let mut req: ResponsesRequest = serde_json::from_slice(body).map_err(|e| {
                     AppError::BadRequest(responses_member_missing(body).unwrap_or_else(|| format!("invalid JSON: {e}")))
+                })?;
+                // Every reader sees a namespace's members as plain tools.
+                namespaces::flatten(&mut req).map_err(|e| match e {
+                    namespaces::FlattenError::Collision(name) => AppError::BadRequest(format!(
+                        "two tools would reach the model as `{name}`: a namespace member's name joined to its namespace (`<namespace>__<name>`) must not equal another tool's"
+                    )),
+                    namespaces::FlattenError::Malformed => AppError::BadRequest(
+                        "a `namespace` tool needs a `name` and at least one named member in `tools`".into(),
+                    ),
                 })?;
                 Ok(Self::Responses(req))
             }
@@ -808,7 +818,7 @@ impl ApiRequest {
     pub fn serialize(&self) -> Result<Bytes, AppError> {
         let json = match self {
             Self::ChatCompletions(req) => serde_json::to_vec(req),
-            Self::Responses(req) => serde_json::to_vec(req),
+            Self::Responses(req) => responses_wire(req).and_then(|v| serde_json::to_vec(&v)),
             Self::AnthropicMessages(req) => serde_json::to_vec(req),
             Self::GoogleGemini(req) => serde_json::to_vec(req),
         }
@@ -2235,6 +2245,17 @@ fn defaults_to_a_code_execution_caller(server_type: &str) -> bool {
         return false;
     };
     date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) && date >= "20260209"
+}
+
+/// A Responses request as the wire carries it: its namespaces nested again
+/// ([`namespaces::regroup`]) — what every body sent upstream, and the response
+/// cache's key, are made of.
+fn responses_wire(req: &responses::ResponsesRequest) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(req)?;
+    if let Value::Object(body) = &mut value {
+        namespaces::regroup(body, &req.namespaced);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]

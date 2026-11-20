@@ -1221,6 +1221,10 @@ pub struct ClientToolFacts {
     /// The client's Chat Completions custom (freeform) tools, by name: a call
     /// to one reaches a Chat client as the custom call it declared.
     pub freeform: std::collections::HashSet<String>,
+    /// A Responses client's `namespace` tools, read flat at ingress: a call to
+    /// a member reaches the client named as the member of its namespace
+    /// ([`crate::api::namespaces::NamespacedTools::split_item`]).
+    pub namespaced: std::sync::Arc<crate::api::namespaces::NamespacedTools>,
 }
 
 impl ClientToolFacts {
@@ -1253,9 +1257,14 @@ impl ClientToolFacts {
             // A Gemini client's names are Gemini's own.
             ApiRequest::GoogleGemini(_) => Vec::new(),
         };
+        let namespaced = match req {
+            ApiRequest::Responses(r) => std::sync::Arc::new(r.namespaced.clone()),
+            _ => Default::default(),
+        };
         Self {
             gemini_encoded: crate::api::gemini::encoded_function_names(names.iter().map(String::as_str)),
             freeform,
+            namespaced,
         }
     }
 }
@@ -3508,11 +3517,8 @@ fn convert_raw_items_to_domain(items: &[Value], out: &mut Vec<DomainMessage>) {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let name = item
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+                // A namespace member's call is read by its flat name.
+                let name = crate::api::namespaces::call_item_name(item).map(|n| n.into_owned()).unwrap_or_default();
                 let (input, input_raw) = if item_type == "custom_tool_call" {
                     (freeform_call_input(item.get("input").and_then(Value::as_str).unwrap_or("")), None)
                 } else {
@@ -5335,6 +5341,7 @@ pub fn domain_messages_from_stored(
                 metadata: None,
                 previous_response_id: None,
                 extra: BTreeMap::new(),
+                namespaced: Default::default(),
             };
             Ok(DomainRequest::from_responses(&stub).messages)
         }
@@ -5495,11 +5502,12 @@ fn decode_stored_tool_call(protocol: ApiVersion, tc: &Value, idx: usize) -> Doma
         name = call.name.to_string();
         input = serde_json::from_str(&call.arguments).unwrap_or(Value::Null);
     }
-    // (5)+(6) Native Anthropic or OpenAI Responses raw function_call item.
-    else if let Some(n) = tc.get("name").and_then(|v| v.as_str())
+    // (5)+(6) Native Anthropic or OpenAI Responses raw function_call item (a
+    // namespace member's call read by its flat name).
+    else if let Some(n) = crate::api::namespaces::call_item_name(tc)
         && !n.is_empty()
     {
-        name = n.to_string();
+        name = n.into_owned();
         if let Some(obj) = tc.get("input").cloned() {
             // Anthropic native — input is already an Object.
             input = obj;
@@ -7681,6 +7689,7 @@ impl DomainRequest {
             store: self.store,
             metadata: self.metadata.clone(),
             extra,
+            namespaced: Default::default(),
         }
     }
 
@@ -12469,6 +12478,20 @@ mod tests {
         }
     }
 
+    /// A stored Responses call of a namespace member is read by its flat name,
+    /// as the gateway read it on the answer; the request's items alike.
+    #[test]
+    fn a_stored_namespace_members_call_is_read_by_its_flat_name() {
+        let tcs = serde_json::json!([
+            {"type": "function_call", "call_id": "c1", "namespace": "mcp__web", "name": "web_fetch", "arguments": "{}"}
+        ]);
+        let blocks = domain_assistant_content_from_stored(ApiVersion::Responses, None, Some(&tcs), None);
+        assert_matches!(&blocks[0], DomainContentBlock::ToolUse { name, .. } if name == "mcp__web__web_fetch");
+        let mut out = Vec::new();
+        convert_raw_items_to_domain(tcs.as_array().unwrap(), &mut out);
+        assert_matches!(&out[0].content[0], DomainContentBlock::ToolUse { name, .. } if name == "mcp__web__web_fetch");
+    }
+
     #[test]
     fn test_domain_assistant_content_from_stored_anthropic() {
         let tcs = serde_json::json!([
@@ -13462,6 +13485,7 @@ mod tests {
             store: Some(true),
             metadata: Some(serde_json::json!({})),
             extra: BTreeMap::new(),
+            namespaced: Default::default(),
         };
         assert_every_field_classified(
             &req,

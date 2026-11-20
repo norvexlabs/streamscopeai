@@ -1,9 +1,11 @@
-//! Mandatory audit pipeline — every proxied request produces an [`AuditRecord`].
+//! Audit pipeline — every proxied request produces an [`AuditRecord`].
 //!
 //! Records flow through an MPSC channel to a background writer task that batches
-//! them before forwarding. The channel has bounded capacity; when full, request
-//! handlers block (backpressure) rather than drop records. This guarantees a
-//! complete audit trail at the cost of latency under extreme load.
+//! them before forwarding. The channel has bounded capacity; what a full one
+//! does is `AUDIT_FAIL_MODE`'s ([`AuditSender::deliver`]): `closed` (the
+//! default) holds admission and waits, so no record is dropped in front of the
+//! outbox at the cost of throughput; `open` drops the record and counts it, so
+//! the gateway never slows down.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -25,8 +27,10 @@ fn one() -> f64 {
 /// stage invariants are `stream_tasks_spawned == stream_tasks_finalized` and
 /// `channel_sent == buffered (proxy-side) + writer_dropped` (`channel_lost`
 /// counts records the channel REJECTED — disjoint from `channel_sent`).
-/// A persistent gap localizes which stage lost a record — the audit trail is
-/// mandatory, so any nonzero loss counter is a defect signal.
+/// A persistent gap localizes which stage lost a record; a record dropped
+/// on a full channel under `AUDIT_FAIL_MODE=open` is in none of these
+/// stages, counted apart by [`dropped_records`]. Any other nonzero loss
+/// counter is a defect signal.
 pub struct EmissionStats {
     /// Streaming audit tasks spawned (`spawn_audit_task` calls).
     pub stream_tasks_spawned: AtomicU64,
@@ -88,6 +92,52 @@ impl<T> AuditSender<T> {
         Ok(())
     }
 
+    /// Wait until the channel has room for a record, taking none; returns
+    /// whether it had to wait. The gateway admits a request only once every
+    /// audit channel has room, so a writer behind the arrival rate slows
+    /// admission instead of holding finished requests' records in memory. A
+    /// closed channel does not hold anyone: its records are lost and logged
+    /// where they are sent.
+    pub async fn room(&self) -> bool {
+        if self.tx.capacity() > 0 {
+            return false;
+        }
+        // Waited only if the permit was not there at once (a slot freed
+        // between the two reads is no hold); a closed channel admits at once.
+        let started = tokio::time::Instant::now();
+        let reserved = self.tx.reserve().await.is_ok();
+        reserved && started.elapsed() > Duration::from_millis(1)
+    }
+
+    /// Deliver a request's record as [`AuditFailMode`](crate::settings::AuditFailMode)
+    /// says: `closed`, waiting for room (admission waited for room first, so
+    /// what waits here is bounded by the requests in flight); `open`, taking
+    /// room only if there is some, else
+    /// dropping the record — counted ([`dropped_records`]) and logged at most
+    /// once a minute. `Err` only when the channel is closed.
+    pub async fn deliver(&self, record: T) -> Result<Delivered, tokio::sync::mpsc::error::SendError<T>> {
+        self.deliver_as(crate::settings::core_settings().audit_fail_mode, record).await
+    }
+
+    /// [`Self::deliver`] under `mode`.
+    async fn deliver_as(
+        &self,
+        mode: crate::settings::AuditFailMode,
+        record: T,
+    ) -> Result<Delivered, tokio::sync::mpsc::error::SendError<T>> {
+        if mode == crate::settings::AuditFailMode::Closed {
+            return self.send(record).await.map(|()| Delivered::Sent);
+        }
+        match self.try_send(record) {
+            Ok(()) => Ok(Delivered::Sent),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                record_dropped();
+                Ok(Delivered::Dropped)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(record)) => Err(tokio::sync::mpsc::error::SendError(record)),
+        }
+    }
+
     /// Send, waiting for capacity. Counted only once the channel takes it, so
     /// a send cancelled while it waits leaves nothing counted.
     pub async fn send(&self, record: T) -> Result<(), tokio::sync::mpsc::error::SendError<T>> {
@@ -147,6 +197,42 @@ pub fn counted_channel<T>(capacity: usize) -> (AuditSender<T>, AuditReceiver<T>)
     let (tx, rx) = tokio::sync::mpsc::channel(capacity);
     let pending = std::sync::Arc::new(AtomicU64::new(0));
     (AuditSender { tx, pending: pending.clone() }, AuditReceiver { rx, pending })
+}
+
+/// What [`AuditSender::deliver`] did with a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivered {
+    /// The channel took it.
+    Sent,
+    /// Its channel was full under `AUDIT_FAIL_MODE=open`: dropped, counted.
+    Dropped,
+}
+
+/// Records dropped because their audit channel was full under
+/// `AUDIT_FAIL_MODE=open` (cumulative; `/metrics`).
+static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
+/// When a drop was last logged, in seconds since the epoch.
+static DROP_LOGGED_AT: AtomicU64 = AtomicU64::new(0);
+
+pub fn dropped_records() -> u64 {
+    DROPPED_RECORDS.load(Ordering::Relaxed)
+}
+
+/// Count (and log, at most once a minute) a record dropped because its
+/// channel was full — by [`AuditSender::deliver`], or by a sender that cannot
+/// wait (the legacy-SSE listener's `try_send`).
+pub fn record_dropped() {
+    let total = DROPPED_RECORDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let last = DROP_LOGGED_AT.load(Ordering::Relaxed);
+    if now >= last + 60 && DROP_LOGGED_AT.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        tracing::error!(
+            dropped_total = total,
+            "audit pipeline behind: records are dropped while an audit channel is full (a request's under \
+             AUDIT_FAIL_MODE=open, an upstream MCP event's in either mode; counted in \
+             streamscope_proxy_audit_dropped_records_total)"
+        );
+    }
 }
 
 /// Global emission accounting for the LLM audit pipeline.
@@ -352,17 +438,16 @@ pub struct AuditRecord {
     /// as the fallback when `request_messages_json` is absent.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub request_messages: Option<serde_json::Value>,
-    /// Pre-serialised per-message JSON, aligned 1:1 with `link_hashes`,
-    /// captured pre-transform — the primary form of the request messages
-    /// (no `Value` tree is built on the capture path). Transient — consumed
+    /// The request's messages, aligned 1:1 with `link_hashes`, captured
+    /// pre-transform: each one's JSON, or the stored key of one the content
+    /// store holds (`known_bodies::capture`, which reads each message's JSON
+    /// once to key it, the tree dropped at once). Transient — consumed
     /// by the edge SQLite buffer, then dropped before the audit row is
     /// forwarded to admin-api. Cleared when the media-strip pass replaces it
     /// with a mutated `request_messages` tree.
     #[serde(skip)]
-    pub request_messages_json: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub request_tools: Option<serde_json::Value>,
-    /// SHA-256 hash of `request_tools` (the client-sent tool blob). Resolves
+    pub request_messages_json: Option<Vec<crate::proxy::known_bodies::CapturedMessage>>,
+    /// SHA-256 hash of the client-sent tool blob. Resolves
     /// to a row in the central `tool_definitions` content-addressed side table.
     /// `None` when the request had no tools.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -606,7 +691,6 @@ impl Default for AuditRecord {
             catchall_method: None,
             request_messages: None,
             request_messages_json: None,
-            request_tools: None,
             tools_available_hash: None,
             tools_effective_hash: None,
             request_params: None,
@@ -689,8 +773,8 @@ pub fn create_audit_channel() -> (AuditSender<AuditRecord>, AuditReceiver<AuditR
 ///
 /// Drains the MPSC channel into batches of up to `batch_size` records, then writes
 /// them to the edge outbox (SQLite). Under high throughput the channel fills
-/// up and applies backpressure to request handlers (audit is mandatory —
-/// records are never dropped).
+/// up, and `AUDIT_FAIL_MODE` decides what a request's record then does
+/// ([`AuditSender::deliver`]).
 pub async fn audit_writer_task(
     mut rx: AuditReceiver<AuditRecord>,
     forwarder: Box<dyn AuditForwarderTrait + Send>,
@@ -956,6 +1040,40 @@ mod tests {
         // Positive control: a send with room counts.
         tx.send(4).await.expect("the channel has room");
         assert_eq!(pending.get(), 1);
+    }
+
+    /// Failing open, a record that finds its channel full is
+    /// dropped and counted at once, never waited for; one with room is taken.
+    #[tokio::test]
+    async fn failing_open_a_full_channel_drops_the_record_without_waiting() {
+        let open = crate::settings::AuditFailMode::Open;
+        let (tx, mut rx) = counted_channel::<u32>(1);
+        assert_eq!(tx.deliver_as(open, 1).await.expect("room: taken"), Delivered::Sent);
+        let before = dropped_records();
+        let dropped = tokio::time::timeout(Duration::from_millis(20), tx.deliver_as(open, 2))
+            .await
+            .expect("not waited for");
+        assert_eq!(dropped.expect("a drop is not an error"), Delivered::Dropped);
+        assert_eq!(dropped_records(), before + 1, "counted");
+        assert_eq!(rx.recv().await, Some(1), "the channel holds the first alone");
+    }
+
+    /// Failing closed, a record waits for room instead (the positive control
+    /// of the drop above): it is taken once the writer frees a slot.
+    #[tokio::test]
+    async fn failing_closed_a_full_channel_waits_for_room() {
+        let closed = crate::settings::AuditFailMode::Closed;
+        let (tx, mut rx) = counted_channel::<u32>(1);
+        tx.deliver_as(closed, 1).await.expect("room: taken");
+        let waiting = tokio::spawn({
+            let tx = tx.clone();
+            async move { tx.deliver_as(closed, 2).await.map_err(|_| ()) }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished(), "held while full");
+        assert_eq!(rx.recv().await, Some(1));
+        assert_eq!(waiting.await.unwrap(), Ok(Delivered::Sent));
+        assert_eq!(rx.recv().await, Some(2));
     }
 
     #[test]

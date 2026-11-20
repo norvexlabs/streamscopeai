@@ -793,7 +793,7 @@ async fn accessible_providers(
 
 use super::audit::{
     get_session_conversation_impl, get_trace_impl, AuditKind, AuditLogRow,
-    AuditQuery, SessionLinkage, SessionSort, ConversationResponse, LinkedSessions, ResponseFormat,
+    AuditQuery, LinkedSessionsQuery, SessionLinkage, SessionSort, ConversationResponse, LinkedSessions, ResponseFormat,
     SessionListQuery, SessionNotFound, SessionSummary, ToolDefinitionBlobResponse, ToolDefinitionQuery, TraceResponse,
     tool_definition_response,
 };
@@ -938,11 +938,12 @@ pub struct PortalSessionQuery {
     pub search: Option<String>,
     pub start: Option<chrono::DateTime<chrono::Utc>>,
     pub end: Option<chrono::DateTime<chrono::Utc>>,
-    /// Default `newest`. While expert findings are withheld from members,
-    /// `alerts` is read as `newest`.
+    /// Default `newest`. `alerts` ranks only the alerts the member is shown
+    /// (each session's workspace profile decides), and is refused with a
+    /// `search` term (`sort_unsupported_with_search`).
     pub sort: Option<SessionSort>,
-    /// Sessions whose alert is exactly this level. Ignored while expert
-    /// findings are withheld from members.
+    /// Sessions whose alert is exactly this level, among the alerts the member
+    /// is shown: a session whose workspace profile hides alerts never matches.
     pub alert_level: Option<streamscope_core::audit::AlertLevel>,
     /// Filter by app_id (agent type, e.g. "opencode", "claude-code").
     pub app_id: Option<String>,
@@ -1015,7 +1016,7 @@ fn teammate_filter(scope: &PortalDataScope, user_email: Option<String>) -> Optio
     params(PortalSessionQuery),
     responses(
         (status = 200, description = "The session summaries the caller may read", body = OffsetPage<SessionSummary>),
-        (status = 400, description = "`start` is not before `end`, or a search term under 3 characters", body = ApiErrorResponse),
+        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 403, description = "The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -1029,12 +1030,8 @@ pub async fn my_sessions(
 ) -> Result<Json<OffsetPage<SessionSummary>>, ApiError> {
     super::check_bounds(q.start, q.end)?;
     super::check_search(q.search.as_deref())?;
-    // Expert findings are withheld from members (`portal_view`): the alert
-    // filter and the alert order are accepted and NOT applied, or the rows
-    // returned would reveal the alerts. Dropped first, so `alerts` with a
-    // search term is read as the default order rather than refused.
-    let _withheld = q.alert_level;
-    let sort = q.sort.filter(|s| *s != SessionSort::Alerts);
+    SessionSort::check_with_search(q.sort, q.search.as_deref())?;
+    SessionLinkage::check_with_search(q.linked, q.search.as_deref())?;
     let limit = q
         .limit
         .unwrap_or(crate::audit_store::sessions::SESSIONS_DEFAULT_LIMIT)
@@ -1053,7 +1050,10 @@ pub async fn my_sessions(
     query.app_id = q.app_id;
     query.linked = q.linked;
     query.user_email = teammate_filter(&data_scope, q.user_email);
-    query.sort = sort;
+    // Both read the alert as the store masks it for this scope, so neither
+    // reveals one a session's workspace hides.
+    query.alert_level = q.alert_level;
+    query.sort = q.sort;
     // Overfetch +1 for cheap has_more (impl trusts the passed limit).
     query.limit = Some(limit + 1);
     query.offset = Some(offset);
@@ -1100,7 +1100,7 @@ pub async fn my_session_conversation(
     get,
     path = "/api/v1/portal/sessions/{id}/linked",
     tag = "Portal",
-    params(("id" = Uuid, Path, description = "Session id"), PortalScopeQuery),
+    params(("id" = Uuid, Path, description = "Session id"), PortalScopeQuery, LinkedSessionsQuery),
     responses(
         (status = 200, description = "Parent/child sessions linked to the caller's own session", body = LinkedSessions),
         (status = 404, description = "Session not found or not owned", body = ApiErrorResponse),
@@ -1114,13 +1114,14 @@ pub async fn my_session_linked(
     Extension(user): Extension<PortalUser>,
     Path(session_id): Path<Uuid>,
     Query(q): Query<PortalScopeQuery>,
+    Query(linked): Query<LinkedSessionsQuery>,
 ) -> Result<Json<LinkedSessions>, ApiError> {
     let scope = PortalDataScope::resolve(db.conn(), &user, q.workspace_id).await?;
     // Gate the root session, then confine the parent/child summaries to the
     // caller: a linked parent or child can belong to another member of the
     // tenant, or of a shared workspace.
     assert_session_owned(db.conn(), session_id, &scope).await?;
-    linked_sessions_in_portal_scope(db.conn(), session_id, &scope).await.map(|l| Json(l.for_member()))
+    linked_sessions_in_portal_scope(db.conn(), session_id, &scope, linked).await.map(|l| Json(l.for_member()))
 }
 
 #[utoipa::path(

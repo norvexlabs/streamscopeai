@@ -76,6 +76,13 @@ impl AuditScope {
         self.include_keyless
     }
 
+    /// Whether the scope is a portal member's: what its rows say of other
+    /// sessions, and which expert findings they carry, follow the member's
+    /// view and each session's workspace.
+    pub(crate) fn confined(&self) -> bool {
+        self.confined
+    }
+
     /// The user and the workspaces a linked session (a row's parent or child)
     /// must belong to for the row to name it: the portal's confinement, and
     /// `(None, None)` — every linked session in the tenant — for a tenant-wide

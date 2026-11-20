@@ -165,6 +165,7 @@ impl PendingInterceptedCall {
         &mut self,
         tool_rules: &[crate::config::tool_rules::Rule],
         field_profiles: &crate::config::tool_rules::FieldProfileSet,
+        mcp_names: &crate::config::tool_names::McpToolNames,
         model: Option<&str>,
         app_id: Option<&str>,
         withheld_tools: &[crate::proxy::content::BlockedToolInfo],
@@ -197,6 +198,7 @@ impl PendingInterceptedCall {
                 rules,
                 withheld_tools,
                 field_profiles,
+                mcp_names,
                 model,
                 app_id,
                 &name,
@@ -824,6 +826,10 @@ pub struct BlockAccumulator {
     /// `TenantConfig.tool_field_profiles`. Drives `arg.<field>` canonicalisation
     /// before rule matching so spacing / encoding tricks don't bypass rules.
     tool_field_profiles: Arc<crate::config::tool_rules::FieldProfileSet>,
+    /// The tenant's virtual servers, for reading the MCP server of a called
+    /// tool exactly as the request side reads a declared one
+    /// ([`crate::config::tool_names::resolve_tool_name`]).
+    mcp_tool_names: Arc<crate::config::tool_names::McpToolNames>,
     /// Response-phase transform programs.
     response_programs: Vec<TransformProgram>,
     /// Script engine for executing response-phase Rhai scripts.
@@ -915,6 +921,7 @@ impl BlockAccumulator {
             interests,
             tool_rules,
             tool_field_profiles,
+            mcp_tool_names: Arc::default(),
             response_programs,
             script_engine,
             request_meta,
@@ -936,6 +943,13 @@ impl BlockAccumulator {
             heal_tool_args,
             tool_calls_delivered: 0,
         }
+    }
+
+    /// The tenant's virtual servers (`McpConfig::tool_names`), so a called
+    /// tool's MCP server is read as the request side reads it.
+    pub fn mcp_tool_names(mut self, names: Arc<crate::config::tool_names::McpToolNames>) -> Self {
+        self.mcp_tool_names = names;
+        self
     }
 
     /// Refuse a call to a tool the request withheld — a declaration tool
@@ -1678,7 +1692,7 @@ impl BlockAccumulator {
     fn police_intercepted(&mut self, call: &mut PendingInterceptedCall) {
         let model = self.request_meta.as_ref().map(|m| m.model.as_str());
         let app_id = self.request_meta.as_ref().and_then(|m| m.app_id.as_deref());
-        let record = call.police(&self.tool_rules, &self.tool_field_profiles, model, app_id, &self.withheld_tools);
+        let record = call.police(&self.tool_rules, &self.tool_field_profiles, &self.mcp_tool_names, model, app_id, &self.withheld_tools);
         if record.blocked.is_some() {
             self.stats.tool_blocks_blocked += 1;
         }
@@ -2201,11 +2215,6 @@ impl BlockAccumulator {
                 rule_title: Some(withheld.title.clone()),
             };
         }
-        let (tool_name, mcp_server) = match tool_rules::parse_mcp_namespace(raw_tool_name) {
-            Some((srv, local)) => (local, Some(srv)),
-            None => (raw_tool_name, None),
-        };
-
         let args: Option<serde_json::Value> = if !block.tool_arguments.is_empty() {
             serde_json::from_str(&block.tool_arguments).ok()
         } else {
@@ -2214,18 +2223,22 @@ impl BlockAccumulator {
 
         let model = self.request_meta.as_ref().map(|m| m.model.as_str());
         let app_id = self.request_meta.as_ref().and_then(|m| m.app_id.as_deref());
+        let crate::config::tool_names::ToolName { local: tool_name, mcp_server, .. } =
+            crate::config::tool_names::resolve_tool_name(
+                raw_tool_name,
+                app_id,
+                Some(&self.mcp_tool_names),
+                Some(&self.tool_field_profiles),
+            );
         let tool_id = self
             .tool_field_profiles
             .resolve_tool_id(tool_name, app_id, mcp_server)
             .map(|s| s.to_string());
-        // LLM-proxy path: `mcp_server` derived from the wire-name namespace
-        // prefix is a heuristic, not authoritative. `mcp_server_filter` rules
-        // only fire on the MCP gateway (where the upstream comes from the
-        // route mapping), so pass `None` here for parity with the pre-check
-        // in `prepare_block_interests`. The wire-derived `mcp_server` still
-        // flows into `ToolCallResolver` for field-profile lookup, which IS
-        // legitimately scoped per-server.
-        let scoped = tool_rules::extract_for(
+        // The call's MCP server is the one its name resolves to — a gateway
+        // tool's upstream, or the server a client-run tool's `mcp__` name
+        // carries — so a server-filtered rule meets the call as it does on the
+        // MCP path.
+        let scoped: Vec<&tool_rules::Rule> = tool_rules::extract_for_each_tool(
             &self.tool_rules,
             Phase::Response,
             Scope::ToolCalls,
@@ -2234,7 +2247,10 @@ impl BlockAccumulator {
                 app_id,
                 ..Default::default()
             },
-        );
+        )
+        .into_iter()
+        .filter(|rule| tool_rules::applies_to_server(rule, mcp_server))
+        .collect();
         let resolver = ToolCallResolver {
             name: tool_name,
             arguments: args.as_ref(),
@@ -2440,7 +2456,7 @@ pub fn compute_interests(
     // forces tool-block buffering: the BlockAccumulator needs the complete
     // tool_use to evaluate args, attach rule id + arguments to the audit
     // record, or mutate args.
-    let has_response_tool_rules = crate::config::tool_rules::extract_for(
+    let has_response_tool_rules = crate::config::tool_rules::extract_for_each_tool(
         tool_rules,
         crate::config::tool_rules::Phase::Response,
         crate::config::tool_rules::Scope::ToolCalls,
@@ -2516,11 +2532,13 @@ fn settle_finish_reason_json(
 /// Returns the captured `BlockedToolInfo` list and a list of tool names that
 /// were blocked. Callers feed the names into `BadgeBuilder::add_tool_blocked`
 /// so the audit chip rolls up name + count.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_response_policy_json(
     response_json: &mut serde_json::Value,
     upstream_version: crate::api::sse::ApiVersion,
     tool_rules: &[crate::config::tool_rules::Rule],
     field_profiles: &crate::config::tool_rules::FieldProfileSet,
+    mcp_names: &crate::config::tool_names::McpToolNames,
     model: Option<&str>,
     app_id: Option<&str>,
     withheld_tools: &[crate::proxy::content::BlockedToolInfo],
@@ -2569,6 +2587,7 @@ pub fn apply_response_policy_json(
                                 tool_rules,
                                 withheld_tools,
                                 field_profiles,
+                                mcp_names,
                                 model,
                                 app_id,
                                 &name,
@@ -2680,6 +2699,7 @@ pub fn apply_response_policy_json(
                         tool_rules,
                         withheld_tools,
                         field_profiles,
+                        mcp_names,
                         model,
                         app_id,
                         &name,
@@ -2774,6 +2794,7 @@ pub fn apply_response_policy_json(
                         tool_rules,
                         withheld_tools,
                         field_profiles,
+                        mcp_names,
                         model,
                         app_id,
                         &name,
@@ -2857,6 +2878,7 @@ pub fn apply_response_policy_json(
                         tool_rules,
                         withheld_tools,
                         field_profiles,
+                        mcp_names,
                         model,
                         app_id,
                         &name,
@@ -2988,7 +3010,7 @@ pub fn extract_round_calls(
                                 continue;
                             };
                             let name = call.name;
-                            let Some(binding) = find_binding(name) else {
+                            let Some(binding) = find_binding(&name) else {
                                 if !name.is_empty() {
                                     real.push(RoundRealCall {
                                         thought_signature: None,
@@ -3057,7 +3079,7 @@ pub fn extract_round_calls(
                     let name = call.name;
                     // A built-in tool's call is the client's to run, whatever
                     // its name: no substitution binding takes it.
-                    let binding = if call.builtin.is_some() { None } else { find_binding(name) };
+                    let binding = if call.builtin.is_some() { None } else { find_binding(&name) };
                     let Some(binding) = binding else {
                         if !name.is_empty() {
                             real.push(RoundRealCall {
@@ -3139,7 +3161,7 @@ pub fn response_tool_policy_acts(
 ) -> bool {
     use crate::config::tool_rules::{self, ActionKind};
     !withheld_tools.is_empty()
-        || tool_rules::extract_for(
+        || tool_rules::extract_for_each_tool(
             tool_rules,
             tool_rules::Phase::Response,
             tool_rules::Scope::ToolCalls,
@@ -3175,6 +3197,7 @@ pub fn real_calls_the_policy_removes(
     bindings: &[crate::proxy::content::InterceptBinding],
     tool_rules: &[crate::config::tool_rules::Rule],
     field_profiles: &crate::config::tool_rules::FieldProfileSet,
+    mcp_names: &crate::config::tool_names::McpToolNames,
     model: Option<&str>,
     app_id: Option<&str>,
     withheld_tools: &[crate::proxy::content::BlockedToolInfo],
@@ -3195,6 +3218,7 @@ pub fn real_calls_the_policy_removes(
         upstream_version,
         tool_rules,
         field_profiles,
+        mcp_names,
         model,
         app_id,
         withheld_tools,
@@ -3248,7 +3272,7 @@ pub fn splice_intercepted_from_response_json(
                         .and_then(|tc| tc.as_array_mut())
                     {
                         tool_calls.retain(|tc| {
-                            crate::api::domain::tool_call_item(tc).is_none_or(|call| !matches(call.name))
+                            crate::api::domain::tool_call_item(tc).is_none_or(|call| !matches(&call.name))
                         });
                         // If we emptied the array, Chat Completions still
                         // expects either an absent field or an empty list.
@@ -3285,7 +3309,7 @@ pub fn splice_intercepted_from_response_json(
             {
                 output.retain(|item| {
                     crate::api::domain::tool_call_item(item)
-                        .is_none_or(|call| call.builtin.is_some() || !matches(call.name))
+                        .is_none_or(|call| call.builtin.is_some() || !matches(&call.name))
                 });
             }
         }
@@ -4044,6 +4068,7 @@ fn evaluate_response_tool_call_policy(
     rules: &[crate::config::tool_rules::Rule],
     withheld_tools: &[crate::proxy::content::BlockedToolInfo],
     field_profiles: &crate::config::tool_rules::FieldProfileSet,
+    mcp_names: &crate::config::tool_names::McpToolNames,
     model: Option<&str>,
     app_id: Option<&str>,
     name: &str,
@@ -4061,18 +4086,14 @@ fn evaluate_response_tool_call_policy(
             description: withheld.description.clone(),
         };
     }
-    let (effective_name, mcp_server) = match tool_rules::parse_mcp_namespace(name) {
-        Some((srv, local)) => (local, Some(srv)),
-        None => (name, None),
-    };
+    let crate::config::tool_names::ToolName { local: effective_name, mcp_server, .. } =
+        crate::config::tool_names::resolve_tool_name(name, app_id, Some(mcp_names), Some(field_profiles));
     let tool_id = field_profiles
         .resolve_tool_id(effective_name, app_id, mcp_server)
         .map(|s| s.to_string());
-    // LLM-proxy enforcement: pass `None` for `mcp_server` so server-filtered
-    // rules only fire on the MCP gateway path (where the upstream is
-    // authoritative). Wire-derived `mcp_server` from the namespace prefix is
-    // a heuristic — keep it for field-profile lookup but not rule filtering.
-    let scoped = tool_rules::extract_for(
+    // The call's MCP server is the one its name resolves to, so a
+    // server-filtered rule meets the call as it does on the MCP path.
+    let scoped: Vec<&tool_rules::Rule> = tool_rules::extract_for_each_tool(
         rules,
         Phase::Response,
         Scope::ToolCalls,
@@ -4081,7 +4102,10 @@ fn evaluate_response_tool_call_policy(
             app_id,
             ..Default::default()
         },
-    );
+    )
+    .into_iter()
+    .filter(|rule| tool_rules::applies_to_server(rule, mcp_server))
+    .collect();
     let resolver = ToolCallResolver {
         name: effective_name,
         arguments: args,
@@ -5543,7 +5567,7 @@ mod tests {
         for (wire, answer) in cases {
             let mut policed = answer.clone();
             let (_, infos, _) = apply_response_policy_json(
-                &mut policed, wire, &[], &default_test_profiles(), None, None, &withheld,
+                &mut policed, wire, &[], &default_test_profiles(), &Default::default(), None, None, &withheld,
             );
             let places: Vec<_> = infos.iter().map(|i| i.call_index).collect();
             let mut row = crate::pipeline::response::TransformState::new(wire);
@@ -5645,7 +5669,7 @@ mod tests {
             let policy = |name: &str, withheld: &[crate::proxy::content::BlockedToolInfo]| {
                 let mut response = answer(wire, name);
                 let (names, infos, _) =
-                    apply_response_policy_json(&mut response, wire, &[], &default_test_profiles(), None, None, withheld);
+                    apply_response_policy_json(&mut response, wire, &[], &default_test_profiles(), &Default::default(), None, None, withheld);
                 (response, names, infos)
             };
             let (response, names, infos) = policy("WebFetch", &withheld);
@@ -5736,6 +5760,126 @@ mod tests {
         assert_eq!(tool_events.len(), 1); // Only the safe one
         assert_eq!(acc.stats.tool_blocks_checked, 2);
         assert_eq!(acc.stats.tool_blocks_blocked, 1);
+    }
+
+    /// A gateway virtual server's tool is policed under its upstream's own
+    /// profile on the answer, streamed or not — the same reading as the
+    /// request's (`resolve_tool_name`). Without the tenant's servers the slug
+    /// is taken for the server and the upstream's profile never matches.
+    #[test]
+    fn a_gateway_tool_is_policed_under_its_upstreams_profile_on_the_answer() {
+        let profiles = crate::config::tool_rules::FieldProfileSet::new(vec![
+            serde_json::from_value(json!({"tool_id": "web_fetch", "tool_pattern": "web_fetch",
+                "mcp_server": "builtin-web", "field": "url", "normalizer": "url"}))
+            .expect("profile"),
+        ]);
+        let rules = rules_from_json(vec![json!({
+            "id": "block-fetch", "phase": "response", "scope": "tool_calls", "risk": "danger",
+            "match": [{ "target": "tool_id", "op": "equals", "value": "web_fetch" }],
+            "action": { "kind": "block" }
+        })]);
+        let servers = Arc::new(crate::config::tool_names::McpToolNames::new(vec![
+            crate::config::tool_names::ToolNameRoute {
+                virtual_server_slug: "web".into(),
+                prefix: String::new(),
+                upstream_name: "builtin-web".into(),
+                route_id: uuid::Uuid::new_v4(),
+            },
+        ]));
+        let args = json!({"url": "https://example.com"});
+        let buffered = |names: &crate::config::tool_names::McpToolNames| {
+            evaluate_response_tool_call_policy(
+                &rules, &[], &profiles, names, None, None, "mcp__web__web_fetch", &args.to_string(), Some(&args),
+            )
+        };
+        assert!(matches!(buffered(&servers), ToolCallPolicy::Block { .. }), "the upstream's profile must block");
+        assert!(matches!(buffered(&Default::default()), ToolCallPolicy::Allow), "the slug alone matches no profile");
+
+        let streamed = |names: Arc<crate::config::tool_names::McpToolNames>| {
+            let mut acc = make_tool_accumulator_with_profiles(rules.clone(), profiles.clone()).mcp_tool_names(names);
+            acc.process(
+                DomainEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    function_name: Some("mcp__web__web_fetch".into()),
+                    arguments_delta: args.to_string(),
+                    form: crate::api::domain::CallArguments::Json,
+                },
+                None,
+            );
+            acc.process(done_event(), None);
+            acc.stats.tool_blocks_blocked
+        };
+        assert_eq!(streamed(servers), 1);
+        assert_eq!(streamed(Arc::default()), 0);
+    }
+
+    /// A rule filtered on an MCP server meets a model's call to that server's
+    /// tool — a gateway tool by its upstream, a client-run server by the name
+    /// its `mcp__` form carries — streamed or not, and no call of another
+    /// server or of none. Neither pre-check that decides whether the answer's
+    /// policy runs at all may drop such a rule for want of a server.
+    #[test]
+    fn a_server_filtered_rule_meets_the_calls_of_its_server_on_the_answer() {
+        let profiles = crate::config::tool_rules::FieldProfileSet::new(vec![
+            serde_json::from_value(json!({"tool_id": "web_fetch", "tool_pattern": "web_fetch",
+                "field": "url", "normalizer": "url"}))
+            .expect("profile"),
+        ]);
+        let rules = rules_from_json(vec![json!({
+            "id": "block-fetch", "phase": "response", "scope": "tool_calls", "risk": "danger",
+            "mcp_server_filter": "builtin-web|local-*",
+            "match": [{ "target": "tool_id", "op": "equals", "value": "web_fetch" }],
+            "action": { "kind": "block" }
+        })]);
+        let servers = crate::config::tool_names::McpToolNames::new(vec![
+            crate::config::tool_names::ToolNameRoute {
+                virtual_server_slug: "web".into(),
+                prefix: String::new(),
+                upstream_name: "builtin-web".into(),
+                route_id: uuid::Uuid::new_v4(),
+            },
+        ]);
+        let servers = Arc::new(servers);
+        let args = json!({"url": "https://example.com"});
+        let buffered = |name: &str| {
+            matches!(
+                evaluate_response_tool_call_policy(
+                    &rules, &[], &profiles, &servers, None, None, name, &args.to_string(), Some(&args),
+                ),
+                ToolCallPolicy::Block { .. }
+            )
+        };
+        let streamed = |name: &str| {
+            let mut acc = make_tool_accumulator_with_profiles(rules.clone(), profiles.clone())
+                .mcp_tool_names(servers.clone());
+            acc.process(
+                DomainEvent::ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    function_name: Some(name.into()),
+                    arguments_delta: args.to_string(),
+                    form: crate::api::domain::CallArguments::Json,
+                },
+                None,
+            );
+            acc.process(done_event(), None);
+            acc.stats.tool_blocks_blocked == 1
+        };
+        for (name, blocked) in [
+            ("mcp__web__web_fetch", true),
+            ("mcp__local-fs__web_fetch", true),
+            // Codex writes a server's `-` as `_`.
+            ("mcp__local_fs__web_fetch", true),
+            ("mcp__docs__web_fetch", false),
+            ("web_fetch", false),
+        ] {
+            assert_eq!(buffered(name), blocked, "{name}, buffered");
+            assert_eq!(streamed(name), blocked, "{name}, streamed");
+        }
+
+        assert!(response_tool_policy_acts(&rules, None, None, &[]));
+        assert!(compute_interests(&[], &rules, None, None).buffer_tool_blocks);
     }
 
     #[test]
@@ -5974,7 +6118,7 @@ mod tests {
         })]);
         let decide = |command: serde_json::Value| {
             let args = json!({ "command": command });
-            evaluate_response_tool_call_policy(&rules, &[], &set, None, None, "shell", &args.to_string(), Some(&args))
+            evaluate_response_tool_call_policy(&rules, &[], &set, &Default::default(), None, None, "shell", &args.to_string(), Some(&args))
         };
         let patch = "*** Begin Patch\n*** Add File: .github/workflows/ci.yml\n+x\n*** End Patch";
         assert!(matches!(
@@ -6026,7 +6170,7 @@ mod tests {
         });
 
         let (blocked_names, _blocked_infos, _arg_mods) =
-            apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &rules, &default_test_profiles(), None, None, &[]);
+            apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &rules, &default_test_profiles(), &Default::default(), None, None, &[]);
 
         let tool_calls = response["choices"][0]["message"]["tool_calls"]
             .as_array()
@@ -6074,7 +6218,7 @@ mod tests {
             }]
         });
         let (blocked_names, _, _) =
-            apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &rules, &default_test_profiles(), None, None, &[]);
+            apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &rules, &default_test_profiles(), &Default::default(), None, None, &[]);
         assert_eq!(blocked_names.len(), 1);
         let message = &response["choices"][0]["message"];
         assert_eq!(crate::api::chat::message_reasoning(message).as_deref(), Some("why"));
@@ -6664,7 +6808,7 @@ mod tests {
             ]
         });
         let (blocked, infos, _) = apply_response_policy_json(
-            &mut response, ApiVersion::Responses, &block_patch_deletes(), &default_test_profiles(), None, None,
+            &mut response, ApiVersion::Responses, &block_patch_deletes(), &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
         assert_eq!(blocked, ["apply_patch"]);
@@ -6685,7 +6829,7 @@ mod tests {
         let mut response = json!({"output": [
             {"type": "custom_tool_call", "call_id": "call_1", "name": "apply_patch", "input": "*** Delete File: a.txt"}
         ]});
-        apply_response_policy_json(&mut response, ApiVersion::Responses, &rewrite, &default_test_profiles(), None, None, &[]);
+        apply_response_policy_json(&mut response, ApiVersion::Responses, &rewrite, &default_test_profiles(), &Default::default(), None, None, &[]);
         let call = &response["output"][0];
         assert_eq!(call["type"], "custom_tool_call");
         assert_eq!(call["input"], "*** Begin Patch", "{call}");
@@ -6779,7 +6923,7 @@ mod tests {
                 {"id": "call_2", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Update File: b.txt"}}
             ]}}]});
         let (blocked, infos, _) = apply_response_policy_json(
-            &mut response, ApiVersion::ChatCompletions, &block_patch_deletes(), &default_test_profiles(), None, None,
+            &mut response, ApiVersion::ChatCompletions, &block_patch_deletes(), &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
         assert_eq!(blocked, ["apply_patch"]);
@@ -6797,7 +6941,7 @@ mod tests {
         let mut response = json!({"choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [
             {"id": "call_1", "type": "custom", "custom": {"name": "apply_patch", "input": "*** Delete File: a.txt"}}
         ]}}]});
-        apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &rewrite, &default_test_profiles(), None, None, &[]);
+        apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &rewrite, &default_test_profiles(), &Default::default(), None, None, &[]);
         let call = &response["choices"][0]["message"]["tool_calls"][0];
         assert_eq!(call["custom"]["input"], "*** Begin Patch", "{call}");
         assert!(call.get("function").is_none());
@@ -7754,7 +7898,7 @@ mod tests {
         });
 
         let (blocked_names, _blocked_infos, _arg_mods) =
-            apply_response_policy_json(&mut response, ApiVersion::AnthropicMessages, &rules, &default_test_profiles(), None, None, &[]);
+            apply_response_policy_json(&mut response, ApiVersion::AnthropicMessages, &rules, &default_test_profiles(), &Default::default(), None, None, &[]);
 
         let content = response["content"].as_array().unwrap();
         assert_eq!(content.len(), 3); // text block + safe tool_use + block notice
@@ -7795,7 +7939,7 @@ mod tests {
         });
 
         let (blocked_names, _blocked_infos, _arg_mods) =
-            apply_response_policy_json(&mut response, ApiVersion::Responses, &rules, &default_test_profiles(), None, None, &[]);
+            apply_response_policy_json(&mut response, ApiVersion::Responses, &rules, &default_test_profiles(), &Default::default(), None, None, &[]);
 
         let output = response["output"].as_array().unwrap();
         assert_eq!(output.len(), 3); // message + safe function_call + block notice
@@ -7824,7 +7968,7 @@ mod tests {
         });
 
         let (blocked_names, _blocked_infos, _arg_mods) =
-            apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &[], &Default::default(), None, None, &[]);
+            apply_response_policy_json(&mut response, ApiVersion::ChatCompletions, &[], &Default::default(), &Default::default(), None, None, &[]);
 
         let tool_calls = response["choices"][0]["message"]["tool_calls"].as_array().unwrap();
         assert_eq!(tool_calls.len(), 1); // nothing blocked
@@ -7878,7 +8022,7 @@ mod tests {
 
         let (blocked, _, _) = apply_response_policy_json(
             &mut response, ApiVersion::ChatCompletions, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -7912,7 +8056,7 @@ mod tests {
 
         apply_response_policy_json(
             &mut response, ApiVersion::ChatCompletions, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -7936,7 +8080,7 @@ mod tests {
 
         apply_response_policy_json(
             &mut response, ApiVersion::ChatCompletions, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -7957,7 +8101,7 @@ mod tests {
 
         apply_response_policy_json(
             &mut response, ApiVersion::AnthropicMessages, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -7984,7 +8128,7 @@ mod tests {
 
         apply_response_policy_json(
             &mut response, ApiVersion::AnthropicMessages, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -8008,7 +8152,7 @@ mod tests {
 
         let (blocked, _, _) = apply_response_policy_json(
             &mut response, ApiVersion::GoogleGemini, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -8038,7 +8182,7 @@ mod tests {
 
         apply_response_policy_json(
             &mut response, ApiVersion::Responses, &block_rm_rf(),
-            &default_test_profiles(), None, None,
+            &default_test_profiles(), &Default::default(), None, None,
             &[],
         );
 
@@ -8566,14 +8710,14 @@ mod tests {
         for named in ["ssai_web_fetch", "WebFetch"] {
             let profiles = fetch_profile_for(named);
             let mut call = fetch_call("https://pastebin.com/raw/x");
-            let record = call.police(&rules, &profiles, None, None, &[]);
+            let record = call.police(&rules, &profiles, &Default::default(), None, None, &[]);
             assert_eq!(call.blocked.as_deref(), Some("paste sites are exfiltration"), "read as {named}");
             let info = record.blocked.expect("the block is recorded");
             assert_eq!((info.name.as_str(), info.rule_id.as_str()), ("WebFetch", "NO-PASTE"));
             assert_eq!(info.tool_use_id.as_deref(), Some("call_1"));
 
             let mut call = fetch_call("https://example.com/");
-            let record = call.police(&rules, &profiles, None, None, &[]);
+            let record = call.police(&rules, &profiles, &Default::default(), None, None, &[]);
             assert!(call.blocked.is_none() && record.blocked.is_none(), "read as {named}");
         }
     }
@@ -8586,12 +8730,12 @@ mod tests {
         let withheld = [withheld_web_fetch()];
         let profiles = fetch_profile_for("WebFetch");
         let mut call = fetch_call("https://example.com/");
-        let record = call.police(&[], &profiles, None, None, &withheld);
+        let record = call.police(&[], &profiles, &Default::default(), None, None, &withheld);
         assert_eq!(call.blocked.as_deref(), Some("WebFetch is withheld"));
         assert_eq!(record.blocked.map(|b| b.rule_id).as_deref(), Some("R-FETCH"));
 
         let mut call = fetch_call("https://example.com/");
-        let record = call.police(&[], &profiles, None, None, &[]);
+        let record = call.police(&[], &profiles, &Default::default(), None, None, &[]);
         assert!(call.blocked.is_none() && record.blocked.is_none());
     }
 
@@ -8599,7 +8743,7 @@ mod tests {
     fn a_rewrite_changes_what_the_gateway_runs() {
         let rules = [fetch_rule(serde_json::json!({"kind": "replace", "regex": "pastebin\\.com", "with": "example.com"}))];
         let mut call = fetch_call("https://pastebin.com/raw/x");
-        let record = call.police(&rules, &fetch_profile_for("WebFetch"), None, None, &[]);
+        let record = call.police(&rules, &fetch_profile_for("WebFetch"), &Default::default(), None, None, &[]);
         assert!(call.blocked.is_none());
         assert_eq!(call.arguments_json, r#"{"url":"https://example.com/raw/x"}"#);
         assert_eq!(record.modifications.len(), 1);
@@ -8640,7 +8784,7 @@ mod tests {
         let profiles = fetch_profile_for("ssai_web_fetch");
         for (url, blocked) in [("https://pastebin.com/raw/x", true), ("https://example.com/", false)] {
             let mut call = PendingInterceptedCall { tool_name: "WebFetch".into(), ..fetch_call(url) };
-            call.police(&rules, &profiles, None, None, &[]);
+            call.police(&rules, &profiles, &Default::default(), None, None, &[]);
             assert_eq!(call.blocked.is_some(), blocked, "{url}");
         }
     }
@@ -8658,7 +8802,7 @@ mod tests {
         ];
         let profiles = fetch_profiles(&[("ssai_web_fetch", "sub_fetch"), ("WebFetch", "web_fetch")]);
         let mut call = fetch_call("https://pastebin.com/raw/x");
-        let record = call.police(&rules, &profiles, None, None, &[]);
+        let record = call.police(&rules, &profiles, &Default::default(), None, None, &[]);
         assert_eq!(record.blocked.as_ref().map(|b| b.rule_id.as_str()), Some("CLIENT-BLOCK"));
         assert!(record.modifications.is_empty(), "{:?}", record.modifications);
         assert_eq!(call.arguments_json, r#"{"url":"https://pastebin.com/raw/x"}"#);
@@ -8708,7 +8852,7 @@ mod tests {
         // client's: the rule reads it under both, and rewrites it once.
         let rules = [fetch_rule(serde_json::json!({"kind": "replace", "regex": "(pastebin\\.com)", "with": "$1.invalid"}))];
         let mut call = fetch_call("https://pastebin.com/raw/x");
-        let record = call.police(&rules, &fetch_profile_for("ssai_web_fetch|WebFetch"), None, None, &[]);
+        let record = call.police(&rules, &fetch_profile_for("ssai_web_fetch|WebFetch"), &Default::default(), None, None, &[]);
         assert_eq!(call.arguments_json, r#"{"url":"https://pastebin.com.invalid/raw/x"}"#);
         assert_eq!(record.modifications.len(), 1);
     }
@@ -8913,7 +9057,7 @@ mod tests {
             arguments: None,
         };
         let decide = |response: &serde_json::Value, version, withheld: &[crate::proxy::content::BlockedToolInfo]| {
-            real_calls_the_policy_removes(response, version, &bindings, &[], &default_test_profiles(), None, None, withheld, false)
+            real_calls_the_policy_removes(response, version, &bindings, &[], &default_test_profiles(), &Default::default(), None, None, withheld, false)
         };
         let anthropic = json!({"content": [
             {"type": "tool_use", "id": "toolu_s", "name": "web_search", "input": {"query": "X"}},
@@ -12226,7 +12370,7 @@ mod tests {
         // Non-streaming, the same.
         let profiles = acc.tool_field_profiles.clone();
         let mut response = json!({"output": [item("completed")]});
-        apply_response_policy_json(&mut response, crate::api::sse::ApiVersion::Responses, &block_destructive_shell(), &profiles, None, None, &[]);
+        apply_response_policy_json(&mut response, crate::api::sse::ApiVersion::Responses, &block_destructive_shell(), &profiles, &Default::default(), None, None, &[]);
         assert!(!response.to_string().contains("SECRET"), "{response}");
     }
 
@@ -12410,7 +12554,7 @@ mod tests {
         assert!(notice["id"].is_string() && notice["status"] == "completed" && notice["content"][0]["annotations"] == json!([]),
             "the notice is a whole output message: {notice}");
         assert!(injected.iter().any(|b| b.action == "remove" && b.field == "tool_call"), "{injected:?}");
-        let (blocked, _, mods) = apply_response_policy_json(&mut response, ApiVersion::Responses, &rules, &profiles, None, None, &[]);
+        let (blocked, _, mods) = apply_response_policy_json(&mut response, ApiVersion::Responses, &rules, &profiles, &Default::default(), None, None, &[]);
         assert_eq!(blocked, ["shell_call"]);
         assert!(mods.is_empty(), "a rewrite that was not written is not recorded as one");
         assert!(!response.to_string().contains("rm -rf"), "{response}");
@@ -12538,7 +12682,7 @@ mod tests {
         let mut response = json!({"output": [
             {"type": "shell_call", "id": "sh_1", "call_id": "call_1", "status": "completed", "action": {"commands": ["rm -rf /"]}}
         ]});
-        let (blocked, _, _) = apply_response_policy_json(&mut response, ApiVersion::Responses, &rules, &profiles, None, None, &[]);
+        let (blocked, _, _) = apply_response_policy_json(&mut response, ApiVersion::Responses, &rules, &profiles, &Default::default(), None, None, &[]);
         assert_eq!(blocked, ["shell_call"]);
         assert!(response["output"].as_array().unwrap().iter().all(|i| i["type"] != "shell_call"), "{response}");
     }
@@ -12578,7 +12722,7 @@ mod tests {
             {"type": "shell_call", "id": "sh_2", "call_id": "call_2", "status": "completed", "action": {"commands": ["ls -la"]}}
         ]});
         let (blocked, _, _) =
-            apply_response_policy_json(&mut response, ApiVersion::Responses, &block_destructive_shell(), &profiles, None, None, &[]);
+            apply_response_policy_json(&mut response, ApiVersion::Responses, &block_destructive_shell(), &profiles, &Default::default(), None, None, &[]);
         assert_eq!(blocked, ["shell_call"]);
         let output = response["output"].as_array().unwrap();
         assert!(!response.to_string().contains("rm -rf"), "{response}");
@@ -12595,7 +12739,7 @@ mod tests {
         let mut response = json!({"id": "resp_1", "status": "completed", "output": [
             {"type": "shell_call", "id": "sh_1", "call_id": "call_1", "status": "completed", "action": {"commands": ["rm -rf /"]}, "environment": {"type": "local"}}
         ]});
-        apply_response_policy_json(&mut response, ApiVersion::Responses, &rewrite, &profiles, None, None, &[]);
+        apply_response_policy_json(&mut response, ApiVersion::Responses, &rewrite, &profiles, &Default::default(), None, None, &[]);
         assert_eq!(
             response["output"][0],
             json!({"type": "shell_call", "id": "sh_1", "call_id": "call_1", "status": "completed",

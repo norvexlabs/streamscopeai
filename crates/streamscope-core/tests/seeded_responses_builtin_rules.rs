@@ -46,7 +46,7 @@ fn read_through(rule: &str, item: &Value) -> (Option<String>, Option<String>) {
     assert!(call.builtin.is_some(), "read as a built-in tool's call: {item}");
     let args: Value = serde_json::from_str(&call.arguments).expect("a built-in call's arguments are its JSON payload");
     // No app: the built-in calls are the protocol's own, whichever client runs them.
-    let result = classify_tool_call(&rules, None, None, Some(&profiles), call.name, Some(&args));
+    let result = classify_tool_call(&rules, None, None, Some(&profiles), None, &call.name, Some(&args));
     (result.tool_id, result.id)
 }
 
@@ -112,7 +112,7 @@ fn a_computer_call_resolves_to_a_tool_a_rule_can_name() {
                       "pending_safety_checks": [], "action": {"type": "keypress", "keys": ["CTRL", "L"]}});
     let call = tool_call_item(&item).expect("read as a call");
     let args: Value = serde_json::from_str(&call.arguments).expect("JSON payload");
-    let result = classify_tool_call(&[], None, None, Some(&profiles), call.name, Some(&args));
+    let result = classify_tool_call(&[], None, None, Some(&profiles), None, &call.name, Some(&args));
     assert_eq!(result.tool_id.as_deref(), Some("browser_action"));
 }
 
@@ -126,7 +126,7 @@ fn a_clients_own_shell_function_keeps_its_profile() {
         let rules: Vec<Rule> = seed::<Rule>("rules.json").into_iter().filter(|r| r.id == "ASI02-06").collect();
         let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
         let args = json!({"command": ["bash", "-lc", "rm -rf /"]});
-        let result = classify_tool_call(&rules, None, None, Some(&profiles), "shell", Some(&args));
+        let result = classify_tool_call(&rules, None, None, Some(&profiles), None, "shell", Some(&args));
         (result.tool_id, result.id)
     };
     assert_eq!(tool_id.as_deref(), Some("shell_exec"));
@@ -143,7 +143,7 @@ fn a_shell_functions_argv_is_read_as_the_command_it_runs() {
     let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
     let fired = |argv: Value| {
         let args = json!({ "command": argv });
-        classify_tool_call(&rules, None, None, Some(&profiles), "shell", Some(&args)).id
+        classify_tool_call(&rules, None, None, Some(&profiles), None, "shell", Some(&args)).id
     };
     assert_eq!(fired(json!(["rm", "-rf", "/"])).as_deref(), Some("ASI02-06"));
     assert_eq!(fired(json!(["ls", "-la", "/"])), None);
@@ -166,7 +166,7 @@ fn client_patch(rule: &str, app: Option<&str>, tool: &str, args: &Value) -> (Opt
     let rules: Vec<Rule> = seed::<Rule>("rules.json").into_iter().filter(|r| r.id == rule).collect();
     assert_eq!(rules.len(), 1, "{rule} is not in the shipped ruleset exactly once");
     let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
-    let result = classify_tool_call(&rules, None, app, Some(&profiles), tool, Some(args));
+    let result = classify_tool_call(&rules, None, app, Some(&profiles), None, tool, Some(args));
     (result.tool_id, result.id)
 }
 
@@ -212,7 +212,7 @@ fn a_command_codex_runs_through_bash_lc_is_offered_at_argv_0() {
     let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
     let fired = |argv: Value| {
         let args = json!({ "command": argv });
-        classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&profiles), "shell", Some(&args)).id
+        classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&profiles), None, "shell", Some(&args)).id
     };
     assert_eq!(fired(json!(["bash", "-lc", "shutdown -h now"])).as_deref(), Some("op-no-shutdown"));
     assert_eq!(fired(json!(["bash", "-lc", "ls -la"])), None);

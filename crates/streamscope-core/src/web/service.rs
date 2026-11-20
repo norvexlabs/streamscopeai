@@ -710,16 +710,13 @@ fn audit_backend(ctx: &WebContext<'_>, operation: &str) -> String {
 /// The `web_audit.backend` of a fetch served by the built-in fetcher.
 pub const FETCH_BACKEND_BUILTIN: &str = "builtin";
 
-/// Send a `web_audit` record on the channel with back-pressure.
-///
-/// Mirrors [`crate::proxy::send_audit`]: audit is mandatory, never silently
-/// dropped. A saturated channel blocks the caller until the writer task
-/// drains, applying natural back-pressure to the substitution agent loop
-/// (and to MCP `/mcp/web` callers). Never `try_send`: under load it would
-/// silently drop audit rows, and nothing is silently discarded.
+/// Send a `web_audit` record as `AUDIT_FAIL_MODE` says, like
+/// [`crate::proxy::send_audit`] ([`crate::audit::AuditSender::deliver`]):
+/// `closed` waits for room, `open` drops and counts a record its full
+/// channel refuses.
 async fn emit(ctx: &WebContext<'_>, record: WebAuditRecord) {
     if let Some(tx) = ctx.audit_tx
-        && let Err(e) = tx.send(record).await
+        && let Err(e) = tx.deliver(record).await
     {
         tracing::error!(
             request_id = %ctx.request_id,

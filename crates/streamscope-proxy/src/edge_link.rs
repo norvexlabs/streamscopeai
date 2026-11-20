@@ -25,6 +25,7 @@ use streamscope_core::config::mcp::McpUserCredential;
 use streamscope_core::config::TenantRegistry;
 use streamscope_core::mcp::sse_events::McpSseEventRecord;
 use streamscope_core::proxy::health::EdgeHealthEvent;
+use streamscope_core::proxy::known_bodies::CapturedMessage;
 use streamscope_core::usage::{UsageCounterKey, UsageCounterReport};
 use streamscope_core::web::{WebAuditForwarderTrait, WebAuditRecord};
 use streamscope_edge_api::ingest::{
@@ -176,41 +177,45 @@ impl OutboxSink {
 /// One LLM audit record's content, moved out of the record: the record keeps
 /// only the hashes it names.
 fn take_content(record: &mut AuditRecord, content: &mut Content) {
-    // Prefer the per-message strings serialised once at request-capture time;
-    // the `request_messages` tree only when the media-strip pass rebuilt it.
-    let messages_json: Option<Vec<String>> = record.request_messages_json.take().or_else(|| {
+    // Prefer the messages captured at request time (each one's JSON, or the
+    // stored key of one the content store holds); the `request_messages` tree
+    // only when the media-strip pass rebuilt it.
+    let messages: Option<Vec<CapturedMessage>> = record.request_messages_json.take().or_else(|| {
         record
             .request_messages
             .as_ref()?
             .as_array()
-            .map(|arr| arr.iter().map(|m| serde_json::to_string(m).unwrap_or_default()).collect())
+            .map(|arr| arr.iter().map(|m| CapturedMessage::Body(serde_json::to_string(m).unwrap_or_default())).collect())
     });
     // Each message is stored, and named by the turn, under the hash of the
     // stored bytes — never under its session-link hash, which leaves parts out
     // and so is shared by messages that differ. A message with no body to ship
     // is named by a key no stored body has (a stored key is 64 hex digits): it
-    // reads as unavailable, never as another request's message.
+    // reads as unavailable, never as another request's message. One the
+    // content store holds is named by its stored key, its body not carried.
     if let Some(links) = &record.link_hashes {
         let mut keys = Vec::with_capacity(links.len());
         for (i, link) in links.iter().enumerate() {
-            let parsed = messages_json.as_ref().and_then(|all| all.get(i)).map(|json| serde_json::from_str::<serde_json::Value>(json));
-            match parsed {
-                Some(Ok(message)) => {
-                    let (hash, size) = streamscope_core::proxy::content::stored_message_key(&message);
-                    content.messages.push(MessageContent {
-                        hash: hash.clone(),
-                        message,
-                        content_size: i32::try_from(size).unwrap_or(i32::MAX),
-                    });
-                    keys.push(hash);
-                }
-                Some(Err(e)) => {
-                    tracing::error!(
-                        request_id = %record.request_id, link = %link,
-                        "conversation message could not be read back for shipping — not stored: {e}"
-                    );
-                    keys.push(format!("unstored-{link}"));
-                }
+            match messages.as_ref().and_then(|all| all.get(i)) {
+                Some(CapturedMessage::Known { key }) => keys.push(key.clone()),
+                Some(CapturedMessage::Body(json)) => match serde_json::from_str::<serde_json::Value>(json) {
+                    Ok(message) => {
+                        let (hash, size) = streamscope_core::proxy::content::stored_message_key(&message);
+                        content.messages.push(MessageContent {
+                            hash: hash.clone(),
+                            message,
+                            content_size: i32::try_from(size).unwrap_or(i32::MAX),
+                        });
+                        keys.push(hash);
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            request_id = %record.request_id, link = %link,
+                            "conversation message could not be read back for shipping — not stored: {e}"
+                        );
+                        keys.push(format!("unstored-{link}"));
+                    }
+                },
                 None => keys.push(format!("unstored-{link}")),
             }
         }
@@ -269,7 +274,6 @@ fn take_content(record: &mut AuditRecord, content: &mut Content) {
     }
     // Content travels as content; the record keeps only what names it.
     record.request_messages = None;
-    record.request_tools = None;
 }
 
 /// `(content_hash, blob_type, media_type)` of the first blob reference in a
@@ -1384,7 +1388,10 @@ mod tests {
         .unwrap();
         let mut record = AuditRecord {
             link_hashes: Some(vec!["h1".into(), "h2".into()]),
-            request_messages_json: Some(vec![r#"{"role":"user","content":"a"}"#.into(), r#"{"role":"user","content":"b"}"#.into()]),
+            request_messages_json: Some(vec![
+                CapturedMessage::Body(r#"{"role":"user","content":"a"}"#.into()),
+                CapturedMessage::Body(r#"{"role":"user","content":"b"}"#.into()),
+            ]),
             tools_available_hash: Some("tools".into()),
             tool_definitions_to_buffer: vec![streamscope_core::audit::ToolDefinitionBlobEntry {
                 hash: "tools".into(),
@@ -1434,6 +1441,26 @@ mod tests {
         assert_eq!(empty.system_prompt_hash, None);
     }
 
+    /// A message the content store holds is named by its stored key and not
+    /// carried; one beside it that it lacks is carried under its own.
+    #[test]
+    fn a_known_message_is_named_and_not_carried() {
+        let body = r#"{"role":"user","content":"new"}"#;
+        let mut record = AuditRecord {
+            link_hashes: Some(vec!["h1".into(), "h2".into()]),
+            request_messages_json: Some(vec![
+                CapturedMessage::Known { key: "k".repeat(64) },
+                CapturedMessage::Body(body.into()),
+            ]),
+            ..Default::default()
+        };
+        let mut content = Content::default();
+        take_content(&mut record, &mut content);
+        let new_key = streamscope_core::proxy::content::stored_message_key(&serde_json::from_str(body).unwrap()).0;
+        assert_eq!(record.message_hashes, Some(vec!["k".repeat(64), new_key.clone()]));
+        assert_eq!(content.messages.iter().map(|m| m.hash.clone()).collect::<Vec<_>>(), vec![new_key]);
+    }
+
     /// A message is stored, and its turn names it, under the hash of the
     /// stored bytes: two messages the session-link hash cannot tell apart — a
     /// teammate's `<system-reminder>`, their `name` — are two bodies, so one
@@ -1443,7 +1470,7 @@ mod tests {
         let ship = |link: &str, messages: &[serde_json::Value]| {
             let mut record = AuditRecord {
                 link_hashes: Some(vec![link.to_string(); messages.len()]),
-                request_messages_json: Some(messages.iter().map(|m| m.to_string()).collect()),
+                request_messages_json: Some(messages.iter().map(|m| CapturedMessage::Body(m.to_string())).collect()),
                 ..Default::default()
             };
             let mut content = Content::default();

@@ -1,19 +1,25 @@
 <script lang="ts">
   // The session list, on both planes: the console's Sessions page and the
   // portal's. `plane` (`#lib/browse/planes.js`) decides which API answers, the
-  // scope controls and the period default. The expert alert filter is offered
-  // only where the server applies it (`plane.offersAlerts`): the portal
-  // withholds expert findings, so a control there would do nothing.
+  // scope controls and the period default. Expert alerts reach a portal member
+  // only where the profile of each session's workspace shows them — the
+  // server masks them, and the alert filter matches only what it shows.
+  //
+  // The list is a tree (`#lib/browse/sessionTree.js`): its rows are the top
+  // level, and a row's sub-agents badge loads them under it. A search, or a
+  // Linked choice, lists flat — each sub-agent then carries its parent chip.
   import type { SessionSummary } from '#lib/api-types.js';
   import type { BrowsePlane, SessionFilterQuery } from '#lib/browse/planes.js';
-  import { ALERT_LEVELS, oneOf, SESSION_LINKAGE } from '#lib/filter-values.js';
+  import { ALERT_LEVELS, LINKAGE_CHOICES, oneOf } from '#lib/filter-values.js';
+  import { canExpand, EXPAND_LIMIT, listLinkage, nests, unlisted } from '#lib/browse/sessionTree.js';
+  import { page } from '$app/state';
   import { toast } from '#lib/toast.svelte.js';
   import { extractError } from '#lib/api-helpers.js';
   import { daysToDateRange, appName } from '#lib/formatters.js';
   import { PERIOD_FILTER_KEYS, portalWorkspaceName } from '#lib/scope.svelte.js';
   import { usePeriodicLoad, usePagination, UrlFilters, useAuditPeriod } from '#lib/hooks.svelte.js';
   import { useRefreshView } from '#lib/loadView.svelte.js';
-  import { setPortalWorkspace } from '#lib/selfScoped.js';
+  import { sessionHref, setPortalWorkspace } from '#lib/selfScoped.js';
   import { searchTooShort, MIN_SEARCH_CHARS } from '#lib/browse/search.js';
   import Page from '#lib/components/page/Page.svelte';
   import PeriodSelector from '#lib/components/PeriodSelector.svelte';
@@ -42,6 +48,10 @@
   const p = plane;
 
   let sessions = $state<SessionSummary[]>([]);
+  // Whether the rows shown are a tree's top level, as the last load asked.
+  let nested = $state(false);
+  /** A row's sub-agents, once its badge was opened: `null` while they load. */
+  let expanded = $state<Record<string, SessionSummary[] | null>>({});
   let apps = $state<Map<string, { name?: string }>>(new Map());
   let loading = $state(true);
   // A refresh keeps what is shown; a filter or page change shows the skeleton.
@@ -74,6 +84,7 @@
     const v = filters.values;
     const pv = period.value;
     const { start, end } = pv.kind === 'absolute' ? { start: pv.start, end: pv.end } : daysToDateRange(pv.days);
+    const alertLevel = oneOf(ALERT_LEVELS, v.alert_level);
     return {
       app_id: v.app_id || undefined,
       model: v.model || undefined,
@@ -82,8 +93,8 @@
       search: shortSearch ? undefined : v.search?.trim() || undefined,
       start,
       end,
-      alert_level: p.offersAlerts ? oneOf(ALERT_LEVELS, v.alert_level) : undefined,
-      linked: oneOf(SESSION_LINKAGE, v.linked),
+      alert_level: alertLevel,
+      linked: listLinkage(oneOf(LINKAGE_CHOICES, v.linked), shortSearch ? undefined : v.search?.trim() || undefined, alertLevel),
       limit: pager.limit,
       offset: pager.offset,
     };
@@ -96,14 +107,20 @@
     loading = true;
     const gen = ++loadGen;
     try {
-      const { data, error: err } = await p.listSessions(query(), scope);
+      const q = query();
+      const { data, error: err } = await p.listSessions(q, scope);
       if (gen !== loadGen) return;
+      nested = nests(q.linked);
       if (err) {
         toast.error(extractError(err));
         // A failed refresh keeps the list it showed.
         if (!view.refreshing) { sessions = []; }
       } else {
         sessions = pager.absorbOffset(data);
+        // A refresh keeps what is open and still shown, read again; a flat
+        // list shows nothing under a row.
+        expanded = nested ? shownOpen() : {};
+        for (const id of Object.keys(expanded)) void loadChildren(id);
       }
     } catch (e) {
       toast.error(extractError(e));
@@ -119,7 +136,78 @@
 
   async function applyFilters() {
     pager.reset();
+    await changeList();
+  }
+
+  // A new set of rows (filters, page): what was opened belonged to the old one.
+  // A refresh keeps it.
+  async function changeList() {
+    expanded = {};
     await loadSessions();
+  }
+
+  /** The open rows still on the list: a row of the page, or a sub-agent shown
+   *  under an open row that is. */
+  function shownOpen(): Record<string, SessionSummary[] | null> {
+    const kept: Record<string, SessionSummary[] | null> = {};
+    const visit = (rows: SessionSummary[]) => {
+      for (const row of rows) {
+        const id = row.session_id;
+        if (!(id in expanded) || id in kept) continue;
+        kept[id] = expanded[id];
+        visit(expanded[id] ?? []);
+      }
+    };
+    visit(sessions);
+    return kept;
+  }
+
+  // The latest read of each open row: an older answer arriving after a newer
+  // read started (a refresh, a close and reopen) is dropped.
+  const childGen: Record<string, number> = {};
+
+  async function toggle(session: SessionSummary) {
+    const id = session.session_id;
+    if (id in expanded) {
+      // Closing a row closes what was open under it.
+      const closed = new Set<string>();
+      const close = (rowId: string) => {
+        if (closed.has(rowId) || !(rowId in expanded)) return;
+        closed.add(rowId);
+        for (const child of expanded[rowId] ?? []) close(child.session_id);
+      };
+      close(id);
+      expanded = Object.fromEntries(Object.entries(expanded).filter(([k]) => !closed.has(k)));
+      return;
+    }
+    expanded = { ...expanded, [id]: null };
+    await loadChildren(id);
+  }
+
+  /** Read the sub-agents of an open row; a row closed meanwhile stays closed.
+   *  A failed read closes a row that was opening, and keeps what a row already
+   *  showed (a refresh), as the list does. */
+  async function loadChildren(id: string) {
+    const gen = (childGen[id] = (childGen[id] ?? 0) + 1);
+    let failure: unknown;
+    try {
+      const { data, error: err } = await p.linked(id, filters.values.workspace_id || undefined, {
+        kind: 'sub_agent',
+        limit: EXPAND_LIMIT,
+      });
+      if (gen !== childGen[id] || !(id in expanded)) return; // superseded, or closed meanwhile
+      if (!err) {
+        expanded = { ...expanded, [id]: data?.children ?? [] };
+        return;
+      }
+      failure = err;
+    } catch (e) {
+      failure = e;
+    }
+    if (gen !== childGen[id] || !(id in expanded) || expanded[id] !== null) return;
+    toast.error(extractError(failure));
+    const { [id]: _failed, ...rest } = expanded;
+    expanded = rest;
   }
 
   async function clearFilters() {
@@ -151,16 +239,14 @@
     <FilterField label={m.browse_filter_model()} class="min-w-30">
       <TextInput bind:value={filters.values.model} onkeydown={handleFilterKeydown} placeholder={m.browse_filter_model_placeholder()} />
     </FilterField>
-    {#if p.offersAlerts}
-      <FilterField label={m.browse_filter_alert()} class="min-w-22.5">
-        <SelectInput bind:value={filters.values.alert_level} onchange={applyFilters}>
-          <option value="">{m.browse_all()}</option>
-          <option value="major">{m.browse_alert_major()}</option>
-          <option value="minor">{m.browse_alert_minor()}</option>
-          <option value="info">{m.browse_alert_info()}</option>
-        </SelectInput>
-      </FilterField>
-    {/if}
+    <FilterField label={m.browse_filter_alert()} class="min-w-22.5">
+      <SelectInput bind:value={filters.values.alert_level} onchange={applyFilters}>
+        <option value="">{m.browse_all()}</option>
+        <option value="major">{m.browse_alert_major()}</option>
+        <option value="minor">{m.browse_alert_minor()}</option>
+        <option value="info">{m.browse_alert_info()}</option>
+      </SelectInput>
+    </FilterField>
     <FilterField label={m.browse_filter_linked()} class="min-w-27.5">
       <SelectInput bind:value={filters.values.linked} onchange={applyFilters}>
         <option value="">{m.browse_all()}</option>
@@ -188,7 +274,7 @@
     <div class="bg-(--bg-card) rounded-xl border border-(--border) overflow-hidden">
       <div class="divide-y divide-(--border)">
         {#each sessions as session (session.session_id)}
-          <SessionRow {session} selfScoped={p.portal && !userFilter} appName={(id) => appName(apps, id)} />
+          {@render branch(session, 0)}
         {/each}
       </div>
       <!-- A cut search found nothing yet: the notice below says why. -->
@@ -200,6 +286,41 @@
         </EmptyState>
       {/if}
     </div>
-    <Pagination state={pager} onchange={loadSessions} itemsShown={sessions.length} />
+    <Pagination state={pager} onchange={changeList} itemsShown={sessions.length} />
   {/if}
 </Page>
+
+{#snippet branch(session: SessionSummary, depth: number)}
+  <SessionRow
+    {session}
+    selfScoped={p.portal && !userFilter}
+    appName={(id) => appName(apps, id)}
+    nested={depth > 0}
+    expand={canExpand(nested, depth, session.links?.sub_agents)
+      ? { open: session.session_id in expanded, toggle: () => void toggle(session) }
+      : undefined}
+  />
+  <!-- Only a row that offers the toggle shows its sub-agents: below the depth
+       cap a session open elsewhere (a link cycle) renders nothing more. -->
+  {#if canExpand(nested, depth, session.links?.sub_agents) && session.session_id in expanded}
+    {@const children = expanded[session.session_id]}
+    <div class="ml-6 border-l-2 border-l-(--accent)/40 bg-(--bg-secondary) divide-y divide-(--border) border-t border-t-(--border)">
+      {#if children === null}
+        <p class="px-6 py-2 text-xs text-(--text-secondary)">{m.browse_subagents_loading()}</p>
+      {:else}
+        {@const more = unlisted(session.links?.sub_agents, children.length)}
+        {#each children as child (child.session_id)}
+          {@render branch(child, depth + 1)}
+        {/each}
+        {#if more > 0}
+          <a
+            href={sessionHref(page.params.slug ?? '', page.url.pathname, session.session_id, filters.values.workspace_id || undefined)}
+            class="block px-6 py-2 text-xs text-(--accent) hover:underline"
+          >
+            {m.browse_subagents_more({ count: more })}
+          </a>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+{/snippet}

@@ -1349,6 +1349,9 @@ pub struct ResponsesResponseBuilder {
     /// `Done`, it would state zero tokens. Sent on the next `Usage`, or at the
     /// stream-end flush if none comes.
     pending_completed: Option<Option<Incomplete>>,
+    /// The client's `namespace` tools: a call to a member is named to the
+    /// client as the member of its namespace (`api::namespaces`).
+    namespaced: std::sync::Arc<crate::api::namespaces::NamespacedTools>,
 }
 
 /// Why a translated Responses turn stopped short: a reason the upstream's
@@ -1436,7 +1439,15 @@ impl ResponsesResponseBuilder {
             finished: false,
             completed: false,
             pending_completed: None,
+            namespaced: Default::default(),
         }
+    }
+
+    /// Name the client's namespace members as it declared them
+    /// (`ClientToolFacts::namespaced`).
+    pub fn with_namespaced_tools(mut self, namespaced: std::sync::Arc<crate::api::namespaces::NamespacedTools>) -> Self {
+        self.namespaced = namespaced;
+        self
     }
 
     /// One Responses streaming event. Every event the spec defines carries a
@@ -1563,10 +1574,12 @@ impl ResponsesResponseBuilder {
                 }),
                 ResponsesItemKind::FunctionCall { call_id, name, wire_call_id, .. } => {
                     *wire_call_id = if call_id.is_empty() { minted } else { call_id.clone() };
-                    serde_json::json!({
+                    let mut item = serde_json::json!({
                         "id": id, "type": "function_call", "status": "in_progress",
                         "call_id": wire_call_id, "name": name, "arguments": ""
-                    })
+                    });
+                    self.namespaced.split_item(&mut item);
+                    item
                 }
                 // Announced by its own opener, which carries the action.
                 ResponsesItemKind::WebSearchCall => continue,
@@ -1793,10 +1806,11 @@ impl ResponsesResponseBuilder {
             Some(Some(_)) => "incomplete",
             _ => "completed",
         };
-        let closed = serde_json::json!({
+        let mut closed = serde_json::json!({
             "id": id, "type": "function_call", "status": status,
             "call_id": wire_call_id, "name": name, "arguments": arguments
         });
+        self.namespaced.split_item(&mut closed);
         out.push(self.responses_sse("response.function_call_arguments.done", serde_json::json!({
             "type": "response.function_call_arguments.done",
             "item_id": id,

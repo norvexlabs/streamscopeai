@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isWorkspaceId, oneOf, SESSION_LINKAGE, TOOL_CALL_OUTCOMES } from './filter-values';
+import { isWorkspaceId, LINKAGE_CHOICES, oneOf, SESSION_LINKAGE, TOOL_CALL_OUTCOMES } from './filter-values';
 
 describe('oneOf', () => {
   it('keeps a value the API accepts', () => {
@@ -15,7 +15,9 @@ describe('oneOf', () => {
 
 describe('the filter sets', () => {
   it('list every value the API names, once', () => {
-    expect([...SESSION_LINKAGE].sort()).toEqual(['has_children', 'has_parent', 'unlinked']);
+    expect([...SESSION_LINKAGE].sort()).toEqual(['has_children', 'has_parent', 'top_level', 'unlinked']);
+    // The tree's own value is never a viewer's choice.
+    expect([...LINKAGE_CHOICES].sort()).toEqual(['has_children', 'has_parent', 'unlinked']);
     expect([...TOOL_CALL_OUTCOMES].sort()).toEqual(['args_modified', 'blocked', 'not_applied', 'ok', 'redacted']);
   });
 });

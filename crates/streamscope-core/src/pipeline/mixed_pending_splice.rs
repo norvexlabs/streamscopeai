@@ -250,24 +250,14 @@ fn failure_outcome(
     }
 }
 
+/// The spliced body read back as the client's request, through the one parser
+/// every inbound body goes through — so what it does at parse (a Responses
+/// request's namespaces read flat) holds after the splice too.
 fn parse_api_request_bytes(
     bytes: &[u8],
     api_version: ApiVersion,
 ) -> Result<ApiRequest, String> {
-    match api_version {
-        ApiVersion::AnthropicMessages => serde_json::from_slice(bytes)
-            .map(ApiRequest::AnthropicMessages)
-            .map_err(|e| e.to_string()),
-        ApiVersion::ChatCompletions => serde_json::from_slice(bytes)
-            .map(ApiRequest::ChatCompletions)
-            .map_err(|e| e.to_string()),
-        ApiVersion::Responses => serde_json::from_slice(bytes)
-            .map(ApiRequest::Responses)
-            .map_err(|e| e.to_string()),
-        ApiVersion::GoogleGemini => serde_json::from_slice(bytes)
-            .map(ApiRequest::GoogleGemini)
-            .map_err(|e| e.to_string()),
-    }
+    ApiRequest::parse(api_version, &bytes::Bytes::copy_from_slice(bytes)).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -417,6 +407,28 @@ mod tests {
             serde_json::json!({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "q"}]}),
         );
         assert!(out.injection_blocks[0].content.contains(r#""thought_signature":"not_carried""#), "{:?}", out.injection_blocks);
+    }
+
+    /// A spliced Responses request still reads a namespace's members flat, and
+    /// still puts the namespace back on its wire.
+    #[test]
+    fn a_spliced_request_keeps_its_namespaces_read_flat() {
+        let cache = MixedPendingCache::new(Duration::from_secs(60));
+        let (tenant, user) = (Uuid::new_v4(), Uuid::new_v4());
+        let session = crate::proxy::content::session_id_from_client("s", tenant, user);
+        cache.record(session, make_entry(tenant));
+        let body = serde_json::json!({"model": "m", "input": [{"type": "message", "role": "user", "content": "q"}],
+            "tools": [{"type": "namespace", "name": "mcp__web", "description": "Web",
+                       "tools": [{"type": "function", "name": "web_fetch", "parameters": {"type": "object"}}]}]});
+        let mut req = ApiRequest::parse(ApiVersion::Responses, &bytes::Bytes::from(body.to_string())).unwrap();
+        let out = apply_inbound_mixed_pending_splice(&mut req, &cache, tenant, session, ApiVersion::Responses);
+        assert_eq!(out.spliced_count, 1);
+        let ApiRequest::Responses(r) = &req else { unreachable!() };
+        let names: Vec<_> = r.tools.iter().flatten().filter_map(|t| t.function_name()).collect();
+        assert_eq!(names, ["mcp__web__web_fetch"]);
+        let sent: serde_json::Value = serde_json::from_slice(&req.serialize().unwrap()).unwrap();
+        assert_eq!(sent["tools"][0]["type"], "namespace", "{sent}");
+        assert_eq!(sent["tools"][0]["tools"][0]["name"], "web_fetch", "{sent}");
     }
 
     /// The splice re-renders the client's own request in its own protocol, so

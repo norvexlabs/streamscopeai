@@ -64,7 +64,7 @@ fn fired_rule(rule: &str, tool: &str, path: &str) -> Option<String> {
     let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
     // The seeded Claude profiles read the path from `file_path`, not `path`.
     let args = json!({ "file_path": path });
-    let result = classify_tool_call(&rules, None, APP, Some(&profiles), tool, Some(&args));
+    let result = classify_tool_call(&rules, None, APP, Some(&profiles), None, tool, Some(&args));
     // The profile must resolve, or every assertion below passes vacuously.
     assert!(
         result.tool_id.is_some(),
@@ -170,7 +170,7 @@ fn a_patch_applied_through_the_shell_is_read_by_the_write_rule() {
     let profiles = FieldProfileSet::new(seed::<FieldProfile>("tool_field_profiles.json"));
     let fired = |command: serde_json::Value| {
         let args = json!({ "command": command });
-        classify_tool_call(&rules, None, Some("codex"), Some(&profiles), "shell", Some(&args)).id
+        classify_tool_call(&rules, None, Some("codex"), Some(&profiles), None, "shell", Some(&args)).id
     };
     let patch = |file: &str| format!("*** Begin Patch\n*** Update File: {file}\n@@\n-a\n+b\n*** End Patch\n");
     let spellings = |file: &str| {
@@ -192,13 +192,13 @@ fn a_patch_applied_through_the_shell_is_read_by_the_write_rule() {
     // So does running the call in it.
     let args = json!({ "command": ["apply_patch", patch("authorized_keys")], "workdir": "/home/u/.ssh" });
     assert_eq!(
-        classify_tool_call(&rules, None, Some("codex"), Some(&profiles), "shell", Some(&args)).id.as_deref(),
+        classify_tool_call(&rules, None, Some("codex"), Some(&profiles), None, "shell", Some(&args)).id.as_deref(),
         Some(WRITE_RULE)
     );
     // A Responses built-in shell call holding the one heredoc script.
     let args = json!({ "commands": [format!("apply_patch <<'EOF'\n{}EOF\n", patch("/home/u/.ssh/authorized_keys"))] });
     assert_eq!(
-        classify_tool_call(&rules, None, None, Some(&profiles), "shell_call", Some(&args)).id.as_deref(),
+        classify_tool_call(&rules, None, None, Some(&profiles), None, "shell_call", Some(&args)).id.as_deref(),
         Some(WRITE_RULE)
     );
     for command in spellings("src/main.rs") {

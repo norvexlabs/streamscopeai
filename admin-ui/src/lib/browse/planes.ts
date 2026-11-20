@@ -25,6 +25,8 @@ type PortalSessionQuery = NonNullable<paths['/api/v1/portal/sessions']['get']['p
 export type AuditFilterQuery = Omit<PortalAuditQuery, 'workspace_id'>;
 /** The session filters both planes apply: the portal's query without its scope. */
 export type SessionFilterQuery = Omit<PortalSessionQuery, 'workspace_id'>;
+/** Which linked sessions a read returns beside the parent, on both planes. */
+type LinkedFilter = NonNullable<paths['/api/v1/admin/sessions/{session_id}/linked']['get']['parameters']['query']>;
 
 /** One page of a list, as both planes answer it. */
 interface ListPage<T> {
@@ -62,16 +64,15 @@ export interface BrowsePlane {
   readonly periodDefaults: Readonly<Record<string, string>>;
   /** Whether the period follows the viewer across the views (console only). */
   readonly persistPeriod: boolean;
-  /** Whether the expert alert filter and order are offered. The portal
-   *  server withholds expert findings, so it does not offer them. */
-  readonly offersAlerts: boolean;
   listAudit(q: AuditFilterQuery, scope: Record<string, string>): Promise<Answer<ListPage<AuditLogRow>>>;
   listSessions(q: SessionFilterQuery, scope: Record<string, string>): Promise<Answer<ListPage<SessionSummary>>>;
   auditOptions(): Promise<AuditOptions>;
   /** app_id → display name: the Sessions list's one option. */
   apps(): Promise<Map<string, { name?: string }>>;
   conversation(id: string, workspaceId: string | undefined): Promise<Answer<ConversationResponse>>;
-  linked(id: string, workspaceId: string | undefined): Promise<Answer<LinkedSessionsResponse>>;
+  /** A session's parent and linked sessions; `which` narrows the latter (a
+   *  list row's expand reads its sub-agents, capped). */
+  linked(id: string, workspaceId: string | undefined, which?: LinkedFilter): Promise<Answer<LinkedSessionsResponse>>;
   webCalls(requestId: string, workspaceId: string | undefined): Promise<Answer<{ items: WebAuditLogEntry[] }>>;
   /** The cross-session expert issues a session appears in, or `null` when
    *  the read failed. They name other users' sessions, so the portal never
@@ -102,7 +103,6 @@ export const consolePlane: BrowsePlane = {
   sessionKeys: SESSIONS_FILTER_KEYS,
   periodDefaults: PERIOD_FILTER_DEFAULTS,
   persistPeriod: true,
-  offersAlerts: true,
   listAudit: (q, scope) =>
     adminApi.GET('/api/v1/admin/audit', {
       params: {
@@ -146,7 +146,8 @@ export const consolePlane: BrowsePlane = {
     adminApi.GET('/api/v1/admin/sessions/{session_id}/conversation', {
       params: { path: { session_id: id }, query: { format: 'parsed_raw' } },
     }),
-  linked: (id) => adminApi.GET('/api/v1/admin/sessions/{session_id}/linked', { params: { path: { session_id: id } } }),
+  linked: (id, _workspaceId, which) =>
+    adminApi.GET('/api/v1/admin/sessions/{session_id}/linked', { params: { path: { session_id: id }, query: { ...which } } }),
   webCalls: (requestId) =>
     adminApi.GET('/api/v1/admin/audit/{request_id}/web', { params: { path: { request_id: requestId }, query: {} } }),
   async apps() {
@@ -170,7 +171,6 @@ export const portalPlane: BrowsePlane = {
   sessionKeys: [...SESSIONS_FILTER_KEYS.filter((k) => !CONSOLE_ONLY.has(k)), 'workspace_id'],
   periodDefaults: { days: '7' },
   persistPeriod: false,
-  offersAlerts: false,
   listAudit: (q, scope) =>
     portalApi.GET('/api/v1/portal/audit', {
       params: { query: { ...q, ...ws(scope.workspace_id), user_email: teammate(scope) } },
@@ -195,8 +195,8 @@ export const portalPlane: BrowsePlane = {
   },
   conversation: (id, workspaceId) =>
     portalApi.GET('/api/v1/portal/sessions/{id}/conversation', { params: { path: { id }, query: ws(workspaceId) } }),
-  linked: (id, workspaceId) =>
-    portalApi.GET('/api/v1/portal/sessions/{id}/linked', { params: { path: { id }, query: ws(workspaceId) } }),
+  linked: (id, workspaceId, which) =>
+    portalApi.GET('/api/v1/portal/sessions/{id}/linked', { params: { path: { id }, query: { ...which, ...ws(workspaceId) } } }),
   webCalls: (requestId, workspaceId) =>
     portalApi.GET('/api/v1/portal/audit/{request_id}/web', {
       params: { path: { request_id: requestId }, query: ws(workspaceId) },

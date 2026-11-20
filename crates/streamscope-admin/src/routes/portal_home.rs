@@ -309,6 +309,8 @@ pub async fn home(
     } else {
         let mut query = SessionListQuery::default();
         query.limit = Some(RECENT_SESSIONS);
+        // The tree's top level: a sub-agent shows on its parent's badge.
+        query.linked = Some(super::audit::SessionLinkage::TopLevel);
         let rows = list_sessions_impl(db.conn(), query, &AuditScope::portal(&own))
             .await
             .map_err(|e| {

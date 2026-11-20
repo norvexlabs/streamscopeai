@@ -274,14 +274,13 @@ pub struct Rule {
     /// fires for matching apps. `None` means "any app".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_filter: Option<String>,
-    /// Optional pipe-separated glob over the MCP upstream server name
-    /// (`mcp_upstream_servers.name`, e.g. `notion-prod`, `internal-*`).
-    /// When set, the rule only fires for matching upstreams; `None` means
-    /// "any upstream". Non-MCP traffic (LLM tool calls without an MCP
-    /// namespace) never matches a rule with this filter set — pairs
-    /// naturally with `(request, resource_reads | prompt_invocations)`
-    /// rules. Use this to keep per-upstream policies (and per-test rules)
-    /// from spilling onto other servers in the same tenant.
+    /// Optional pipe-separated glob over the MCP server of the tool a rule
+    /// reads (e.g. `notion-prod`, `internal-*`; `-` and `_` match each other,
+    /// [`applies_to_server`]): on the MCP gateway the upstream a request
+    /// reaches; on a model's tool call the server its name resolves to — a
+    /// gateway virtual server's upstream, or `<server>` in a client-run tool
+    /// named `mcp__<server>__<tool>`. `None` means any server; a tool of no
+    /// MCP server never matches a rule with this filter set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_filter: Option<String>,
     /// Optional pipe-separated glob over the A2A upstream agent's slug
@@ -361,8 +360,11 @@ pub struct RuleAxes<'a> {
     pub model: Option<&'a str>,
     /// Client identity (`claude-code`, `cursor-*`, …).
     pub app_id: Option<&'a str>,
-    /// Authoritative MCP upstream server name — from the resolved route, never
-    /// the wire prefix.
+    /// The MCP server of the tool a step reads: on the MCP gateway the
+    /// upstream the route reaches; on a model's tool call the server its name
+    /// resolves to — a gateway tool's upstream, or, for a tool the client runs
+    /// itself, the server its `mcp__<server>__` name carries, which the client
+    /// chooses.
     pub mcp_server: Option<&'a str>,
     /// Addressed A2A agent slug (A2A path only).
     pub a2a_agent: Option<&'a str>,
@@ -380,18 +382,61 @@ pub fn extract_for<'a>(
     scope: Scope,
     axes: RuleAxes<'_>,
 ) -> Vec<&'a Rule> {
-    let axis_matches = |filter: &Option<String>, value: Option<&str>| match (filter, value) {
+    extract(rules, phase, scope, axes, |rule| axis_matches(&rule.mcp_server_filter, axes.mcp_server))
+}
+
+/// [`extract_for`] for a step that reads several tools at once — the
+/// declarations, the calls or the results of one LLM request — each with its
+/// own MCP server: every rule is kept whatever its server filter, so a step
+/// that applies a rule to a tool MUST first test [`applies_to_server`] with
+/// the server that tool's name resolves to. `axes` carries no server.
+pub fn extract_for_each_tool<'a>(
+    rules: &'a [Rule],
+    phase: Phase,
+    scope: Scope,
+    axes: RuleAxes<'_>,
+) -> Vec<&'a Rule> {
+    debug_assert!(axes.mcp_server.is_none(), "a step over several tools tests each tool's server");
+    extract(rules, phase, scope, axes, |_| true)
+}
+
+/// Whether `rule`'s MCP server filter admits a model's tool of `server` — the
+/// server its name resolves to, `None` for a tool of no MCP server, which a
+/// rule filtering on the server never reaches. `-` and `_` match each other:
+/// Codex writes a server's `-` as `_` in its tool names. The MCP gateway's own
+/// upstream names are matched exactly ([`extract_for`]).
+pub fn applies_to_server(rule: &Rule, server: Option<&str>) -> bool {
+    match (&rule.mcp_server_filter, server) {
+        (Some(filter), Some(server)) => {
+            matches_glob(server, filter)
+                || matches_glob(&server.replace('_', "-"), &filter.replace('_', "-"))
+        }
+        (filter, server) => axis_matches(filter, server),
+    }
+}
+
+fn axis_matches(filter: &Option<String>, value: Option<&str>) -> bool {
+    match (filter, value) {
         (None, _) => true,
         (Some(_), None) => false,
         (Some(filter), Some(v)) => matches_glob(v, filter),
-    };
+    }
+}
+
+fn extract<'a>(
+    rules: &'a [Rule],
+    phase: Phase,
+    scope: Scope,
+    axes: RuleAxes<'_>,
+    server_admits: impl Fn(&Rule) -> bool,
+) -> Vec<&'a Rule> {
     let mut indexed: Vec<(usize, &'a Rule)> = rules
         .iter()
         .enumerate()
         .filter(|(_, r)| r.enabled && r.phase == phase && r.scope == scope)
         .filter(|(_, r)| axis_matches(&r.model_filter, axes.model))
         .filter(|(_, r)| axis_matches(&r.app_filter, axes.app_id))
-        .filter(|(_, r)| axis_matches(&r.mcp_server_filter, axes.mcp_server))
+        .filter(|(_, r)| server_admits(r))
         .filter(|(_, r)| axis_matches(&r.a2a_agent_filter, axes.a2a_agent))
         .collect();
     indexed.sort_by_key(|(idx, r)| (r.priority, *idx));
@@ -1070,63 +1115,45 @@ fn escape_hiding_syntax(word: &str) -> String {
     out
 }
 
-// ─── MCP namespacing ────────────────────────────────────────────────
-
-/// Parse the `mcp__<server>__<local_name>` tool-name convention used by
-/// MCP-aware clients. Returns `(server, local_name)` on a clean match,
-/// `None` otherwise (no `mcp__` prefix, empty server, or empty local part).
-///
-/// Server identity is the segment between the first two `__` separators;
-/// any trailing `__` in the local name is preserved (`mcp__fs__a__b` →
-/// `("fs", "a__b")`) since some MCP servers expose nested-namespaced tools.
-pub fn parse_mcp_namespace(tool_name: &str) -> Option<(&str, &str)> {
-    let body = tool_name.strip_prefix("mcp__")?;
-    let sep = body.find("__")?;
-    let server = &body[..sep];
-    let local = &body[sep + 2..];
-    if server.is_empty() || local.is_empty() {
-        return None;
-    }
-    Some((server, local))
-}
-
 // ─── Convenience: classify_tool_call ────────────────────────────────
 
 /// Walk response/tool_calls rules and return the first match's classification.
 /// Returns the synthetic "unknown" fallback when no rule matches.
 ///
-/// Resolves the `tool_id` once via `field_profiles` (using the wire tool name
-/// and the parsed MCP namespace if applicable) so the result includes both
-/// `tool_id` and the resolving `profile_id` for downstream display.
+/// Resolves the `tool_id` once via `field_profiles`, on the name and MCP
+/// server [`crate::config::tool_names::resolve_tool_name`] reads from the wire
+/// name (`mcp_names`: the tenant's virtual servers), so the result includes
+/// both `tool_id` and the resolving `profile_id` for downstream display.
 pub fn classify_tool_call(
     rules: &[Rule],
     model: Option<&str>,
     app_id: Option<&str>,
     field_profiles: Option<&FieldProfileSet>,
+    mcp_names: Option<&crate::config::tool_names::McpToolNames>,
     tool_name: &str,
     arguments: Option<&Value>,
 ) -> RiskResult {
-    let (effective_name, mcp_server) = match parse_mcp_namespace(tool_name) {
-        Some((server, local)) => (local, Some(server)),
-        None => (tool_name, None),
-    };
+    let crate::config::tool_names::ToolName { local: effective_name, mcp_server, .. } =
+        crate::config::tool_names::resolve_tool_name(tool_name, app_id, mcp_names, field_profiles);
     let lookup_id = field_profiles.and_then(|set| {
         set.resolve_tool_id_with_profile(effective_name, app_id, mcp_server)
     });
     let tool_id = lookup_id.as_ref().map(|m| m.tool_id.clone());
     let profile_id = lookup_id.as_ref().and_then(|m| m.profile_id.clone());
 
-    let scoped = extract_for(
+    let scoped: Vec<&Rule> = extract_for_each_tool(
         rules,
         Phase::Response,
         Scope::ToolCalls,
         RuleAxes {
             model,
             app_id,
-            mcp_server,
             ..Default::default()
         },
-    );
+    )
+    .into_iter()
+    .filter(|rule| applies_to_server(rule, mcp_server))
+    .collect();
     let resolver = ToolCallResolver {
         name: effective_name,
         arguments,
@@ -1666,10 +1693,11 @@ pub struct FieldProfile {
     /// MCP-server-scoped, never both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_filter: Option<String>,
-    /// Optional MCP server identifier. When set, this profile only matches
-    /// when the wire tool name is `mcp__<server>__<local>` and `<server>`
-    /// equals (case-insensitively) this value, OR when the engine was given
-    /// an out-of-band `mcp_server` hint matching this value.
+    /// Optional MCP server identifier. When set, this profile only matches a
+    /// tool of that server (case-insensitively), as the gateway reads it from
+    /// the tool's name: for a tool of a gateway virtual server, the upstream
+    /// server behind its route; for one the client runs itself, the `<server>`
+    /// of `mcp__<server>__<local>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<String>,
     /// Optional server-side server-tool discriminator. When set, this
@@ -1950,6 +1978,28 @@ impl FieldProfileSet {
                 tool_id: p.tool_id.clone(),
                 profile_id: p.id.clone(),
             })
+    }
+
+    /// Whether an App-tier profile of `app_id` or a Generic profile names
+    /// `tool_name` LITERALLY (one `tool_pattern` alternate equal to it, case
+    /// folded): a tool the client itself is known to define under that whole
+    /// name. A glob alternate never counts — `web*` says nothing about whether
+    /// `web_fetch` is the client's own tool.
+    pub fn names_tool_literally(&self, tool_name: &str, app_id: Option<&str>) -> bool {
+        self.profiles.iter().any(|p| {
+            let in_scope = match profile_specificity(p) {
+                Specificity::Generic => true,
+                Specificity::App => match (app_id, p.app_filter.as_deref()) {
+                    (Some(app), Some(filter)) => matches_glob(app, filter),
+                    _ => false,
+                },
+                Specificity::ServerType | Specificity::Mcp => false,
+            };
+            in_scope
+                && pattern_alternates(&p.tool_pattern)
+                    .iter()
+                    .any(|alt| alternate_is_literal(alt) && alt.eq_ignore_ascii_case(tool_name))
+        })
     }
 
     fn find_tool_profile(
@@ -2320,7 +2370,7 @@ mod tests {
         ];
         let decided = |command: serde_json::Value| {
             let args = json!({ "command": command });
-            classify_tool_call(&rules, None, None, Some(&set), "shell", Some(&args)).id
+            classify_tool_call(&rules, None, None, Some(&set), None, "shell", Some(&args)).id
         };
         let patch = |file: &str| format!("*** Begin Patch\n*** Add File: {file}\n+x\n*** End Patch");
         assert_eq!(decided(json!(["apply_patch", patch("/root/notes")])).as_deref(), Some("block-root"));
@@ -2334,7 +2384,7 @@ mod tests {
         // under it: a rule anchored to the project still matches.
         let args = json!({ "command": ["apply_patch", patch(".github/workflows/ci.yml")], "workdir": "/repo" });
         assert_eq!(
-            classify_tool_call(&rules, None, None, Some(&set), "shell", Some(&args)).id.as_deref(),
+            classify_tool_call(&rules, None, None, Some(&set), None, "shell", Some(&args)).id.as_deref(),
             Some("block-workflows")
         );
         // `./apply_patch` is a program Codex runs, not its patch command.
@@ -2457,15 +2507,6 @@ mod tests {
         assert!(!matches_glob("Read", "Write|Edit"));
         assert!(matches_glob("read_file", "*read*"));
         assert!(matches_glob("anything", "*"));
-    }
-
-    #[test]
-    fn parse_mcp_namespace_basic() {
-        assert_eq!(parse_mcp_namespace("mcp__filesystem__read_file"), Some(("filesystem", "read_file")));
-        assert_eq!(parse_mcp_namespace("mcp__postgres__query"), Some(("postgres", "query")));
-        assert_eq!(parse_mcp_namespace("Bash"), None);
-        assert_eq!(parse_mcp_namespace("mcp__filesystem"), None); // missing local
-        assert_eq!(parse_mcp_namespace("mcp____read_file"), None); // empty server
     }
 
     fn fp(tool_id: &str, tool_pattern: &str, field: &str, n: crate::config::tool_rules_normalize::Normalizer, prio: i32) -> FieldProfile {
@@ -2755,7 +2796,7 @@ mod tests {
         let rules = vec![classify_rule_for_tool_id("shell_exec", "danger")];
         let set = FieldProfileSet::new(vec![]);
         // Tool name not profiled → tool_id is None → tool_id rule doesn't fire.
-        let r = classify_tool_call(&rules, None, None, Some(&set), "weird_tool", None);
+        let r = classify_tool_call(&rules, None, None, Some(&set), None, "weird_tool", None);
         assert_eq!(r.risk, "unknown");
         assert!(r.tool_id.is_none());
         assert!(r.profile_id.is_none());
@@ -2765,7 +2806,7 @@ mod tests {
     fn classify_via_tool_id_rule() {
         let rules = vec![classify_rule_for_tool_id("shell_exec", "caution")];
         let set = FieldProfileSet::new(vec![fp("shell_exec", "Bash", "command", Normalizer::Shell, 100)]);
-        let r = classify_tool_call(&rules, None, None, Some(&set), "Bash", None);
+        let r = classify_tool_call(&rules, None, None, Some(&set), None, "Bash", None);
         assert_eq!(r.risk, "caution");
         assert_eq!(r.tool_id.as_deref(), Some("shell_exec"));
     }
@@ -2781,7 +2822,7 @@ mod tests {
             ..classify_rule_for_tool_id("read_file", "danger")
         };
         let set = FieldProfileSet::new(vec![fp("read_file", "Read", "path", Normalizer::Path, 100)]);
-        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), "Read", None);
+        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), None, "Read", None);
         assert_eq!(r.risk, "danger");
     }
 
@@ -2792,12 +2833,12 @@ mod tests {
         let set = FieldProfileSet::new(vec![fp("shell_exec", "Bash", "command", Normalizer::Shell, 100)]);
         // Right app → fires
         assert_eq!(
-            classify_tool_call(std::slice::from_ref(&rule), None, Some("cursor-1"), Some(&set), "Bash", None).risk,
+            classify_tool_call(std::slice::from_ref(&rule), None, Some("cursor-1"), Some(&set), None, "Bash", None).risk,
             "danger"
         );
         // Wrong app → skipped
         assert_eq!(
-            classify_tool_call(std::slice::from_ref(&rule), None, Some("opencode"), Some(&set), "Bash", None).risk,
+            classify_tool_call(std::slice::from_ref(&rule), None, Some("opencode"), Some(&set), None, "Bash", None).risk,
             "unknown"
         );
     }
@@ -3031,17 +3072,17 @@ mod tests {
 
         // Cursor call → fires
         let cursor_args = json!({"target_file": "/etc/passwd"});
-        let r1 = classify_tool_call(&rules, None, Some("cursor-1"), Some(&set), "read_file", Some(&cursor_args));
+        let r1 = classify_tool_call(&rules, None, Some("cursor-1"), Some(&set), None, "read_file", Some(&cursor_args));
         assert_eq!(r1.risk, "danger", "cursor: {r1:?}");
 
         // OpenCode call → SAME rule fires
         let oc_args = json!({"filePath": "/etc/shadow"});
-        let r2 = classify_tool_call(&rules, None, Some("opencode"), Some(&set), "read", Some(&oc_args));
+        let r2 = classify_tool_call(&rules, None, Some("opencode"), Some(&set), None, "read", Some(&oc_args));
         assert_eq!(r2.risk, "danger", "opencode: {r2:?}");
 
         // Neither client matches a /home call
         let safe = json!({"target_file": "/home/user/x"});
-        let r3 = classify_tool_call(&rules, None, Some("cursor-1"), Some(&set), "read_file", Some(&safe));
+        let r3 = classify_tool_call(&rules, None, Some("cursor-1"), Some(&set), None, "read_file", Some(&safe));
         assert_eq!(r3.risk, "unknown");
     }
 
@@ -3064,7 +3105,7 @@ mod tests {
             ..classify_rule_for_tool_id("shell_exec", "danger")
         };
         let args = json!({"command": "rm   -rf   /tmp/x"});
-        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), "Bash", Some(&args));
+        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), None, "Bash", Some(&args));
         assert_eq!(r.risk, "danger");
     }
 
@@ -3090,7 +3131,7 @@ mod tests {
             ..classify_rule_for_tool_id("shell_exec", "danger")
         };
         let args = json!({"command": "rm$IFS-rf$IFS/tmp"});
-        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), "Bash", Some(&args));
+        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), None, "Bash", Some(&args));
         assert_eq!(r.risk, "danger", "IFS evasion should not bypass: {r:?}");
     }
 
@@ -3122,7 +3163,7 @@ mod tests {
                 std::slice::from_ref(&rule),
                 None,
                 None,
-                Some(&set),
+                Some(&set), None,
                 "Fetch",
                 Some(&args),
             )
@@ -3162,13 +3203,13 @@ mod tests {
         // Attached comment: empty-replace → `droptable`, space-replace →
         // `drop table`. Rule matches the space-form.
         let args = json!({"query": "DROP/**/TABLE users"});
-        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), "Query", Some(&args));
+        let r = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), None, "Query", Some(&args));
         assert_eq!(r.risk, "danger", "attached-comment evasion should not bypass: {r:?}");
 
         // Intra-keyword split: empty-replace → `drop table users`,
         // space-replace → `dr op table users`. Rule matches empty form.
         let args2 = json!({"query": "DR/**/OP TABLE users"});
-        let r2 = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), "Query", Some(&args2));
+        let r2 = classify_tool_call(std::slice::from_ref(&rule), None, None, Some(&set), None, "Query", Some(&args2));
         assert_eq!(r2.risk, "danger", "intra-keyword evasion should not bypass: {r2:?}");
     }
 
@@ -3200,7 +3241,7 @@ mod tests {
             std::slice::from_ref(&rule),
             None,
             None,
-            Some(&set),
+            Some(&set), None,
             "mcp__filesystem__read_file",
             Some(&args),
         );
@@ -3314,7 +3355,7 @@ mod tests {
             std::slice::from_ref(&rule),
             None,
             None,
-            Some(&set),
+            Some(&set), None,
             "Bash",
             Some(&args_sh),
         );
@@ -3324,7 +3365,7 @@ mod tests {
             std::slice::from_ref(&rule),
             None,
             None,
-            Some(&set),
+            Some(&set), None,
             "Read",
             Some(&args_rd),
         );
@@ -3335,7 +3376,7 @@ mod tests {
             std::slice::from_ref(&rule),
             None,
             None,
-            Some(&set),
+            Some(&set), None,
             "Bash",
             Some(&args_other),
         );
@@ -3452,7 +3493,7 @@ mod tests {
                 std::slice::from_ref(&rule),
                 None,
                 None,
-                Some(&set),
+                Some(&set), None,
                 "Bash",
                 Some(&args),
             );
@@ -3473,7 +3514,7 @@ mod tests {
                 std::slice::from_ref(&rule),
                 None,
                 None,
-                Some(&set),
+                Some(&set), None,
                 "Bash",
                 Some(&args),
             );
@@ -3493,7 +3534,7 @@ mod tests {
             std::slice::from_ref(&family),
             None,
             None,
-            Some(&set),
+            Some(&set), None,
             "Bash",
             Some(&args),
         );
@@ -4175,7 +4216,7 @@ mod tests {
             std::slice::from_ref(&model_scoped),
             Some("gpt-4o"),
             None,
-            Some(&profiles),
+            Some(&profiles), None,
             "Bash",
             None,
         );
@@ -4184,7 +4225,7 @@ mod tests {
             std::slice::from_ref(&model_scoped),
             Some("claude-3"),
             None,
-            Some(&profiles),
+            Some(&profiles), None,
             "Bash",
             None,
         );
@@ -4203,7 +4244,7 @@ mod tests {
             std::slice::from_ref(&server_scoped),
             None,
             None,
-            Some(&mcp_profiles),
+            Some(&mcp_profiles), None,
             "mcp__filesystem__read_file",
             None,
         );
@@ -4242,7 +4283,7 @@ mod tests {
                 action,
                 ..classify_rule_for_tool_id("shell_exec", "danger")
             };
-            let out = classify_tool_call(&[rule], None, None, Some(&profiles), "Bash", None);
+            let out = classify_tool_call(&[rule], None, None, Some(&profiles), None, "Bash", None);
             assert_eq!(out.action, expected);
             assert_eq!(
                 out.pattern.as_deref(),
@@ -4259,10 +4300,10 @@ mod tests {
             }],
             ..classify_rule_for_tool_id("shell_exec", "danger")
         };
-        let out = classify_tool_call(&[listed], None, None, Some(&profiles), "Bash", None);
+        let out = classify_tool_call(&[listed], None, None, Some(&profiles), None, "Bash", None);
         assert_eq!(out.pattern.as_deref(), Some("shell_exec, read_file"));
         // No rule matched: the synthetic fallback, whose action is `allow`.
-        let none = classify_tool_call(&[], None, None, Some(&profiles), "Bash", None);
+        let none = classify_tool_call(&[], None, None, Some(&profiles), None, "Bash", None);
         assert_eq!(none.action, "allow");
         assert_eq!(none.pattern, None);
     }
@@ -4541,4 +4582,50 @@ mod tests {
         );
     }
 
+
+    /// The server filter's claim, for a server name and a filter of plain
+    /// name characters (no glob, no `|`): it admits the server exactly when
+    /// the two are the same name once case is ignored and `_` read as `-`.
+    /// It claims nothing about a glob beyond [`matches_glob`]'s own reading.
+    mod server_filter_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn with_filter(filter: &str) -> Rule {
+            Rule { mcp_server_filter: Some(filter.to_string()), ..classify_rule_for_tool_id("web_fetch", "caution") }
+        }
+
+        fn fold(s: &str) -> String {
+            s.to_lowercase().replace('_', "-")
+        }
+
+        proptest! {
+            #[test]
+            fn a_filter_admits_exactly_its_own_name_up_to_case_and_dash(
+                server in "[a-zA-Z0-9_-]{1,12}",
+                filter in "[a-zA-Z0-9_-]{1,12}",
+            ) {
+                prop_assert_eq!(applies_to_server(&with_filter(&filter), Some(&server)), fold(&server) == fold(&filter));
+            }
+
+            #[test]
+            fn a_spelling_of_the_filter_is_admitted(
+                filter in "[a-z0-9_-]{1,12}",
+                flips in proptest::collection::vec(any::<bool>(), 12),
+            ) {
+                let server: String = filter
+                    .chars()
+                    .zip(flips.iter())
+                    .map(|(c, flip)| match (c, *flip) {
+                        ('-', true) => '_',
+                        ('_', true) => '-',
+                        (c, true) => c.to_ascii_uppercase(),
+                        (c, false) => c,
+                    })
+                    .collect();
+                prop_assert!(applies_to_server(&with_filter(&filter), Some(&server)));
+                prop_assert!(!applies_to_server(&with_filter(&filter), None));
+            }
+        }
+    }
 }

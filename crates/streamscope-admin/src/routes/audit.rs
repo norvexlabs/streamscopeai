@@ -1694,12 +1694,26 @@ pub struct LinkedSessions {
     pub(crate) children: Vec<SessionSummary>,
 }
 
+/// Which of a session's linked sessions a read returns beside its parent.
+#[derive(Deserialize, IntoParams, Default, Clone, Copy)]
+#[into_params(parameter_in = Query)]
+pub struct LinkedSessionsQuery {
+    /// Only the linked sessions of this kind (`sub_agent`: the children a
+    /// session list expands). Absent = every kind.
+    pub kind: Option<SessionLinkKind>,
+    /// At most this many, oldest first (1–100). Absent = all of them.
+    pub limit: Option<i64>,
+}
+
+/// The most linked sessions one read returns.
+pub(crate) const LINKED_SESSIONS_MAX_LIMIT: i64 = 100;
+
 /// Get linked sessions (parent + children) for a given session.
 #[utoipa::path(
     get,
     path = "/api/v1/admin/sessions/{session_id}/linked",
     tag = "Sessions",
-    params(("session_id" = Uuid, Path, description = "Session ID")),
+    params(("session_id" = Uuid, Path, description = "Session ID"), LinkedSessionsQuery),
     responses(
         (status = 200, description = "Parent and child sessions", body = LinkedSessions),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
@@ -1710,8 +1724,9 @@ pub struct LinkedSessions {
 pub async fn get_session_linked(
     mut db: TenantConn,
     Path(session_id): Path<Uuid>,
+    Query(q): Query<LinkedSessionsQuery>,
 ) -> Result<Json<LinkedSessions>, ApiError> {
-    linked_sessions_tenant_wide(db.conn(), session_id).await.map(Json)
+    linked_sessions_tenant_wide(db.conn(), session_id, q).await.map(Json)
 }
 
 /// How a session sits in a cross-session relation.
@@ -1721,6 +1736,23 @@ pub enum SessionLinkage {
     HasChildren,
     HasParent,
     Unlinked,
+    /// Every session but a sub-agent whose parent is a row of the same list
+    /// (the same filters, the parent's row on record and visible to the
+    /// caller): the list as a tree's top level. A continuation stays a row.
+    TopLevel,
+}
+
+impl SessionLinkage {
+    /// Refuse `top_level` with a search term: whether a parent is a row of
+    /// the list would need the parent's own match, which the search lookup
+    /// does not state.
+    pub fn check_with_search(linked: Option<Self>, search: Option<&str>) -> Result<(), ApiError> {
+        if matches!(linked, Some(Self::TopLevel)) && search_text(search).is_some() {
+            return Err(ApiError::bad_request("linked=top_level cannot be combined with a search term")
+                .code(super::ApiErrorCode::TopLevelUnsupportedWithSearch));
+        }
+        Ok(())
+    }
 }
 
 /// The order of a session list. A text search pages through its matches by
@@ -1806,7 +1838,7 @@ impl SessionListQuery {
 }
 
 /// What a session is to the session it is linked to.
-#[derive(Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLinkKind {
     /// A sub-agent it spawned.
@@ -1861,6 +1893,11 @@ pub struct LinkedCounts {
     /// The session that continues it after a compaction.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continued_in: Option<Uuid>,
+    /// The most severe expert alert among its sub-agents the caller may see;
+    /// absent when none has one. In the portal, a sub-agent's alert counts only
+    /// where the profile of that sub-agent's own workspace shows alerts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_agent_alert: Option<streamscope_core::audit::AlertLevel>,
 }
 
 /// Session summary for list view.
@@ -1928,7 +1965,7 @@ pub struct SessionSummary {
     params(SessionListQuery),
     responses(
         (status = 200, description = "Paginated session summaries", body = OffsetPage<SessionSummary>),
-        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or `sort=alerts` with a search term", body = ApiErrorResponse),
+        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -1941,6 +1978,7 @@ pub async fn list_sessions(
     super::check_bounds(query.start, query.end)?;
     super::check_search(query.search.as_deref())?;
     SessionSort::check_with_search(query.sort, query.search.as_deref())?;
+    SessionLinkage::check_with_search(query.linked, query.search.as_deref())?;
     let limit = query.limit.unwrap_or(SESSIONS_DEFAULT_LIMIT).clamp(1, crate::settings::admin_settings().sessions_max_limit().max(1));
     let offset = crate::routes::resolve_offset(query.offset);
     // Overfetch limit+1 so `has_more` is cheap (no COUNT on partitioned tables).
@@ -3032,6 +3070,7 @@ pub async fn get_session_conversation_impl(
     // Post-process: classify tool calls against risk rules.
     let risk_rules = crate::routes::analytics::load_risk_rules(&mut *conn).await;
     let field_profiles = crate::routes::analytics::load_field_profiles(&mut *conn).await;
+    let mcp_names = crate::routes::analytics::load_mcp_tool_names(&mut *conn).await;
     if !risk_rules.is_empty() {
         for event in &mut events {
             if let ConversationEvent::ToolCall {
@@ -3048,7 +3087,7 @@ pub async fn get_session_conversation_impl(
                     // Pass the session's app_id so rules with `app_filter`
                     // evaluate identically to the proxy-time path.
                     session_app_id.as_deref(),
-                    Some(&field_profiles),
+                    Some(&field_profiles), Some(&mcp_names),
                     name,
                     Some(arguments),
                 );
@@ -3928,6 +3967,11 @@ mod tests {
         assert!(SessionSort::check_with_search(Some(SessionSort::Alerts), Some("  ")).is_ok());
         assert!(SessionSort::check_with_search(Some(SessionSort::Alerts), None).is_ok());
         assert!(SessionSort::check_with_search(Some(SessionSort::Oldest), Some("x")).is_ok());
+        // `top_level` alone, or with a blank term, is a tree; with a term, refused.
+        assert!(SessionLinkage::check_with_search(Some(SessionLinkage::TopLevel), Some("x")).is_err());
+        assert!(SessionLinkage::check_with_search(Some(SessionLinkage::TopLevel), Some("  ")).is_ok());
+        assert!(SessionLinkage::check_with_search(Some(SessionLinkage::TopLevel), None).is_ok());
+        assert!(SessionLinkage::check_with_search(Some(SessionLinkage::Unlinked), Some("x")).is_ok());
     }
 
     #[test]

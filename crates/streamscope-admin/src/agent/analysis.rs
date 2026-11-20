@@ -4689,7 +4689,7 @@ fn axis_payload_schema(
                     "wire_field": { "type": ["string", "null"], "description": "Actual wire arg key when it differs from `field`" },
                     "normalizer": { "type": "string", "enum": streamscope_core::config::tool_rules_normalize::Normalizer::ALL.map(|n| n.as_str()), "description": "Canonicaliser applied before matching (see the field-profile snippet)" },
                     "app_filter": { "type": ["string", "null"], "description": "Pipe-separated glob over app_id; exclusive with mcp_server/server_type" },
-                    "mcp_server": { "type": ["string", "null"], "description": "MCP server slug for `mcp__<server>__<tool>` tools; exclusive with app_filter/server_type" },
+                    "mcp_server": { "type": ["string", "null"], "description": "MCP server: the upstream behind a gateway virtual server's tool, else the <server> of mcp__<server>__<tool>; exclusive with app_filter/server_type" },
                     "server_type": { "type": ["string", "null"], "description": "Native server-tool tag; exclusive with app_filter/mcp_server" },
                     "description": { "type": ["string", "null"], "description": "Short human-readable label" },
                     "priority": { "type": ["integer", "null"], "description": "Sort key on overlapping matches, lower wins, default 100" },
@@ -6664,7 +6664,7 @@ mod tests {
             first_user_prompt: None,
             pos: None,
         };
-        let parent = meta(1, None, Some(LinkedCounts { sub_agents: 2, continued_in: Some(uuid::Uuid::from_u128(9)) }));
+        let parent = meta(1, None, Some(LinkedCounts { sub_agents: 2, continued_in: Some(uuid::Uuid::from_u128(9)), sub_agent_alert: None }));
         let child = meta(
             2,
             Some(SessionLink {
