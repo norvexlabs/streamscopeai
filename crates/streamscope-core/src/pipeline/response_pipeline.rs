@@ -1339,6 +1339,16 @@ impl ResponsePipeline {
             let (local_state, mut accumulator, cumulative_usage) = audit.parts();
             let mut event_count: u32 = 0;
             let mut got_done_event = false;
+            // The round's upstream went silent past the idle timeout: the
+            // stream's end (`end_the_clients_stream`) gives the client the
+            // gateway's timeout error if its answer had not finished. Per
+            // round, like `got_done_event`: a later round that ends on its own
+            // ended on its own.
+            let mut round_stalled = false;
+            // The round's upstream sent its stream's own end (`[DONE]`,
+            // `message_stop`, a Responses terminal event): a stall after it is
+            // a connection kept open, not an answer cut short.
+            let mut upstream_ended = false;
 
             // Cancellation token for the substitution agent loop. The
             // `_cancel_drop_guard` is captured into the stream's state
@@ -1421,6 +1431,8 @@ impl ResponsePipeline {
                 if round > 0 {
                     event_count = 0;
                     got_done_event = false;
+                    round_stalled = false;
+                    upstream_ended = false;
                     round_bytes = 0;
                     round_byte_cap_hit = false;
                 }
@@ -1430,6 +1442,7 @@ impl ResponsePipeline {
                         match frame_result {
                             Ok(mut event) => {
                                 event_count += 1;
+                                upstream_ended |= ends_the_stream(&event);
                                 if event_count == 1 {
                                     tracing::debug!(
                                         request_id = %request_id,
@@ -1442,6 +1455,10 @@ impl ResponsePipeline {
 
                                 // Parse upstream SSE into domain events
                                 let mut domain_events = stream_parser.parse(&event);
+                                // An upstream's own error ends its stream: a
+                                // stall after it is the upstream's failure, not
+                                // the gateway's timeout.
+                                upstream_ended |= domain_events.iter().any(|e| matches!(e, DomainEvent::Error { .. }));
                                 // The sources the answer cites, kept as each
                                 // frame is read — where the client is sent
                                 // them; a translated one is told they were not
@@ -1668,16 +1685,11 @@ impl ResponsePipeline {
                             "stream idle timeout after {}s",
                             idle_timeout.as_secs()
                         );
-                        local_state.stream_timed_out = true;
-                        // Only emit timeout error events for passthrough — translated
-                        // paths silently break to avoid sending wrong-protocol data.
-                        if matches!(emitter, EventEmitter::Passthrough { .. }) {
-                            yield Ok(Bytes::from(format!(
-                                "data: {{\"error\":\"stream idle timeout after {}s\"}}\n\n",
-                                idle_timeout.as_secs()
-                            )));
-                            yield Ok(Bytes::from("data: [DONE]\n\n"));
-                        }
+                        // Nothing is written here: what the round still holds
+                        // reaches the client first, and whether it is owed an
+                        // error at all is decided at the stream's end, from
+                        // what it was handed (`end_the_clients_stream`).
+                        round_stalled = true;
                         break;
                     }
                 }
@@ -2830,49 +2842,42 @@ impl ResponsePipeline {
             // Flush deferred events from emitter (e.g., pending Done/Usage) —
             // where a translated emitter writes the stream's end when no usage
             // followed the finish, or the upstream sent both together.
-            let chunks = emitter.flush();
+            let chunks = flush_the_emitter(&mut emitter, round_stalled && !upstream_ended);
             if answer_delivered(got_done_event, &emitter, local_state) {
                 local_state.answer_ended = true;
             }
             for chunk in chunks {
                 yield Ok::<Bytes, std::io::Error>(chunk);
             }
-            // Zero-token guard — Anthropic-only. Two very different failure modes:
-            //
-            //  (A) The client was sent nothing: upstream returned an empty
-            //      stream (overloaded / broken / misconfigured provider). Signal
-            //      the client to retry with a synthesized `overloaded_error`.
-            //
-            //  (B) Events received, but the message never ended: the stream was
-            //      truncated mid-flight. This is the common case when vLLM hits
-            //      `max_model_len` or `max_tokens` and closes the HTTP
-            //      connection without emitting the finish + `[DONE]` — with or
-            //      without the usage it may have reported on every chunk. The
-            //      client has already received real content deltas and possibly
-            //      partial tool-call arguments — returning `overloaded_error`
-            //      here makes the client retry a doomed request (same ceiling,
-            //      same truncation). Synthesize a clean Anthropic close with
-            //      `stop_reason: "max_tokens"` so Claude Code / the Anthropic SDK
-            //      treats the response as semantically incomplete (and
-            //      correctly refuses to act on partial tool-call JSON) instead
-            //      of looping — and is given every call the audit records,
-            //      the one still held for its id and name included.
-            match close_a_stream_that_never_ended(&mut emitter) {
-                UnendedStream::Ended => {}
-                UnendedStream::Empty(chunks) => {
-                    tracing::warn!(
-                        request_id = %request_id,
-                        "upstream stream gave the client nothing — emitting overloaded_error"
-                    );
-                    for chunk in chunks {
-                        yield Ok::<Bytes, std::io::Error>(chunk);
-                    }
-                }
-                UnendedStream::CutShort(chunks) => {
+            // The client's stream ends here, after everything held reached it
+            // — decided by what it was handed (`end_the_clients_stream`): an
+            // ended stream gets nothing, a finished answer only its stream's
+            // end, a stalled one the gateway's timeout error, and one the
+            // upstream closed short the Anthropic guard's `overloaded_error` /
+            // `max_tokens` close or the Responses `incomplete` close.
+            // A stall is the gateway's timeout only before the upstream ended
+            // its stream (its own end, or its own error): the client and the
+            // row then say the same. Recorded before the end is yielded: a
+            // client that closes on the timeout error may never let the stream
+            // be polled again.
+            let stalled_secs = (round_stalled && !upstream_ended).then_some(idle_timeout.as_secs());
+            local_state.stream_timed_out =
+                stall_cut_the_answer(round_stalled, upstream_ended, local_state.answer_ended);
+            let end = end_the_clients_stream(&mut emitter, stalled_secs);
+            match &end {
+                ClientEnd::EndOnly(_) => tracing::debug!(
+                    request_id = %request_id,
+                    stalled = round_stalled,
+                    "the client's stream did not end after its finish or its error — writing the stream's end"
+                ),
+                ClientEnd::Empty(_) => tracing::warn!(
+                    request_id = %request_id,
+                    "upstream stream gave the client nothing — emitting overloaded_error"
+                ),
+                ClientEnd::CutShort(_) => {
                     tracing::warn!(
                         request_id = %request_id,
                         events_received = event_count,
-                        stream_timed_out = local_state.stream_timed_out,
                         "stream truncated before the message ended (got {} events) — synthesizing clean close with stop_reason=max_tokens",
                         event_count,
                     );
@@ -2882,13 +2887,15 @@ impl ResponsePipeline {
                     if local_state.finish_reason.is_none() {
                         local_state.finish_reason = Some(FinishReason::Length);
                     }
-                    for chunk in chunks {
-                        yield Ok::<Bytes, std::io::Error>(chunk);
-                    }
                 }
+                ClientEnd::Ended | ClientEnd::TimedOut(_) | ClientEnd::Incomplete(_) => {}
             }
-            // What the client's emitter did to calls — the last close included.
+            // What the client's emitter did to calls — the last close included
+            // — recorded before the end is yielded, like the timeout.
             record_emitter_withheld(local_state, &mut emitter);
+            for chunk in end.chunks() {
+                yield Ok::<Bytes, std::io::Error>(chunk);
+            }
 
             tracing::info!(
                 request_id = %request_id,
@@ -4519,6 +4526,90 @@ impl EventEmitter {
         }
     }
 
+    /// Whether the client's stream has ended in its own grammar — by its end
+    /// or by an error. A translated emitter writes its own end (a deferred one
+    /// at [`Self::flush`]); a pass-through client is handed the upstream's.
+    pub fn client_stream_ended(&self) -> bool {
+        match self {
+            Self::Passthrough { position, .. } => position.stream_ended || position.ended_by_error,
+            _ => self.terminal_sent(),
+        }
+    }
+
+    /// Whether a Chat pass-through client was handed the upstream's error
+    /// chunk but not the `[DONE]` that ends a Chat stream after it (an
+    /// upstream that sent its own error and then nothing). An error the
+    /// client was never handed a frame of is no reason to end its stream
+    /// cleanly.
+    fn chat_error_without_done(&self) -> bool {
+        matches!(self, Self::Passthrough { position, api_version: ApiVersion::ChatCompletions, .. }
+            if position.error_handed && !position.stream_ended)
+    }
+
+    /// The stream stalled before the upstream's own end: a translated builder
+    /// drops the calls it held before the finish, the timeout error following
+    /// — a failed response holds no call the client may run. The Anthropic
+    /// and Responses builders write no held call at a flush; a pass-through
+    /// client is handed the upstream's frames as they come.
+    fn stalled(&mut self) {
+        match self {
+            Self::ChatCompletions(builder) => builder.stalled(),
+            Self::Gemini(builder) => builder.stalled(),
+            Self::Passthrough { .. } | Self::Anthropic(_) | Self::Responses(_) => {}
+        }
+    }
+
+    /// Whether a pass-through client was handed the answer's finish (see
+    /// [`PassthroughPosition::answer_finished`]). A translated emitter that
+    /// read the finish has written the stream's end by its flush, so it is
+    /// never finished without having ended.
+    pub fn answer_finished(&self) -> bool {
+        matches!(self, Self::Passthrough { position, .. } if position.answer_finished)
+    }
+
+    /// The stream's end alone, for a pass-through client that was handed the
+    /// answer's finish but not its stream's end: a Chat `[DONE]`, an Anthropic
+    /// `message_stop`. Responses and Gemini end with the finish itself.
+    pub fn write_stream_end(&mut self) -> Vec<Bytes> {
+        let Self::Passthrough { encoder, scratch, position, api_version } = self else {
+            return Vec::new();
+        };
+        let frame = match api_version {
+            ApiVersion::ChatCompletions => SseEvent { event_type: None, data: "[DONE]".to_string(), id: None },
+            ApiVersion::AnthropicMessages => SseEvent {
+                event_type: Some("message_stop".to_string()),
+                data: r#"{"type":"message_stop"}"#.to_string(),
+                id: None,
+            },
+            ApiVersion::Responses | ApiVersion::GoogleGemini => return Vec::new(),
+        };
+        position.stream_ended = true;
+        encode_all(encoder, scratch, &[frame])
+    }
+
+    /// The GATEWAY's own error, which ends the client's stream: a translated
+    /// client's builder renders it as any error; a pass-through client is
+    /// written it in its grammar ([`passthrough_error_frames`]). Never reached
+    /// through [`Self::process_streaming_event`]: an upstream's error there
+    /// may arrive without its frame (a split or held frame gives the frame to
+    /// another event) and is the upstream's, never the gateway's.
+    pub fn write_gateway_error(&mut self, message: &str, code: &str) -> Vec<Bytes> {
+        match self {
+            Self::Passthrough { encoder, scratch, position, api_version } => {
+                if position.ended_by_error {
+                    return Vec::new();
+                }
+                position.ended_by_error = true;
+                let frames = passthrough_error_frames(*api_version, message, Some(code), position);
+                encode_all(encoder, scratch, &frames)
+            }
+            _ => self.process_streaming_event(
+                &DomainEvent::Error { message: message.to_string(), code: Some(code.to_string()) },
+                None,
+            ),
+        }
+    }
+
     /// Create the appropriate emitter for the given protocol translation path.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -4656,6 +4747,29 @@ impl EventEmitter {
         domain_event: &DomainEvent,
         raw_event: Option<&SseEvent>,
     ) -> Vec<Bytes> {
+        let out = self.emit_streaming_event(domain_event, raw_event);
+        // The answer's finish is the parser's `Done` (a Chat `finish_reason`,
+        // an Anthropic `message_delta`, a Responses terminal event, a Gemini
+        // `finishReason`): it is the client's once a frame carrying it was
+        // handed over. Responses and Gemini have nothing after it.
+        if let Self::Passthrough { position, api_version, .. } = self
+            && matches!(domain_event, DomainEvent::Done { .. })
+            && !out.is_empty()
+        {
+            position.answer_finished = true;
+            if matches!(api_version, ApiVersion::Responses | ApiVersion::GoogleGemini) {
+                position.stream_ended = true;
+            }
+        }
+        out
+    }
+
+    /// [`Self::process_streaming_event`]'s bytes.
+    fn emit_streaming_event(
+        &mut self,
+        domain_event: &DomainEvent,
+        raw_event: Option<&SseEvent>,
+    ) -> Vec<Bytes> {
         match self {
             Self::Passthrough {
                 encoder,
@@ -4668,8 +4782,8 @@ impl EventEmitter {
                 if position.ended_by_error {
                     return Vec::new();
                 }
-                if matches!(domain_event, DomainEvent::Error { .. }) {
-                    position.error_read = true;
+                if let DomainEvent::Error { message, code } = domain_event {
+                    position.read_error.get_or_insert_with(|| (message.clone(), code.clone()));
                 }
                 // Bytes no call may take — of no call, or a custom call's text
                 // after its end — are not forwarded: the audit and every other
@@ -5100,10 +5214,11 @@ fn fast_path_frame(
     }
     // The frame carries an error, whichever event carries the frame (a
     // Responses `response.failed` is an error and a finish).
-    if events.iter().any(|e| matches!(e, DomainEvent::Error { .. }))
+    if let Some(DomainEvent::Error { message, code }) =
+        events.iter().find(|e| matches!(e, DomainEvent::Error { .. }))
         && let EventEmitter::Passthrough { position, .. } = emitter
     {
-        position.error_read = true;
+        position.read_error.get_or_insert_with(|| (message.clone(), code.clone()));
     }
     // A frame a pass-through client is not given whole — it carries bytes no
     // call may take, or a Chat call the client may hold at another index — is
@@ -5136,41 +5251,122 @@ fn fast_path_frame(
     }
 }
 
-/// How a translated Anthropic client's stream ended: by its own end (or an
-/// error), or — see the zero-token guard where it is called — not at all.
-enum UnendedStream {
+/// How the client's stream ends — see [`end_the_clients_stream`].
+enum ClientEnd {
+    /// Its stream had ended (its own end, or an error): nothing follows.
     Ended,
-    /// The client was sent nothing: the `overloaded_error` it is given.
+    /// The answer's finish was handed, its stream's end was not: the end alone.
+    EndOnly(Vec<Bytes>),
+    /// The upstream stalled before the answer finished: the gateway's timeout
+    /// error, in the client's grammar.
+    TimedOut(Vec<Bytes>),
+    /// An Anthropic client the upstream closed on before it was sent anything:
+    /// the `overloaded_error` it retries on.
     Empty(Vec<Bytes>),
-    /// The message never ended: the gateway's close of it.
+    /// An Anthropic message the upstream closed on before it ended: the
+    /// gateway's `max_tokens` close.
     CutShort(Vec<Bytes>),
+    /// A Responses response the upstream closed on before it ended: closed
+    /// `incomplete`.
+    Incomplete(Vec<Bytes>),
 }
 
-/// Close a translated Anthropic client's stream that never ended — the
-/// zero-token guard's two cases, decided by what the client was sent, never
-/// by what the upstream reported: an error or the message's own end ends it,
-/// and nothing follows either.
-fn close_a_stream_that_never_ended(emitter: &mut EventEmitter) -> UnendedStream {
-    let EventEmitter::Anthropic(builder) = emitter else {
-        return UnendedStream::Ended;
-    };
-    if builder.terminal_sent() {
-        return UnendedStream::Ended;
+impl ClientEnd {
+    /// The bytes this end writes to the client.
+    fn chunks(self) -> Vec<Bytes> {
+        match self {
+            Self::Ended => Vec::new(),
+            Self::EndOnly(c) | Self::TimedOut(c) | Self::Empty(c) | Self::CutShort(c) | Self::Incomplete(c) => c,
+        }
     }
-    if !builder.message_started() {
-        let error_event = format!(
-            "event: error\ndata: {}\n\n",
-            serde_json::json!({
-                "type": "error",
-                "error": {
-                    "type": "overloaded_error",
-                    "message": "Upstream returned empty response, please retry"
-                }
-            })
-        );
-        return UnendedStream::Empty(vec![Bytes::from(error_event)]);
+}
+
+/// Whether the audit row says the stream timed out: the upstream stalled
+/// before its stream ended and before the answer was whole, usage included. A
+/// stall after the usage cost the row nothing; one after the upstream's own
+/// end (or its own error) is a connection it kept open; one between the finish and the usage
+/// left the row without its counts — a timeout, whatever end the client was
+/// handed.
+fn stall_cut_the_answer(stalled: bool, upstream_ended: bool, answer_ended: bool) -> bool {
+    stalled && !upstream_ended && !answer_ended
+}
+
+/// Whether an upstream frame is its stream's own end: a Chat `[DONE]`, an
+/// Anthropic `message_stop`, a Responses terminal event. A Gemini stream has
+/// none: it ends with its connection.
+fn ends_the_stream(frame: &SseEvent) -> bool {
+    frame.is_done()
+        || matches!(
+            frame.event_type.as_deref(),
+            Some("message_stop" | "response.completed" | "response.incomplete" | "response.failed" | "response.done")
+        )
+}
+
+/// The timeout error's code: Anthropic's documented type for a request that
+/// timed out, which every other grammar reads as its own (`server_error`,
+/// `DEADLINE_EXCEEDED`) — see `error::envelope`.
+const IDLE_TIMEOUT_CODE: &str = "timeout_error";
+
+/// The emitter's flush at the stream's end — where a translated emitter
+/// writes what it deferred (the finish waiting for its usage, the calls it
+/// held). When the upstream stalled before its own end (`stalled`), the calls
+/// a builder held before the finish are dropped first: the timeout error
+/// follows, and a call is never written ahead of it.
+fn flush_the_emitter(emitter: &mut EventEmitter, stalled: bool) -> Vec<Bytes> {
+    if stalled {
+        emitter.stalled();
     }
-    UnendedStream::CutShort(emitter.force_close_truncated())
+    emitter.flush()
+}
+
+/// End the client's stream, once everything held has reached it — decided by
+/// what the client was HANDED, never by what the upstream reported:
+///
+/// 1. its stream has ended (its own end or an error) → nothing — but a Chat
+///    client handed an error chunk without its `[DONE]` (the upstream's own,
+///    then nothing) gets the `[DONE]`, as after every other Chat error;
+/// 2. the answer's finish was handed but not the stream's end (a Chat
+///    `[DONE]`, an Anthropic `message_stop`) → the end alone, never an error:
+///    the SDKs raise on an error after a whole answer and lose it;
+/// 3. the upstream stalled (`stalled_secs`, the idle timeout) → the gateway's
+///    timeout error, rendered as every other error is for that client;
+/// 4. the upstream closed the stream short → an Anthropic client gets
+///    `overloaded_error` when it was sent nothing, else a `max_tokens` close (a
+///    vLLM `max_model_len` cut closes the connection without a finish; an
+///    error would make the client retry a doomed request), and a Responses
+///    client its response closed `incomplete`. Any other client is left as
+///    its upstream left it.
+fn end_the_clients_stream(emitter: &mut EventEmitter, stalled_secs: Option<u64>) -> ClientEnd {
+    if emitter.chat_error_without_done() {
+        return ClientEnd::EndOnly(emitter.write_stream_end());
+    }
+    if emitter.client_stream_ended() {
+        return ClientEnd::Ended;
+    }
+    if emitter.answer_finished() {
+        return ClientEnd::EndOnly(emitter.write_stream_end());
+    }
+    if let Some(secs) = stalled_secs {
+        let message = format!("stream idle timeout after {secs}s");
+        return ClientEnd::TimedOut(emitter.write_gateway_error(&message, IDLE_TIMEOUT_CODE));
+    }
+    match emitter {
+        EventEmitter::Anthropic(builder) if !builder.message_started() => {
+            let error_event = format!(
+                "event: error\ndata: {}\n\n",
+                crate::error::envelope::anthropic_stream_error(
+                    "Upstream returned empty response, please retry",
+                    Some("overloaded_error"),
+                )
+            );
+            ClientEnd::Empty(vec![Bytes::from(error_event)])
+        }
+        EventEmitter::Anthropic(_) => ClientEnd::CutShort(emitter.force_close_truncated()),
+        EventEmitter::Responses(builder) => {
+            ClientEnd::Incomplete(builder.close_cut_short().into_iter().map(Bytes::from).collect())
+        }
+        _ => ClientEnd::Ended,
+    }
 }
 
 /// Record, on the audit row, what the client's emitter did to calls: the
@@ -5236,9 +5432,11 @@ fn counts_tokens(usage: &Usage) -> bool {
 
 /// Whether the client abandoned a streamed exchange: it went away before the
 /// upstream finished the answer. One that hangs up after — while only the
-/// upstream's trailing framing was still to come — received the whole answer.
+/// upstream's trailing framing was still to come — received the whole answer,
+/// and one that hangs up on the gateway's timeout error was given the stream's
+/// end: the exchange is the timeout's.
 fn abandoned(stream_completed: bool, ts: &TransformState) -> bool {
-    !stream_completed && !ts.answer_ended
+    !stream_completed && !ts.answer_ended && !ts.stream_timed_out
 }
 
 /// Spawn an async audit task that waits for stream completion, then records.
@@ -7350,13 +7548,23 @@ pub struct PassthroughPosition {
     /// and a delta the upstream sent at another index (a restated id, a
     /// positional index, none) reaches the call it belongs to.
     chat_wire_indexes: translate::ChatWireIndexes,
-    /// An upstream error was read from the frame being forwarded.
-    error_read: bool,
+    /// An upstream error was read from the frame being forwarded: its message
+    /// and code, as the parser read them.
+    read_error: Option<(String, Option<String>)>,
     /// The frame carrying the upstream's error reached the client: the
     /// client's stream has ended, and nothing the upstream sends after it is
     /// forwarded or written — save a Chat stream's `[DONE]`, which ends a Chat
     /// stream after its error chunk as the Chat builder's does.
     ended_by_error: bool,
+    /// A frame carrying the upstream's error reached the client — not merely
+    /// read: an error with no frame of its own hands the client nothing.
+    error_handed: bool,
+    /// The client was handed the answer's finish (a frame carrying the
+    /// parser's `Done`) — what an error must never follow.
+    answer_finished: bool,
+    /// The client was handed its stream's end: a Chat `[DONE]`, an Anthropic
+    /// `message_stop`, a Responses terminal event, a Gemini `finishReason`.
+    stream_ended: bool,
     /// Chat Completions: the client did not ask for usage
     /// (`stream_options.include_usage`), which the gateway asks the upstream
     /// for on its own account — see [`chat_usage_admit`].
@@ -8344,7 +8552,10 @@ fn chat_usage_admit(withheld: bool, event: &SseEvent) -> Admit {
     if object.remove("usage").is_none_or(|usage| usage.is_null()) {
         return Admit::Send;
     }
-    if object.get("choices").is_none_or(|c| c.as_array().is_some_and(Vec::is_empty)) {
+    // A usage-only chunk is dropped whole — but not one carrying an error,
+    // which is the client's stream's last word.
+    let carries_error = object.get("error").is_some_and(crate::error::envelope::is_error);
+    if !carries_error && object.get("choices").is_none_or(|c| c.as_array().is_some_and(Vec::is_empty)) {
         return Admit::Drop;
     }
     serde_json::to_string(&chunk).map_or(Admit::Send, Admit::Rewrite)
@@ -8379,8 +8590,16 @@ fn forward_passthrough_frame(
     if position.ended_by_error && !(api_version == ApiVersion::ChatCompletions && event.is_done()) {
         return vec![];
     }
-    position.ended_by_error |= position.error_read;
-    match position.admit(api_version, event) {
+    // The frame carrying the upstream's error is restated when its client's
+    // grammar would refuse the error as sent.
+    let restated = position
+        .read_error
+        .as_ref()
+        .and_then(|(message, code)| restate_error_chunk(api_version, event, message, code.as_deref()));
+    let event = restated.as_ref().unwrap_or(event);
+    let carries_error = position.read_error.is_some() && !position.ended_by_error;
+    position.ended_by_error |= position.read_error.is_some();
+    let out = match position.admit(api_version, event) {
         Admit::Send => encode(encoder, scratch, event),
         Admit::Rewrite(data) => {
             let frame = SseEvent {
@@ -8395,6 +8614,93 @@ fn forward_passthrough_frame(
             .flat_map(|(kind, data)| encode(encoder, scratch, &SseEvent { event_type: Some(kind), data, id: None }))
             .collect(),
         Admit::Drop => vec![],
+    };
+    if !out.is_empty() && (event.is_done() || event.event_type.as_deref() == Some("message_stop")) {
+        position.stream_ended = true;
+    }
+    // The first frame forwarded after the error was read is the error's own
+    // frame only when it carries one.
+    if carries_error
+        && !out.is_empty()
+        && serde_json::from_str::<serde_json::Value>(&event.data)
+            .is_ok_and(|v| v.get("error").is_some_and(crate::error::envelope::is_error))
+    {
+        position.error_handed = true;
+    }
+    out
+}
+
+/// An upstream's error chunk restated as its pass-through client's protocol
+/// states an error, when the `error` it sent is one the client's grammar
+/// refuses: a bare message string (some OpenAI-compatible servers), or an
+/// object without the members the client's SDK requires — a string `message`
+/// (OpenCode v2's chunk schema), and for Gemini the integer `code`. The
+/// `error` member is rebuilt from the error as the parser read it
+/// (`message`, `code`), by the same `error::envelope` helpers every other
+/// error to that client goes through; the chunk's other members, and the
+/// error object's members the envelope does not write, are kept. A
+/// well-formed error, and every other protocol's frame, is forwarded as sent.
+fn restate_error_chunk(api: ApiVersion, frame: &SseEvent, message: &str, code: Option<&str>) -> Option<SseEvent> {
+    use crate::error::envelope;
+    if !matches!(api, ApiVersion::ChatCompletions | ApiVersion::GoogleGemini) {
+        return None;
+    }
+    let mut data: serde_json::Value = serde_json::from_str(&frame.data).ok()?;
+    let error = data.get("error")?;
+    let has_message = error.get("message").is_some_and(serde_json::Value::is_string);
+    let well_formed = match api {
+        ApiVersion::GoogleGemini => has_message && error.get("code").is_some_and(serde_json::Value::is_i64),
+        _ => has_message,
+    };
+    if well_formed || !envelope::is_error(error) {
+        return None;
+    }
+    let body = match api {
+        ApiVersion::GoogleGemini => envelope::gemini_stream_error(message, code),
+        _ => envelope::openai_stream_error(ApiVersion::ChatCompletions, message, code),
+    };
+    // The members the client's grammar requires are written over what the
+    // upstream sent; any other member of its error object (Gemini `details`,
+    // a server's `metadata`) is kept.
+    match (data["error"].as_object_mut(), body["error"].as_object()) {
+        (Some(sent), Some(stated)) => sent.extend(stated.clone()),
+        _ => data["error"] = body["error"].clone(),
+    }
+    Some(SseEvent { event_type: frame.event_type.clone(), data: data.to_string(), id: frame.id.clone() })
+}
+
+/// The gateway's own error in a pass-through client's grammar, rendered by
+/// the same `error::envelope` helpers a translated client's builder uses: an
+/// Anthropic `error` event, a Chat error chunk and its `[DONE]`, a Responses
+/// `error` event numbered in the client's sequence, a Gemini AIP-193 chunk.
+fn passthrough_error_frames(
+    api: ApiVersion,
+    message: &str,
+    code: Option<&str>,
+    pos: &mut PassthroughPosition,
+) -> Vec<SseEvent> {
+    use crate::error::envelope;
+    let frame = |kind: Option<&str>, data: serde_json::Value| SseEvent {
+        event_type: kind.map(str::to_string),
+        data: data.to_string(),
+        id: None,
+    };
+    match api {
+        ApiVersion::AnthropicMessages => vec![frame(Some("error"), envelope::anthropic_stream_error(message, code))],
+        ApiVersion::Responses => {
+            let mut data = envelope::openai_stream_error(ApiVersion::Responses, message, code);
+            data["sequence_number"] = pos.responses_sequence.into();
+            pos.responses_sequence += 1;
+            vec![frame(Some("error"), data)]
+        }
+        ApiVersion::ChatCompletions => {
+            pos.stream_ended = true;
+            vec![
+                frame(None, envelope::openai_stream_error(ApiVersion::ChatCompletions, message, code)),
+                SseEvent { event_type: None, data: "[DONE]".to_string(), id: None },
+            ]
+        }
+        ApiVersion::GoogleGemini => vec![frame(None, envelope::gemini_stream_error(message, code))],
     }
 }
 
@@ -9540,6 +9846,7 @@ mod tests {
 
 
     mod call_stream_properties;
+    mod stream_end;
 
     #[test]
     fn earlier_rounds_are_folded_into_the_row_once() {
@@ -12167,6 +12474,10 @@ mod tests {
         /// hanging up before is — and a stream that ran to its end never is.
         #[test]
         fn only_a_client_gone_before_the_answer_ended_abandoned_it() {
+            // A client closing on the timeout error left a timed-out stream.
+            let mut timed_out = streamed(1, false);
+            timed_out.stream_timed_out = true;
+            assert!(!abandoned(false, &timed_out));
             assert!(!abandoned(false, &streamed(1, true)));
             assert!(abandoned(false, &streamed(1, false)));
             assert!(!abandoned(true, &streamed(1, false)));

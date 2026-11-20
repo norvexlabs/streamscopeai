@@ -56,11 +56,25 @@ build. The image refuses a macOS build of another version than its own, so it is
 release; an image built without it serves no macOS download, and the release spec refuses to
 ship one without it.
 
+A release serves the Windows CLI signed with the Norvex Labs code-signing certificate,
+`keys/codesign-windows-2026.cer`. The signing key never enters an image build: the publisher
+builds the image's `release` stage, copies `ssai.exe` out, signs it with
+[osslsigncode](https://github.com/mtrojnar/osslsigncode) (`osslsigncode sign -pkcs12 <key> -h sha256
+-ts <RFC 3161 timestamp authority> …`) and copies the result to
+`artifacts/cli/ssai-windows-x86_64.exe` before the image build. The image refuses a staged Windows
+build that `docker/check-windows-signature.sh` rejects (exactly one signature, made by that
+certificate, with a valid timestamp) or that is of another version; with none staged it serves its
+own unsigned build, and the release spec refuses to ship one without it.
+
 A complete release (the images, the installer `ssai-stow`, the Helm chart and the VM images)
 is packaged by [Stowage](https://github.com/norvexlabs/stowage) from `stowage.yaml`, pinned by
 `stowage.lock`. To package your own, point the spec's `registry` at a registry you control, sign
 with a key of your own, and list its public key under `signing.public_keys` in place of the
-project's: the installers a release carries trust only the keys listed there.
+project's: the installers a release carries trust only the keys listed there. The Windows CLI is
+signed for the project's certificate only: sign it with a code-signing certificate of your own and
+put that certificate in place of `keys/codesign-windows-2026.cer` (the file and the Dockerfile's
+`winsig` stage), or remove the `ssai-windows-x86_64.exe` entry from the admin-api image's
+`untracked` list to serve the image's own unsigned build.
 
 ## Versions and the changelog
 

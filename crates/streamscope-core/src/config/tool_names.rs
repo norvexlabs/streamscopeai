@@ -119,20 +119,28 @@ impl McpToolNames {
 }
 
 /// `slug` as a client may write it: a client that keeps only `[A-Za-z0-9_]`
-/// writes its `-` as `_`.
-fn slug_eq(slug: &str, written: &str) -> bool {
+/// writes its `-` as `_`, and a self-delimiting form (`mcp__<slug>__`,
+/// `mcp_<slug>_`) is read in any case. The bare form (`exact_case`) keeps the
+/// slug's case: there the name may be a tool of the client's own, and one
+/// starting with a slug in another case (`W_A` beside server `w`) is not that
+/// server's.
+fn slug_eq(slug: &str, written: &str, exact_case: bool) -> bool {
     slug.len() == written.len()
         && slug.bytes().zip(written.bytes()).all(|(s, w)| {
-            let fold = |b: u8| if b == b'-' { b'_' } else { b.to_ascii_lowercase() };
+            let fold = |b: u8| match b {
+                b'-' => b'_',
+                b if exact_case => b,
+                b => b.to_ascii_lowercase(),
+            };
             fold(s) == fold(w)
         })
 }
 
 /// `name` with `slug` (as a client may write it) and then `sep` cut from its
 /// front, or `None` when it does not start that way.
-fn strip_slug<'n>(name: &'n str, slug: &str, sep: &str) -> Option<&'n str> {
+fn strip_slug<'n>(name: &'n str, slug: &str, sep: &str, exact_case: bool) -> Option<&'n str> {
     let head = name.get(..slug.len())?;
-    slug_eq(slug, head).then(|| name[slug.len()..].strip_prefix(sep)).flatten()
+    slug_eq(slug, head, exact_case).then(|| name[slug.len()..].strip_prefix(sep)).flatten()
 }
 
 /// A tool name split for the field profiles: the name its server knows it by,
@@ -228,7 +236,7 @@ fn read_slug_form<'a>(
     bare: bool,
 ) -> Option<ToolName<'a>> {
     servers.servers.iter().filter(|vs| !(bare && vs.slug == "mcp")).find_map(|vs| {
-        let tool = strip_slug(rest, &vs.slug, sep).filter(|t| !t.is_empty())?;
+        let tool = strip_slug(rest, &vs.slug, sep, bare).filter(|t| !t.is_empty())?;
         let (upstream, local) = vs.route(tool)?;
         Some(ToolName::served(local, upstream))
     })
@@ -371,6 +379,20 @@ mod tests {
         let known_servers = resolve_tool_name("mcp__web__web_fetch", None, Some(&web), Some(&by_slug));
         assert_eq!(by_slug.resolve_tool_id(known_servers.local, None, known_servers.mcp_server), None);
         assert!(known_servers.gateway);
+    }
+
+    /// A tool of the client's own whose name starts with a server's slug in
+    /// another case is the client's: the case a slug is written in is kept.
+    #[test]
+    fn a_slug_in_another_case_is_not_the_server() {
+        let s = names(&[("a", "", "u1"), ("u", "", "u2"), ("w", "", "u3")]);
+        assert_eq!(resolve("U_a", Some("opencode"), &s), ("U_a", None));
+        assert_eq!(resolve("W_A", Some("opencode"), &s), ("W_A", None));
+        // Positive control: the slug as written reads as the server, and a
+        // self-delimiting form reads it in any case.
+        assert_eq!(resolve("u_a", Some("opencode"), &s), ("a", Some("u2")));
+        assert_eq!(resolve("mcp__U__a", None, &s), ("a", Some("u2")));
+        assert_eq!(resolve("mcp_W_A", None, &s), ("A", Some("u3")));
     }
 
     fn slug() -> impl Strategy<Value = String> {

@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.75]
+
+### Added
+
+- **The Windows `ssai` CLI a gateway serves is signed by Norvex Labs** (Authenticode, SHA-256,
+  timestamped). An organisation that deploys the published certificate (thumbprint
+  `8061BA54146A8D17F22E4B5210650147C1CAB75A`) to Trusted Root and Trusted Publishers sees the
+  signature as valid and can allow the CLI by publisher in App Control (WDAC) or AppLocker. Without
+  it, SmartScreen and Smart App Control treat the CLI as before.
+
+### Fixed
+
+- **A stream that fails no longer hands the client a tool call it cannot run.** When the model's
+  stream failed before its answer finished — an upstream error, or the stream idle timeout — a client
+  whose protocol was translated to OpenAI Chat Completions or Gemini was still sent the tool calls
+  still being assembled, a Gemini call with its arguments cut off as `{}`. It is now sent only the
+  error, as Anthropic and Responses clients already were, and the request's record names each call
+  that was not delivered.
+- **An upstream's error reaches every client in that client's terms.** An Anthropic client of
+  another vendor's model is now told when an error is a timeout, an overload, a rate limit or a
+  rejected request (`timeout_error`, `overloaded_error`, `rate_limit_error`,
+  `invalid_request_error`) instead of always `api_error`. An OpenAI-compatible server's error sent
+  as a bare message, or without the members a client requires, now reaches an OpenAI Chat Completions
+  or Gemini client of the same protocol as that protocol's error object (OpenCode refused it), and an
+  OpenAI Chat Completions client whose upstream ended on its own error is sent the `[DONE]` that ends
+  the stream.
+
+## [2026.11.74]
+
+### Fixed
+
+- **A model that stops sending mid-answer now ends the client's stream with an error the client
+  understands.** When the upstream went silent past the stream idle timeout (5 minutes by default),
+  a client speaking the upstream's own protocol was sent an error in no protocol's format (OpenCode
+  aborted the session on it), and one whose protocol was translated was sent nothing. Every client now
+  gets a timeout error in its own protocol's format, after the text it was already sent: an Anthropic
+  `timeout_error` event, the OpenAI error chunk followed by `[DONE]`, a Responses `error` event, or a
+  Gemini `DEADLINE_EXCEEDED` error. An Anthropic client of a translated model gets this error instead
+  of a `max_tokens` stop. A stall after the answer finished is not an error: the client gets the
+  stream's end (`[DONE]`, `message_stop`), and once its usage had arrived the request is no longer
+  recorded as timed out. A Gemini client of a translated model is now told when an upstream error is
+  a timeout, an overload, a rate limit or a rejected request, instead of always a server error. A Chat error that arrived with usage the client had
+  not asked for is no longer dropped.
+- **A tool rule written for one MCP server no longer applies to a client's own tool whose name starts
+  with that server's name in another case** (for example a tool `W_A` beside a server `w`).
+
 ## [2026.11.73]
 
 ### Fixed

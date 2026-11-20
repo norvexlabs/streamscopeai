@@ -112,7 +112,14 @@ only a Responses client; any other client is told, in the call's place, that it 
 and the audit record says so — as is an Anthropic, Chat Completions or Gemini client of a
 translated, streamed answer of a call that arrived without a name, which no client could run; a
 turn whose only calls were withheld so ends as a plain stop. A Responses client whose translated
-answer stops before the upstream finishes it (the connection closed, the stream went idle) receives that answer as incomplete, with every call it had. The audit record's
+answer stops because the upstream closed the connection before finishing it receives that answer as
+incomplete, with every call it had. When the upstream instead goes silent mid-answer for longer than
+the stream idle timeout, every client — whatever its protocol, translated or not — is sent the text
+it already had (a Chat Completions or Gemini client of a translated model also the tool calls the
+gateway was still holding, possibly cut short), then a timeout error in its own protocol's format (an Anthropic `timeout_error`, the
+OpenAI error chunk then `[DONE]`, a Responses `error` event, a Gemini `DEADLINE_EXCEEDED`), and the
+request is recorded as timed out. A stall after the answer has finished is not an error: the client
+is sent the stream's end, and the request is recorded as answered once its usage had arrived. The audit record's
 **Protocol Translated** chip names, in its tooltip, the tool and reasoning settings a translation
 could not carry: a hosted tool the upstream protocol has no place for, a tool choice only the
 client's own protocol understands (sent as "call no tool" when it limited the model to tools the
@@ -3071,6 +3078,25 @@ the same:
 ```powershell
 irm https://<portal-host>/api/v1/cli/install.ps1 | iex   # installs to %LOCALAPPDATA%\Programs\ssai, adds it to your PATH
 ```
+
+The Windows `ssai.exe` is signed by **Norvex Labs** (Authenticode, SHA-256, timestamped) with a
+self-signed code-signing certificate whose SHA-1 thumbprint is
+`8061BA54146A8D17F22E4B5210650147C1CAB75A`. As no public certification authority issued it, the
+signature alone does not quiet SmartScreen or Smart App Control, and Windows reports it as untrusted
+(`Get-AuthenticodeSignature` answers `UnknownError`). An organisation that wants it to count takes the
+certificate from an installed `ssai.exe`, checks its thumbprint against the one above, and deploys it
+to **Trusted Root Certification Authorities** and **Trusted Publishers** (Group Policy or Intune):
+
+```powershell
+$cert = (Get-AuthenticodeSignature "$env:LOCALAPPDATA\Programs\ssai\ssai.exe").SignerCertificate
+$cert.Thumbprint                                   # must read 8061BA54146A8D17F22E4B5210650147C1CAB75A
+Export-Certificate -Cert $cert -FilePath norvexlabs-codesign.cer
+```
+
+`Get-AuthenticodeSignature` then answers `Valid`, signer `CN=Norvex Labs`, and an App Control for
+Business (WDAC) or AppLocker publisher rule can allow the CLI across releases, where a hash rule
+breaks on every update. The certificate can sign code only: it cannot issue certificates, so trusting
+it trusts nothing else.
 
 On Windows the CLI keeps its own state in `%LOCALAPPDATA%\streamscopeai\config\` (never the
 roaming profile a domain copies to its server), readable by your account

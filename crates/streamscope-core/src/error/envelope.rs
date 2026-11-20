@@ -14,9 +14,10 @@
 //!
 //! Invariant to preserve: every HTTP error body an LLM route returns is shaped
 //! here, and so are the mid-stream errors whose grammar these same specs define
-//! (Gemini's AIP-193 chunk via [`ClientError::stream_failure`], an Anthropic
-//! error's `type` via [`anthropic_stream_error_type`], the Chat Completions
-//! error chunk and the Responses `error` event via [`openai_stream_error`]).
+//! (Gemini's AIP-193 chunk via [`gemini_stream_error`], the Anthropic `error`
+//! event via [`anthropic_stream_error`], the Chat Completions error chunk and
+//! the Responses `error` event via [`openai_stream_error`]) — for a translated
+//! client and a pass-through one alike.
 //! A handler or pipeline
 //! exit that renders its own error JSON drifts from the spec in whichever way it
 //! happens to — add a case here instead. The per-target shapes are locked by the
@@ -176,14 +177,75 @@ const ANTHROPIC_ERROR_TYPES: &[&str] = &[
     "overloaded_error",
 ];
 
+/// What a mid-stream error means for a retry, read from whatever code the
+/// upstream (or the gateway) attached, in any of the three vocabularies —
+/// Anthropic's error types, OpenAI's codes, Google's `code.proto` names. The
+/// ONE classifier every protocol's renderer reads a code it does not speak
+/// through, so a code means the same to every client. An upstream's refused
+/// credential or permission, or a missing model, is a [`Self::Fault`] to a
+/// client of another protocol: the gateway's provider account is the
+/// operator's to fix. A code already in the client's own vocabulary is passed
+/// as the upstream sent it, by each renderer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StreamErrorClass {
+    /// The answer did not come in time.
+    Deadline,
+    /// The service is overloaded or unavailable.
+    Overload,
+    /// A rate limit.
+    RateLimit,
+    /// The request was rejected as sent: no retry can make it succeed.
+    Rejected,
+    /// Any other failure: the server's fault.
+    Fault,
+}
+
+/// The [`StreamErrorClass`] of a mid-stream error's code.
+pub fn stream_error_class(code: Option<&str>) -> StreamErrorClass {
+    match code {
+        Some("timeout_error" | "vector_store_timeout" | "DEADLINE_EXCEEDED") => StreamErrorClass::Deadline,
+        Some("overloaded_error" | "UNAVAILABLE") => StreamErrorClass::Overload,
+        Some("rate_limit_error" | "rate_limit_exceeded" | "RESOURCE_EXHAUSTED") => StreamErrorClass::RateLimit,
+        Some(
+            "invalid_request_error" | "request_too_large" | "invalid_prompt" | "context_length_exceeded"
+            | "invalid_image" | "invalid_image_format" | "invalid_base64_image" | "invalid_image_url"
+            | "image_too_large" | "image_too_small" | "image_parse_error" | "image_content_policy_violation"
+            | "invalid_image_mode" | "image_file_too_large" | "unsupported_image_media_type" | "empty_image_file"
+            | "failed_to_download_image" | "image_file_not_found" | "INVALID_ARGUMENT" | "OUT_OF_RANGE",
+        ) => StreamErrorClass::Rejected,
+        // `FAILED_PRECONDITION` is Google's word for the gateway's account
+        // (billing, an API not enabled, an unsupported location): a fault.
+        _ => StreamErrorClass::Fault,
+    }
+}
+
 /// The Anthropic error `type` for a mid-stream error that carries no HTTP
 /// status — only whatever code the upstream attached, in the upstream's own
 /// vocabulary. A code already in Anthropic's table is kept; any other (an
-/// OpenAI `server_error`, a Gemini status name) is `api_error`, never passed
-/// through as a type no Anthropic client knows.
+/// OpenAI `rate_limit_exceeded`, a Gemini `UNAVAILABLE`) is the type of its
+/// [`StreamErrorClass`], never passed through as a type no Anthropic client
+/// knows.
 pub fn anthropic_stream_error_type(code: Option<&str>) -> &'static str {
-    code.and_then(|c| ANTHROPIC_ERROR_TYPES.iter().copied().find(|t| *t == c))
-        .unwrap_or("api_error")
+    if let Some(own) = code.and_then(|c| ANTHROPIC_ERROR_TYPES.iter().copied().find(|t| *t == c)) {
+        return own;
+    }
+    match stream_error_class(code) {
+        StreamErrorClass::Deadline => "timeout_error",
+        StreamErrorClass::Overload => "overloaded_error",
+        StreamErrorClass::RateLimit => "rate_limit_error",
+        StreamErrorClass::Rejected => "invalid_request_error",
+        StreamErrorClass::Fault => "api_error",
+    }
+}
+
+/// An error reported mid-stream to an Anthropic client: the stream's `error`
+/// event body, its `type` read from the error's code by
+/// [`anthropic_stream_error_type`].
+pub fn anthropic_stream_error(message: &str, code: Option<&str>) -> Value {
+    json!({
+        "type": "error",
+        "error": { "type": anthropic_stream_error_type(code), "message": message },
+    })
 }
 
 /// Every name in `google/rpc/code.proto` — the closed vocabulary a Gemini
@@ -210,12 +272,10 @@ const GOOGLE_RPC_CODES: &[&str] = &[
 
 /// A mid-stream error's `code` for an OpenAI-protocol client, from whatever the
 /// upstream called it. The two FOREIGN vocabularies are closed, so a code in
-/// one is recognised and translated by what it means for a retry: a rate limit
-/// — Anthropic's `rate_limit_error`, Gemini's `RESOURCE_EXHAUSTED` — is
-/// `rate_limit_exceeded`; a request rejected as sent, which no retry can make
-/// succeed — Anthropic's `invalid_request_error` / `request_too_large`,
-/// Gemini's `INVALID_ARGUMENT` / `FAILED_PRECONDITION` / `OUT_OF_RANGE` — is
-/// `invalid_prompt`; every other code of theirs the server fault
+/// one is recognised and translated by its [`StreamErrorClass`]: a rate limit
+/// is `rate_limit_exceeded`; a request rejected as sent, which no retry can
+/// make succeed, `invalid_prompt`; every other class — OpenAI names no
+/// deadline or overload code for a stream — the server fault
 /// `server_error`. Anything else came from an OpenAI or OpenAI-compatible
 /// upstream and is already in the client's vocabulary, so it passes as sent: a
 /// code such as `context_length_exceeded` is what a client acts on (Codex
@@ -223,13 +283,13 @@ const GOOGLE_RPC_CODES: &[&str] = &[
 /// succeed into one it retries. No code at all is `server_error`.
 pub fn openai_stream_error_code(code: Option<&str>) -> String {
     match code {
-        Some("rate_limit_error" | "RESOURCE_EXHAUSTED") => "rate_limit_exceeded".to_string(),
-        Some(
-            "invalid_request_error" | "request_too_large" | "INVALID_ARGUMENT" | "FAILED_PRECONDITION"
-            | "OUT_OF_RANGE",
-        ) => "invalid_prompt".to_string(),
         Some(c) if ANTHROPIC_ERROR_TYPES.contains(&c) || GOOGLE_RPC_CODES.contains(&c) => {
-            "server_error".to_string()
+            match stream_error_class(code) {
+                StreamErrorClass::RateLimit => "rate_limit_exceeded",
+                StreamErrorClass::Rejected => "invalid_prompt",
+                StreamErrorClass::Deadline | StreamErrorClass::Overload | StreamErrorClass::Fault => "server_error",
+            }
+            .to_string()
         }
         Some(c) if !c.is_empty() => c.to_string(),
         _ => "server_error".to_string(),
@@ -258,6 +318,50 @@ pub fn openai_stream_error(protocol: ApiVersion, message: &str, code: Option<&st
             body
         }
     }
+}
+
+/// The HTTP status a mid-stream error is stated under to a Gemini client: a
+/// code of Google's own its HTTP mapping (`google/rpc/code.proto`), any other
+/// its [`StreamErrorClass`]'s — a deadline 504, an overload 503, a rate limit
+/// 429, a request rejected as sent 400, the server fault 500. The AIP-193
+/// `status` name is then [`google_rpc_status`]'s for it.
+pub fn gemini_stream_status(code: Option<&str>) -> StatusCode {
+    // The Google codes no class names keep their own HTTP mapping; the rest
+    // are read by their class.
+    let google = match code {
+        Some("CANCELLED") => Some(499),
+        Some("FAILED_PRECONDITION") => Some(400),
+        Some("NOT_FOUND") => Some(404),
+        Some("ALREADY_EXISTS" | "ABORTED") => Some(409),
+        Some("PERMISSION_DENIED") => Some(403),
+        Some("UNAUTHENTICATED") => Some(401),
+        Some("UNIMPLEMENTED") => Some(501),
+        _ => None,
+    };
+    if let Some(status) = google.and_then(|s| StatusCode::from_u16(s).ok()) {
+        return status;
+    }
+    match stream_error_class(code) {
+        StreamErrorClass::Deadline => StatusCode::GATEWAY_TIMEOUT,
+        StreamErrorClass::Overload => StatusCode::SERVICE_UNAVAILABLE,
+        StreamErrorClass::RateLimit => StatusCode::TOO_MANY_REQUESTS,
+        StreamErrorClass::Rejected => StatusCode::BAD_REQUEST,
+        StreamErrorClass::Fault => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// An error reported mid-stream to a Gemini client: the AIP-193 chunk, its
+/// `code` and `status` read from the error's code by [`gemini_stream_status`].
+/// A code already in Google's own vocabulary is kept as the `status`, as
+/// [`anthropic_stream_error_type`] keeps a code already in Anthropic's.
+pub fn gemini_stream_error(message: &str, code: Option<&str>) -> Value {
+    let mut body = ClientError { status: gemini_stream_status(code), ..ClientError::stream_failure(message) }
+        .body(ApiVersion::GoogleGemini);
+    // `OK` names no failure: the status is then the one its HTTP code pairs with.
+    if let Some(own) = code.filter(|c| *c != "OK" && GOOGLE_RPC_CODES.contains(c)) {
+        body["error"]["status"] = own.into();
+    }
+    body
 }
 
 /// The `google.rpc.Code` name AIP-193 pairs with an HTTP status, per the HTTP
@@ -505,8 +609,74 @@ mod tests {
         assert_eq!(anthropic_stream_error_type(Some("overloaded_error")), "overloaded_error");
         assert_eq!(anthropic_stream_error_type(Some("rate_limit_error")), "rate_limit_error");
         assert_eq!(anthropic_stream_error_type(Some("server_error")), "api_error");
-        assert_eq!(anthropic_stream_error_type(Some("RESOURCE_EXHAUSTED")), "api_error");
+        assert_eq!(anthropic_stream_error_type(Some("authentication_error")), "authentication_error");
         assert_eq!(anthropic_stream_error_type(None), "api_error");
+        // A foreign code is the type of its class.
+        let cases = [
+            (Some("DEADLINE_EXCEEDED"), "timeout_error"),
+            (Some("UNAVAILABLE"), "overloaded_error"),
+            (Some("RESOURCE_EXHAUSTED"), "rate_limit_error"),
+            (Some("rate_limit_exceeded"), "rate_limit_error"),
+            (Some("INVALID_ARGUMENT"), "invalid_request_error"),
+            (Some("context_length_exceeded"), "invalid_request_error"),
+            (Some("invalid_prompt"), "invalid_request_error"),
+            (Some("INTERNAL"), "api_error"),
+            (Some("NOT_FOUND"), "api_error"),
+            (Some("PERMISSION_DENIED"), "api_error"),
+        ];
+        for (code, want) in cases {
+            assert_eq!(anthropic_stream_error_type(code), want, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn every_renderer_reads_a_code_by_the_one_classifier() {
+        use StreamErrorClass::*;
+        // Codes of each vocabulary that mean one thing for a retry: each
+        // protocol's rendering of a code it does not speak is that class's.
+        let cases: [(&[&str], StreamErrorClass, &str, u16, &str); 5] = [
+            (&["timeout_error", "DEADLINE_EXCEEDED"], Deadline, "timeout_error", 504, "server_error"),
+            (&["overloaded_error", "UNAVAILABLE"], Overload, "overloaded_error", 503, "server_error"),
+            (
+                &["rate_limit_error", "rate_limit_exceeded", "RESOURCE_EXHAUSTED"],
+                RateLimit,
+                "rate_limit_error",
+                429,
+                "rate_limit_exceeded",
+            ),
+            (
+                &["invalid_request_error", "invalid_prompt", "context_length_exceeded", "INVALID_ARGUMENT"],
+                Rejected,
+                "invalid_request_error",
+                400,
+                "invalid_prompt",
+            ),
+            // An upstream's refused credential or missing model is the
+            // operator's to fix: never the client's key or request.
+            (
+                &["api_error", "server_error", "INTERNAL", "UNAUTHENTICATED", "invalid_api_key", "model_not_found"],
+                Fault,
+                "api_error",
+                500,
+                "server_error",
+            ),
+        ];
+        for (codes, class, anthropic, gemini, openai) in cases {
+            for code in codes {
+                assert!(stream_error_class(Some(code)) == class, "{code}");
+                let own_anthropic = ANTHROPIC_ERROR_TYPES.contains(code);
+                let own_google = GOOGLE_RPC_CODES.contains(code);
+                if !own_anthropic {
+                    assert_eq!(anthropic_stream_error_type(Some(code)), anthropic, "{code}");
+                }
+                if !own_google {
+                    assert_eq!(gemini_stream_status(Some(code)).as_u16(), gemini, "{code}");
+                }
+                // An OpenAI client is sent its own code as it came.
+                let want = if own_anthropic || own_google { openai.to_string() } else { (*code).to_string() };
+                assert_eq!(openai_stream_error_code(Some(code)), want, "{code}");
+            }
+        }
     }
 
     /// One case per vocabulary a stream error's code arrives in, plus none.
@@ -545,6 +715,53 @@ mod tests {
                 "code": "rate_limit_exceeded",
             }})
         );
+    }
+
+    /// Anthropic's stream `error` event body: its `type` one of the error
+    /// table's, the gateway's timeout kept as `timeout_error` and a foreign
+    /// code read by its class.
+    #[test]
+    fn an_anthropic_stream_error_is_the_error_event_body() {
+        assert_eq!(
+            anthropic_stream_error("late", Some("timeout_error")),
+            json!({"type": "error", "error": {"type": "timeout_error", "message": "late"}})
+        );
+        assert_eq!(anthropic_stream_error("x", Some("DEADLINE_EXCEEDED"))["error"]["type"], "timeout_error");
+        assert_eq!(anthropic_stream_error("x", Some("server_error"))["error"]["type"], "api_error");
+    }
+
+    /// A Gemini client's mid-stream error says what failed, in AIP-193's
+    /// pairing of HTTP status and RPC name: a deadline, an overload, a rate
+    /// limit or a rejected request in any vocabulary is that class; anything
+    /// else, or no code, the server fault.
+    #[test]
+    fn a_gemini_stream_error_states_the_errors_class() {
+        for (code, http, status) in [
+            (Some("timeout_error"), 504, "DEADLINE_EXCEEDED"),
+            (Some("DEADLINE_EXCEEDED"), 504, "DEADLINE_EXCEEDED"),
+            (Some("overloaded_error"), 503, "UNAVAILABLE"),
+            (Some("UNAVAILABLE"), 503, "UNAVAILABLE"),
+            (Some("rate_limit_error"), 429, "RESOURCE_EXHAUSTED"),
+            (Some("rate_limit_exceeded"), 429, "RESOURCE_EXHAUSTED"),
+            (Some("RESOURCE_EXHAUSTED"), 429, "RESOURCE_EXHAUSTED"),
+            (Some("invalid_request_error"), 400, "INVALID_ARGUMENT"),
+            (Some("context_length_exceeded"), 400, "INVALID_ARGUMENT"),
+            (Some("INVALID_ARGUMENT"), 400, "INVALID_ARGUMENT"),
+            (Some("FAILED_PRECONDITION"), 400, "FAILED_PRECONDITION"),
+            (Some("NOT_FOUND"), 404, "NOT_FOUND"),
+            (Some("PERMISSION_DENIED"), 403, "PERMISSION_DENIED"),
+            (Some("UNAUTHENTICATED"), 401, "UNAUTHENTICATED"),
+            (Some("ABORTED"), 409, "ABORTED"),
+            (Some("OK"), 500, "INTERNAL"),
+            (Some("server_error"), 500, "INTERNAL"),
+            (None, 500, "INTERNAL"),
+        ] {
+            assert_eq!(
+                gemini_stream_error("m", code),
+                json!({"error": {"code": http, "message": "m", "status": status}}),
+                "{code:?}"
+            );
+        }
     }
 
     /// Responses' `error` event carries its members beside `type` — an `error`

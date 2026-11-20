@@ -34,13 +34,17 @@ signing:
 
 images:
   proxy:      { context: ., dockerfile: docker/Dockerfile.proxy }
-  # The macOS CLI is built on a Mac, out of band, and git never records it:
-  # each ship takes it from the working tree, and the image refuses one of
-  # another release, so every release carries the macOS build of its version.
+  # The macOS CLI is built on a Mac, and the Windows CLI is signed with a key
+  # that never enters a build — both out of band, and git never records them:
+  # each ship takes them from the working tree, and the image refuses one of
+  # another release (and a Windows build not signed by keys/), so every release
+  # carries both of its version.
   admin-api:
     context: .
     dockerfile: docker/Dockerfile.admin-api
-    untracked: [{ path: artifacts/cli/ssai-darwin-arm64, required: true }]
+    untracked:
+      - { path: artifacts/cli/ssai-darwin-arm64, required: true }
+      - { path: artifacts/cli/ssai-windows-x86_64.exe, required: true }
   admin-ui:   { context: ., dockerfile: admin-ui/Dockerfile }
   provision:  { context: ., dockerfile: deploy/docker/Dockerfile.provision, inputs: [deploy/docker/Dockerfile.provision, deploy/docker/provision.sh, LICENSE, NOTICE] }
   postgres:   { ref: "postgres:18.7-alpine3.24@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015" }

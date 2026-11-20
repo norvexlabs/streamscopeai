@@ -80,8 +80,8 @@ use crate::api::sse::{ApiVersion, SseEvent, StreamParser};
 use crate::pipeline::response::{TransformState, WITHHELD_NOTICE};
 use crate::pipeline::response_blocks::{BlockAccumulator, BlockInterests, BufferedEvent};
 use crate::pipeline::response_pipeline::{
-    close_a_stream_that_never_ended, fast_path_frame, fold_accumulator, frame_opens_container, record_emitter_withheld,
-    split_frame, EventEmitter, UnendedStream,
+    end_the_clients_stream, fast_path_frame, fold_accumulator, frame_opens_container, record_emitter_withheld,
+    split_frame, EventEmitter,
 };
 
 /// The custom tool every generated freeform call is to — declared custom by
@@ -989,10 +989,7 @@ fn run(stream: &GenStream, client: ApiVersion, held: bool) -> (TransformState, S
     }
     emit(out.flush(), &mut bytes);
     // The pipeline's zero-token guard, then its record of the emitter's work.
-    match close_a_stream_that_never_ended(&mut out) {
-        UnendedStream::Ended => {}
-        UnendedStream::Empty(chunks) | UnendedStream::CutShort(chunks) => emit(chunks, &mut bytes),
-    }
+    emit(end_the_clients_stream(&mut out, None).chunks(), &mut bytes);
     record_emitter_withheld(&mut audit, &mut out);
     fold_accumulator(&mut audit, acc.as_ref());
     (audit, String::from_utf8_lossy(&bytes).into_owned())
@@ -1730,10 +1727,11 @@ fn usage_after_the_finish_reaches_a_chat_client_before_its_end() {
     holds(&GenStream { upstream: ApiVersion::GoogleGemini, rounds: vec![round] });
 }
 
-/// A Gemini client is given the calls it held before an upstream error ends
-/// its stream — never after it.
+/// An upstream error before the finish ends every client's stream well
+/// shaped, with nothing after the error — a Gemini client's builder drops the
+/// calls it held (`an_error_writes_no_call_the_builder_still_held` holds which).
 #[test]
-fn a_gemini_client_is_given_its_calls_before_an_error() {
+fn an_error_before_the_finish_ends_every_clients_stream() {
     let mut round = gen_round(vec![gen_call("call_0_0", "Read", false, &[r#"{"v":"a"}"#], Opening::Whole, None)], vec![0]);
     round.finished = false;
     round.error_at = Some(4);

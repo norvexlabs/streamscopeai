@@ -1,4 +1,4 @@
-# Seven stages, so the checks run BESIDE the release build instead of in front of it:
+# Nine stages, so the checks run BESIDE the release build instead of in front of it:
 #
 #   builder  — toolchain + every dependency, pre-built for each profile/target used
 #   source   — builder + the workspace source
@@ -6,7 +6,10 @@
 #   licenses — source + the third-party licence list
 #   sbom     — source + the SBOMs of the binaries the image ships
 #   release  — source + the admin binary and the CLI (static Linux, Windows)
-#   macos    — release + the optional macOS CLI artifact, of this release or refused
+#   winsig-tool — osslsigncode + openssl, pinned once (the signing script builds it too)
+#   winsig   — the signed Windows CLI staged out of band, its signature checked (no source)
+#   staged   — release + the CLI builds staged out of band (macOS; Windows signed),
+#              of this release or refused
 #
 # BuildKit builds `checks` and `release` concurrently. The runtime stage copies a
 # marker out of `checks`, which is what keeps them a GATE: BuildKit builds only
@@ -143,7 +146,7 @@ RUN cargo about generate --fail --locked -m crates/streamscope-admin/Cargo.toml 
 
 # The SBOMs of the crates compiled into the binaries the image ships — the admin
 # API and the CLI for each target it serves, macOS included (shipped only beside
-# that artifact, by the `macos` stage) — which the release's SBOM merges in: a
+# that artifact, by the `staged` stage) — which the release's SBOM merges in: a
 # scanner of the image sees the binaries, not what they were built from. Read
 # from the lockfile for each target; build scripts' dependencies are left out.
 # SOURCE_DATE_EPOCH keeps the documents the same for the same lockfile. Each run
@@ -207,27 +210,55 @@ RUN if [ "$COVERAGE" = "1" ]; then \
     fi && \
     cargo build --release -p streamscope-cli --target x86_64-pc-windows-gnu
 
-FROM release AS macos
+# The signed Windows CLI, staged out of band as artifacts/cli/ssai-windows-x86_64.exe:
+# a release serves ssai.exe signed with the Norvex Labs code-signing certificate
+# (keys/), and the signing key never enters a build. Its signature is checked here,
+# by check-windows-signature.sh (exactly one signature, made by that certificate,
+# with a valid timestamp), in stages of their own that read no source: a source
+# change re-runs neither, so only a build with a cold cache fetches the tool's
+# packages. The file passes to `staged` only if it is signed; with none staged,
+# nothing passes. `winsig-tool` is also what the publisher's signing step signs
+# and checks with (`--target winsig-tool`): one pin for both.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS winsig-tool
+RUN apt-get update -qq && \
+    apt-get install -y -qq --no-install-recommends osslsigncode openssl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
 
-# Optional macOS (Apple Silicon) CLI artifact for the /api/v1/cli/* download
-# surface. Cross-building Darwin from the Debian builder needs the Apple SDK
-# (license-gated), so a macOS build is produced out-of-band
-# (`cargo build --release -p streamscope-cli --target aarch64-apple-darwin` on an
-# arm64 Mac or a macOS CI runner) and copied to artifacts/cli/ssai-darwin-arm64
-# before `docker build`. When present it's installed here and served alongside the
-# Linux binary; when absent the directory holds only .gitkeep and the macOS download
-# target simply 404s. Checked in this stage (GNU grep, the Linux CLI beside it),
-# so the runtime image only copies the result. World-readable so the unprivileged
-# runtime user can read it without owning /usr/local/share.
+FROM winsig-tool AS winsig
+COPY docker/check-windows-signature.sh keys/codesign-windows-2026.cer /check/
+COPY artifacts/cli/ /tmp/streamscope-cli-artifacts/
+RUN mkdir /verified && a=/tmp/streamscope-cli-artifacts/ssai-windows-x86_64.exe && \
+    if [ -f "$a" ]; then \
+        if ! sh /check/check-windows-signature.sh "$a" /check/codesign-windows-2026.cer; then \
+            echo "ERROR: artifacts/cli/ssai-windows-x86_64.exe is not signed as a release" >&2; \
+            echo "  serves it. Sign this tree's build as CONTRIBUTING.md says, or delete" >&2; \
+            echo "  it to serve the image's own unsigned build." >&2; \
+            exit 1; \
+        fi && \
+        cp "$a" /verified/; \
+    fi && rm -rf /tmp/streamscope-cli-artifacts
+
+FROM release AS staged
+
+# The CLI builds staged out of band in artifacts/cli/ before `docker build`, for the
+# /api/v1/cli/* download surface. Checked in this stage (GNU grep, the Linux CLI
+# beside it), so the runtime image only copies the result. World-readable so the
+# unprivileged runtime user can read it without owning /usr/local/share.
 #
-# It is checked against the Linux binary's version before it is installed, and a
-# disagreement FAILS the build: the gateway's version manifest names one version
-# for every target, so a macOS binary from another release would be announced as
-# this one: `ssai update` and the installer would put an older build on a Mac
-# while claiming the gateway's version, and the new-version notice would never
-# clear. Every release therefore stages a macOS build of its own version, or none (the macOS
-# target is then absent). The Windows binary cannot disagree: it is built here,
-# from this tree.
+# - macOS (Apple Silicon), optional: cross-building Darwin from the Debian builder
+#   needs the Apple SDK (license-gated), so it is built on an arm64 Mac and copied
+#   to artifacts/cli/ssai-darwin-arm64. When absent the macOS download target
+#   simply 404s.
+# - Windows: the signed build `winsig` passed, served in place of the image's own
+#   unsigned ssai.exe; when none is staged (a build that is never shipped), the
+#   image's own is served.
+#
+# Each staged binary is checked against the Linux binary's version before it is
+# installed, and a disagreement FAILS the build: the gateway's version manifest
+# names one version for every target, so a binary from another release would be
+# announced as this one: `ssai update` and the installer would put an older build
+# on a machine while claiming the gateway's version, and the new-version notice
+# would never clear. Every release therefore stages builds of its own version.
 #
 # Also fatal is the Linux binary reporting no version: that means the probe
 # itself failed, and an empty pattern matches every file — a check that passes
@@ -237,32 +268,42 @@ FROM release AS macos
 # literal prefix of another: an unanchored search for 2026.8.4 finds it inside
 # an artifact's own 2026.8.45 and reports a stale binary as current.
 COPY artifacts/cli/ /tmp/streamscope-cli-artifacts/
+COPY --from=winsig /verified/ /tmp/streamscope-cli-artifacts/windows/
 COPY --from=sbom /ssai-aarch64-apple-darwin.cdx.json /tmp/
-RUN mkdir /macos /macos-sbom && if [ -f /tmp/streamscope-cli-artifacts/ssai-darwin-arm64 ]; then \
-        ver="$(/app/target/x86_64-unknown-linux-musl/release/ssai --version | awk 'NR==1{print $NF}')"; \
+RUN mkdir /macos /macos-sbom /windows && a=/tmp/streamscope-cli-artifacts && \
+    ver="$(/app/target/x86_64-unknown-linux-musl/release/ssai --version | awk 'NR==1{print $NF}')" && \
+    of_this_release() { \
         if [ -z "$ver" ]; then \
-            echo "ERROR: the Linux CLI did not report a version, so the macOS artifact" >&2; \
+            echo "ERROR: the Linux CLI did not report a version, so artifacts/cli/$2" >&2; \
             echo "  cannot be checked against it. Refusing rather than installing it" >&2; \
             echo "  unverified: an empty pattern matches every file." >&2; \
-            exit 1; \
+            return 1; \
         fi; \
-        if ! grep -qaP "\Q$ver\E(?![0-9])" /tmp/streamscope-cli-artifacts/ssai-darwin-arm64; then \
-            echo "ERROR: artifacts/cli/ssai-darwin-arm64 is not a v$ver build." >&2; \
-            echo "  Every target the gateway serves is of its own release. Rebuild it on" >&2; \
-            echo "  an arm64 Mac as CONTRIBUTING.md says and copy it to" >&2; \
-            echo "  artifacts/cli/ssai-darwin-arm64, or delete it to serve no macOS build." >&2; \
-            exit 1; \
+        if ! grep -qaP "\Q$ver\E(?![0-9])" "$1"; then \
+            echo "ERROR: artifacts/cli/$2 is not a v$ver build." >&2; \
+            echo "  Every target the gateway serves is of its own release. Rebuild it as" >&2; \
+            echo "  CONTRIBUTING.md says, or delete it to serve none of its own." >&2; \
+            return 1; \
         fi; \
-        if grep -qa "made without its third-party licence list" /tmp/streamscope-cli-artifacts/ssai-darwin-arm64; then \
-            echo "ERROR: artifacts/cli/ssai-darwin-arm64 was built without its third-party" >&2; \
-            echo "  licence list, which a downloaded binary must carry. Rebuild it as" >&2; \
+        if grep -qa "made without its third-party licence list" "$1"; then \
+            echo "ERROR: artifacts/cli/$2 was built without its third-party licence" >&2; \
+            echo "  list, which a downloaded binary must carry. Rebuild it as" >&2; \
             echo "  CONTRIBUTING.md says." >&2; \
-            exit 1; \
+            return 1; \
         fi; \
-        install -D -m 0755 /tmp/streamscope-cli-artifacts/ssai-darwin-arm64 \
-            /macos/ssai-darwin-arm64 && \
+    } && \
+    if [ -f "$a/ssai-darwin-arm64" ]; then \
+        of_this_release "$a/ssai-darwin-arm64" ssai-darwin-arm64 && \
+        install -D -m 0755 "$a/ssai-darwin-arm64" /macos/ssai-darwin-arm64 && \
         cp /tmp/ssai-aarch64-apple-darwin.cdx.json /macos-sbom/; \
-    fi && rm -rf /tmp/streamscope-cli-artifacts
+    fi && \
+    if [ -f "$a/windows/ssai-windows-x86_64.exe" ]; then \
+        of_this_release "$a/windows/ssai-windows-x86_64.exe" ssai-windows-x86_64.exe && \
+        install -D -m 0755 "$a/windows/ssai-windows-x86_64.exe" /windows/ssai-windows-x86_64.exe; \
+    else \
+        install -D -m 0755 /app/target/x86_64-pc-windows-gnu/release/ssai.exe \
+            /windows/ssai-windows-x86_64.exe; \
+    fi && rm -rf "$a"
 
 FROM alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
 
@@ -292,13 +333,13 @@ RUN addgroup -g 65532 streamscope && adduser -D -H -u 65532 -G streamscope -s /s
 
 COPY --from=release /app/target/x86_64-unknown-linux-musl/release/streamscope-admin /usr/local/bin/streamscopeai-admin
 COPY --from=release /app/target/x86_64-unknown-linux-musl/release/ssai /usr/local/bin/ssai
-# The Windows CLI for the /api/v1/cli/* download surface, built with the image.
-# No --chmod: it would apply to the folder COPY creates as well, and a folder
-# without its execute bit cannot be entered — every CLI download then fails.
-COPY --from=release /app/target/x86_64-pc-windows-gnu/release/ssai.exe \
-    /usr/local/share/ssai/ssai-windows-x86_64.exe
-COPY --from=macos /macos/ /usr/local/share/ssai/
-COPY --from=macos /macos-sbom/ /usr/share/sbom/
+# The Windows and macOS CLIs for the /api/v1/cli/* download surface (the `staged`
+# stage decides which Windows build is served). No --chmod: it would apply to the
+# folder COPY creates as well, and a folder without its execute bit cannot be
+# entered — every CLI download then fails.
+COPY --from=staged /windows/ /usr/local/share/ssai/
+COPY --from=staged /macos/ /usr/local/share/ssai/
+COPY --from=staged /macos-sbom/ /usr/share/sbom/
 COPY seeds/ /app/seeds/
 
 WORKDIR /app

@@ -329,12 +329,14 @@ impl StreamError {
 /// went wrong — Gemini's AIP-193 `status` (its `code` is the HTTP status),
 /// OpenAI's `code`, or its `type` where `code` is null.
 ///
-/// Every member but `message` is read as any value and kept only when it is a
-/// string: a server sending a number there (`"status": 500`) still sent an
-/// error, and a strict type would make the chunk unparseable and drop it.
+/// Every member is read as any value and kept only when it is a string: a
+/// server sending a number or an object there (`"status": 500`, a `message`
+/// object) still sent an error, and a strict type would make the chunk
+/// unparseable and drop it. An error without a string `message` is told by
+/// the chunk's own text.
 #[derive(Deserialize)]
 struct StreamErrorObject {
-    message: Option<String>,
+    message: Option<serde_json::Value>,
     code: Option<serde_json::Value>,
     #[serde(rename = "type")]
     kind: Option<serde_json::Value>,
@@ -346,7 +348,7 @@ impl StreamErrorObject {
         let text = |v: &Option<serde_json::Value>| v.as_ref().and_then(|v| v.as_str()).map(str::to_string);
         let code = text(&self.status).or_else(|| text(&self.code)).or_else(|| text(&self.kind));
         DomainEvent::Error {
-            message: self.message.unwrap_or_else(|| raw.to_string()),
+            message: text(&self.message).unwrap_or_else(|| raw.to_string()),
             code,
         }
     }
@@ -2798,6 +2800,13 @@ mod tests {
             // where a name belongs.
             (ApiVersion::ChatCompletions, r#"{"error":"Internal server error"}"#, "Internal server error", None),
             (ApiVersion::ChatCompletions, r#"{"error":{"message":"overloaded","status":500}}"#, "overloaded", None),
+            // A `message` that is not a string is told by the chunk's text.
+            (
+                ApiVersion::ChatCompletions,
+                r#"{"error":{"message":{"detail":"x"},"code":"boom"}}"#,
+                r#"{"error":{"message":{"detail":"x"},"code":"boom"}}"#,
+                Some("boom"),
+            ),
         ];
         for (protocol, data, want_message, want_code) in cases {
             let event = SseEvent { event_type: None, data: data.to_string(), id: None };

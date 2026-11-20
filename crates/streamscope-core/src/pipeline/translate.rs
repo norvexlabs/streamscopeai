@@ -450,20 +450,17 @@ impl AnthropicResponseBuilder {
                 // Defer message_delta/message_stop — Usage may arrive next.
                 self.pending_stop_reason = Some(finish_reason.clone());
             }
-            // An error ends the client's stream: nothing is written after it
-            // (no close of a message the upstream failed).
+            // An error ends the client's stream: nothing is written after it,
+            // and nothing before it is closed — a failed response holds no
+            // call the client may run (a block closed here would hand it a
+            // call with cut-off input), as the Messages API sends its own
+            // error mid-block.
             DomainEvent::Error { message, code } => {
-                tracing::warn!(error_message = %message, error_code = ?code, "upstream error during stream");
+                tracing::warn!(error_message = %message, error_code = ?code, "stream ended with an error");
                 self.terminal_sent = true;
                 sse_events.push(format!(
                     "event: error\ndata: {}\n\n",
-                    serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": crate::error::envelope::anthropic_stream_error_type(code.as_deref()),
-                            "message": message
-                        }
-                    })
+                    crate::error::envelope::anthropic_stream_error(message, code.as_deref())
                 ));
             }
             // ImageGeneration is Responses-API-only; no Anthropic equivalent.
@@ -2017,9 +2014,11 @@ impl ResponsesResponseBuilder {
                 // after its finish still lands in it.
                 self.pending_completed = Some(responses_incomplete_reason(finish_reason.as_ref()).map(Incomplete::Reason));
             }
-            // An error ends the client's stream: nothing is written after it.
+            // An error ends the client's stream: nothing is written after it,
+            // and nothing before it is closed — a failed response holds no
+            // call the client may run.
             DomainEvent::Error { message, code } => {
-                tracing::warn!(error_message = %message, error_code = ?code, "upstream error during stream");
+                tracing::warn!(error_message = %message, error_code = ?code, "stream ended with an error");
                 self.completed = true;
                 out.push(self.responses_sse(
                     "error",
@@ -2120,8 +2119,8 @@ impl ResponsesResponseBuilder {
         });
     }
 
-    /// Stream-end flush: the response held for its usage is sent, and one
-    /// whose stream ended with no finish ends `incomplete` — plus a
+    /// Stream-end flush: the response held for its usage is sent (one whose
+    /// stream ended with no finish is [`Self::close_cut_short`]'s) — plus a
     /// defense-in-depth close for any in-flight
     /// `web_search_call` output_item. No current loop-exit path leaves
     /// `pending_web_search_call` non-empty (open + close fire in the same
@@ -2141,10 +2140,19 @@ impl ResponsesResponseBuilder {
         }
         if let Some(incomplete) = self.pending_completed.take() {
             self.complete(incomplete, &mut out);
-        } else if self.response_created {
-            // The stream ended with no finish (cut short): the response ends
-            // `incomplete`, its open items closed and every call announced,
-            // so the client holds every call the audit records.
+        }
+        out
+    }
+
+    /// Close a response whose upstream stream closed with no finish (cut
+    /// short): it ends `incomplete`, its open items closed and every call
+    /// announced, so the client holds every call the audit records. Called
+    /// only for an upstream that ENDED the stream — a stalled one is given the
+    /// gateway's timeout error instead (`DomainEvent::Error`); a response that
+    /// already ended, or never started, is left as it is.
+    pub fn close_cut_short(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.completed && self.response_created {
             self.complete(Some(Incomplete::CutShort), &mut out);
         }
         out
@@ -2983,6 +2991,26 @@ impl ChatCompletionsResponseBuilder {
         }
     }
 
+    /// The calls still held when the response failed — an error, or a stall
+    /// before the finish: a failed response holds no call the client may run
+    /// (a held call's arguments may be cut off), so none is written, not even
+    /// a nameless one's notice; each is recorded withheld for the audit. A
+    /// call written at the finish is the client's already.
+    fn drop_held_calls(&mut self) {
+        for index in std::mem::take(&mut self.held_calls).into_keys() {
+            self.withheld.failed(index);
+        }
+    }
+
+    /// The stream stalled, and the timeout error follows: before the finish
+    /// the calls held are dropped ([`Self::drop_held_calls`]); after it the
+    /// answer is whole, and its stream's end writes them.
+    pub fn stalled(&mut self) {
+        if !self.done_pending {
+            self.drop_held_calls();
+        }
+    }
+
     /// Write every call still held — the stream is ending.
     fn write_held_calls(&mut self, out: &mut Vec<String>) {
         for (index, held) in std::mem::take(&mut self.held_calls) {
@@ -3197,7 +3225,15 @@ impl ChatCompletionsResponseBuilder {
                 }
                 return out;
             }
-            DomainEvent::Done { .. } | DomainEvent::Error { .. } => self.write_held_calls(&mut out),
+            DomainEvent::Done { .. } => self.write_held_calls(&mut out),
+            // After the finish the answer is whole (as a Gemini client's is):
+            // its calls and its finish come before the error. Before it, a
+            // held call is dropped.
+            DomainEvent::Error { .. } if self.done_pending => {
+                self.write_held_calls(&mut out);
+                self.write_finish(&mut out);
+            }
+            DomainEvent::Error { .. } => self.drop_held_calls(),
             // A call first seen after the finish is held like any other; the
             // usage that ends the stream writes it, then the finish.
             DomainEvent::Usage(_) if self.done_pending => {
@@ -3288,8 +3324,9 @@ impl ChatCompletionsResponseBuilder {
                 self.done_pending = true;
             }
             DomainEvent::Error { message, code } => {
-                tracing::warn!(error_message = %message, error_code = ?code, "upstream error during stream");
-                self.write_finish(&mut out);
+                // A finish read was written above, with its calls; none is
+                // claimed for an answer that did not reach one.
+                tracing::warn!(error_message = %message, error_code = ?code, "stream ended with an error");
                 let error_data = crate::error::envelope::openai_stream_error(
                     crate::api::sse::ApiVersion::ChatCompletions,
                     message,
@@ -3633,13 +3670,21 @@ impl GeminiResponseBuilder {
                     self.pending_stop_reason = Some(reason);
                 }
             }
-            // An error ends the client's stream: the calls it held go first,
-            // and nothing follows it.
-            DomainEvent::Error { message, .. } => {
-                out.extend(self.drain_pending_tool_calls());
+            // An error ends the client's stream, and nothing follows it. After
+            // the finish (one waiting for its usage) the answer's calls are
+            // whole and go before the error, as a Chat client's do; the
+            // finish does not — a Gemini `finishReason` ends the stream, and
+            // the error must be its last chunk. Before the finish every held
+            // call is dropped (`drop_held_calls`).
+            DomainEvent::Error { message, code } => {
+                tracing::warn!(error_message = %message, error_code = ?code, "stream ended with an error");
+                if self.pending_stop_reason.take().is_some() {
+                    out.extend(self.drain_pending_tool_calls());
+                } else {
+                    self.drop_held_calls();
+                }
                 self.terminal_sent = true;
-                let chunk = crate::error::envelope::ClientError::stream_failure(message)
-                    .body(crate::api::sse::ApiVersion::GoogleGemini);
+                let chunk = crate::error::envelope::gemini_stream_error(message, code.as_deref());
                 out.push(format!(
                     "data: {}\n\n",
                     serde_json::to_string(&chunk).unwrap_or_default()
@@ -3658,6 +3703,25 @@ impl GeminiResponseBuilder {
     /// audit row.
     pub fn take_withheld_calls(&mut self) -> Vec<(usize, crate::pipeline::response::Withheld)> {
         self.withheld.take_unreported()
+    }
+
+    /// The calls still held when the response failed — an error, or a stall
+    /// before the finish: a failed response holds no call the client may run
+    /// (a cut-off call's arguments would parse to `{}`), so none is written;
+    /// each is recorded withheld for the audit.
+    fn drop_held_calls(&mut self) {
+        for call in std::mem::take(&mut self.pending_tool_calls) {
+            self.withheld.failed(call.index);
+        }
+    }
+
+    /// The stream stalled, and the timeout error follows: before the finish
+    /// the calls held are dropped ([`Self::drop_held_calls`]); after it they
+    /// are whole, and the stream's end writes them.
+    pub fn stalled(&mut self) {
+        if self.pending_stop_reason.is_none() {
+            self.drop_held_calls();
+        }
     }
 
     /// Flush any deferred events (call at stream end).
@@ -4416,6 +4480,7 @@ mod tests {
     }
     use super::*;
     use crate::api::domain::Usage;
+    use std::assert_matches;
 
     /// A custom call's input is closed at its end, and nothing is written
     /// into it after: a piece of the call arriving later is not written, so
@@ -5116,6 +5181,72 @@ mod tests {
             assert_eq!(event["message"], "boom");
             assert!(event.get("error").is_none(), "{event}");
         }
+    }
+
+    /// A failed response holds no call the client may run: a Chat or Gemini
+    /// client is never written a call the builder still held when the error
+    /// came — a Chat call not yet named (not even told as nameless), a Gemini
+    /// call whose arguments may be cut off — nor the finish. Positive control:
+    /// the same calls are written (the Chat one told) when the response
+    /// finishes.
+    #[test]
+    fn an_error_writes_no_call_the_builder_still_held() {
+        let call = |id: Option<&str>, name: Option<&str>, args: &str| DomainEvent::ToolCallDelta {
+            index: 0,
+            id: id.map(String::from),
+            function_name: name.map(String::from),
+            arguments_delta: args.into(),
+            form: crate::api::domain::CallArguments::Json,
+        };
+        let error = DomainEvent::Error { message: "boom".into(), code: None };
+        let done = DomainEvent::Done { finish_reason: Some(FinishReason::ToolCalls), native_finish_reason: None };
+        for (end, runs) in [(&error, false), (&done, true)] {
+            let mut chat = ChatCompletionsResponseBuilder::new("m".into(), "chatcmpl-1".into());
+            let mut frames = chat.process_event(&call(Some("call_1"), None, r#"{"p":"#));
+            frames.extend(chat.process_event(end));
+            // The audit records the call either way: told as nameless at the
+            // finish, dropped with its failed response at the error.
+            use crate::pipeline::response::Withheld;
+            let why: Vec<Withheld> = chat.take_withheld_calls().into_iter().map(|(_, why)| why).collect();
+            assert_eq!(why, [if runs { Withheld::Nameless } else { Withheld::FailedTurn }], "chat after {end:?}");
+            frames.extend(chat.flush_pending());
+            // A call never named is told as such when the response finishes.
+            let written = sse_data(&frames).iter().any(|c| {
+                c["choices"][0]["delta"]["content"].as_str().is_some_and(|t| t.contains(crate::pipeline::response::NAMELESS_CALL_NOTICE.trim()))
+            });
+            assert_eq!(written, runs, "chat after {end:?}: {frames:?}");
+            let finish = sse_data(&frames).iter().any(|c| c["choices"][0]["finish_reason"].is_string());
+            assert_eq!(finish, runs, "chat after {end:?}: {frames:?}");
+
+            let mut gemini = GeminiResponseBuilder::new("m".to_string());
+            let mut frames = gemini.process_event(&call(Some("call_1"), Some("read"), r#"{"p":"#));
+            frames.extend(gemini.process_event(end));
+            assert_eq!(gemini.take_withheld_calls().len(), usize::from(!runs), "gemini after {end:?}");
+            frames.extend(gemini.flush_pending());
+            let written = frames.iter().any(|f| f.contains("functionCall"));
+            assert_eq!(written, runs, "gemini after {end:?}: {frames:?}");
+            assert_eq!(frames.iter().any(|f| f.contains("finishReason")), runs, "gemini after {end:?}: {frames:?}");
+        }
+
+        // After the finish the answer's calls are whole: an error that follows
+        // comes after them, for a Chat client (a call first seen after the
+        // finish, still held) as for a Gemini one (every call held until its
+        // finish's usage).
+        let mut chat = ChatCompletionsResponseBuilder::new("m".into(), "chatcmpl-1".into());
+        let mut frames = chat.process_event(&done);
+        frames.extend(chat.process_event(&call(Some("call_1"), None, "{}")));
+        frames.extend(chat.process_event(&error));
+        let notice = crate::pipeline::response::NAMELESS_CALL_NOTICE.trim();
+        let told = frames.iter().position(|f| f.contains(notice));
+        let failed = frames.iter().position(|f| f.contains("\"error\""));
+        assert_matches!((told, failed), (Some(t), Some(e)) if t < e, "chat: {frames:?}");
+        let mut gemini = GeminiResponseBuilder::new("m".to_string());
+        let mut frames = gemini.process_event(&call(Some("call_1"), Some("read"), "{}"));
+        frames.extend(gemini.process_event(&done));
+        frames.extend(gemini.process_event(&error));
+        let written = frames.iter().position(|f| f.contains("functionCall"));
+        let failed = frames.iter().position(|f| f.contains("\"error\""));
+        assert_matches!((written, failed), (Some(w), Some(e)) if w < e, "gemini: {frames:?}");
     }
 
     /// Every event of a translated Responses stream carries the
@@ -7303,12 +7434,13 @@ mod tests {
         assert!(out[0].contains("\"args\":{\"k\":1}"), "{out:?}");
     }
 
-    /// A translated stream that ends with no finish is a response that
-    /// stopped short: the Responses client is closed with
+    /// A translated stream whose upstream closed with no finish is a response
+    /// that stopped short: the Responses client is closed with
     /// `response.incomplete` (no reason — the gateway cannot know one), the
     /// call still open closed `incomplete`, and announced under a minted id
-    /// since the client had not yet been handed it. A builder that sent nothing
-    /// sends nothing.
+    /// since the client had not yet been handed it. The flush alone writes no
+    /// such close (a stalled stream is given the timeout error instead), and a
+    /// builder that sent nothing sends nothing.
     #[test]
     fn a_responses_stream_cut_short_ends_incomplete() {
         let mut builder = ResponsesResponseBuilder::new("resp_1".to_string(), "m".to_string());
@@ -7321,6 +7453,8 @@ mod tests {
             form: crate::api::domain::CallArguments::Json,
         }));
         out.extend(builder.flush_pending());
+        assert!(!builder.terminal_sent(), "the flush leaves an unfinished response open");
+        out.extend(builder.close_cut_short());
         let events: Vec<Value> = out
             .iter()
             .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("data: ")).and_then(|d| serde_json::from_str(d).ok()))
@@ -7335,8 +7469,9 @@ mod tests {
         let statuses: Vec<&str> = last["response"]["output"].as_array().unwrap().iter().map(|i| i["status"].as_str().unwrap()).collect();
         // The message ended when the call opened; the call is what was cut.
         assert_eq!(statuses, ["completed", "incomplete"]);
+        assert!(builder.close_cut_short().is_empty(), "the response ends once");
         assert!(builder.flush_pending().is_empty(), "the response ends once");
-        assert!(ResponsesResponseBuilder::new("resp_2".to_string(), "m".to_string()).flush_pending().is_empty());
+        assert!(ResponsesResponseBuilder::new("resp_2".to_string(), "m".to_string()).close_cut_short().is_empty());
     }
 
     /// A call first seen after the finish, still unidentified when the usage

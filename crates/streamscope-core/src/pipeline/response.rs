@@ -70,8 +70,9 @@ pub enum Withheld {
     NotCarried(crate::api::domain::ClientBuiltin),
     /// A call the stream never named: the client is told in its place.
     Nameless,
-    /// A call of a Responses turn that ended `failed` or `cancelled`
-    /// ([`FAILED_TURN_NOTICE`]).
+    /// A call of a turn that did not complete: a Responses turn that ended
+    /// `failed` or `cancelled` ([`FAILED_TURN_NOTICE`]), or a call a builder
+    /// still held when its stream failed ([`WithheldCalls::failed`]).
     FailedTurn,
 }
 
@@ -124,6 +125,18 @@ impl WithheldCalls {
         }
         self.calls.push((call, Withheld::Nameless));
         true
+    }
+
+    /// Withhold call `call` whole because its response failed — an error, or
+    /// a stall before the finish — while the builder still held it: a failed
+    /// response holds no call the client may run. The error tells the client;
+    /// the audit records the call as not carried.
+    /// A call whose late bytes were withheld already is recorded again: the
+    /// call itself goes missing here, as with [`Self::nameless`].
+    pub fn failed(&mut self, call: usize) {
+        if !self.calls.contains(&(call, Withheld::FailedTurn)) {
+            self.calls.push((call, Withheld::FailedTurn));
+        }
     }
 
     /// Whether call `call` went to the client as a nameless call's notice.
