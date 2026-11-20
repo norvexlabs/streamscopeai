@@ -2338,9 +2338,22 @@ async fn upsert_session_for_turn(
     // $18 — the currency the turn's charge is booked in, as its `llm_audit`
     // row stamps it.
     .bind(record.cost_currency.as_str())
+    // $19 — the client session id the turn came under, where it is not the
+    // session's own id ([`correlation_of`]).
+    .bind(correlation_of(record, session_id))
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// The client session id (`gateway_audit.session_id`) a conversation's turn
+/// came under, when the conversation is not keyed by it — what its MCP and A2A
+/// calls carry, and what their gateway-only session is keyed by: the Sessions
+/// list folds that session under the conversation naming it.
+/// `None` for a turn with no client session id, and for a session keyed by its
+/// client session id (a media call with no history), which IS that session.
+fn correlation_of(record: &streamscope_core::audit::AuditRecord, session_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    record.session_id.filter(|c| *c != session_id)
 }
 
 /// How a turn moves its session's spend classification
@@ -2375,16 +2388,18 @@ const SESSION_TURN_UPSERT: &str = concat!(
          turn_count, total_prompt_tokens, total_completion_tokens, \
          total_cache_creation_tokens, total_cache_read_tokens, total_reasoning_tokens, \
          total_cost, cost_currency, cost_currency_count, \
-         first_user_prompt, created_at, updated_at, last_latency_ms, last_llm_at, first_prompt_at, landed_xid) \
+         first_user_prompt, created_at, updated_at, last_latency_ms, last_llm_at, first_prompt_at, landed_xid, \
+         correlation_id) \
          VALUES ($1, $2, $3, (SELECT email FROM users WHERE tenant_id = $2 AND id = $3), \
                  CASE WHEN (SELECT email FROM users WHERE tenant_id = $2 AND id = $3) = $16 THEN 'agent' ELSE 'user' END, \
                  $14, $17, $4, $5, \
                  1, $6, $7, $12, $13, $15, $8, $18, 1, $9, $10::timestamptz, $10::timestamptz, $11, \
                  $10::timestamptz, CASE WHEN $9::text IS NULL THEN NULL ELSE $10::timestamptz END, \
-                 pg_current_xact_id()::text::bigint) \
+                 pg_current_xact_id()::text::bigint, $19) \
          ON CONFLICT (tenant_id, session_id) DO UPDATE SET \
              turn_count = sessions.turn_count + 1, \
-             landed_xid = EXCLUDED.landed_xid, ",
+             landed_xid = EXCLUDED.landed_xid, \
+             correlation_id = COALESCE(sessions.correlation_id, EXCLUDED.correlation_id), ",
         session_spend_currency_update!(),
         "total_prompt_tokens = sessions.total_prompt_tokens + EXCLUDED.total_prompt_tokens, \
              total_completion_tokens = sessions.total_completion_tokens + EXCLUDED.total_completion_tokens, \

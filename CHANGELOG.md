@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.73]
+
+### Fixed
+
+- **A conversation whose client sends its session id on its MCP and A2A calls too is listed once.**
+  Since 2026.11.62 those calls were also listed as a second, empty session beside the conversation.
+  The Sessions list no longer lists that session beside its conversation, unless it carries an
+  expert alert you are shown, and the conversation's page links to it (**All tool and agent calls under
+  this client's session id**). A search, an **Alert** filter or a **Linked** choice still lists it
+  flat. Nothing is removed. A conversation from before the upgrade folds it once it continues. A
+  client that only calls MCP or A2A tools still has a session of its own, whose page now names its
+  user, key and workspace instead of "--".
+
+## [2026.11.72]
+
+### Fixed
+
+- **A tool-call rule written for the built-in Web server now decides the web searches and fetches
+  the gateway runs for a substitution rule.** A rule on the built-in Web server's `web_search` or
+  `web_fetch` — with no server filter, or one matching that server (`*` included) — now refuses or
+  rewrites the same call when the model reaches it through a substituted tool (a provider's
+  server-side search, or a coding client's own web tool), beside the rules on the client's tool
+  name, which are read first.
+
 ## [2026.11.71]
 
 ### Added

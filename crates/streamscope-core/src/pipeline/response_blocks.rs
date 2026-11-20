@@ -153,7 +153,10 @@ impl PendingInterceptedCall {
     /// Decide this call by the response-phase tool-call rules before the
     /// gateway runs it, as every call the client receives is decided: under
     /// the name the model called, the substitute's (`binding.replaced_name`)
-    /// and the client's tool it stands for (`binding.original_name`), each
+    /// and the client's tool it stands for (`binding.original_name`), then as
+    /// the tool of the gateway's server that runs it
+    /// (`InterceptKind::served_tool`, so a rule filtered on `builtin-web`
+    /// reads it too), each
     /// reading the arguments as the one before left them — and, once one
     /// rewrote them, reading only the block rules, so a rule two names resolve
     /// to never rewrites twice and a rewrite never hides a block. A rewrite
@@ -172,16 +175,25 @@ impl PendingInterceptedCall {
     ) -> InterceptPolicyRecord {
         let mut record = InterceptPolicyRecord { name: self.binding.original_name.clone(), ..Default::default() };
         let sent = self.arguments_json.clone();
-        let mut names: Vec<String> = Vec::new();
+        let mut readings: Vec<(String, Option<crate::config::tool_names::ToolName<'static>>)> = Vec::new();
         for name in [&self.tool_name, &self.binding.replaced_name, &self.binding.original_name] {
-            if !name.is_empty() && !names.contains(name) {
-                names.push(name.clone());
+            if !name.is_empty() && !readings.iter().any(|(n, _)| n == name) {
+                readings.push((name.clone(), None));
             }
         }
+        // The last reading is the tool of the gateway's own server that runs
+        // the call (`builtin-web`'s `web_search` / `web_fetch`), so the rules
+        // filtered on that server decide it too. Last, so it only adds to what
+        // the names decide: after their rewrite it reads only block rules.
+        let (server, served) = self.binding.intercept.served_tool();
+        readings.push((
+            served.to_string(),
+            Some(crate::config::tool_names::ToolName::served(served, server)),
+        ));
         // Once a reading has rewritten the call, the later ones read only the
         // block rules: a rewrite they would take first must not hide a block.
         let block_rules = std::cell::OnceCell::new();
-        for name in names {
+        for (name, served) in readings {
             let rules: &[crate::config::tool_rules::Rule] = if record.modifications.is_empty() {
                 tool_rules
             } else {
@@ -194,17 +206,30 @@ impl PendingInterceptedCall {
                 })
             };
             let args: Option<serde_json::Value> = serde_json::from_str(&self.arguments_json).ok();
-            match evaluate_response_tool_call_policy(
-                rules,
-                withheld_tools,
-                field_profiles,
-                mcp_names,
-                model,
-                app_id,
-                &name,
-                &self.arguments_json,
-                args.as_ref(),
-            ) {
+            let policy = match served {
+                Some(resolved) => evaluate_resolved_tool_call_policy(
+                    rules,
+                    field_profiles,
+                    model,
+                    app_id,
+                    &name,
+                    resolved,
+                    &self.arguments_json,
+                    args.as_ref(),
+                ),
+                None => evaluate_response_tool_call_policy(
+                    rules,
+                    withheld_tools,
+                    field_profiles,
+                    mcp_names,
+                    model,
+                    app_id,
+                    &name,
+                    &self.arguments_json,
+                    args.as_ref(),
+                ),
+            };
+            match policy {
                 ToolCallPolicy::Allow => {}
                 ToolCallPolicy::Replace { new_args_str, modifications, .. } => {
                     self.arguments_json = new_args_str;
@@ -4075,8 +4100,6 @@ fn evaluate_response_tool_call_policy(
     args_str: &str,
     args: Option<&serde_json::Value>,
 ) -> ToolCallPolicy {
-    use crate::config::tool_rules::{self, ActionKind, Phase, RuleAction, Scope, ToolCallResolver};
-
     // A call to a tool the request withheld is refused before the answer's
     // own rules are read (`BlockAccumulator::withheld_tools`).
     if let Some(withheld) = withheld_tool(withheld_tools, name) {
@@ -4086,13 +4109,33 @@ fn evaluate_response_tool_call_policy(
             description: withheld.description.clone(),
         };
     }
-    let crate::config::tool_names::ToolName { local: effective_name, mcp_server, .. } =
-        crate::config::tool_names::resolve_tool_name(name, app_id, Some(mcp_names), Some(field_profiles));
+    let resolved = crate::config::tool_names::resolve_tool_name(name, app_id, Some(mcp_names), Some(field_profiles));
+    evaluate_resolved_tool_call_policy(rules, field_profiles, model, app_id, name, resolved, args_str, args)
+}
+
+/// [`evaluate_response_tool_call_policy`] for a call whose tool and MCP
+/// server are already known (`resolved`), not read from its name — a call the
+/// gateway runs on its own server. Reads no withheld tool: `name` is the
+/// rules' title for the call, not a name the client declared.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_resolved_tool_call_policy(
+    rules: &[crate::config::tool_rules::Rule],
+    field_profiles: &crate::config::tool_rules::FieldProfileSet,
+    model: Option<&str>,
+    app_id: Option<&str>,
+    name: &str,
+    resolved: crate::config::tool_names::ToolName<'_>,
+    args_str: &str,
+    args: Option<&serde_json::Value>,
+) -> ToolCallPolicy {
+    use crate::config::tool_rules::{self, ActionKind, Phase, RuleAction, Scope, ToolCallResolver};
+
+    let crate::config::tool_names::ToolName { local: effective_name, mcp_server, .. } = resolved;
     let tool_id = field_profiles
         .resolve_tool_id(effective_name, app_id, mcp_server)
         .map(|s| s.to_string());
-    // The call's MCP server is the one its name resolves to, so a
-    // server-filtered rule meets the call as it does on the MCP path.
+    // The call's MCP server (`resolved.mcp_server`) decides which
+    // server-filtered rules meet it.
     let scoped: Vec<&tool_rules::Rule> = tool_rules::extract_for_each_tool(
         rules,
         Phase::Response,
@@ -8662,6 +8705,9 @@ mod tests {
     fn client_fetch_binding() -> crate::proxy::content::InterceptBinding {
         crate::proxy::content::InterceptBinding {
             original_name: "WebFetch".into(),
+            intercept: crate::config::tool_rules::InterceptKind::WebExecutor {
+                kind: crate::config::tool_rules::WebInterceptKind::Fetch,
+            },
             ..make_substitute_binding("ssai_web_fetch", "WS-SUB")
         }
     }
@@ -8774,6 +8820,143 @@ mod tests {
             ],
         }))
         .unwrap()
+    }
+
+    /// The `builtin-web` profiles as seeded: `/mcp/web`'s tools, each read
+    /// on its own server only.
+    fn builtin_web_profiles() -> crate::config::tool_rules::FieldProfileSet {
+        crate::config::tool_rules::FieldProfileSet::new(
+            [("web_fetch", "url", "url"), ("web_search", "query", "raw")]
+                .iter()
+                .map(|(tool, field, normalizer)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("TFP-{tool}"), "tool_id": tool, "tool_pattern": tool,
+                        "mcp_server": "builtin-web", "field": field, "normalizer": normalizer,
+                    }))
+                    .unwrap()
+                })
+                .collect(),
+        )
+    }
+
+    /// A rule on `server`'s `tool_id` whose `arg.<field>` names `needle`.
+    fn server_rule(server: &str, tool_id: &str, field: &str, needle: &str, action: serde_json::Value) -> crate::config::tool_rules::Rule {
+        serde_json::from_value(serde_json::json!({
+            "id": format!("{server}-{tool_id}"), "description": "web rule", "risk": "danger",
+            "phase": "response", "scope": "tool_calls", "action": action, "mcp_server_filter": server,
+            "match": [
+                {"target": "tool_id", "op": "in", "value": [tool_id]},
+                {"target": format!("arg.{field}"), "op": "contains_any", "value": [needle]},
+            ],
+        }))
+        .unwrap()
+    }
+
+    /// The gateway runs a substituted call on the service `/mcp/web` runs, so
+    /// a rule written for that server decides it — though none of the call's
+    /// names resolves to it. The same call to a URL the rule does not name
+    /// runs, and a rule on another server never reads it.
+    #[test]
+    fn a_builtin_web_rule_decides_a_substituted_call() {
+        let block = serde_json::json!({"kind": "block"});
+        let rules = [server_rule("builtin-web", "web_fetch", "url", "pastebin.com", block.clone())];
+        for (url, blocked) in [("https://pastebin.com/raw/x", true), ("https://example.com/", false)] {
+            let mut call = fetch_call(url);
+            let record = call.police(&rules, &builtin_web_profiles(), &Default::default(), None, None, &[]);
+            assert_eq!(call.blocked.is_some(), blocked, "{url}");
+            if blocked {
+                let info = record.blocked.expect("the block is recorded");
+                assert_eq!((info.name.as_str(), info.rule_id.as_str()), ("WebFetch", "builtin-web-web_fetch"));
+            }
+        }
+        let elsewhere = [server_rule("tools-up", "web_fetch", "url", "pastebin.com", block)];
+        let mut call = fetch_call("https://pastebin.com/raw/x");
+        call.police(&elsewhere, &builtin_web_profiles(), &Default::default(), None, None, &[]);
+        assert!(call.blocked.is_none());
+    }
+
+    /// A search binding is read as `web_search`, not `web_fetch`: the rule
+    /// on the search's query decides it, the fetch rule does not.
+    #[test]
+    fn a_substituted_search_is_read_as_the_servers_search() {
+        let block = serde_json::json!({"kind": "block"});
+        let call = |query: &str| PendingInterceptedCall {
+            binding: make_substitute_binding("ssai_web_search", "WS-SUB"),
+            tool_name: "ssai_web_search".into(),
+            arguments_json: serde_json::json!({ "query": query }).to_string(),
+            ..fetch_call("unused")
+        };
+        let rules = [server_rule("builtin-web", "web_search", "query", "secret", block.clone())];
+        for (query, blocked) in [("company secret plans", true), ("weather", false)] {
+            let mut c = call(query);
+            c.police(&rules, &builtin_web_profiles(), &Default::default(), None, None, &[]);
+            assert_eq!(c.blocked.is_some(), blocked, "{query}");
+        }
+        let fetch_rules = [server_rule("builtin-web", "web_fetch", "query", "secret", block)];
+        let mut c = call("company secret plans");
+        c.police(&fetch_rules, &builtin_web_profiles(), &Default::default(), None, None, &[]);
+        assert!(c.blocked.is_none());
+    }
+
+    fn builtin_web_rewrite() -> crate::config::tool_rules::Rule {
+        server_rule(
+            "builtin-web",
+            "web_fetch",
+            "url",
+            "pastebin.com",
+            serde_json::json!({"kind": "replace", "regex": "(pastebin\\.com)", "with": "$1.invalid"}),
+        )
+    }
+
+    /// A rewrite filtered on `builtin-web` changes what the gateway runs.
+    #[test]
+    fn a_builtin_web_rewrite_changes_a_substituted_call() {
+        let mut call = fetch_call("https://pastebin.com/raw/x");
+        let record = call.police(&[builtin_web_rewrite()], &builtin_web_profiles(), &Default::default(), None, None, &[]);
+        assert!(call.blocked.is_none());
+        assert_eq!(call.arguments_json, r#"{"url":"https://pastebin.com.invalid/raw/x"}"#);
+        assert_eq!(record.modifications.len(), 1);
+    }
+
+    /// The server's reading only adds to what the names decide: a rewrite on
+    /// the client's tool is applied as before, and after it the server's
+    /// reading reads only its block rules — its own rewrite gives way.
+    #[test]
+    fn a_builtin_web_rewrite_gives_way_to_the_client_tools_rewrite() {
+        let client = url_rule("CLIENT-REDACT", "client_fetch", "token=", serde_json::json!({"kind": "replace", "regex": "token=[a-z]+", "with": "token=redacted"}));
+        let server = server_rule("builtin-web", "web_fetch", "url", "x.test", serde_json::json!({"kind": "replace", "regex": "http://", "with": "https://"}));
+        let profiles = crate::config::tool_rules::FieldProfileSet::new(
+            builtin_web_profiles().iter().cloned().chain(fetch_profiles(&[("WebFetch", "client_fetch")]).iter().cloned()).collect(),
+        );
+        let mut call = fetch_call("http://x.test/?token=abc");
+        call.police(std::slice::from_ref(&server), &profiles, &Default::default(), None, None, &[]);
+        assert_eq!(call.arguments_json, r#"{"url":"https://x.test/?token=abc"}"#, "the server's rewrite alone applies");
+        let mut call = fetch_call("http://x.test/?token=abc");
+        let record = call.police(&[server, client], &profiles, &Default::default(), None, None, &[]);
+        assert_eq!(call.arguments_json, r#"{"url":"http://x.test/?token=redacted"}"#);
+        assert_eq!(record.modifications.len(), 1);
+        // Its block rules still read the call after the client's rewrite.
+        let block = server_rule("builtin-web", "web_fetch", "url", "x.test", serde_json::json!({"kind": "block"}));
+        let client = url_rule("CLIENT-REDACT", "client_fetch", "token=", serde_json::json!({"kind": "replace", "regex": "token=[a-z]+", "with": "token=redacted"}));
+        let mut call = fetch_call("http://x.test/?token=abc");
+        let record = call.police(&[client, block], &profiles, &Default::default(), None, None, &[]);
+        assert_eq!(record.blocked.map(|b| b.rule_id).as_deref(), Some("builtin-web-web_fetch"));
+    }
+
+    /// A rewrite of `web_fetch` changes what is run, once, though the
+    /// client's tool's reading resolves to the same tool id.
+    #[test]
+    fn a_builtin_web_rewrite_is_applied_once() {
+        let mut rules = [builtin_web_rewrite()];
+        rules[0].mcp_server_filter = None;
+        let profiles = crate::config::tool_rules::FieldProfileSet::new(
+            builtin_web_profiles().iter().cloned().chain(fetch_profile_for("WebFetch").iter().cloned()).collect(),
+        );
+        let mut call = fetch_call("https://pastebin.com/raw/x");
+        let record = call.police(&rules, &profiles, &Default::default(), None, None, &[]);
+        assert!(call.blocked.is_none());
+        assert_eq!(call.arguments_json, r#"{"url":"https://pastebin.com.invalid/raw/x"}"#);
+        assert_eq!(record.modifications.len(), 1);
     }
 
     #[test]

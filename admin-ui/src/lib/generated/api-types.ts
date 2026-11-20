@@ -2725,8 +2725,8 @@ export interface paths {
         head?: never;
         /**
          * Replace the sections sent — the clients offered, the destination lists, the
-         *     sandbox settings, the hidden portal pages — and leave the others as they
-         *     are.
+         *     sandbox settings, the hidden portal pages, whether the portal shows expert
+         *     alerts — and leave the others as they are.
          */
         patch: operations["update_profile_client_access"];
         trace?: never;
@@ -9745,6 +9745,14 @@ export interface components {
              *     authenticated here (distinct from `user_email`, the internal account).
              */
             client_ip?: string | null;
+            /**
+             * Format: uuid
+             * @description The session of the client session id this conversation's turns came
+             *     under — the MCP and A2A calls the client made under it, which the
+             *     Sessions list shows under this conversation; absent when there is none
+             *     the caller may see.
+             */
+            client_session_id?: string | null;
             end_user?: string | null;
             end_user_groups?: string[];
             events?: components["schemas"]["ConversationEvent"][] | null;
@@ -10445,8 +10453,9 @@ export interface components {
              *     definitions of matching servers: on the MCP gateway the upstream a
              *     request reaches; on a model's tool call the server its tool name
              *     resolves to — a gateway virtual server's upstream, or `<server>` in a
-             *     client-run tool named `mcp__<server>__<tool>`. A tool of no MCP server
-             *     never matches a rule that sets it.
+             *     client-run tool named `mcp__<server>__<tool>`; a call the gateway runs
+             *     for a substitution rule also as `builtin-web`'s `web_search` /
+             *     `web_fetch`. A tool of no MCP server never matches a rule that sets it.
              */
             mcp_server_filter?: string | null;
             model_filter?: string | null;
@@ -16609,8 +16618,10 @@ export interface components {
                  *     [`applies_to_server`]): on the MCP gateway the upstream a request
                  *     reaches; on a model's tool call the server its name resolves to — a
                  *     gateway virtual server's upstream, or `<server>` in a client-run tool
-                 *     named `mcp__<server>__<tool>`. `None` means any server; a tool of no
-                 *     MCP server never matches a rule with this filter set.
+                 *     named `mcp__<server>__<tool>`; a call the gateway runs for a
+                 *     substitution rule also as `builtin-web`'s `web_search` / `web_fetch`.
+                 *     `None` means any server; a tool of no MCP server never matches a rule
+                 *     with this filter set.
                  */
                 mcp_server_filter?: string | null;
                 /** @description Optional pipe-separated glob over the resolved upstream model name. */
@@ -19160,8 +19171,10 @@ export interface components {
              *     [`applies_to_server`]): on the MCP gateway the upstream a request
              *     reaches; on a model's tool call the server its name resolves to — a
              *     gateway virtual server's upstream, or `<server>` in a client-run tool
-             *     named `mcp__<server>__<tool>`. `None` means any server; a tool of no
-             *     MCP server never matches a rule with this filter set.
+             *     named `mcp__<server>__<tool>`; a call the gateway runs for a
+             *     substitution rule also as `builtin-web`'s `web_search` / `web_fetch`.
+             *     `None` means any server; a tool of no MCP server never matches a rule
+             *     with this filter set.
              */
             mcp_server_filter?: string | null;
             /** @description Optional pipe-separated glob over the resolved upstream model name. */
@@ -21393,8 +21406,10 @@ export interface components {
              *     [`applies_to_server`]): on the MCP gateway the upstream a request
              *     reaches; on a model's tool call the server its name resolves to — a
              *     gateway virtual server's upstream, or `<server>` in a client-run tool
-             *     named `mcp__<server>__<tool>`. `None` means any server; a tool of no
-             *     MCP server never matches a rule with this filter set.
+             *     named `mcp__<server>__<tool>`; a call the gateway runs for a
+             *     substitution rule also as `builtin-web`'s `web_search` / `web_fetch`.
+             *     `None` means any server; a tool of no MCP server never matches a rule
+             *     with this filter set.
              */
             mcp_server_filter?: string | null;
             /** @description Optional pipe-separated glob over the resolved upstream model name. */

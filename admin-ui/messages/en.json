@@ -1115,6 +1115,7 @@
   "conv_link_evidence_agent_medium": "expert, medium",
   "session_row_continued_in": "Continued in",
   "browse_session_continued_in": "Continued in a later session",
+  "browse_session_client_session": "All tool and agent calls under this client's session id",
   "browse_subagent_alert": "Sub-agent alert: {level}",
   "browse_subagents_more": "{count} more — open the session to see them all",
   "browse_subagents_loading": "Loading sub-agents…"

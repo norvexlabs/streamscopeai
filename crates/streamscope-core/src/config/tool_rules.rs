@@ -191,12 +191,27 @@ pub struct ToolDefValue {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InterceptKind {
-    /// Execute via the built-in `WebService` (phase-1 executor). The
-    /// only intercept currently supported; agent-loop wiring lands in a
-    /// follow-up PR.
+    /// Run the call on the built-in Web service (`/mcp/web`'s search or
+    /// fetch), inside the substitution agent loop.
     WebExecutor {
         kind: WebInterceptKind,
     },
+}
+
+impl InterceptKind {
+    /// The tool of the gateway's own MCP server that runs a call bound to
+    /// this handler: `(server, tool)`, as `/mcp/web` names it — the reading
+    /// under which that server's rules decide the call.
+    pub fn served_tool(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::WebExecutor { kind: WebInterceptKind::Search } => {
+                (crate::web::BUILTIN_WEB_UPSTREAM_NAME, crate::web::TOOL_WEB_SEARCH)
+            }
+            Self::WebExecutor { kind: WebInterceptKind::Fetch } => {
+                (crate::web::BUILTIN_WEB_UPSTREAM_NAME, crate::web::TOOL_WEB_FETCH)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -279,8 +294,10 @@ pub struct Rule {
     /// [`applies_to_server`]): on the MCP gateway the upstream a request
     /// reaches; on a model's tool call the server its name resolves to — a
     /// gateway virtual server's upstream, or `<server>` in a client-run tool
-    /// named `mcp__<server>__<tool>`. `None` means any server; a tool of no
-    /// MCP server never matches a rule with this filter set.
+    /// named `mcp__<server>__<tool>`; a call the gateway runs for a
+    /// substitution rule also as `builtin-web`'s `web_search` / `web_fetch`.
+    /// `None` means any server; a tool of no MCP server never matches a rule
+    /// with this filter set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_filter: Option<String>,
     /// Optional pipe-separated glob over the A2A upstream agent's slug

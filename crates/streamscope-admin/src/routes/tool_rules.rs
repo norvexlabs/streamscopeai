@@ -166,8 +166,9 @@ pub struct CreateToolRule {
     /// definitions of matching servers: on the MCP gateway the upstream a
     /// request reaches; on a model's tool call the server its tool name
     /// resolves to — a gateway virtual server's upstream, or `<server>` in a
-    /// client-run tool named `mcp__<server>__<tool>`. A tool of no MCP server
-    /// never matches a rule that sets it.
+    /// client-run tool named `mcp__<server>__<tool>`; a call the gateway runs
+    /// for a substitution rule also as `builtin-web`'s `web_search` /
+    /// `web_fetch`. A tool of no MCP server never matches a rule that sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server_filter: Option<String>,
     /// Optional pipe-separated glob over the A2A upstream agent slug. Scopes the

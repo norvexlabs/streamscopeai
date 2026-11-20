@@ -151,7 +151,7 @@ impl<'a> ToolName<'a> {
         Self { local: name, mcp_server: None, gateway: false }
     }
 
-    fn served(local: &'a str, upstream: &'a str) -> Self {
+    pub(crate) fn served(local: &'a str, upstream: &'a str) -> Self {
         Self { local, mcp_server: Some(upstream), gateway: true }
     }
 }

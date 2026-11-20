@@ -1115,6 +1115,7 @@
   "conv_link_evidence_agent_medium": "expert, moyenne",
   "session_row_continued_in": "Suite dans",
   "browse_session_continued_in": "Suite dans une session ultérieure",
+  "browse_session_client_session": "Tous les appels d'outils et d'agents sous l'identifiant de session du client",
   "browse_subagent_alert": "Alerte de sous-agent : {level}",
   "browse_subagents_more": "{count} de plus — ouvrez la session pour tous les voir",
   "browse_subagents_loading": "Chargement des sous-agents…"

@@ -342,6 +342,20 @@
     </button>
   {/if}
 
+  {#if conversation?.client_session_id}
+    {@const calls = conversation.client_session_id}
+    <button
+      onclick={() => navigateToSession(calls)}
+      class="mb-4 w-full rounded-xl border border-(--border) bg-(--bg-card) hover:bg-(--bg-elevated) px-4 py-3 flex items-center gap-3 cursor-pointer transition-colors text-left"
+    >
+      <Icon name="arrowRight" size="sm" color="var(--text-secondary)" />
+      <span class="text-sm text-(--text-primary)">
+        {m.browse_session_client_session()}
+        <span class="text-(--accent) font-mono text-xs ml-1">{calls.substring(0, 8)}...</span>
+      </span>
+    </button>
+  {/if}
+
   {#if sessionIssues.length > 0}
     <div class="mb-4 rounded-xl border border-(--border) bg-(--bg-card) px-4 py-3">
       <div class="flex items-center gap-2 mb-2.5">

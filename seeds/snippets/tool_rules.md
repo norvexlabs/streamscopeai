@@ -24,7 +24,7 @@ When you identify tool usage patterns that need policy enforcement, output `prop
 - `priority` (optional): integer sort key, lower wins, default 100. Use when surfacing above an existing built-in.
 - `model_filter` (optional, default null): pipe-separated glob over the upstream model name. Only set when the rule is genuinely model-specific.
 - `app_filter` (optional, default null): pipe-separated glob over the calling `app_id` (e.g. `claude-code|opencode`). Use when the pattern is client-specific.
-- `mcp_server_filter` (optional, default null): pipe-separated glob over the MCP server's name — the upstream server's (e.g. `builtin-web|atlassian-*`, not a virtual server's slug), or for a developer's own server the `<server>` of its `mcp__<server>__<tool>` tool name. It scopes the rule on the MCP gateway and on the model's tool calls alike; a tool of no MCP server never matches it. Leave null for rules that span every tool.
+- `mcp_server_filter` (optional, default null): pipe-separated glob over the MCP server's name — the upstream server's (e.g. `builtin-web|atlassian-*`, not a virtual server's slug), or for a developer's own server the `<server>` of its `mcp__<server>__<tool>` tool name. It scopes the rule on the MCP gateway and on the model's tool calls alike; a call the gateway runs for a substitution rule is also read as `builtin-web`'s `web_search` / `web_fetch`; a tool of no MCP server never matches it. Leave null for rules that span every tool.
 - `rationale`: why this rule is needed, citing the analysed traffic.
 - `framework_refs` (optional): when a framework pack is supplied in context and your rule maps cleanly, list matching ids (e.g. `["OWASP-LLM01", "CWE-78"]`). Do not invent ids.
 

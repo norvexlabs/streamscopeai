@@ -4656,7 +4656,7 @@ fn axis_payload_schema(
                     },
                     "mcp_server_filter": {
                         "type": ["string", "null"],
-                        "description": "Pipe-separated glob over the mcp_server slug, or null"
+                        "description": "Pipe-separated glob over the MCP server name, or null; a web search/fetch the gateway runs for a substitution rule counts as builtin-web's"
                     },
                     "rationale": { "type": "string", "description": "Why this rule should exist; cited from the analysed traffic" },
                     "framework_refs": {

@@ -659,7 +659,7 @@
     <div class="grid grid-cols-2 gap-3">
       <FormField label="MCP server filter" for="rule-mcp">
         <TextInput id="rule-mcp" bind:value={mcpServerFilter} placeholder="notion-prod | internal-*" mono />
-        {#snippet help()}Pipe-separated glob over the MCP server name: a gateway tool's upstream server, or the server in a model's call named mcp__&lt;server&gt;__&lt;tool&gt;. Empty = any server.{/snippet}
+        {#snippet help()}Pipe-separated glob over the MCP server name: a gateway tool's upstream server, or the server in a model's call named mcp__&lt;server&gt;__&lt;tool&gt;; a web search or fetch the gateway runs for a substitution rule counts as builtin-web's. Empty = any server.{/snippet}
       </FormField>
       <FormField label="A2A agent filter" for="rule-a2a">
         <TextInput id="rule-a2a" bind:value={a2aAgentFilter} placeholder="partner-* | research-prod" mono />

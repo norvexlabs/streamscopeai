@@ -2104,6 +2104,12 @@ pub struct ConversationResponse {
     /// there are none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub links: Option<LinkedCounts>,
+    /// The session of the client session id this conversation's turns came
+    /// under — the MCP and A2A calls the client made under it, which the
+    /// Sessions list shows under this conversation; absent when there is none
+    /// the caller may see.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_session_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2476,6 +2482,8 @@ pub async fn get_session_conversation_impl(
         link,
         links,
         app_id: session_app_id,
+        identity: session_identity,
+        client_session: client_session_id,
     } = session_row.unwrap_or_default();
 
     // 2. Collect all unique message hashes across all turns
@@ -2593,6 +2601,11 @@ pub async fn get_session_conversation_impl(
             end_user_groups = row.end_user_groups.clone().unwrap_or_default();
         }
     }
+    // A session with no turn (MCP-only, A2A-only) is named by its own row.
+    let user_email = user_email.or(session_identity.user_email);
+    let key_name = key_name.or(session_identity.key_name);
+    let key_prefix = key_prefix.or(session_identity.key_prefix);
+    let workspace_name = workspace_name.or(session_identity.workspace_name);
 
     let first_ts = rows
         .first()
@@ -2692,6 +2705,7 @@ pub async fn get_session_conversation_impl(
             alert_note: alert_note.clone(),
             link: link.clone(),
             links: links.clone(),
+            client_session_id,
             key_name: key_name.clone(),
             key_prefix: key_prefix.clone(),
             workspace_name: workspace_name.clone(),
@@ -3199,6 +3213,7 @@ pub async fn get_session_conversation_impl(
             alert_note,
             link,
             links,
+            client_session_id,
             key_name,
             key_prefix,
             workspace_name,
@@ -3222,6 +3237,7 @@ pub async fn get_session_conversation_impl(
         alert_note,
         link,
         links,
+        client_session_id,
         key_name,
         key_prefix,
         workspace_name,

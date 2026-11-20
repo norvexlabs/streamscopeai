@@ -446,6 +446,22 @@ pub(crate) struct ConversationSessionRow {
     pub link: Option<SessionLink>,
     pub links: Option<LinkedCounts>,
     pub app_id: Option<String>,
+    /// Who the session is, as its own row names it: what a conversation with
+    /// no turn to read it from shows.
+    pub identity: SessionIdentity,
+    /// The session of the client session id the conversation's turns came
+    /// under (`correlation_id`), when it has no turn (its MCP and A2A calls —
+    /// the session the Sessions list folds here) and the view admits it.
+    pub client_session: Option<Uuid>,
+}
+
+/// A session's user, key and workspace, as its row names them.
+#[derive(Default, sqlx::FromRow)]
+pub(crate) struct SessionIdentity {
+    pub user_email: Option<String>,
+    pub key_name: Option<String>,
+    pub key_prefix: Option<String>,
+    pub workspace_name: Option<String>,
 }
 
 /// [`ConversationSessionRow`] as the row states it.
@@ -457,6 +473,9 @@ struct ConversationSessionColumns {
     app_id: Option<String>,
     #[sqlx(flatten)]
     links: LinkColumns,
+    #[sqlx(flatten)]
+    identity: SessionIdentity,
+    client_session: Option<Uuid>,
 }
 
 /// The conversation's session row; its links name a session only when
@@ -469,9 +488,15 @@ pub(crate) async fn conversation_session(
     let (view_user, view_workspaces) = scope.linked_view();
     let linked = LinkedView::at(2, 3, scope);
     let row = sqlx::query_as::<_, ConversationSessionColumns>(sqlx::AssertSqlSafe(&*format!(
-        "SELECT {ALERT_COLUMNS}, {LINKAGE_COLUMNS}, s.app_id \
-         FROM sessions s {join} WHERE s.session_id = $1",
+        "SELECT {ALERT_COLUMNS}, {LINKAGE_COLUMNS}, s.app_id, \
+                s.user_email, ak.name AS key_name, ak.key_prefix, ws.name AS workspace_name, \
+                (SELECT cs.session_id FROM sessions cs \
+                  WHERE cs.tenant_id = s.tenant_id AND cs.session_id = s.correlation_id \
+                    AND cs.turn_count = 0 AND {admits}) \
+                  AS client_session \
+         FROM sessions s {join} {WORKSPACE_JOIN} WHERE s.session_id = $1",
         join = linked.join(),
+        admits = linked.admits_row("cs"),
     )))
     .bind(session_id)
     .bind(view_user)
@@ -485,6 +510,8 @@ pub(crate) async fn conversation_session(
         alert_expert_axis: r.alert_expert_axis,
         alert_note: r.alert_note,
         app_id: r.app_id,
+        identity: r.identity,
+        client_session: r.client_session,
     }))
 }
 
@@ -997,11 +1024,31 @@ fn push_session_filters(
              AND NOT {cycle_root} OFFSET 0))",
         admits = view.admits_row("ps"),
     );
+    // A session with no turn keyed by a client session id (the MCP and A2A
+    // calls a client made under it) whose id a conversation of this same list
+    // names (`correlation_id`): the calls replay in that conversation, which
+    // links to this session (`ConversationSessionRow::client_session`), so it
+    // folds there rather than list the conversation twice. Never one carrying
+    // an alert the view is shown: that stays a row (a hidden alert folds like
+    // none, so the fold says nothing of it). The conversation passes every
+    // filter above and the view admits it, so nothing is folded under a
+    // session outside the list — though a conversation that is itself a
+    // sub-agent folds under its parent, its client session one level further.
+    // Only a turn's upsert writes `correlation_id`, so the conversation has a
+    // turn. `OFFSET 0` fences the probe as above.
+    let correlated = format!(
+        "(s.turn_count = 0 AND (s.alert_level IS NULL OR NOT ({shown})) \
+           AND EXISTS (SELECT 1 FROM sessions ps \
+             WHERE ps.tenant_id = s.tenant_id AND ps.correlation_id = s.session_id \
+               AND {admits}{parent} OFFSET 0))",
+        shown = view.alerts_shown(),
+        admits = view.admits_row("ps"),
+    );
     match query.linked {
         Some(SessionLinkage::HasChildren) => sql.push_str(&format!(" AND {has_children}")),
         Some(SessionLinkage::HasParent) => sql.push_str(&format!(" AND {has_parent}")),
         Some(SessionLinkage::Unlinked) => sql.push_str(&format!(" AND NOT {has_children} AND NOT {has_parent}")),
-        Some(SessionLinkage::TopLevel) => sql.push_str(&format!(" AND NOT {folded}")),
+        Some(SessionLinkage::TopLevel) => sql.push_str(&format!(" AND NOT {folded} AND NOT {correlated}")),
         None => {}
     }
     (bind_idx, post_filtered || query.linked.is_some())
