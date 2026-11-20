@@ -169,4 +169,6 @@ maintainers write the changelog entry and set the version when they release.
 **Comments and docs**
 - A comment states what the code does now and, where it is easy to break, the invariant to keep;
   never its history.
-- A change to behaviour updates the Admin Guide or the Operator Guide in the same pull request.
+- A change to behaviour updates the Admin Guide, the Portal Guide or the Operator Guide in the same
+  pull request: infrastructure in the Operator Guide, what an administrator configures in the Admin
+  Guide, what a user does in the portal and with the `ssai` CLI in the Portal Guide.

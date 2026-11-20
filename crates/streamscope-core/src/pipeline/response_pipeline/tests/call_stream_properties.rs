@@ -181,12 +181,14 @@ struct GenStream {
 }
 
 impl GenStream {
+    /// The client is owed the upstream's error: one before the answer's
+    /// finish. One after it leaves the client the whole answer and its end.
     fn errored(&self) -> bool {
-        self.rounds.last().is_some_and(|r| r.error_at.is_some())
+        self.rounds.last().is_some_and(|r| r.error_at.is_some() && !r.error_after_finish)
     }
 
     fn cut_short(&self) -> bool {
-        self.rounds.last().is_some_and(|r| !r.finished)
+        self.rounds.last().is_some_and(|r| !r.finished && !(r.error_at.is_some() && r.error_after_finish))
     }
 }
 
@@ -1434,14 +1436,26 @@ fn check(stream: &GenStream, client: ApiVersion, held: bool) -> Result<(), Strin
     }
     // The stream's end: exactly one, or none where the stream was cut short
     // and no one closes it.
-    let closes_cut_short = client == ApiVersion::AnthropicMessages && !pass_through;
+    // A translated leg closes a stream cut short — Anthropic `max_tokens`
+    // (an opened message), Chat `length` and Gemini `MAX_TOKENS` (once the
+    // client was written some of the answer: a usage report alone is none).
+    let closes_cut_short = !pass_through
+        && match client {
+            ApiVersion::AnthropicMessages => true,
+            ApiVersion::ChatCompletions | ApiVersion::GoogleGemini => !view.calls.is_empty() || !view.text.is_empty(),
+            _ => false,
+        };
     let ends = if stream.errored() || !stream.cut_short() || closes_cut_short { 1..=1 } else { 0..=1 };
     if client == ApiVersion::Responses && stream.cut_short() && !stream.errored() {
         return Ok(());
     }
-    // A translated Anthropic stream that gave the client nothing ends in the
-    // gateway's `overloaded_error`.
-    let empty = client == ApiVersion::AnthropicMessages && !pass_through && !view.opened;
+    // A translated stream that gave the client none of the answer ends in the
+    // gateway's `overloaded_error` (an Anthropic one: no message opened).
+    let empty = !pass_through
+        && match client {
+            ApiVersion::AnthropicMessages => !view.opened,
+            _ => stream.cut_short() && view.calls.is_empty() && view.text.is_empty(),
+        };
     if empty && !stream.errored() {
         return if view.terminals == 1 && view.ended_in_error && view.calls.is_empty() {
             Ok(())
@@ -1470,6 +1484,45 @@ fn check(stream: &GenStream, client: ApiVersion, held: bool) -> Result<(), Strin
         return Err(format!("client has {given_unnamed} unnamed calls, the stream cut {unnamed} before naming them\n{body}"));
     }
     calls.retain(|c| !c.name.is_empty());
+    // A translated Gemini client is never written a call whose arguments
+    // are not whole JSON (its `args` would read `{}`): the audit row records
+    // it withheld instead.
+    // What reached its builder decides — a policy holding calls may hand it
+    // a call cut short whose upstream text was whole.
+    let mut dropped: Vec<usize> = Vec::new();
+    let offered: Vec<usize> = if client == ApiVersion::GoogleGemini && !pass_through {
+        let mut kept = Vec::new();
+        for i in offered {
+            let record = TransformState::failed_turn_not_carried(recorded[i].index);
+            let not_carried = audit.response_injection_blocks.iter().any(|b| b.transform == record.transform && b.content == record.content);
+            if not_carried {
+                if calls.iter().any(|c| !recorded[i].id.is_empty() && c.id == recorded[i].id) {
+                    return Err(format!("call {} is recorded not carried, yet the client has it\n{body}", expected[i].id));
+                }
+                // Only a call whose arguments reached the builder cut off is
+                // dropped: whole JSON upstream, none of it withheld, is kept.
+                if !matches!(carried_args(expected[i].freeform, &expected[i].text, held), Args::Raw(_))
+                    && withheld_records(recorded[i].index) == 0
+                {
+                    return Err(format!("call {} was whole, yet dropped\n{body}", expected[i].id));
+                }
+                dropped.push(i);
+            } else if matches!(carried_args(expected[i].freeform, &expected[i].text, held), Args::Raw(_))
+                && !expected[i].text.trim().is_empty()
+                && withheld_records(recorded[i].index) == 0
+            {
+                // A call cut before any argument is a call of none, written
+                // `{}`; one a policy read before its later bytes came (them
+                // withheld) reaches the builder as the policy read it.
+                return Err(format!("a cut-off call {} reached the client\n{body}", expected[i].id));
+            } else {
+                kept.push(i);
+            }
+        }
+        kept
+    } else {
+        offered
+    };
     if calls.len() != offered.len() {
         return Err(format!("client has {} calls, the stream offered it {}: {calls:?}\n{body}", calls.len(), offered.len()));
     }
@@ -1481,7 +1534,9 @@ fn check(stream: &GenStream, client: ApiVersion, held: bool) -> Result<(), Strin
             audit.response_injection_blocks.iter().any(|b| b.transform == record.transform && b.content == record.content)
         })
     };
-    let mut withheld: Vec<usize> = Vec::new();
+    // A dropped call whose later bytes were withheld before it was dropped
+    // was told so, as any other.
+    let mut withheld: Vec<usize> = dropped.iter().copied().filter(|&i| withheld_records(recorded[i].index) == 1).collect();
     let mut matched: Vec<usize> = Vec::new();
     for got in &calls {
         let at = offered.iter().copied().find(|&i| !recorded[i].id.is_empty() && recorded[i].id == got.id).or_else(|| minted_for(&got.id));
@@ -1833,7 +1888,8 @@ fn nothing_follows_an_error_the_upstream_goes_on_after() {
 }
 
 /// An error after the finish, while a builder holds the finish for its
-/// usage, ends the stream: the held finish is never written after it.
+/// usage, leaves the client the whole answer and its end — the error the
+/// audit's alone — and the stream ends exactly once.
 #[test]
 fn an_error_after_the_finish_ends_the_stream() {
     let mut round = gen_round(vec![gen_call("call_0_0", "Read", false, &[r#"{"v":"a"}"#], Opening::Whole, None)], vec![0]);

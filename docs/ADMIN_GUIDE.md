@@ -9,7 +9,8 @@ walks the day-2 setup in dependency order, across three roles:
 - **Tenant admin** — sets up auth, providers, workspaces, users, and policy for one tenant
   (section B).
 - **Workspace manager** — the elevated end-user who provisions keys for their team in the
-  self-service portal (section C).
+  self-service portal: the [Portal Guide](PORTAL_GUIDE.md), which also covers every member's own
+  setup (section C says how to make someone a manager).
 
 New tenant admin in a hurry? Jump to **[Getting started](#getting-started)** for the
 half-hour zero-to-first-audited-request path, then dip into the sections below for depth.
@@ -153,7 +154,7 @@ Streamscope has two distinct web surfaces, and keeping them straight prevents mo
   A and B.
 - **The portal** (the console host's root, `/`) — where **end users** self-serve: mint their own
   keys, run the quickstart wizard, and connect MCP accounts. A workspace **manager** is an elevated portal user
-  who provisions keys for their teammates. Covered by section C. Members and managers never touch
+  who provisions keys for their teammates. Covered by the [Portal Guide](PORTAL_GUIDE.md). Members and managers never touch
   the admin console; admins never need the portal to do their job.
 
 Both surfaces are **organization-scoped in the address**: once you sign in, console pages live under
@@ -247,11 +248,12 @@ gateway within a couple of seconds.
      in a workspace they mint their own keys and run the **Quickstart** wizard, which prints the exact
      config for their client (Claude Code, Cursor, opencode, Cline, …). Promote one person per team to
      **manager** so they can provision teammates. Best for onboarding a whole team. *(Detail: step 10,
-     **Hand off to end users**.)*
+     **Hand off to end users**, and the [Portal Guide](PORTAL_GUIDE.md).)*
 
 5. **Point a client at the gateway.** In any AI client, set the base URL to your gateway and use the
    Streamscope key in place of the provider key — no other change. The Quickstart wizard gives you the
-   copy-paste form per client. Send one real request.
+   copy-paste form per client; the minimal settings per client are also in the Portal Guide's
+   [Configure a client by hand](PORTAL_GUIDE.md#configure-a-client-by-hand). Send one real request.
 
 6. **Watch it land.** Back in the console, the **Dashboard** shows the request (tokens, cost,
    latency, status); **Sessions** replays it turn-by-turn, and **Audit** holds the per-request row.
@@ -868,8 +870,8 @@ in the request's audit trail.
 **fast** one for background work (titles, search, commit messages, thread summaries) and a **plan** one
 for planning. Edit a route and pick its **Client Slots** — Fast, Plan or both — and every generated
 config whose client the route is offered to (its **Client Tags**) names that alias there, as long as
-every target of the alias serves a chat model (an embedding or image alias is skipped) (which client reads which: *Set up tools
-with the `ssai` CLI*); a client the route is not offered to, and a slot no route fills, use the
+every target of the alias serves a chat model (an embedding or image alias is skipped) (which client reads which: the Portal Guide's
+[Model slots and provider names](PORTAL_GUIDE.md#model-slots-and-provider-names)); a client the route is not offered to, and a slot no route fills, use the
 default model, so nothing changes until you set one. Each slot belongs to one route per downstream —
 choosing it on a route takes it off the route that held it, which the form names — and one route may
 fill both. Pair a slot with a preset to offer one model two ways: a `-fast` alias with thinking off
@@ -1687,17 +1689,13 @@ In the **system tenant**, service accounts mint **Operator keys only** — the
 platform tenant runs no gateway workloads, so gateway keys and tenant-level
 scopes are refused there.
 
-**Workspace managers can self-serve automation keys.** A workspace manager does
-not need an admin to automate their own workspace. On the portal **Team** page,
-under **Automation**, a manager creates an *automation account* and mints `ak-…`
-keys under it. Such a key calls the **portal API scoped to that one workspace** —
-acting with the manager's authority there (manage members' keys, view the
-workspace's usage) and nothing else; the same key presented against another
-workspace is refused. The plaintext is shown once, keys take an optional expiry
-and can be revoked, and removing an automation account revokes its keys in that
-workspace. Each action is recorded in the portal audit log against the automation
-account and the specific key. (Admins can manage these accounts too — they appear
-on the Service Accounts page like any other service account.)
+**Workspace managers can self-serve automation keys.** On the portal's **Members & limits** page,
+under **Automation**, a manager creates an *automation account* and mints `ak-…` keys under it that
+call the portal API for that one workspace only
+([Portal Guide § 11](PORTAL_GUIDE.md#automation-accounts)). Each action is recorded in the portal audit
+log against the automation account and the specific key, and removing an automation account revokes
+its keys in that workspace. These accounts appear on the Service Accounts page like any other
+service account, and you can manage them there.
 
 ### 4c. Automation recipes (`curl`)
 
@@ -2057,7 +2055,8 @@ The line is written so that it can be pasted into a shell as it stands.
 
 `ssai provision` prints the lines that apply to each local server it adds.
 
-**Test a server** from the portal's **Try a server** page (step 10): it
+**Test a server** from the portal's **Try a server** page
+([Portal Guide § 8](PORTAL_GUIDE.md#8-connect-your-accounts-to-mcp-servers)): it
 connects as that user — your values plus theirs — and reports the tools each upstream offers,
 or why it could not connect. A server that needs a value the client sends cannot be fully
 tested there, and the result says so. The test never follows a redirect: a server that answers
@@ -2907,7 +2906,7 @@ Open a profile to edit it:
   your own and attach it beside them — and, while **Internal networks** is blocked, remove their
   ranges from it: a block on an address wins over an allowed name. **Require the sandbox** refuses `ssai run --sandbox off` and `--sandbox learn`
   (which leaves the filesystem unconfined); on Windows the developer first runs `ssai sandbox setup` once
-  (see *The Windows sandbox* under [Set up tools with the `ssai` CLI](#set-up-tools-with-the-ssai-cli)). **Allow the container sandbox** (on by default) lets developers
+  (see [The Windows sandbox](PORTAL_GUIDE.md#the-windows-sandbox) in the Portal Guide). **Allow the container sandbox** (on by default) lets developers
   run `ssai run --sandbox docker`, which starts the agent in a container on their Linux machine; turned
   off, that run is refused and names `--sandbox native`. While it is on, **Default container image**
   sets what such a run uses in a project with no `.streamscopeai/sandbox.json` of its own: an image
@@ -2965,884 +2964,24 @@ it reaches it — nor can the tool reach its model.
 ### 10. Hand off to end users — the **Portal**
 
 Once a workspace has a provider and a user has a portal password (or OIDC access), point
-them at the console host's root, `/` (or `/portal/login/{slug}`). There they:
+them at the console host's root, `/` (or `/portal/login/{slug}`), and hand them the
+**[Portal Guide](PORTAL_GUIDE.md)**. It walks a member from the portal's **Quickstart** page through
+installing the `ssai` CLI, provisioning their tools and running them in the sandbox, then through the
+portal itself — their Home, keys, MCP sign-ins and activity — and a manager through running their
+team. What they are offered there is yours to decide, elsewhere in this guide:
 
-- **Quickstart** — opens on **Set up via CLI** (the `ssai` commands that configure every
-  installed tool at once, below; under its run step, **How the sandbox works — modes and options**
-  opens a short reference: the run modes, what the tool can reach, keeping a container up to date,
-  and the other options); the **Web wizard** tab is the copy-paste alternative. In the
-  wizard — which works in the workspace selected in the portal header and starts over when that
-  changes; a configuration already on screen stays, under a notice, until they start over —
-  they pick their client (Claude Code, opencode, Cursor, Cline, Claude Desktop,
-  Continue, Aider, Gemini CLI, Codex, Mistral Vibe, Qwen Code, Goose, Zed, Open Code Review, generic curl/SDK); the wizard mints a key bound to the chosen
-  provider and renders a copy-paste config with the right base URL, model alias, and flags.
-  A tool that can speak both the OpenAI and the Anthropic protocol (OpenCode, Crush, Continue,
-  Cline, Aider, Open Code Review) defaults to its **OpenAI-compatible** variant, which works with every model; its
-  **Native Anthropic** variant is the one to pick for Claude
-  models — extended thinking and prompt caching then pass through unchanged. Some tools read their key from a second file of their own — a secrets file, or an environment
-  file the tool loads on start — and the wizard renders that file alongside the config, with the
-  key filled in when you copy it. Claude Code's MCP servers come as commands to run once
-  (`claude mcp add-json --scope user …`, in a POSIX shell — on Windows, Git Bash): Claude Code never
-  reads them from its `settings.json`. With a gateway key the commands hold no key — each server reads
-  it from `STREAMSCOPE_MCP_KEY`, which the settings file sets; a BYOK server's address carries its key. Where a tool takes its key only from a shell variable and no
-  file can hold it, the wizard shows the key itself instead. Either way, **that page is the one
-  time the key can be read**: the gateway keeps only a hash of it.
-- **Home** (`/portal/home`) — where every member lands after signing in: their dashboard. Three
-  buttons start the common tasks (**New key**, **Set up a tool**, **Try an MCP server**). Their
-  own activity, over every workspace they use: spend and requests today (UTC) and over the last 7
-  days (UTC days, today included), and a bar per day for those 7 days. Their 5 latest sessions.
-  Beside them, only what applies:
-  - **To do** — one line per thing waiting on them, each with the way to fix it: no key and no
-    traffic yet (create one), a key that expires within 7 days or expired in the last 7 (a key
-    created to live 7 days or less, such as the CLI's per-run keys, is not one), the MCP servers
-    waiting for their sign-in or values, and each machine whose `ssai` CLI is older than the one
-    the gateway serves — named by its host, with `ssai update` to copy. A machine is named from
-    what its CLI reports on each call; one not seen in 30 days is not listed, and the line goes
-    away on the machine's first call after the update.
-  - **My limits** — every limit that applies to them in the workspace picked in the header, as on
-    the team pages: the organisation, the workspace pool, their member limit and their keys'
-    budgets, each meter turning to the warning colour at 80 % of its cap. It shows what they have
-    used of their own member limit and keys; the pool's use (everyone's spend) only when the
-    workspace shares usage among its members or they manage it, and the organisation's never.
-    Nothing set, no panel.
-  - **Your team** — for a manager of the header workspace: its members, and its spend today and
-    in the current 30-day period against the workspace pool.
-- **The workspace picker** in the portal header (shown to a member of several workspaces) sets
-  the workspace the portal works in — keys, quickstart, the team page and, on the activity pages,
-  the **Me / Team** switch, which appears where that workspace shares activity with its members.
-- **API keys** (`/portal/keys`) — mint/revoke their own keys in any workspace they belong to,
-  and see each live key's requests, tokens, spend and last use today, over the last 7 days or
-  over the last 30 (UTC days, today included).
-- **My Sessions** (`/portal/sessions`) and **My Requests** (`/portal/audit`) — the console's
-  Sessions and Audit pages, with the same filters and details, over their own traffic — or, with
-  **Team** on a workspace that shares, that workspace's, where a teammate filter also appears.
-  The default period is the last 7 days. An administrator can hide conversations — the Sessions
-  page and every request's content — or the Requests page for a team (**Portal pages** in
-  [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)); with
-  conversations hidden, Requests lists each request's model, tokens, cost and status, and a
-  request does not open.
-  - **Requests** lists every kind of request: model calls, MCP tool calls, agent (A2A) calls and
-    web searches and fetches, each expandable to its full captured content. The MCP server,
-    upstream and agent filters offer only what the member's workspaces are granted.
-  - **A session** opens in the same conversation viewer as the console, with its linked parent
-    and child sessions, the web calls a turn made, and the before/after view of a transformed
-    message.
-  - Every field the console shows is shown, the upstream server and endpoint that answered a
-    model call included.
-  - **Expert alerts** show as in the console — a session's alert and its note, the alert filter
-    and order — on the sessions whose workspace's profile shows them (**Show expert alerts**,
-    on by default); on the others none is shown, filtered or ranked. The cross-session issues an
-    expert finds are console-only, since they name other people's sessions.
-  - The list is the console's tree: a sub-agent opens under its parent, and only a parent the
-    member may see folds one — another member's session never does.
-- **Members & limits** (`/portal/team`, in the menu for managers only) — managers see the roster
-  and per-member usage, provision on behalf of members, and manage member limit exceptions.
-- **Sign-ins** (`/portal/mcp/connections`) — connect your **own** account to the MCP servers
-  that need one. Each server shows its state — *Connected*, *Needs your values*, *Needs
-  sign-in* or *Sign-in expired* — and one button for the next step (**Enter values**, **Sign
-  in** or **Reconnect**); a server that needs both your values and a sign-in lists the two steps
-  in order. While any of your servers waits, Home's To do card and the Quickstart page's banner
-  name them with a link here, and an agent calling such a server is answered with this page's
-  address. For an OAuth server (e.g. GitHub) you're sent to the provider to approve; the
-  gateway then stores and auto-refreshes a token that is yours alone, so your agent acts as you
-  on that upstream. For a server that asks each user for values (a personal access token, say),
-  **Enter values** (or **Edit**, once entered) opens a form with just your fields, filled with the values you entered before —
-  secret ones are never shown back (the form only says they are set), and values your
-  administrator set are neither shown nor yours to change. Changes
-  take effect within seconds. Each member connects once; the page shows what you've connected,
-  the granted scopes, and lets you disconnect (which also deletes the values you entered).
-- **Try a server** (`/portal/mcp/test`) — probe a virtual server before pointing an agent at it: runs
-  `initialize` / `tools/list` / `resources/list` / `prompts/get` against each upstream the route fans
-  out to and shows the merged catalog, using the same headers the gateway would (a server that needs
-  a value your client sends is reported as needing it, since the test has no client). For an OAuth or
-  per-user-values server you must have connected your account first; if your stored token has expired the test says so and points you back to reconnect —
-  your real agent calls are unaffected, since the gateway refreshes the token on its own.
+- which clients the portal and the CLI offer, what the sandbox may reach, and which portal pages a
+  team sees — [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations);
+- which providers, MCP servers and limits a workspace has, and who manages it —
+  [3](#3-workspaces--governance--workspaces-page);
+- every machine a member signed in on with `ssai login`, and revoking one — **Clients → CLI
+  Sessions** ([9b](#9b-clients--clients-page));
+- making the signed Windows `ssai.exe` trusted across your computers (Group Policy or Intune) — the
+  certificate, its thumbprint and the steps are in the Portal Guide's
+  [Install the `ssai` CLI](PORTAL_GUIDE.md#2-install-the-ssai-cli).
 
-#### Set up tools with the `ssai` CLI
+#### What a client sees when a request is refused
 
-The `ssai` command-line tool automates the whole Quickstart flow — instead of copy-pasting
-a snippet per tool, it writes each AI client's configuration directly. The gateway itself serves
-the CLI (Linux x86_64, Windows x86_64, and macOS Apple Silicon when your gateway ships a macOS
-build; the installers verify the download's checksum), and the Quickstart page's **Set up via CLI**
-tab shows these commands pre-filled for your portal:
-
-```bash
-curl -fsSL https://<portal-host>/api/v1/cli/install.sh | sh   # installs to ~/.local/bin
-ssai login https://<portal-host>/portal/t/<org>   # any portal URL works — opens your browser
-ssai provision                                     # detects installed tools, mints one workspace key, writes configs
-```
-
-On Windows, install from PowerShell (Windows PowerShell 5.1 or PowerShell 7) instead; the rest is
-the same:
-
-```powershell
-irm https://<portal-host>/api/v1/cli/install.ps1 | iex   # installs to %LOCALAPPDATA%\Programs\ssai, adds it to your PATH
-```
-
-The Windows `ssai.exe` is signed by **Norvex Labs** (Authenticode, SHA-256, timestamped) with a
-self-signed code-signing certificate whose SHA-1 thumbprint is
-`8061BA54146A8D17F22E4B5210650147C1CAB75A`. As no public certification authority issued it, the
-signature alone does not quiet SmartScreen or Smart App Control, and Windows reports it as untrusted
-(`Get-AuthenticodeSignature` answers `UnknownError`). An organisation that wants it to count takes the
-certificate from an installed `ssai.exe`, checks its thumbprint against the one above, and deploys it
-to **Trusted Root Certification Authorities** and **Trusted Publishers** (Group Policy or Intune):
-
-```powershell
-$cert = (Get-AuthenticodeSignature "$env:LOCALAPPDATA\Programs\ssai\ssai.exe").SignerCertificate
-$cert.Thumbprint                                   # must read 8061BA54146A8D17F22E4B5210650147C1CAB75A
-Export-Certificate -Cert $cert -FilePath norvexlabs-codesign.cer
-```
-
-`Get-AuthenticodeSignature` then answers `Valid`, signer `CN=Norvex Labs`, and an App Control for
-Business (WDAC) or AppLocker publisher rule can allow the CLI across releases, where a hash rule
-breaks on every update. The certificate can sign code only: it cannot issue certificates, so trusting
-it trusts nothing else.
-
-On Windows the CLI keeps its own state in `%LOCALAPPDATA%\streamscopeai\config\` (never the
-roaming profile a domain copies to its server), readable by your account
-alone, and writes each tool's configuration where that tool reads it on Windows: in your profile
-folder for most (`%USERPROFILE%\.claude`, `.codex`, `.gemini`, `.config\opencode`, …), and under
-`%APPDATA%` for Goose, Zed, VS Code (Cline) and Claude Desktop. The sandbox described below runs on
-Windows through a dedicated sandbox account, set up once by an administrator (**The Windows
-sandbox**, below). (`--ca-file` there gives the client, for that run, the roots Windows trusts plus
-the file's — it changes nothing in Windows' own trust.)
-
-If your gateway uses a private or self-signed certificate, `curl` cannot fetch the installer itself
-until it trusts that certificate: ask your gateway operator for its root certificate and fetch with
-`curl -fsSL --cacert <that file> https://<portal-host>/api/v1/cli/install.sh | sh`. The installer detects that the
-certificate isn't trusted, captures the gateway's CA, and prints its SHA-256 fingerprint before
-offering to install it into the system trust store — compare that fingerprint against the value your
-gateway operator published and only accept if they match (the certificate is captured over an
-as-yet-untrusted connection, so this out-of-band check is what makes trusting it safe). It then
-builds a **combined** trust bundle — your system's certificate authorities **plus** the gateway's —
-and prints the environment variables that point the Node- and Python-based AI CLIs (which ignore the
-OS trust store) at it: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, and
-`CURL_CA_BUNDLE`. Because the bundle is additive, your other certificate authorities keep working —
-which matters behind a corporate CA that already trusts the gateway, where pointing the tools at the
-gateway certificate alone would break everything else. The installer verifies a real connection
-succeeds with the captured trust before reporting success. (`provision` writes those variables
-automatically into the env-file clients it configures, such as Gemini CLI and Mistral Vibe.) The
-`ssai` command itself trusts the captured certificate authority as well as the system ones,
-so it reaches the gateway even if you declined the system install and set none of those variables.
-Each private gateway you install from keeps its certificate authority in a file of its own under
-`~/.config/streamscopeai/gateway-ca.d/`, beside the others', so the command keeps reaching every
-gateway it is logged in to; installing from a gateway again replaces only its own file. When a gateway's certificate is not trusted, the error names that
-gateway and tells you to install from it again — check the fingerprint the installer prints against
-the one your operator publishes. A damaged file is warned about and left out without affecting the
-others — remove it, or re-run that gateway's installer if your system does not otherwise trust its
-certificate.
-
-On Windows the gateway's certificate is Windows' to trust, as it is for `irm` itself: a gateway
-with a private certificate authority needs its root in Windows' trusted roots before you install
-(your IT department may already push it; otherwise import the root from
-`https://<portal-host>/api/v1/cli/ca` with **certmgr.msc → Trusted Root Certification Authorities**,
-after checking its fingerprint with the gateway's operator). The installer stops with that advice when
-the certificate is not trusted. The `ssai` command trusts what Windows trusts. The Node-based AI CLIs
-do not read the Windows store: point them at the root with `setx NODE_EXTRA_CA_CERTS <root file>`
-(a sandboxed run carries it when it sets no trust of its own — with `--ca-file`, or a gateway
-certificate the CLI captured, the run's own bundle is used instead — and gives the sandbox account
-the file to read when it is in your profile).
-The installer uses Windows' proxy settings, signing in to a proxy with your Windows account.
-
-`login` sends you through the same sign-in the portal uses (password or SSO) plus a one-click
-device approval; the CLI never sees your password. On a machine with no browser — an SSH session,
-a remote box — use `ssai login --device` (the CLI also falls back to it automatically): it
-shows a short `XXXX-XXXX` code and a portal link; open the link on any device, sign in, check the
-code matches, and approve — the terminal completes the login by itself within a few seconds. Run
-`ssai login` with no URL and it asks for one, refusing an address that names no tenant
-before it goes any further (with no input to read, it stops with an error instead).
-
-In a terminal the CLI's questions are interactive: a choice list moves with the arrow keys (`/`
-filters it), a multiple choice starts with everything ticked and toggles with space (`a` toggles
-all; the tools to provision need at least one), and a yes/no question offers two buttons. Enter answers; **Esc or Ctrl+C cancels the
-command before it writes any tool config, mints a key, or restores a file** (while a filter is open, the first Esc only closes it). Each answered question folds into one line, so the run reads
-as a transcript. Colours follow the portal's, stepping down to the basic terminal colours where
-the terminal advertises no more; `NO_COLOR` turns them off. When input is piped, the terminal is
-`TERM=dumb`, or `STREAMSCOPE_PLAIN=1` is set, the same questions are asked as numbered lines
-instead (answer a multiple choice with `1,3,5`, `all`, or `none`), which also suits a script
-feeding answers on standard input. A script that runs out of answers gets each question's default
-— the capitalised answer of a `[Y/n]` / `[y/N]` question, `all` for a multiple choice — except a single choice, which has
-none and stops the command with an error.
-
-`provision` first asks which workspace to bill to, then offers only **that workspace's** providers,
-shows the detected tools and asks which to provision in a single multiple choice, and prints a
-short per-tool summary — for each tool, the file it wrote and the command to
-start it (e.g. `Run: claude`); pass `--verbose` for the full per-tool setup notes. A tool counts
-as installed when its program is on your `PATH`, its editor extension is installed (Continue in VS
-Code or any of its forks, Cline in VS Code), or its desktop app is (Cursor, Zed, Claude Desktop); a config
-folder left behind by a tool you uninstalled is listed as
-such and skipped unless you name the tool with `--client`. Each tool gets **its own** gateway key,
-named after the tool (`opencode`, `claude-code`, … — `-byok` appended for a BYOK provider), so usage
-and audit show which tool made each request; the same tool reuses that key in every project you
-provision on this machine while it stays valid (the CLI keeps it, readable only by you, in its own
-state folder), and a revoked one is replaced by the next `provision` or `sync`. The CLI
-merges each tool's settings **into its existing config file** — your themes, custom options, and
-other providers are preserved, and re-running updates only the entries the gateway manages (your
-manual edits to them are kept, with a note). That holds inside lists too: providers and models you
-added yourself to Mistral Vibe's `[[providers]]` / `[[models]]` or Continue's `models` /
-`mcpServers` stay where they are, beside the gateway's. A tool that's configured through its own UI (Cursor)
-prints setup instructions instead of writing a file, and a tool that can only be set up with an MCP
-server is skipped with a notice rather than failing the run. Supported in this release: Claude Code, Codex, Gemini CLI, OpenCode 2,
-Mistral Vibe, Qwen Code, Goose, Zed, Cursor, Cline, Continue, Aider, Crush, Claude Desktop, Open Code Review,
-and the curl/SDK snippets (printed to the terminal). Your own entries in Aider's `set-env` list and Continue's `models` and `mcpServers` lists are kept beside the gateway's.
-One caveat: Aider's, Continue's, and Goose's YAML config files keep all your settings but not
-your comments — the other formats preserve comments too, including a JSON config with comments or
-trailing commas (VS Code's `settings.json` for Cline, Gemini CLI's and Qwen Code's), which is edited in
-place around your text. Zed reads the API key from a `STREAMSCOPE_API_KEY`
-environment variable (or the Agent Panel) rather than its `settings.json`, so export the minted key in your shell. Gemini CLI
-gets the model in its `settings.json` both as its own and for each built-in subagent that would otherwise call a Google model
-by name (`codebase_investigator`, `cli_help`, `browser_agent`); `generalist` follows the session's model. Qwen Code
-gets the gateway in `~/.qwen/.env` with an output cap (the model alias's, else the model's, else 8 192 or its window if smaller), plus two keys merged into
-`~/.qwen/settings.json`: the OpenAI sign-in type (so a Qwen account you signed in with earlier does not
-take over) and, when the gateway knows the model, its context window. Aider gets
-`~/.aider.model.metadata.json` beside `~/.aider.conf.yml`: its model with the output cap and, when the
-gateway knows it, the context window, and its weak model by name, so Aider neither warns of an unknown
-window nor downloads a public model list each time it starts. A BYOK provider gets none, since the gateway
-does not know the model you name. A config file that is not valid
-JSON even allowing comments and trailing commas, or one with comments that repeats a key, is not
-rewritten — `provision` stops before writing anything for that tool and names the file.
-
-**Picking a variant.** A tool that can speak both the OpenAI and the Anthropic protocol (OpenCode,
-Crush, Continue, Cline, Aider, Open Code Review) is provisioned with its OpenAI-compatible variant, which works with
-every model. On a BYOK provider it gets the variant speaking that provider's own protocol instead,
-when it has one: your credential is forwarded as-is, and one a vendor issues for its own protocol (a
-subscription sign-in) works on nothing else. The Quickstart page picks the same, until you choose a
-variant yourself. Choose `anthropic` for Claude models on a gateway provider (extended thinking and
-prompt caching then pass through unchanged). When the CLI can write another variant, `provision` names the one it picked
-with the flag that switches it. An installation keeps the config variant it was provisioned with —
-through `sync`, and when you run `provision` for it again in the same mode (on a BYOK provider, the same
-provider) — until you pass
-`--template`; an MCP-only installation provisioned again without `--template` gets the full
-config.
-
-Pick a variant with `--template <tool>=<variant>` — `chat`, `responses`, `anthropic` or `gemini`
-for the protocol, `mcp` for an MCP-only config, `instructions` for UI-setup notes, and an `-oauth`
-suffix for the variant whose MCP servers sign in by OAuth (e.g. `--template opencode=anthropic`,
-`--template claude-code=anthropic-oauth`). A name the tool doesn't ship is refused with the list of
-the ones it does. `--template` picks the config a tool writes; the copy-paste snippets that go with
-some of them (shell exports, SDK environment variables) are on the portal Quickstart page; no built-in config
-`--template` writes depends on one of them.
-
-**MCP servers.** When a tool you're provisioning can use MCP (every one listed above except Aider,
-Zed and the curl/SDK snippets), `provision` proposes the MCP virtual servers your workspace can reach and lets you pick
-which to wire in — exactly the choice the Quickstart page's MCP step offers, kept in sync with it.
-Pick from the list interactively, or select them non-interactively with `--mcp <slug>` (repeatable),
-`--all-mcp` (wire every reachable server), or `--no-mcp` (skip the proposal). With `--yes` (or in CI)
-and none of those flags, no MCP servers are wired. A server that uses **per-user OAuth** is tagged
-*connect first*: the CLI still writes it into your config, but prints a note reminding you to link
-your own account under **Portal → Sign-ins** — requests through that server start working the
-moment you connect (nothing to re-run). This mirrors the portal: the config can be written before you
-connect; connecting makes it live. A server the tool's setup cannot reach is left out of its config,
-and `provision` prints a warning naming the tool and the server: a sign-in (OAuth) setup cannot
-reach a server that takes your client's own `Authorization` header, and a pass-through key reaches
-only a server that carries nothing but what your client sends. The portal Quickstart shows the same
-warnings for the same choice.
-
-**Local MCP servers.** When your workspace is handed local MCP servers — servers your own machine
-starts — and a tool you're provisioning can be given one, `provision` proposes them too, each with the
-command line it runs. Select them non-interactively with `--local-mcp <slug>` (repeatable). A tool
-you provision again keeps the MCP servers it already has — gateway servers and local servers
-alike — unless you say otherwise: with no MCP flag they stay (each prompt opens with them ticked),
-`--mcp` / `--all-mcp` replace the gateway servers and `--local-mcp` the local ones, `--no-local-mcp`
-takes the local ones out and keeps the gateway servers, and `--no-mcp` selects none of either kind.
-It also stays on the setup it has unless `--template` names another. A tool provisioned for the
-first time with `--yes` and no MCP flag gets none. Before it writes
-anything, `provision` prints each selected server's whole command line (your administrator's
-environment values included), the environment variables you must fill in yourself (the written
-config holds a `<paste-your-…-here>` placeholder for each; a later run keeps what you pasted), and
-what applies to that kind of command: that its runner must be installed, what a sandboxed run
-changes, and on Windows that a client may need the runner wrapped (`cmd /c npx …`). `sync` re-applies
-the same selection: it prints a server's command line when your administrator changed it — the
-command, an argument or an environment value — and removes, saying so, a server the workspace is no
-longer offered (turned off, revoked or deleted), keeping the rest of the configuration. Nothing
-else in the file is touched — the tool's provider, key, model and gateway servers stay — and the
-tool stays managed. A tool set up for MCP servers only that is left with none is simply left alone:
-`provision` and `sync` say there is no MCP server selected for it and nothing to write, and that is
-not an error. Removing a
-server — at a sync, or because you deselected it — takes its whole entry out of the file, the values
-you pasted into it included; an entry your file already had under that name before the server was
-added is not removed: only what was written into it and you did not change goes, and the rest is
-named. A tool that
-cannot be given a local server is provisioned without it and a warning names it; Claude Code is
-given one only in a project (`--local` / `--dir`).
-
-By default `provision` writes each tool's **global** configuration in your home directory. To set a
-tool up for **one project** instead, run `ssai provision --local` from inside the project (or
-`--dir <path>`): it writes the tool's project-local config there — for example `./.claude/settings.json`
-(with your MCP servers in `./.mcp.json`, enabled by name so Claude Code loads them without asking once
-you trust the folder; a home-directory run instead prints the `claude mcp add-json` command for each
-server, since Claude Code keeps its own state in the one file it reads them from there — run them once,
-and again when your servers change; `forget` and `restore` leave a server you added this way, which
-`claude mcp remove --scope user <name>` removes), `./.gemini/settings.json`, or `./.opencode/opencode.json` — and tracks what it wrote in a
-`./.streamscopeai/` folder inside the project. A project provisioning writes **only** project files: a
-tool that has only a global configuration (Codex, Continue, Crush, Goose, Qwen Code, Mistral Vibe, Open Code Review —
-Continue's editor extension and CLI, for one, both read a single file in your home directory) is
-skipped with the command that provisions it globally (`ssai provision --global --client …`),
-unless you name it with `--client`, or tick it in the prompt and confirm writing it to your home
-directory. (When neither `--local` nor `--dir` is given, `provision` offers
-the global-vs-project choice only if at least one selected tool supports a project-local config.) Use
-`ssai provision --global` to force the home-directory config even when you're inside a
-project that has a `./.streamscopeai/` folder (which otherwise auto-selects the project).
-
-**OpenCode and your home-directory config.** OpenCode reads your home-directory config
-(`~/.config/opencode/opencode.json`) as well as the project's, and two of its settings outrank a
-project's: a provider rule (`policies`, `experimental.policies`, or an older `enabled_providers` list) that
-leaves the gateway's provider out, and a model pinned to an agent (`agents.build.model`, …). Every
-OpenCode config the CLI writes, project or home directory, therefore pins every built-in OpenCode
-agent (`build`, `plan`, `general`, `explore`, `compaction`, `title`, `summary`) to one of the
-gateway's models (the table under *Set up tools with the `ssai` CLI*), so a pin in your home config can't take OpenCode elsewhere. A
-home-directory provisioning replaces a model you had pinned to one of those agents, and every later
-`provision` or `sync` does the same to a model you pin there again — to run an agent on another
-gateway model for yourself, pin it in a project config. Agents of your own, and providers and policy
-entries you define yourself in that file, are kept, except a rule of your own for `opencode` (below). A home-directory provider rule still wins over any project, so
-`provision` and `status` name the file and the exact line that would allow the gateway's
-provider when yours leaves it out (then restart OpenCode's background service with `opencode service
-restart`), and list every agent your home config, or another OpenCode config it loads, still pins to another provider it can use (one of your own, in a config or in a Markdown agent file, or a pin under
-the older `agent` key). An agent pinned to a provider your rules deny runs on the default model, so it is not listed. They also name a config loaded after the
-gateway's that sets the default `model` to another provider: every agent without a model of its own runs there. A **global** OpenCode
-provisioning adds that allow line itself, in both of the file's lists of provider rules — `experimental.policies`
-and the top-level `policies`, which OpenCode 2.3 reads after it (an earlier OpenCode 2 reads only the first): at
-the end of each list, or — when a list already has a rule for the gateway's provider — in that rule's place, which
-it then manages. Your other rules are kept, so a `deny` on `*` in either list is lifted, and a deny you add after
-the allow in the top-level list still wins; `provision` and `status` name it. A project
-provisioning never writes your home-directory config.
-
-Every OpenCode config for the gateway's models, from the CLI or Web Quickstart, project or home
-directory, also adds a provider rule denying `opencode`, OpenCode's own hosted provider. OpenCode otherwise offers that provider's free models in
-its model list even without an account, and a request to one goes to OpenCode's service, so the
-gateway never audits it or applies policy to it. A rule of yours for `opencode` in that same file is
-replaced, and a user with their own OpenCode account loses that provider too. An MCP-only OpenCode config leaves
-your providers alone and adds no such rule. A rule that allows it, `*` included, can still win: plain
-`opencode` reads your home-directory config first, then a repository's own `opencode.json`, then
-`.opencode/opencode.json`, and the first of those with a rule for the provider decides. Under `ssai run`
-in a project, `.opencode/opencode.json` comes first. `provision` and `status` name the file that
-brings the provider back, and say which launch it reaches. Edit the OpenCode client profile to allow
-the provider again. A tenant whose profile was edited before this rule existed keeps its version, so
-add the rule to it by hand. `ssai forget` removes the rule, so it does not bring back one of your own
-that it replaced: restore that from the backup `provision` took. A provider OpenCode finds through its own API key in your environment is not
-covered by this rule.
-
-Every OpenCode config the gateway writes also
-turns off OpenCode's session sharing and its own web search, so the agent searches through the
-gateway's MCP web tools when the workspace has access to them (without them OpenCode has no web
-search); edit the OpenCode client profile to change that default.
-
-The configs for the other tools likewise turn off what each tool sends its own vendor besides
-your requests, wherever its config file has a switch for it: usage statistics, telemetry and crash
-reports, and update checks, for Claude Code, Codex, Gemini CLI, Qwen Code, Crush, Goose, Mistral
-Vibe, Aider and Zed. Continue's command-line client sends no usage data of its own (its metrics go
-only to a collector you configure yourself), and Open Code Review sends none unless
-`OCR_ENABLE_TELEMETRY=1` is set; its npm launcher's check for a newer release is switched off only by
-the environment (`OCR_NO_UPDATE=1`, which `ssai run` sets). Cline and Cursor have no such
-switch in the files the gateway writes. To turn one of these back on, edit that tool's client
-profile.
-
-Because a provisioned config can hold your gateway key, both the
-`./.streamscopeai/` folder and each written tool config are added to the project's `.gitignore`
-automatically, so a `git add .` never commits a credential. Where the project's `.gitignore` does
-not reach — a home directory that is itself a git repository, or a repository nested in the project
-(a submodule) — a file the CLI writes your key or sign-in tokens into (and the CLI's own files in
-its settings folder) is instead added to that repository's `.git/info/exclude`, which only your
-clone reads, and the CLI says so. A file git already tracks (a team's committed
-`.claude/settings.json`) cannot be ignored either way, so the CLI refuses to write your key into it
-and names the file; it refuses as well when a rule in that repository's `.gitignore` brings the file
-back (git reads it over `.git/info/exclude`), or when a git repository is above the file but git
-cannot answer for it (git not installed, a broken repository) — before signing in or asking for a key
-when it is its own settings folder. Keep that file out of git, or provision the tool in the other scope.
-A tracked file your clone marks `skip-worktree` or `assume-unchanged` (`git update-index`) is
-refused too — git does not promise that either mark keeps a change out of a commit — and the CLI says
-so; keep an ignored copy of a committed template instead. `ssai restore` checks the same way each
-file it puts back holding a gateway key, before it puts anything back. When you run
-`sync`, `status`, `forget`, or `restore` from inside a provisioned project they act on **that
-project**; run from anywhere else they act on your global setup.
-
-`ssai status` lists every gateway you're logged in to or have provisioned tools from (one
-you're no longer logged in to is marked so, with its files), and whether any managed file was edited
-since provisioning; for OpenCode it also reports the settings described above, in your home-directory config
-or in another OpenCode config it loads, instead of `ok`. `ssai sync` re-converges every provisioned config in one go: it does nothing
-when the gateway-side setup hasn't changed, rewrites the managed entries when it has (templates,
-models, MCP servers), and — for each tool whose gateway key was revoked — mints that tool a
-replacement and rewrites its config; `sync --watch` keeps doing that on an interval (default 5 minutes), and a cron or
-systemd timer running plain `ssai sync --yes` works just as well. To converge only some of
-the managed tools in a run — for instance when you maintain Claude Code by hand but want the rest
-kept in sync — use `sync --client opencode` (repeatable) or `sync --skip claude-code`; the filter
-applies to that run only and doesn't change what's managed. (Each tool replaces its own revoked key,
-so a tool a filtered run leaves out gets its replacement on its own next sync.) To
-stop managing a tool entirely, `ssai forget <tool>` drops it from the managed set — `sync`
-no longer touches it and its config file is left exactly as it is for you to take over. Nothing
-changes on the gateway either: `forget` names the key the tool's config still holds, which stays
-valid — other projects may use it — until you revoke it on the **Keys** page. `ssai update` self-updates the CLI from the gateway
-(checksum-verified; on Windows the running `ssai.exe` is set aside as `ssai.old.exe` and removed the
-next time `ssai` starts). When the gateway serves a newer version, `ssai provision` says so every
-time and `ssai sync` once a day, naming the `ssai update` to run. Every call `ssai`
-makes to the gateway names its version, its operating system and the machine's host name (its first
-label), which the portal's Home uses to say which of your machines run an older `ssai`. `ssai logout`
-revokes the device's access immediately — the keys already written into your tools keep working
-(revoke those on the **Keys** page if needed). When `ssai` cannot read its record of what it wrote
-— one an earlier version of `ssai` kept — every command stops and leaves the record as it is, except
-`provision`: run `ssai provision` again for your tools (not a `--dry-run` or `--print` run) and, once
-it saves, it moves the old record aside (the warning names where) and starts a fresh one recording
-what this run writes. Entries the old record owned that this run does not write again stay in the
-tools' files, unmanaged — remove them by hand — as does every file of a tool you do not provision
-again, and the keys the old record held keep working until you revoke them on the **Keys** page.
-`ssai licenses` prints the CLI's licence and the
-licences of the third-party software it bundles.
-
-Every provision and sync snapshots each file before it changes it, and notes each file it creates
-(the five most recent runs are kept). `ssai restore` puts those back: `restore --list` shows the available runs, `restore`
-rolls the latest one back into place (removing the files that run created), and
-`restore --run <timestamp>` picks a specific one — the
-current state is snapshotted first so a restore can itself be undone. Each tool whose file a restore
-puts back is managed as it was when that run started — with the key it had then — and a tool that
-run first provisioned is no longer managed, so `status` and `sync` see the restored state; tools
-whose files the restore does not touch stay as they are. Inside a project, `restore` works on the project's runs and says when
-home-directory runs exist too; `restore --global` reaches those. The
-CLI's own session is narrowly scoped: it can read the setup catalog and mint keys in your
-workspaces, and nothing else — it can never manage your team or reach the admin console. If a
-device is lost, an admin can revoke that one device from **Clients → CLI Sessions** and every other
-machine the user signed in on keeps working; disabling the user's account remains the blunt lever
-that cuts all of them at once. Either takes effect on the device's next request. CLI sessions
-otherwise expire on their own after 30 days of disuse.
-
-`ssai run <tool>` launches a provisioned tool inside a **sandbox** so the agent can only
-reach the gateway and only touch the project it's working in. Run it from a provisioned project —
-for example `ssai run claude`, with any arguments for the tool placed after `--` (e.g.
-`ssai run claude -- -p "summarise this repo"`); the tool starts exactly as it would
-normally, in the current directory. In a project provisioned from more than one gateway, `run`
-uses the one that provisioned the tool, and asks you to pick with `--host` when several did. While it runs, two things are enforced for you: **network
-egress is restricted to the gateway and the destinations your administrator allows** for the
-workspace (§ 9c — every other destination, a vendor API, a paste site, an arbitrary host, is
-blocked; with nothing allowed, all the agent's traffic stays on the gateway and auditable), and **filesystem access
-is confined to the project** while your credentials (SSH keys, cloud tokens, GnuPG, npm, Yarn and
-pnpm registry tokens, the GitHub CLI's login) are kept out of reach. The tools you installed in your home directory stay usable from inside it — anything in
-`~/.local/bin` or `~/bin`, Rust (`~/.cargo/bin`, `~/.rustup`), Go (`~/go/bin`), Bun and Deno, and the
-common version managers (nvm, fnm and n — each installed Node version's programs and libraries —
-pyenv, pipx, rbenv, RVM), plus `/nix` and `/snap` — so an agent can run `uv`, `cargo` or `npm` as
-it would unconfined. This grant is read-and-run only, for every tool. A Node-based tool (OpenCode,
-Claude Code, Gemini CLI, Qwen Code, Continue, Open Code Review) may also write where a global `npm install`
-does — each installed nvm or fnm version's programs, libraries and manual pages — and to the package managers'
-caches, but never to npm's configuration files (`~/.npmrc`, or the global one each Node version
-keeps beside its programs), where a registry token is stored. Volta is the exception: a Node-based
-tool can write its whole directory, because Volta's own launchers run from all of it. On macOS the
-npm configuration inside Volta is still out of reach; on Linux it is not, so use nvm or fnm there if
-a registry token is kept in it. A Python-based tool (Aider, Vibe) may write to uv's and pipx's
-folders and the pip cache, where a `uv tool install` or `pipx install` puts it. Every tool, whatever it
-is written in, may write npm's and uv's package caches (`~/.npm`, `~/.cache/uv`) and uv's tools folder
-(`~/.local/share/uv/tools`) — at those places only, not where a variable moves them, and never one
-that is a link (`run` names one it leaves out) — created on a first run when npm or uv is installed,
-and may read and run the Python versions uv installed (unless that folder is a link); so an `npx` or
-`uvx` local MCP server, or the agent's own `npx` or `uv run`, works under any client — except an `npx`
-installed by Volta, whose folder only a Node-based tool may reach. The rest of uv's folder, its
-logins included, is writable by a Python-based tool only. Gemini CLI reads a project's `.gemini/.env` only in a folder you have trusted, so trust the project
-folder in Gemini (or pass it `--skip-trust`). The shared skills folder `~/.agents/skills` is readable
-inside the sandbox, and a tool's own state folders are created on its first run there. Each run
-gets its own private temporary folder under your cache folder (`~/.cache/streamscopeai/tmp`, or
-`$XDG_CACHE_HOME/streamscopeai/tmp` when you set it — or, when you set `STREAMSCOPE_TMPDIR`, a
-folder of your own inside that directory), which every temporary-folder setting the tool
-reads points at — your own `TMPDIR` is not used inside the sandbox — and which is deleted when the
-run ends (a run that was killed leaves it to the next run to clean up); `/tmp` stays writable.
-Tools load native libraries they unpack there, so that folder must be on a disk that allows
-running programs: if it is mounted `noexec`, `run` stops and names the mount — set
-`STREAMSCOPE_TMPDIR` to a directory of your own on a disk that allows it (not under `/tmp`, which
-every sandboxed run can write). The gateway's trusted certificate is made available inside the sandbox automatically; add
-more with `--ca-file <path>` or pass extra environment with `-e KEY=VALUE`. When it starts, `run`
-prints a one-line summary naming the active sandbox and what it confines, including how many
-destinations are allowed and blocked; blocked-egress details are kept silent while the tool runs so
-they don't disturb its display — pass `--verbose` to see every decision — and once the tool exits,
-`run` names the destinations it refused. Tools that speak plain HTTP through a proxy (apt) and
-Java tools (through their proxy settings, added to your own `JAVA_TOOL_OPTIONS`) go through the same
-rules; `git` over SSH does too: `ssh` takes its connection from `ssai` — unless you have an ssh
-command of your own (`GIT_SSH_COMMAND`, `GIT_SSH` or git's `core.sshCommand` as the project sees it),
-which is left as it is: route it yourself by adding `-o ProxyCommand="ssai __connect %h %p"` to it.
-Inside the run, `ssai`'s command applies to every repository, a submodule's own `core.sshCommand`
-included. An allowed name that resolves to this machine's own addresses
-(loopback) is not reached through it: only an entry naming the address is. A
-destination whose name does not resolve fails as unreachable, not as refused. A raw database
-connection (`psql`, `redis-cli`) is not carried. A client your administrator has disabled is
-refused, and so are `--sandbox off` and `--sandbox learn` when the administrator requires the
-sandbox. The sandbox is **fail-closed**: if the machine can't enforce it, `run` refuses rather than
-launch the tool unconfined — use `--sandbox off` to opt out deliberately. This works on Linux and
-WSL2 (the network confinement needs a Linux kernel 6.7 or newer), on macOS (Apple Silicon, via
-the system's built-in Seatbelt) and on Windows (a dedicated sandbox account, below). A tool that
-runs on Node.js (the Continue CLI, Gemini CLI, Qwen Code) needs Node.js
-22.21 or newer inside the sandbox: an older Node.js does not send all of its connections through the
-sandbox's gateway route, and the sandbox refuses them (the Continue CLI then stops with "MCP
-server(s) failed to load"). (`run` only launches already-provisioned tools; provision the project
-first.)
-
-The project's git hooks and configuration (`.git/hooks`, `.git/config`, a worktree's or a
-submodule's links and configuration, a hooks folder `core.hooksPath` names) and its
-`.streamscopeai/` folder are read-only to the agent, and `.git` (with its worktrees' and submodules'
-git folders) cannot be renamed — so an agent cannot change the hooks and settings that will run
-later, outside the sandbox, when you use git there. A
-linked worktree's own git folder, which lives in its main repository outside the project, is
-granted, so the agent can commit from the worktree. Git commands that write the repository's
-configuration then fail inside the sandbox — `git push -u` (after the push itself succeeds), a new
-branch that tracks a remote, `git remote add`, `git submodule add`, `git config`: run those yourself.
-This holds on macOS, on Windows and in the
-container sandbox. **On Linux the native sandbox cannot hold them** (it grants a folder whole), and
-`run` says so when it starts: look at them before you run git or `ssai` there outside the sandbox,
-or use `--sandbox docker`. What is held is what exists when the run starts and what git reads
-there. Not held: git files the agent creates where there were none (a repository in a project that
-had none; a link file git follows, except on macOS, which holds those too), a hooks folder that is a
-link or is reached through one, a hooks folder only your
-global git configuration names, a file the project's git configuration includes from the work tree,
-and the tools' own settings that can run commands (a project's `.claude/settings.json` hooks, for
-one). The sandbox guards against an agent's mistakes and the instructions injected into it, not
-against an agent built to get out.
-
-OpenCode 2 runs the agent's tools in a separate background server. Under `ssai run`,
-each run gets its own private OpenCode server inside the same sandbox, used only by that run and
-stopped when it ends — an OpenCode server you already run on your machine is never used, so the
-agent's tools can never escape the confinement through it. In a project whose OpenCode config is at
-`.opencode/opencode.json`, `run` also hands OpenCode that config **in place of** your home-directory
-one, so a provider rule or agent pin there cannot send a run elsewhere — and, for the same reason,
-nothing else in your home-directory OpenCode config applies under `run` there either: its agents,
-plugins and commands, and its `permissions` rules (a deny you set on a shell command, say). Put a
-rule you want under `run` in the project's `.opencode/opencode.json`. `~/.opencode` and a repository's own
-`opencode.json` apply under `run` too (`~/.opencode` for a project under your home directory): that project file
-decides a provider rule ahead of them, and a model they pin on an agent replaces the one it pins, which `provision`
-and `status` report, as they report a default `model` one of them sets for another provider (loaded after the project
-file under `run`, it replaces the project's) and an agent a Markdown file defines. A config in a subdirectory applies
-only when you start OpenCode there: `provision` and `status` do not read it. `ssai run opencode` prints the same
-warnings as it starts, judged from the folder you start it in, so it names that one too — as it does, for a global
-provisioning, a config in a folder outside your home directory, which `provision` and `status` (judging OpenCode as
-started from your home directory) do not see. Under `--sandbox docker` the container keeps a home of its own
-that your machine does not read, so the run checks the OpenCode configs it loads inside the container, with the
-agent's own permissions. Under the Windows sandbox the run does not check them. Outside such a project (a global provisioning), OpenCode reads your
-home-directory config as usual, and `provision` and `status` report a rule there that would keep it
-off the gateway. When a run fails, `run` keeps the private
-server's log and names it. From a script, give `opencode run` a stdin that ends (`ssai run opencode -- run "…" < /dev/null`):
-OpenCode reads a stdin that is not a terminal into its message, and waits for it to end. The OpenCode TUI, `opencode run` and its
-session commands work this way; OpenCode's built-in terminal panes are not available under the
-sandbox. `run` needs OpenCode 2 or later (it says so and stops if it finds an older one).
-
-On Linux, anything the agent leaves running in the background — a server it started from a shell
-command, for instance — is stopped when the tool exits (not with `--sandbox off`). To stop a run
-from a script or another terminal, send `ssai run` SIGTERM: it passes the signal on to the
-tool and cleans up after it. Ctrl-C at the terminal reaches the tool directly, as without
-`ssai run`.
-
-**The Windows sandbox.** On Windows the agent runs as a dedicated local account of yours,
-`ssai-sbx-<six hex digits>`: a standard user (never an administrator), hidden from the sign-in
-screen, which owns nothing of yours and so reads nothing in your profile but what a run grants it
-(below), and whose every
-connection except to this computer is blocked by a Windows Firewall rule — the run's guard, on this
-computer, lets it reach only the gateway and the destinations your administrator allows, and serves
-only programs running as the sandbox account. Set it up
-once with `ssai sandbox setup`, which asks for administrator rights (one UAC prompt; a standard
-user enters an administrator's credentials). `ssai sandbox setup --check` checks the account, its
-firewall rule and that the firewall is on for every network profile, and changes nothing; running
-`ssai sandbox setup` again repairs what is missing or changed;
-`ssai run --sandbox native` refuses to start while any of it is missing or changed, and names the
-command. The account's password is generated by setup and kept for your account with Windows data
-protection, which needs a sign-in with your password: from an SSH session signed in with a key,
-`run` cannot read it and says so — sign in at the desktop, over Remote Desktop, or over SSH with
-your password. `ssai sandbox uninstall` removes the account, its profile and its firewall rule,
-after taking back every grant.
-
-The first run in a project grants the sandbox account that folder (read, write, run, delete —
-never its access settings), the tool's configuration folder among your folders
-(`%USERPROFILE%\.claude` for Claude Code, `.codex` for Codex, `.gemini` for Gemini CLI, `.qwen` for
-Qwen Code, `.config\opencode` for OpenCode (in a project provisioned for it, the project's own
-`.opencode`), `.config\crush` for Crush, `.continue` for the Continue
-CLI, `.vibe` for Mistral Vibe, `.opencodereview` for Open Code Review, `.aider` for Aider,
-`%APPDATA%\Block\goose` for Goose; or the one you name with `--env CLAUDE_CONFIG_DIR=…`,
-`CODEX_HOME=…`, `GEMINI_CLI_HOME=…` — the folder holding `.gemini` — `QWEN_HOME=…`,
-`OPENCODE_CONFIG_DIR=…`, `CRUSH_GLOBAL_CONFIG=…`,
-`CONTINUE_GLOBAL_DIR=…`, `VIBE_HOME=…` or `GOOSE_PATH_ROOT=…`; Open Code Review and Aider read
-only the home folder, so they run with `USERPROFILE` set to your profile, of which only their own
-folder is granted; the agent reads and writes all of that folder, the tool's own sign-ins and history in it included —
-Claude Code keeps its user-scope settings there too, so an MCP server added with
-`claude mcp add --scope user` outside the sandbox — the gateway's own included — is not seen in it;
-provision Claude Code for the project instead, which writes the gateway's servers into the project), read-and-run on the folders of `ssai` and of the tool (for a Python tool installed with uv or
-pipx, also its environment and the Python it was made with), and read on the gateway's
-certificate files — each of those inside your profile (elsewhere every account may read them
-already) — and read, never write, on each file `provision` wrote for the tool (its configuration,
-which holds its gateway key and is otherwise readable by you alone), inside your profile or the
-project, and read on a file an `--env` value names — and keeps the git and `.streamscopeai\` holds described above. Git, which refuses a
-repository another account owns, trusts the project for the run without a change to your git
-configuration (and, with Git for Windows 2.46 or later, every repository in it — a submodule's
-checkout); Claude Code starts past its first-run screen. The grants stay between runs (granting a large project again each time would cost seconds), so
-while one project runs, the sandbox account can also write every project it was granted before:
-`ssai sandbox revoke [<folder>]` takes one project's back, and
-`--all` every one (revoking a project that holds another granted project inside it takes that
-folder's entries back too; the inner project's next run grants them again). A folder in the project
-with an access list of its own (one that inherits nothing) is named on the first run: the sandbox's
-grant does not reach into it. Granting a project takes a moment the first time, as every file in it is given
-the account's access; the folders above a grant are opened for the account alone, so your profile's
-other files are never touched. `run` refuses a drive's root, a network share (the sandbox's
-account cannot reach one), your profile folder and any folder above it. A project folder that
-every account on the computer may write — a folder made directly on a drive inherits that
-setting — would let the sandbox's account write it whatever it is granted, so the sandbox runs
-there only once the folder is private to you: `run` explains this and asks whether to make it so
-(it stops instead when nobody can be asked), and `--private-project` makes it so without asking.
-The project folder then stops inheriting from the folder above it: you keep full control, SYSTEM
-and the administrators keep their access, and the groups every account belongs to (Everyone,
-Authenticated Users, Users and the like) keep reading but no longer write it, even where the
-folder named them itself; any other account or group it names keeps what it has. A file or folder
-inside it that lets every account write by its own access list keeps that. A change that was stopped part-way is asked for again on the next
-run. For a linked worktree, the main repository's folder is checked and made private the same
-way. A drive that keeps no access lists (FAT, exFAT) cannot hold a sandboxed project. Revoke
-leaves the folder private; the run that changes it names the command that makes it inherit
-again. A folder above the project that every account may write is named on each run and never
-changed (it may be shared by every account on the computer): the agent can leave there what a
-tool looking upward finds, such as a `node_modules` folder — and so it can at a drive's root,
-where every account may create folders. Outside your profile each run also warns that the agent
-can change who may open the files it creates, and giving them back to you may need an
-administrator. Files the agent creates in the
-project are given back to you when a run ends with no other run of yours still going (otherwise
-by the next one that does), so you remain their owner. The tool runs with the
-account's own profile and temporary folder: its history and caches stay there, apart from yours,
-except for the configuration folder above. Codex's own sandbox is turned off inside it (it cannot
-run under another account; the sandbox account confines Codex instead). Every process of the run
-ends with it, and whatever the agent scheduled to run later as the account, or left running outside
-the run, is removed when the run ends and before the next one starts — while you have another
-sandboxed run open, this waits until the last one ends, so one run never stops another. The
-Windows sandbox runs the command-line agents — Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode,
-Crush, the Continue CLI, Goose, Aider and Open Code Review, with their terminal interfaces — not
-OpenCode's desktop app. Aider writes a git identity into the project's own git configuration when
-it finds none, which the sandbox refuses: set `user.name` and `user.email` in the project (or run it
-with `--no-git`). Mistral Vibe changes the access settings of the folders it creates, which the
-sandbox never allows, so it stops at its first session. A Go tool resolving a project inside your
-profile (Open Code Review's `review`) needs to list your profile folder, which the sandbox account
-cannot: keep such a project outside your profile. Aider and Open Code Review's `USERPROFILE` reaches every program the agent starts: one
-reading its home (`gh`, git's global settings) looks in your profile, which it may not read, rather
-than in the sandbox account's.
-
-What it does not hold, as on the other systems: name lookups (DNS) still resolve, a channel an
-agent could use to leak data in small amounts; the agent can write where every account on the
-computer may (`C:\Users\Public`, `C:\ProgramData`, `C:\Windows\Temp`, a new folder at a drive's root);
-a connection to one of this computer's own network addresses counts as local and is not blocked; a
-window the agent opens shares your desktop (its keyboard, clipboard and screen); Windows Credential
-Manager is per account, so a tool that keeps its login there does not find it (a provisioned tool
-uses the gateway key in its configuration, which the sandbox account may read but not change); and `--sandbox learn` is not available. Windows checks
-whether a server's certificate was revoked, and tools using Windows' own TLS (git, `curl.exe`,
-.NET) fail when that check cannot reach its servers: if your administrator allows an internal HTTPS
-host (a git server, a registry), the destination list must also allow the hosts its certificate
-authority publishes revocation lists on.
-
-**The container sandbox (Linux).** `ssai run --sandbox docker <tool>` runs the agent in a container
-built from your project's own image instead of on your machine — for a project whose toolchain lives in
-an image, or one that needs a Docker engine of its own. Step by step:
-
-1. **Your administrator allows it.** **Allow the container sandbox** is on by default (**Governance →
-   Portal & clients**, the **Sandbox** section of the profile your workspace is on — see [9c](#9c-portal--clients-and-destinations--governance--portal--clients--destinations)). The agent reaches the gateway and what that section's **Network** and lists
-   allow: with **Allowed lists only**, a project whose agent installs packages or pulls images needs
-   those registries allowed (**Use the developer defaults** covers the public ones).
-2. **Set up rootless Podman, once per machine.** You need Podman 4.4 or newer, run as your own user
-   (never as root), with a subordinate id range for your user and cgroup v2 with the `memory` and
-   `pids` controllers delegated to it (`cpu` too, for a `cpus` limit). On Ubuntu or Debian:
-
-   ```sh
-   sudo apt install podman
-   # a subordinate id range, if `grep $USER /etc/subuid /etc/subgid` shows none: pick one that no
-   # other line of /etc/subuid or /etc/subgid overlaps (200000-265535 here)
-   sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 $USER
-   podman system migrate
-   # delegate the cgroup controllers to your user's session
-   sudo mkdir -p /etc/systemd/system/user@.service.d
-   printf '[Service]\nDelegate=cpu cpuset io memory pids\n' | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
-   sudo systemctl daemon-reload   # then log out and in again
-   ```
-
-   `run` checks each of these before it starts, and names the fix for anything still missing.
-   `"docker": true` (step 3) also needs `/dev/fuse` (the `fuse` kernel module).
-3. **Name the project's image** — or use your administrator's default. When your workspace's profile
-   sets a **Default container image** (step 1), a project without a `sandbox.json` runs in it, and `run`
-   says so. Otherwise, or to use another image, create `.streamscopeai/sandbox.json` in the project; it
-   replaces the default whole. It holds named sandboxes under `sandboxes`; `run` starts the one named
-   `default`, which names either a registry image or the project's dev container:
-
-   ```json
-   {"sandboxes": {"default": {"image": "mcr.microsoft.com/devcontainers/javascript-node:22"}}}
-   ```
-
-   ```json
-   {"sandboxes": {"default": {"devcontainer": ".devcontainer/devcontainer.json", "docker": true, "memory": "6g"}}}
-   ```
-
-   A file naming another sandbox, naming one twice, or whose keys are not under `sandboxes` is refused.
-
-   `run` installs Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue, Crush and Open Code Review into the
-   image, with a Node.js runtime of the sandbox's own, so the image needs none; Goose, Aider and Vibe must already be
-   in it. `"docker": true` gives the agent a Docker engine of its own: the image's, or one the sandbox adds from
-   the image's distribution when it has none. Every key is in the table below.
-4. **Provision the tool in the project** as for any other run: `ssai provision`.
-5. **Run it:** `ssai run --sandbox docker claude` (or `codex`, `opencode`, …). The first run pulls or
-   builds the image, adds the tool to it and then starts the agent; later runs start at once. `run`
-   prints the image, where the project sits in the container, and the gateway the agent reaches.
-6. **Keep it current.** `ssai sandbox prepare <tool>` (with `--host`, as for `run`, when several
-   gateways are provisioned) rebuilds (or pulls again) the image — one named
-   `localhost/…`, built on this machine, is used as it is — and installs the tool's latest release — the way the tool is updated in the container (an update the tool makes of itself there does
-   not replace that install). `run` stops and asks you to run it when `sandbox.json` names another
-   image, when the image's recipe changed (its Dockerfile or the `devcontainer.json` keys it is built from), and when `"docker": true`
-   was turned on. A run never removes an image: an image replaced by a rebuild or another reference
-   stays until you remove it. `ssai sandbox status` lists each project's image, tool layers and
-   volumes with their sizes (a project whose folder was deleted is not listed), what no project
-   uses any more, and the total a prune frees;
-   `ssai sandbox prune --project [<folder>]` removes one project's (the project at or above the folder,
-   the current one by default) — its image when the sandbox built or pulled it and no other project
-   uses it, its tool layers and its volumes — and `ssai sandbox prune` every image and volume the
-   container sandbox made. An image you had before, or named yourself, always stays.
-
-If a run says it refused a destination, ask your administrator to add it to an allowed list (step 1),
-then run `ssai sync`: the run banner names the network setting and lists the run has.
-
-The keys of a sandbox in `.streamscopeai/sandbox.json` (`{"sandboxes": {"default": {…}}}`):
-
-| Key | Meaning |
-|---|---|
-| `image` | an image reference from a registry, e.g. `"mcr.microsoft.com/devcontainers/base:ubuntu-24.04"` (a local archive or folder — `oci-archive:`, `dir:` — is refused). A dev container image's own metadata applies: its user, its variables, and its features' lifecycle commands (below) |
-| `devcontainer` | instead of `image`: the path of a `devcontainer.json` inside the project (its `image`, or `build` with `dockerfile`, `context`, `target` and `args`; its `remoteUser` or `containerUser`; its `workspaceFolder`. `${localWorkspaceFolder}` and `${localWorkspaceFolderBasename}` are expanded in `workspaceFolder`, the users and `build.args`, and `${containerWorkspaceFolder}` in the last two; `${localEnv:…}` is refused, since it would carry your environment into the build) |
-| `docker` | `true` starts a Docker engine inside the container, its image cache kept between runs (needs `/dev/fuse`). An image without Docker Engine gets one from its distribution (Debian, Ubuntu, Alpine, Fedora) |
-| `network` | `"gateway"` limits this project's container-sandbox runs to the gateway alone; `"policy"` (the default) takes the profile's network. `ssai run --network` wins over it, and narrows a native run too |
-| `memory`, `cpus`, `pids` | the container's limits, e.g. `"6g"`, `3`; `pids` defaults to 16384, at least 64 |
-
-A `devcontainer.json` that sets `runArgs`, `mounts`, `workspaceMount`, `privileged`, `capAdd`,
-`securityOpt`, `dockerComposeFile`, `build.options` or the legacy `dockerFile`/`context` is refused, since each would widen what the
-container or its build reaches — and so is a `build` whose Dockerfile or context leads outside the
-project, through a symlink included;
-`initializeCommand` (it would run on your machine), `forwardPorts` and `appPort` are not applied, and
-`run` names each one it finds.
-
-The lifecycle commands run inside the sandbox, as the agent's user, in the project folder, one after
-another and each to its end (named commands too, in the order of their names, which a dev container tool would run side by side; and
-`waitFor` is not read), before the tool starts — a command that keeps running, such as a development
-server, is started in the background (`npm run dev > dev.log 2>&1 &`):
-`onCreateCommand`, `updateContentCommand` and `postCreateCommand` on the tool's first run in the project,
-and again when one of them, their variables, the user they run as, the project's folder in the container or
-the image changes; `postStartCommand` and `postAttachCommand` on every
-run. The commands of the features the image was built with (read from its dev container metadata) run
-first, then the project's own; the commands of the `devcontainer.json` another image was built from do
-not, and `run` names those it leaves out. An entry of the metadata
-the sandbox cannot read is skipped, and `run` names it. While one run's create commands run, another run
-on the project waits for them (Ctrl-C stops it; on a filesystem that cannot lock, such as some network
-mounts, they run unlocked, and `run` says so). A command that fails stops the run,
-naming it, before the tool starts; when it was a create command, they all run again next time. They reach the network
-only as the tool does, through the sandbox's allowed destinations, so an `npm install` needs its registry
-allowed. What a create command writes outside the project and the agent's home is lost when the run
-ends: the container is new on every run. It runs once per tool, since each tool has its own home.
-`containerEnv` and `remoteEnv` apply to the commands and the tool, `${containerEnv:NAME}` reading the
-container's own value (the image's, or `containerEnv`'s; a `PATH` that does not name it replaces the
-image's, the folder the sandbox installs the tool in kept first; a `null` value leaves the image's own); the sandbox's own variables (its
-proxy, the tool's gateway settings, `HOME`) win over the project's. `${localEnv:…}` is refused there too. One that uses
-`features` is built with the Dev Container CLI (`npm install -g @devcontainers/cli`), from what that build
-reads alone — the image or `build`, the features and `overrideFeatureInstallOrder`, the users,
-`workspaceFolder` and the features' lockfile (`devcontainer-lock.json` beside it) — so editing a lifecycle
-command or a variable rebuilds nothing. Its features may not hold `${env:…}` (that CLI would read it from
-your environment, even the shell's `${env:-x}`), nor name a local feature folder (only a
-published feature is taken). A `workspaceFolder` on a system path of the container (`/etc`, `/run`,
-`/usr` and the like) or over the agent's home is refused, and so is a workspace, or an agent home, at or
-around `/opt/ssai-agent`, where the sandbox installs the tool. On the first run,
-`run` adds the tool to the image (Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode, Continue,
-Crush and Open Code Review, at their latest release), with the Node.js runtime the tool runs on: a pinned release,
-downloaded once on your machine from nodejs.org and checked against its checksum, kept apart from the image's own
-`node`, which the project keeps using. With `"docker": true`, an image that has no Docker Engine also gets one, from
-its own distribution's packages (the engine, `iptables`, and compose and buildx where the distribution has them); an
-image with no `apt-get`, `apk` or `dnf` must bring its own. A Dev Container image that does gets it from the
-`ghcr.io/devcontainers/features/docker-in-docker:2` feature (on Debian trixie images, such as
-`javascript-node:22`, with `{"moby": false}`, since trixie has no Moby packages);
-`docker-outside-of-docker` cannot work in the sandbox, which has no host engine to reach. Goose, Aider and Vibe must
-already be in the image. Images with an engine are large: `ssai sandbox status` shows what each project
-keeps, and `ssai sandbox prune` removes them. Only a project's first image is built (or pulled) by
-`run` on its own. After that, when the image reference changed to one not on this machine yet, or
-the image needs building again (its Dockerfile changed, or the `build` of its `devcontainer.json` —
-with `features`, also what that build reads, above — or the image was removed), `run` stops and asks you to read what it would build — the agent can edit all of it, and
-a pull or a build reaches the network before the sandbox does. A change to other files of the build
-context is not noticed: the image already built keeps being used until you rebuild it; `ssai
-sandbox prepare <tool>` then rebuilds both — also to pick up the tool's latest release — and `ssai sandbox
-prune` removes every image and volume the container sandbox made (a project built from a
-Dockerfile then asks for `ssai sandbox prepare` once, as for a changed recipe). Turning
-`"docker": true` on in a project that ran without it also asks for `ssai sandbox prepare` first: an
-engine runs privileged, and the agent can edit `sandbox.json`.
-
-Inside, the agent runs as the image's user, as Dev Containers pick it: a `remoteUser` (the
-`devcontainer.json`'s, else the one a Dev Container image names in its metadata), else a
-`containerUser` (the same order), else the image's `USER` (root when it sets none) — which
-is you on the host: what it writes in the project is yours. It sees the project at its `workspaceFolder` (or, without one, at the same path as on your machine), a home
-of its own kept between runs of that tool in that project (filled from the image on its first run:
-what a rebuilt image changes under the home reaches it only after `ssai sandbox prune`), and, for a tool provisioned in your home
-directory, its provisioned configuration — read-only, so a tool that rewrites its own configuration
-cannot save it there (a provisioned file `run` cannot hand over is named, and the tool runs without it). Beside these, only the files `run` hands the tool are mounted, read-only: the
-CA bundles (`--ca-file` and the gateway's) and any file or directory an `-e KEY=/path` names. When
-`run` gives Node no certificate file of its own (no gateway certificate was captured — your machine
-already trusts it, a corporate CA for instance — and neither `--ca-file` nor `-e NODE_EXTRA_CA_CERTS`
-names one), and the image or `devcontainer.json` names none either, Node in the container also
-trusts your machine's system certificate store; an image's own `NODE_EXTRA_CA_CERTS` is left as it is
-(Node reads one such file). The tool's installation into the image (its `npm install`) trusts your
-machine's system store beside the image's own. The other certificate variables are left to the image. Nothing
-else of your machine is: not your home, your SSH keys, nor the host's Podman or Docker socket. The container has no network: everything leaves through the same guard
-and the same destinations as the native sandbox, and `run` names what it refused. With `"docker": true`, nothing
-needs a proxy setting: every TCP connection made in the container — the tool's, the engine's pulls, and those of
-the engine's own containers and builds (`docker run`, `docker build`, compose, Testcontainers, kind) — is taken to
-the guard by name, so plain commands work as they are. The proxy variables the tool is given name an address the
-engine's containers reach too, so a tool that copies them into a container (kind does) still works. Limits: only TCP and DNS leave (no other UDP);
-a container reaching a private address directly (one not on the engine's own networks) is not taken out; and a tool
-that ignores the container's DNS (a hard-coded resolver over HTTPS, an address written in its configuration) is
-decided by that address alone, so a destination allowed by name is refused to it. When the run ends, any file in the project that the container's root made
-(a setuid binary included) is given back to you, with setuid cleared — by the next run, before its
-tool starts, when a run was killed before it could. A file of one of the container's other users (a
-database's data directory an inner container keeps in the project) keeps its owner, so the service
-still owns it next time; only its setuid and setgid bits are cleared. A project of more than two
-million files is swept only that far, and `run` says so. The tool's exit code is
-`run`'s; SIGTERM to `ssai run` reaches the tool, and so does Ctrl-C at its terminal.
-
-If a tool fails when confined because it needs a directory the sandbox doesn't grant it (some tools
-keep configuration or state in an unusual place), run it once with `--sandbox learn`. This launches
-the tool with its **network egress still restricted to the gateway** but the filesystem left open,
-watches which directories it actually uses, and remembers the ones under your home directory so
-every later `ssai run` allows them — turning a "permission denied" into a one-command fix. It
-never records your credentials, and prints exactly what it added. (Learn mode is available on Linux
-and WSL2.)
-
-Clients with more than one model setting get the gateway's **default**, **fast** and **plan**
-models — each the default model unless a route fills that client slot (LLM Gateway → the route's
-**Client Slots**; see *Client slots* there):
-
-| Client | Default model | Fast model | Plan model |
-|---|---|---|---|
-| Claude Code | `ANTHROPIC_MODEL`, the `sonnet` model | the `haiku` model, background tasks | the `opus` model, `opusplan`'s plan phase |
-| OpenCode | `model`; agents `build`, `general`, `summary`, `compaction` | agents `title`, `explore` | agent `plan` |
-| Crush | `models.large` | `models.small` | — |
-| Zed | your pick in the Agent Panel | commit messages, thread summaries | — |
-| Aider | `model` | `weak-model` | — |
-| Goose | `GOOSE_MODEL` | — | the `/plan` planner |
-
-The other clients have one model setting, which gets the default model.
-
-Clients that list providers by name (OpenCode, Crush, Codex) get the gateway under a provider named
-for your organisation and the provider you chose — `streamscope_<org>_<provider>`, e.g.
-`streamscope_acme_nvidia` — so OpenCode's model is addressed as `streamscope_acme_nvidia/<alias>`.
-Configs provisioned for different organisations or providers therefore never blend into one
-entry: OpenCode, for one, merges your home-directory config into a project's, and two entries under
-one name would merge into a single provider that shows both model lists but sends every request
-with one key.
-
-##### CI / pipelines
-
-Non-interactive runners skip the browser login entirely and authenticate with a **workspace
-automation key** (`ak-…`, minted by a workspace manager on the **Team** page) — the same
-credential the portal automation API uses. Two environment variables make `provision` fully
-unattended:
-
-```bash
-export STREAMSCOPE_URL=https://<portal-host>/portal/t/<org>
-export STREAMSCOPE_AK=ak-…                     # the workspace automation key
-ssai provision --client opencode        # e.g. deploy an OpenCode config on a fresh runner
-```
-
-In this mode nothing is stored on the runner beyond the written tool configs: the workspace is
-the automation key's bound workspace, no prompts are asked, and each run mints a **short-lived**
-gateway key (2 hours by default; tune with `--key-ttl 30m` / `--key-ttl 8h`). Expired per-run keys
-clean themselves up — they stop working at expiry and are removed with the audit data retention
-window. Two refinements:
-
-- `STREAMSCOPE_GATEWAY_KEY=sk-…` skips minting entirely — the supplied key is written into the
-  configs as-is (for pipelines that manage one long-lived key themselves).
-- `--key-ttl` also works interactively, for a personal key that should expire.
-
-#### Client integration snippets
 
 Whatever the client speaks, a refused request comes back in that API's own error format — an
 Anthropic client receives an Anthropic error, a Gemini client a Google one — so the client shows the
@@ -3861,54 +3000,11 @@ is reported as `<model>: upstream provider could not be reached` with status 502
 `<model>: upstream provider did not respond in time` with status 504: the gateway is working and
 the path to the provider is not, so it is never reported as the gateway's own internal error.
 
-**Generic (OpenAI-compatible)** — Continue, Cursor, Aider, any OpenAI client:
-```bash
-export OPENAI_BASE_URL=https://<proxy-host>/v1
-export OPENAI_API_KEY=sk-<your-streamscope-key>
-```
 
-**Claude Code** — speaks Anthropic Messages; Streamscope translates to any upstream:
-```bash
-export ANTHROPIC_BASE_URL=https://<proxy-host>
-export ANTHROPIC_API_KEY=sk-<your-streamscope-key>
-```
-Map the model names Claude Code requests (`claude-opus-4-8`, `claude-sonnet-4-6`, …) to any
-upstream via aliases on the **LLM Gateway** page.
+#### MCP protocol versions behind a virtual server
 
-**opencode** — OpenAI Chat Completions:
-```bash
-export OPENAI_BASE_URL=https://<proxy-host>/v1
-export STREAMSCOPE_API_KEY=sk-<your-streamscope-key>
-```
 
-**Gemini CLI** — native Gemini API:
-```bash
-export GEMINI_API_KEY=sk-<your-streamscope-key>
-export GOOGLE_GEMINI_BASE_URL=https://<proxy-host>
-```
-A Gemini client may present its key either as a header or in the URL — `?key=<your-key>` —
-the way Google's own REST examples write it. Both are accepted on the Gemini endpoints, so a
-hand-written `curl` copied from Google's documentation works with only the host changed. The
-URL form is Gemini's alone: on the OpenAI and Anthropic endpoints a key must travel in a
-header, because neither of those APIs defines a URL parameter for it. Prefer a header where
-you have the choice — anything that logs a request line logs the whole URL with it.
-
-**MCP clients** — point an MCP-aware agent at the per-tenant virtual server:
-```jsonc
-{
-  "mcpServers": {
-    "gateway": {
-      "type": "http",
-      "url": "https://<proxy-host>/mcp/<slug>",
-      "headers": { "Authorization": "Bearer sk-<your-streamscope-key>" }
-    }
-  }
-}
-```
-Use `https://<proxy-host>/fwd/<vk-…>/mcp/<slug>` for BYOK, or the spec-OAuth 2.1 discovery
-flow for native MCP clients.
-
-**Protocol versions.** A virtual server answers every published revision of the Model
+A virtual server answers every published revision of the Model
 Context Protocol, from `2025-03-26` through `2026-07-28`, and picks per request from
 what the client declares — so a mixed fleet needs no separate address and no setting.
 `2026-07-28` is a deliberate break with the revisions before it (no connection setup,
@@ -3956,54 +3052,17 @@ a subscription can stay quiet even though it was accepted. In practice servers a
 changes around activity, so this is rarely visible; if you depend on out-of-band
 announcements, re-listing after a call is the reliable check.
 
+
 ---
 
-## C. Workspace manager (the Portal)
+## C. Workspace managers and members
 
-A **manager** is an elevated member of a workspace — an end-user, not an admin. Managers never
-touch the admin console; everything they do happens in the self-service **Portal** (the console host's root, `/`).
-The role exists so a team lead can hand out and reclaim keys for their team without an admin
-having to mint every one.
-
-**How someone becomes a manager.** A tenant admin sets it on the **Governance → Workspaces** page
-(section B.3): add the person to the workspace and flip their role from *member* to *manager*.
-The change takes effect on the manager's next portal sign-in. Managers can't promote themselves or
-others — granting the role stays admin-only.
-
-**What a manager can do** (beyond an ordinary member):
-
-- **Provision keys for any member of the workspace** — from **Portal → Members & limits** (`/portal/team`),
-  mint an `sk-`/`vk-` key on behalf of another member, optionally with a **per-key budget**
-  (daily/monthly cap + enforce-or-alert-only mode). The key is shown once, the same as
-  self-service minting; the member can use it immediately. (Members minting their own keys cannot
-  set a budget on them — capping a key stays a manager/admin lever.)
-- **Revoke any member's key** in the workspace — reclaim access when someone leaves the team or a
-  key is suspected leaked.
-- **See the roster and per-member usage** — who's in the workspace and how much each member has
-  spent against the workspace budget, and every limit that applies to each member.
-- **Give one member an exception** — raise or lower a member's limit (requests, tokens, daily or
-  monthly budget), field by field, inside the pool and member default you set. A manager can't
-  change **a manager's** exception — their own or a fellow manager's; that stays with an
-  administrator — and a value above the workspace pool changes nothing: the pool still applies.
-
-**What a manager cannot do** — the boundaries that keep this an end-user role, not an admin one:
-
-- **Change membership.** Adding or removing people from the workspace, and granting/revoking the
-  manager role itself, stays with the tenant admin (section B.3).
-- **Change what the workspace can reach.** Provider/MCP allowlists, the workspace pool and the
-  default member limit, and the tool policy profile are all admin-set; a manager works *within*
-  them.
-- **See or manage other workspaces.** A manager's reach is exactly the workspace(s) where they
-  hold the role — never tenant-wide, never the control plane.
-
-**The ordinary member view**, for comparison: any member can mint and revoke **their own** keys in
-any workspace they belong to (**Portal → API keys**, `/portal/keys`), run the **Quickstart** wizard to
-get a ready-to-paste client config, and connect MCP servers that need their own account under
-**Portal → Sign-ins**. A manager has all of this plus the team controls above.
-
-> Budget and rate limits always win. A manager can mint keys freely, but every key the manager
-> creates spends against the same workspace (and per-member) budget and rate-limit ceilings the
-> admin set — minting more keys never raises the ceiling.
+Everything a member and a workspace manager do — in the portal and with the `ssai` CLI — is the
+[Portal Guide](PORTAL_GUIDE.md); a manager's powers and their limits are its
+[section 11](PORTAL_GUIDE.md#11-run-your-team-workspace-managers). Making someone a manager is yours:
+add the person to the workspace on **Governance → Workspaces** (step 3) and flip their role from
+*member* to *manager*. The change takes effect on the manager's next portal sign-in; managers can't
+promote themselves or others.
 
 ---
 
@@ -4040,7 +3099,7 @@ mirrors this under `…/portal/t/<organization>/…`.
 | Configuration | Auth | `/auth` | Three tabs: auth settings (Internal/OIDC, IdP, groups), human accounts, service accounts |
 | Configuration | Audit (admin) | `/admin-audit` | Who changed what on the control plane — before → after diff (secrets redacted), actor, IP |
 | Configuration | Settings | `/settings` | Defaults, retention, feature toggles, agent, advanced |
-| Portal | Home / Activity / Set up / MCP tools / Team | `/portal/*` | End-user self-service: the Home page, own sessions and requests, quickstart wizard, own keys and their usage, MCP sign-ins + server test, team provisioning (managers) |
+| Portal | Home / Activity / Set up / MCP tools / Team | `/portal/*` | End-user self-service: the Home page, own sessions and requests, quickstart wizard, own keys and their usage, MCP sign-ins + server test, team provisioning (managers) — see the [Portal Guide](PORTAL_GUIDE.md) |
 
 ## Appendix — gotchas
 

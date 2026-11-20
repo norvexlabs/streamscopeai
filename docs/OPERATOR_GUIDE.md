@@ -3,7 +3,8 @@
 Everything needed to **deploy, run, and operate the infrastructure** behind Streamscope AI —
 install, networking, TLS, backups, recovery, and updates. Once the system is up, configuring the
 product itself (tenants, providers, workspaces, users, policy) is the [Admin Guide](ADMIN_GUIDE.md),
-done entirely through the web UI.
+done entirely through the web UI, and what its users do — the portal and the `ssai` CLI — is the
+[Portal Guide](PORTAL_GUIDE.md).
 
 Streamscope installs in **three form factors**, all running the **same container images** and all
 installed by the **same installer, `ssai-stow`** — pick the one that fits how you operate:

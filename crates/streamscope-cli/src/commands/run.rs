@@ -36,7 +36,8 @@ pub struct RunArgs {
     pub sandbox: String,
     /// What the sandbox may reach besides the gateway: `policy` (the
     /// workspace's, the default) or `gateway` (the gateway only). Wins over
-    /// `network` in the project's sandbox.json.
+    /// `network` in the project's sandbox.json. A learn run reaches the
+    /// gateway alone.
     #[arg(long, value_parser = ["gateway", "policy"])]
     pub network: Option<String>,
     /// Surface the egress guard's per-connection denial lines (blocked domains,
@@ -73,7 +74,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
 
     // What the administrator offers this workspace: the client must be one of
     // its clients, `--sandbox off` may be refused, and the sandbox reaches
-    // the attached destination lists beside the gateway. Unknown (never
+    // the attached destination lists beside the gateway (a learn run the
+    // gateway alone). Unknown (never
     // recorded, gateway unreachable): the gateway alone.
     let access = current_access(&resolved).await;
     if let Some(a) = &access
@@ -100,23 +102,25 @@ pub async fn run(args: RunArgs) -> Result<()> {
              `--sandbox native`"
         );
     }
-    // Only a confined run reads the lists: `--sandbox off` applies none, so a
-    // block entry this build cannot read does not refuse it.
+    // Only a run that applies the lists reads them: `--sandbox off` applies
+    // none, and a learn run and `--network gateway` reach the gateway alone,
+    // so a block entry this build cannot read refuses none of them.
     if args.network.is_some() && choice == SandboxChoice::Off {
         bail!("`--network` narrows the sandbox, and `--sandbox off` runs without one — drop one of them");
+    }
+    if args.network.as_deref() == Some("policy") && choice == SandboxChoice::Learn {
+        bail!(
+            "a learn run reaches the gateway alone (its filesystem is left open), so `--network policy` \
+             cannot widen it — drop `--network`"
+        );
     }
     let network = match args.network.as_deref() {
         Some("gateway") => Some(sandbox::NetworkChoice::Gateway),
         Some(_) => Some(sandbox::NetworkChoice::Policy),
         None => None,
     };
-    let mut destinations = match choice {
-        SandboxChoice::Off => Policy::default(),
-        _ => access.as_ref().map(destinations_of).transpose()?.unwrap_or_default(),
-    };
-    if network == Some(sandbox::NetworkChoice::Gateway) {
-        destinations.posture = destinations.posture.narrower(Posture::Gateway);
-    }
+    let destinations =
+        run_destinations(choice, network, || Ok(access.as_ref().map(destinations_of).transpose()?.unwrap_or_default()))?;
 
     let command = resolved.command;
     let proxy_origins = resolved.proxy_origins;
@@ -446,6 +450,25 @@ async fn refresh_access(resolved: &ResolvedClient) -> Result<ClientAccess> {
     Ok(access)
 }
 
+/// The destinations a run may reach: none applied off the sandbox; the
+/// gateway alone for a learn run — its filesystem is left open, so its egress
+/// stays pinned to the gateway, as its banner says — and with `--network
+/// gateway`; the workspace's lists otherwise. `workspace` reads them, and is
+/// called only for a run that applies them.
+fn run_destinations(
+    choice: SandboxChoice,
+    network: Option<sandbox::NetworkChoice>,
+    workspace: impl FnOnce() -> Result<Policy>,
+) -> Result<Policy> {
+    Ok(match (choice, network) {
+        (SandboxChoice::Off, _) => Policy::default(),
+        (SandboxChoice::Learn, _) | (_, Some(sandbox::NetworkChoice::Gateway)) => {
+            Policy { posture: Posture::Gateway, ..Policy::default() }
+        }
+        _ => workspace()?,
+    })
+}
+
 /// The sandbox's destination policy from what the workspace offers. Entries
 /// come canonical from the gateway. An allowed entry this build cannot read is
 /// left out with a warning (it allows less); a blocked one refuses the run —
@@ -651,6 +674,28 @@ fn select_client<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A learn run leaves the filesystem open, so its egress is the gateway
+    /// alone whatever the workspace allows — whatever `--network` says — and
+    /// it reads no list, so an unreadable block does not refuse it; a native
+    /// run keeps the workspace's posture (the positive control), and
+    /// `--network gateway` narrows any confined run.
+    #[test]
+    fn a_learn_run_reaches_the_gateway_alone() {
+        let open = || Ok(Policy { posture: Posture::Open, ..Policy::default() });
+        let unreadable = || -> Result<Policy> { Err(anyhow::anyhow!("a block entry this build cannot read")) };
+        for network in [None, Some(sandbox::NetworkChoice::Policy), Some(sandbox::NetworkChoice::Gateway)] {
+            assert_eq!(run_destinations(SandboxChoice::Learn, network, open).unwrap().posture, Posture::Gateway, "{network:?}");
+            assert_eq!(run_destinations(SandboxChoice::Learn, network, unreadable).unwrap().posture, Posture::Gateway);
+        }
+        assert_eq!(run_destinations(SandboxChoice::Native, None, open).unwrap().posture, Posture::Open);
+        assert!(run_destinations(SandboxChoice::Native, None, unreadable).is_err(), "a run applying the lists reads them");
+        assert_eq!(
+            run_destinations(SandboxChoice::Native, Some(sandbox::NetworkChoice::Gateway), open).unwrap().posture,
+            Posture::Gateway
+        );
+        assert_eq!(run_destinations(SandboxChoice::Off, None, open).unwrap(), Policy::default());
+    }
 
     fn manifest(json: serde_json::Value) -> crate::state::Manifest {
         serde_json::from_value(json).unwrap()

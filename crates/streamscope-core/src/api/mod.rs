@@ -846,6 +846,20 @@ impl ApiRequest {
         }
     }
 
+    /// How many answers a client asked for in one stream (Chat `n`, Gemini
+    /// `candidateCount`; 1 by default). The stream parser reads each chunk's
+    /// first choice or candidate, so with several its finish is whichever
+    /// finishes first.
+    pub fn chat_choices(&self) -> u32 {
+        match self {
+            Self::ChatCompletions(req) => req.n.unwrap_or(1).max(1),
+            Self::GoogleGemini(req) => {
+                req.generation_config.as_ref().and_then(|g| g.candidate_count).unwrap_or(1).max(1)
+            }
+            _ => 1,
+        }
+    }
+
     /// Whether a Chat Completions client asked for the stream's usage
     /// (`stream_options.include_usage: true`) — read before the request phase,
     /// which asks the upstream for it on the gateway's own account. `false`

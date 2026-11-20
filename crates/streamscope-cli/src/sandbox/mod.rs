@@ -102,7 +102,9 @@ pub struct LaunchSpec {
     /// Gateway proxy origins (`scheme://host[:port]`) — always reachable.
     pub proxy_origins: Vec<String>,
     /// What else the client may reach: the workspace's destination lists,
-    /// under its posture (narrowed to the gateway by `--network gateway`).
+    /// under its posture (narrowed to the gateway by `--network gateway`, and
+    /// for a learn run, which [`launch`] pins to the gateway whatever it is
+    /// handed).
     pub destinations: streamscope_client_templates::destination::Policy,
     /// `--network`, when given: it wins over the project's sandbox.json (read
     /// by the container tier, Linux only; the posture already carries it).
@@ -420,7 +422,13 @@ pub async fn launch(mut spec: LaunchSpec, tier: Tier, verbose: bool) -> Result<i
             spawn_unconfined(&spec).await
         }
         Tier::Native => launch_confined(spec, verbose, false).await,
-        Tier::Learn => launch_confined(spec, verbose, true).await,
+        // A learn run leaves the filesystem open: its egress is the gateway
+        // alone, as its banner says, whatever destinations it was handed.
+        Tier::Learn => {
+            spec.destinations.posture =
+                spec.destinations.posture.narrower(streamscope_client_templates::destination::Posture::Gateway);
+            launch_confined(spec, verbose, true).await
+        }
         #[cfg(target_os = "linux")]
         Tier::Docker => podman::launch(spec, verbose).await,
         #[cfg(not(target_os = "linux"))]

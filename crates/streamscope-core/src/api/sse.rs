@@ -26,6 +26,28 @@ impl SseEvent {
     pub fn is_done(&self) -> bool {
         self.data.trim() == "[DONE]"
     }
+
+    /// Name an Anthropic or Responses upstream's frame that states its kind
+    /// only in its data's `type` (no `event:` line — neither spec writes a
+    /// frame so, but a server may): it is given that kind as its event line,
+    /// once, as it is read, so the parser, the stream's end and a
+    /// pass-through client all read the one kind. A frame with its event line,
+    /// and any other protocol's, is left as it came.
+    pub fn name_from_data(&mut self, upstream: ApiVersion) {
+        if self.event_type.is_some() || !matches!(upstream, ApiVersion::AnthropicMessages | ApiVersion::Responses) {
+            return;
+        }
+        #[derive(Deserialize)]
+        struct Kind {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+        }
+        if let Ok(Kind { kind: Some(kind) }) = serde_json::from_str::<Kind>(&self.data)
+            && !kind.is_empty()
+        {
+            self.event_type = Some(kind);
+        }
+    }
 }
 
 /// Streaming size cap for a single SSE frame.
@@ -1027,6 +1049,19 @@ fn parse_frame(event: &SseEvent, version: ApiVersion, facts: &mut FrameFacts) ->
     if event.is_done() {
         return vec![]; // [DONE] sentinel is handled separately
     }
+    // A frame naming its kind only in its data is read as that kind, for
+    // every reader (the read loop names it in place before this).
+    let named;
+    let event = if event.event_type.is_none() && matches!(version, ApiVersion::AnthropicMessages | ApiVersion::Responses) {
+        named = {
+            let mut e = event.clone();
+            e.name_from_data(version);
+            e
+        };
+        &named
+    } else {
+        event
+    };
 
     match version {
         ApiVersion::ChatCompletions => parse_chat_completions_event(event, facts),
@@ -1763,9 +1798,18 @@ struct AnthropicMessageStartInner {
 struct GeminiStreamChunk {
     candidates: Option<Vec<GeminiStreamCandidate>>,
     usage_metadata: Option<GeminiStreamUsage>,
+    /// The prompt's verdict: a `blockReason` blocks the prompt, and the
+    /// stream carries no candidate — its only finish.
+    prompt_feedback: Option<GeminiPromptFeedback>,
     /// A mid-stream failure, sent as an AIP-193 error chunk.
     #[serde(default, deserialize_with = "present_error")]
     error: Option<StreamError>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPromptFeedback {
+    block_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1882,6 +1926,16 @@ fn parse_gemini_event(event: &SseEvent) -> Vec<DomainEvent> {
                 native_finish_reason: Some(reason.clone()),
             });
         }
+    }
+    // A blocked prompt is the stream's finish, a filter whatever reason it
+    // names (`OTHER` included): no candidate follows it.
+    if !events.iter().any(|e| matches!(e, DomainEvent::Done { .. }))
+        && let Some(reason) = chunk.prompt_feedback.as_ref().and_then(|f| f.block_reason.as_ref())
+    {
+        events.push(DomainEvent::Done {
+            finish_reason: Some(FinishReason::ContentFilter),
+            native_finish_reason: Some(reason.clone()),
+        });
     }
 
     // Extract usage metadata (present in final chunk)
@@ -2818,6 +2872,30 @@ mod tests {
                 other => panic!("{protocol:?}: expected one Error, got {other:?}"),
             }
         }
+    }
+
+    /// A Gemini prompt the upstream blocked (`promptFeedback.blockReason`, no
+    /// candidate) is the stream's finish, by its reason — a filter, never a
+    /// stream cut short. Positive control: feedback with no block finishes
+    /// nothing.
+    #[test]
+    fn a_blocked_gemini_prompt_is_the_streams_finish() {
+        let frame = |data: &str| SseEvent { event_type: None, data: data.to_string(), id: None };
+        let blocked = parse_domain_event(
+            &frame(r#"{"promptFeedback":{"blockReason":"SAFETY"},"usageMetadata":{"promptTokenCount":4,"totalTokenCount":4}}"#),
+            ApiVersion::GoogleGemini,
+        );
+        assert!(
+            blocked.iter().any(|e| matches!(e, DomainEvent::Done { finish_reason: Some(FinishReason::ContentFilter), .. })),
+            "{blocked:?}"
+        );
+        let other = parse_domain_event(&frame(r#"{"promptFeedback":{"blockReason":"OTHER"}}"#), ApiVersion::GoogleGemini);
+        assert!(
+            other.iter().any(|e| matches!(e, DomainEvent::Done { finish_reason: Some(FinishReason::ContentFilter), .. })),
+            "{other:?}"
+        );
+        let passed = parse_domain_event(&frame(r#"{"promptFeedback":{"safetyRatings":[]}}"#), ApiVersion::GoogleGemini);
+        assert!(!passed.iter().any(|e| matches!(e, DomainEvent::Done { .. })), "{passed:?}");
     }
 
     /// An `error` member that says nothing is no error on a stream either — the

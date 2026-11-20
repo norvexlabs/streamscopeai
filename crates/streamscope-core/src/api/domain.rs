@@ -22,19 +22,37 @@ pub enum FinishReason {
 }
 
 impl FinishReason {
+    /// Whether a finish says the answer FAILED: the parser's `Error` stated
+    /// by the gateway (no word of the upstream's), or the upstream's own word
+    /// for a failure. A finish word the gateway does not know, which
+    /// [`Self::normalize`] also reads as `Error`, is no failure — the answer
+    /// it ends may be whole.
+    pub fn is_failure(finish: Option<&Self>, native: Option<&str>) -> bool {
+        matches!(finish, Some(Self::Error))
+            && native.is_none_or(|word| {
+                matches!(
+                    word,
+                    "error" | "failed" | "cancelled" | "abort" | "aborted" | "missing_response"
+                        | "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" | "TOO_MANY_TOOL_CALLS"
+                        | "MISSING_THOUGHT_SIGNATURE" | "MALFORMED_RESPONSE"
+                )
+            })
+    }
+
     /// Normalize provider-specific finish reason strings to canonical set.
     pub fn normalize(raw: &str) -> Self {
         match raw {
             "stop" | "end_turn" | "stop_sequence" | "STOP" => Self::Stop,
             // Mistral's `model_length` is a stop at the model's context limit:
             // the output was cut short, exactly what `length` reports.
-            "length" | "model_length" | "max_tokens" | "MAX_TOKENS" => Self::Length,
+            // Gemini's `CONTINUATION`: the per-request token limit, resumable.
+            "length" | "model_length" | "max_tokens" | "MAX_TOKENS" | "CONTINUATION" => Self::Length,
             "tool_calls" | "tool_use" | "function_call" => Self::ToolCalls,
             // A stop made by a safety filter or classifier, in each vendor's
             // spelling: Chat `content_filter`, Anthropic `refusal`, Gemini's
             // safety family.
             "content_filter" | "safety" | "refusal" | "SAFETY" | "RECITATION" | "LANGUAGE" | "BLOCKLIST"
-            | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => Self::ContentFilter,
+            | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" | "ESCALATION" => Self::ContentFilter,
             _ => Self::Error,
         }
     }
@@ -938,6 +956,8 @@ mod tests {
         assert_eq!(FinishReason::normalize("max_tokens"), FinishReason::Length);
         assert_eq!(FinishReason::normalize("model_length"), FinishReason::Length);
         assert_eq!(FinishReason::normalize("error"), FinishReason::Error);
+        assert_eq!(FinishReason::normalize("CONTINUATION"), FinishReason::Length);
+        assert_eq!(FinishReason::normalize("ESCALATION"), FinishReason::ContentFilter);
         assert_eq!(FinishReason::normalize("tool_calls"), FinishReason::ToolCalls);
         assert_eq!(FinishReason::normalize("tool_use"), FinishReason::ToolCalls);
         assert_eq!(FinishReason::normalize("function_call"), FinishReason::ToolCalls);

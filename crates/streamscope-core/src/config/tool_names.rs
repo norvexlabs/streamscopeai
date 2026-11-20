@@ -196,12 +196,15 @@ pub fn resolve_tool_name<'a>(
         if let Some(found) = servers.and_then(|s| read_slug_form(body, s, "__", false)) {
             return found;
         }
-        return match body.split_once("__") {
-            Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
-                ToolName { local: tool, mcp_server: Some(server), gateway: false }
-            }
-            _ => ToolName::bare(name),
-        };
+        // A name the `mcp__` form does not split (a slug starting `mcp-`,
+        // written `mcp_`, in another client's form) is read by the forms
+        // below.
+        if let Some((server, tool)) = body.split_once("__")
+            && !server.is_empty()
+            && !tool.is_empty()
+        {
+            return ToolName { local: tool, mcp_server: Some(server), gateway: false };
+        }
     }
     let Some(servers) = servers else {
         return ToolName::bare(name);
@@ -393,6 +396,19 @@ mod tests {
         assert_eq!(resolve("u_a", Some("opencode"), &s), ("a", Some("u2")));
         assert_eq!(resolve("mcp__U__a", None, &s), ("a", Some("u2")));
         assert_eq!(resolve("mcp_W_A", None, &s), ("A", Some("u3")));
+    }
+
+    /// A slug that starts `mcp-` written in the bare form (`mcp___A` for
+    /// server `mcp--`) begins like the `mcp__` form, which does not split it:
+    /// it is read by the bare form. Positive control: a name the `mcp__` form
+    /// splits stays the developer's own server's.
+    #[test]
+    fn a_slug_starting_mcp_is_read_in_the_bare_form() {
+        let s = names(&[("mcp--", "", "the-upstream")]);
+        let t = resolve_tool_name("mcp___A", Some("opencode"), Some(&s), None);
+        assert_eq!((t.local, t.mcp_server), ("A", Some("the-upstream")));
+        let own = resolve_tool_name("mcp__theirs__A", Some("opencode"), Some(&s), None);
+        assert_eq!((own.local, own.mcp_server), ("A", Some("theirs")));
     }
 
     fn slug() -> impl Strategy<Value = String> {

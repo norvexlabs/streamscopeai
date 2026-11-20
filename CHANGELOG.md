@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.76]
+
+### Fixed
+
+- **A model's answer cut short is closed as truncated for a client of another protocol.** When the
+  upstream closed the connection mid-answer (a server hitting its context limit), an OpenAI Chat
+  Completions client of a translated model was sent no finish and no end, and a Gemini client a half-written tool call with
+  empty arguments. Both now get the answer closed as truncated (`finish_reason: "length"`,
+  `finishReason: MAX_TOKENS`), and a Gemini client is never sent a tool call whose arguments were
+  cut off — whether the connection closed or the model hit its own token limit — it is told in its
+  place, and the request's record names it as not delivered. A client of a translated model whose
+  upstream closed before any of the answer is told to retry (`overloaded_error`), as an Anthropic
+  client already was. The request is recorded as truncated where the model's server cut the answer.
+- **An upstream error after a finished answer no longer costs the client the answer.** A model
+  server that reported an error after its answer had finished made every client's SDK raise and
+  discard the answer. The client now receives the whole answer and the stream's normal end; the
+  request's record still shows the upstream's error. An error after an answer that itself ended in
+  failure still reaches the client.
+- **A model server that sends Anthropic or OpenAI Responses stream events without their event names**
+  is now read correctly instead of yielding an empty answer.
+- **Gemini's `CONTINUATION` finish (its token limit) reaches a client of another protocol as a
+  truncated answer, and `ESCALATION` as a filtered one,** instead of an error.
+- **A prompt a Gemini model blocks reaches a client of another protocol as a filtered answer** (for
+  example `finish_reason: "content_filter"`) instead of an empty stream.
+- **A tool of an MCP server whose name starts with `mcp-` is read as that server's** when a client
+  writes it in the plain `<server>_<tool>` form (OpenCode), instead of as a tool of no server, so the
+  server's tool rules apply to it.
+- **`ssai run --sandbox learn` reaches the gateway alone.** A learn run leaves the filesystem open to
+  record what a client needs, and is meant to keep its network to the gateway; it was given the
+  workspace's full destination policy, so on a workspace allowing the Internet it reached every
+  destination not blocked. Its network is now the gateway alone, as its banner says; a learn run no
+  longer reads the workspace's destination lists (an entry this build cannot read no longer refuses
+  it), and `--network policy` cannot widen it.
+
 ## [2026.11.75]
 
 ### Added

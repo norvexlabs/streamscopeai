@@ -323,7 +323,10 @@ appliance, Kubernetes, and installing without internet from a mirror — see the
   with how Streamscope works and a half-hour
   **[Getting started](docs/ADMIN_GUIDE.md#getting-started)**, then walks through sign-in and OIDC,
   providers, workspaces, users and keys, automation, MCP, web search, tool policy, experts,
-  observability and the member portal.
+  observability, and handing the portal to your users.
+- **[Portal Guide](docs/PORTAL_GUIDE.md)** — **for the people who use the gateway**: sign in to the
+  portal, install the `ssai` CLI, set up AI tools and run them in the sandbox (natively or in a
+  container), connect MCP accounts, follow your activity, and run a team as a workspace manager.
 
 ## Build from source
 

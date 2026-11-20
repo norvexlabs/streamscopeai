@@ -1435,6 +1435,7 @@ async fn proxy_handler_inner(
     // Read before the request phase asks the upstream for it on the gateway's
     // own account.
     let chat_usage_asked = api_request.chat_usage_asked();
+    let chat_choices = api_request.chat_choices();
     let mut phase = match crate::pipeline::run_request_phase(
         &mut api_request,
         &ctx.user,
@@ -2461,6 +2462,7 @@ async fn proxy_handler_inner(
         wants_structured_output,
         client_tools,
         chat_usage_asked,
+        chat_choices,
         debug_echo: debug_echo_str,
         api_request: api_request_for_pipeline,
         forward,
