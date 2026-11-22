@@ -50,12 +50,14 @@ pub struct EgressPolicy {
 }
 
 /// A running guard: its loopback port and the background accept task.
+#[cfg_attr(target_os = "freebsd", allow(dead_code, reason = "the jail reaches the guard on its unix socket"))]
 pub struct Guard {
     pub port: u16,
     refused: Arc<Mutex<BTreeSet<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
+#[cfg_attr(target_os = "freebsd", allow(dead_code, reason = "the jail reaches the guard on its unix socket"))]
 impl Guard {
     /// The destinations refused so far (`host:port`), at most [`MAX_REFUSED`].
     pub fn refused(&self) -> Vec<String> {
@@ -66,10 +68,12 @@ impl Guard {
 /// Decides whether the guard serves a loopback connection, from the guard's
 /// own address and the peer's: blocking (it may read system tables), run off
 /// the accept loop. `false` is answered 403.
+#[cfg_attr(target_os = "freebsd", allow(dead_code, reason = "the jail reaches the guard on its unix socket"))]
 type PeerCheck = Arc<dyn Fn(SocketAddr, SocketAddr) -> bool + Send + Sync>;
 
 /// Bind the guard on `127.0.0.1:<ephemeral>` and start accepting.
 #[cfg_attr(windows, allow(dead_code, reason = "Windows starts the account's guard, `start_for_account`"))]
+#[cfg_attr(target_os = "freebsd", allow(dead_code, reason = "the jail reaches the guard on its unix socket"))]
 pub async fn start(policy: EgressPolicy, verbose: bool) -> Result<Guard> {
     listen(policy, verbose, None).await
 }
@@ -99,6 +103,7 @@ pub async fn start_for_account(policy: EgressPolicy, verbose: bool, account_sid:
     listen(policy, verbose, Some(check)).await
 }
 
+#[cfg_attr(target_os = "freebsd", allow(dead_code, reason = "the jail reaches the guard on its unix socket"))]
 async fn listen(policy: EgressPolicy, verbose: bool, check: Option<PeerCheck>) -> Result<Guard> {
     let listener = TcpListener::bind("127.0.0.1:0").await.context("bind egress guard on loopback")?;
     let port = listener.local_addr()?.port();
@@ -144,6 +149,7 @@ async fn listen(policy: EgressPolicy, verbose: bool, check: Option<PeerCheck>) -
 /// connection, and the peer may lose the answer before reading it. So the
 /// write side is shut, then what the peer sent is drained (for a while) until
 /// it closes.
+#[cfg_attr(target_os = "freebsd", allow(dead_code, reason = "the jail reaches the guard on its unix socket"))]
 async fn refuse(mut sock: TcpStream) {
     let _ = sock.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
     let _ = sock.shutdown().await;
@@ -159,7 +165,7 @@ async fn refuse(mut sock: TcpStream) {
 /// developer's own, and their subordinate range — a rootless container's root
 /// and every other id it maps. An id the namespace does not map reads as the
 /// overflow uid, which no range here holds.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 #[derive(Debug, Clone)]
 pub struct Admit {
     pub uid: u32,
@@ -167,7 +173,7 @@ pub struct Admit {
     pub ranges: Vec<(u32, u32)>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl Admit {
     pub fn admits(&self, uid: u32) -> bool {
         uid == self.uid || self.ranges.iter().any(|&(first, count)| uid >= first && uid - first < count)
@@ -175,13 +181,13 @@ impl Admit {
 }
 
 /// A running guard on a unix socket and its background accept task.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub struct SocketGuard {
     refused: Arc<Mutex<BTreeSet<String>>>,
     _task: tokio::task::JoinHandle<()>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 impl SocketGuard {
     /// The destinations refused so far (`host:port`), at most [`MAX_REFUSED`].
     pub fn refused(&self) -> Vec<String> {
@@ -193,7 +199,7 @@ impl SocketGuard {
 /// is made connectable by every user — a container's root is another host uid
 /// than the developer's — so the peer check is its access control: a
 /// connection from a uid `admit` refuses is answered 403 and closed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub async fn start_unix(policy: EgressPolicy, verbose: bool, path: &std::path::Path, admit: Admit) -> Result<SocketGuard> {
     use std::os::unix::fs::PermissionsExt;
     let listener = tokio::net::UnixListener::bind(path)

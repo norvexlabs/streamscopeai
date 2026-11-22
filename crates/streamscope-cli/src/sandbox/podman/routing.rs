@@ -303,7 +303,7 @@ fn forward(conn: TcpStream, names: &Mutex<FakeNames>, guard: &str) -> Result<()>
         bail!("refused");
     }
     up.set_read_timeout(None)?;
-    super::init::pipe(conn, up);
+    crate::sandbox::relay::pipe(conn, up);
     Ok(())
 }
 

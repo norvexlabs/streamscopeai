@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.80]
+
+### Changed
+
+- **The VM appliance runs on Kairos 4.6.** A running appliance upgrades onto it as usual, and rolls
+  back to the previous release whole. The system no longer merges extension images found on its
+  disk over `/usr` or `/etc`: what runs is the signed OS the release carries.
+
+### Fixed
+
+- **An appliance with a second network interface answered IPv6 clients unreliably**: from the boot's
+  first seconds that interface kept IPv6 routes of the primary's network, so a reply could leave by
+  it and never arrive. The appliance's network is now only what its settings give it, from the start
+  of the boot, so an appliance with IPv6 off has no IPv6 address at all: if you reach one over an
+  address its router advertised, turn IPv6 on (Operator Guide, *Changing the network settings*)
+  before upgrading.
+- **A crafted URL could crash the service reading its origin** (RUSTSEC-2026-0592: a stack overflow on
+  nested `blob:` URLs, such as one an upstream sends in a redirect); the URL library is updated.
+
+## [2026.11.79]
+
+### Added
+
+- **`ssai run` confines the agent on FreeBSD.** Each run puts the tool in a jail of its own, built by
+  a service set up once per machine with `sudo ssai sandbox setup` (`--check` checks it, `sudo ssai
+  sandbox uninstall` removes it) and removed when the run ends or `ssai` is killed. Inside, the tool
+  runs as you and sees the system read-only, a `/tmp` of its own, and of your home only the project,
+  its own folders and the read-only tools the other platforms grant; its only network route is the
+  gateway, through the run's guard; git's hooks and configuration and `.streamscopeai/` are
+  read-only and `.git` cannot be renamed; it gets a terminal of its own. A tool published for Linux
+  only runs there under the Linux binary compatibility (FreeBSD 15.0 or newer). `--sandbox off` is
+  no longer needed on FreeBSD, and a workspace that requires the sandbox now accepts FreeBSD runs.
+
+## [2026.11.78]
+
+### Fixed
+
+- **`install.sh` fetched from the gateway's API address now installs.** Its check of whether the
+  machine trusts the gateway's certificate asked a path only the console's address answers, and
+  read any error answer as an untrusted certificate, so a script fetched from the API address — or
+  one answered by the pre-login rate limit — reported a trusted certificate as untrusted and stopped
+  with "publishes no root CA". Only a failed connection or TLS handshake now counts. The install command the
+  portal shows was affected only by the rate limit.
+
+## [2026.11.77]
+
+### Added
+
+- **The `ssai` CLI for FreeBSD.** Every gateway now serves an amd64 build for FreeBSD 14.4 and newer:
+  `install.sh` installs it (and, for a gateway with a private CA, adds its root to the system trust
+  store through `certctl`), and `ssai update` keeps it current. Logging in, provisioning and `sync`
+  work as on any system; FreeBSD has no sandbox, so `ssai run` there needs
+  `--sandbox off`, and is refused where the administrator requires the sandbox.
+
 ## [2026.11.76]
 
 ### Fixed

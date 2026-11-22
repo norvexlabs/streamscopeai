@@ -53,6 +53,7 @@ pub struct ProjectGrants {
     pub protected: Vec<Protected>,
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no native sandbox backend on this system"))]
 impl ProjectGrants {
     /// Create each absent [`Guard::Tree`] folder (empty), so a backend can
     /// hold it: an absent hooks folder the agent could create would be as

@@ -1,5 +1,5 @@
-//! `ssai sandbox` — the Windows sandbox account (`ssai run --sandbox native`
-//! on Windows), and the docker sandbox's images and volumes
+//! `ssai sandbox` — the Windows sandbox account and the FreeBSD jail daemon
+//! (`ssai run --sandbox native` there), and the docker sandbox's images and volumes
 //! (`ssai run --sandbox docker`).
 
 use anyhow::{bail, Result};
@@ -9,7 +9,9 @@ use clap::Subcommand;
 pub enum SandboxCommand {
     /// Windows: create the sandbox account the native sandbox runs clients as,
     /// and the firewall rule that confines its network to loopback — once per
-    /// computer and user, as an administrator (one prompt). Re-run to repair.
+    /// computer and user, as an administrator (one prompt). FreeBSD: install
+    /// the daemon that builds each run's jail — once per machine, as root
+    /// (`sudo`). Re-run to repair, or after an update.
     Setup {
         /// Only check that the sandbox is set up and sound; change nothing.
         #[arg(long)]
@@ -26,7 +28,7 @@ pub enum SandboxCommand {
         all: bool,
     },
     /// Windows: take back every grant, then remove the sandbox account, its
-    /// profile and its firewall rule.
+    /// profile and its firewall rule. FreeBSD: remove the jail daemon (as root).
     Uninstall,
     /// (Re)build this project's image and the agent layer for `client` — after
     /// a change to the image, its Dockerfile's context, or to pick up the
@@ -97,9 +99,18 @@ pub async fn run(command: SandboxCommand) -> Result<()> {
         }
         #[cfg(windows)]
         SandboxCommand::Uninstall => tokio::task::spawn_blocking(crate::sandbox::windows::setup::uninstall).await?,
-        #[cfg(not(windows))]
+        #[cfg(target_os = "freebsd")]
+        SandboxCommand::Setup { check } => {
+            use crate::sandbox::freebsd::setup;
+            tokio::task::spawn_blocking(move || if check { setup::check() } else { setup::setup() }).await?
+        }
+        #[cfg(target_os = "freebsd")]
+        SandboxCommand::Revoke { .. } => crate::sandbox::freebsd::setup::revoke(),
+        #[cfg(target_os = "freebsd")]
+        SandboxCommand::Uninstall => tokio::task::spawn_blocking(crate::sandbox::freebsd::setup::uninstall).await?,
+        #[cfg(not(any(windows, target_os = "freebsd")))]
         SandboxCommand::Setup { .. } | SandboxCommand::Revoke { .. } | SandboxCommand::Uninstall => bail!(
-            "this command is for Windows only — on Linux and macOS the native sandbox needs no setup"
+            "this command is for Windows and FreeBSD only — on Linux and macOS the native sandbox needs no setup"
         ),
     }
 }

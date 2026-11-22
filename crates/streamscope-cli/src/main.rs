@@ -204,6 +204,29 @@ enum Command {
     /// `ssh` ProxyCommand inside `ssai run`.
     #[command(name = "__connect", hide = true)]
     Connect { host: String, port: u16 },
+    /// FreeBSD: the sandbox daemon, as root (started by its rc.d script).
+    /// Not for direct use.
+    #[command(name = "__jaild", hide = true)]
+    Jaild,
+    /// FreeBSD: run a command in a sandboxed run's jail (one process of the
+    /// run). Not for direct use.
+    #[command(name = "__jail-exec", hide = true)]
+    JailExec {
+        run: String,
+        /// The command + args, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// FreeBSD, in a run's jail: pass the jail's loopback port to the egress
+    /// guard's socket (and an engine's probe socket to its port). Not for
+    /// direct use.
+    #[command(name = "__jail-relay", hide = true)]
+    JailRelay {
+        guard: std::path::PathBuf,
+        port: u16,
+        #[arg(long, num_args = 2, value_names = ["SOCKET", "PORT"])]
+        engine: Option<Vec<String>>,
+    },
     /// Internal re-exec trampoline: confine this process to the serialized
     /// policy, then exec the client. Not for direct use.
     #[command(name = "__run-confined", hide = true)]
@@ -235,8 +258,12 @@ fn main() {
         finish(result);
     }
     // A container's init reaps every child with `waitpid(-1)`, which a
-    // runtime's own reaper would race; the sweep needs none.
+    // runtime's own reaper would race; the sweep needs none. The jail daemon
+    // and its helpers fork: they run before any thread exists.
     match &cli.command {
+        Command::Jaild => finish(sandbox::jail_daemon()),
+        Command::JailExec { run, command } => finish(sandbox::jail_exec(run, command)),
+        Command::JailRelay { guard, port, engine } => finish(sandbox::jail_relay(guard, *port, engine.as_deref())),
         Command::SandboxInit { start_file } => finish(sandbox::podman_init(start_file)),
         Command::SandboxSweep { root, container_root_uid, container_root_gid } => {
             finish(sandbox::podman_sweep(root, *container_root_uid, *container_root_gid))
@@ -278,7 +305,8 @@ fn main() {
 }
 
 /// Run an async subcommand. `RunConfined`, `SandboxInit`, `SandboxSweep`,
-/// `OpencodeCheck`, `SandboxSetup` and `SandboxHost` are handled in `main` before the runtime starts, so they never reach here.
+/// `OpencodeCheck`, `SandboxSetup`, `SandboxHost`, `Jaild`, `JailExec` and `JailRelay` are handled in `main` before
+/// the runtime starts, so they never reach here.
 async fn dispatch(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Login {
@@ -312,6 +340,9 @@ async fn dispatch(command: Command) -> anyhow::Result<()> {
         Command::Sandbox(command) => commands::sandbox::run(command).await,
         Command::Connect { host, port } => sandbox::guard::connect_through(&host, port).await,
         Command::RunConfined { .. }
+        | Command::Jaild
+        | Command::JailExec { .. }
+        | Command::JailRelay { .. }
         | Command::SandboxInit { .. }
         | Command::SandboxSweep { .. }
         | Command::OpencodeCheck { .. }

@@ -43418,7 +43418,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Distribution target (`linux-x86_64`, `darwin-arm64`, `windows-x86_64`) */
+                /** @description Distribution target (`linux-x86_64`, `darwin-arm64`, `windows-x86_64`, `freebsd-x86_64`) */
                 target: string;
             };
             cookie?: never;

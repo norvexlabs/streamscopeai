@@ -108,8 +108,8 @@ alternative ([section 9](#the-web-wizard)).
 
 The `ssai` command-line tool automates the whole Quickstart flow — instead of copy-pasting
 a snippet per tool, it writes each AI client's configuration directly. The gateway itself serves
-the CLI (Linux x86_64, Windows x86_64, and macOS Apple Silicon when your gateway ships a macOS
-build; the installers verify the download's checksum), and the Quickstart page's **Set up via CLI**
+the CLI (Linux x86_64, Windows x86_64, FreeBSD amd64 — 14.4 and newer — and macOS Apple Silicon
+when your gateway ships a macOS build; the installers verify the download's checksum), and the Quickstart page's **Set up via CLI**
 tab shows these commands pre-filled for your portal:
 
 ```bash
@@ -117,6 +117,51 @@ curl -fsSL https://<portal-host>/api/v1/cli/install.sh | sh   # installs to ~/.l
 ssai login https://<portal-host>/portal/t/<org>   # any portal URL works — opens your browser
 ssai provision                                     # detects installed tools, mints one workspace key, writes configs
 ```
+
+A fresh FreeBSD system has neither `curl` nor `sudo` (the installer uses `sudo` only to add a
+private gateway root to the system trust store): `pkg install curl sudo` first.
+
+#### AI clients on FreeBSD
+
+`ssai` itself needs FreeBSD 14.4 or newer; the AI clients it provisions are another matter, because
+most of them publish no FreeBSD build:
+
+- **Clients that run natively** — Gemini CLI, Qwen Code and the Continue CLI, installed from npm on
+  FreeBSD's own Node.js (`pkg install node24 npm-node24`, then `npm install -g` as on Linux; Gemini
+  CLI also wants `pkg install ripgrep`), and Crush, from the FreeBSD build on its releases page (its
+  npm package carries none).
+- **Clients published only as Linux binaries** — OpenCode (version 2), Claude Code, Codex, Goose
+  and Open Code Review. These run only under FreeBSD's **Linux binary compatibility**, and only on **FreeBSD 15.0
+  or newer**: the compatibility layer of FreeBSD 14 lacks the file-change notifications (`inotify`)
+  these clients watch your project with, and OpenCode never gets past its start on it. An
+  administrator enables it once, as root:
+
+  ```sh
+  sysrc linux_enable=YES            # load the Linux compatibility at every boot
+  service linux start               # now: the kernel modules and the /compat/linux mounts
+  pkg install linux_base-rl9        # the Linux userland (Rocky Linux 9) the clients' libraries come from
+  ```
+
+  If `service linux start` reports that it cannot load a module, the installed kernel is newer
+  than the running one (a base system upgrade waiting for its reboot): reboot, then run it again.
+  Then put the client's **Linux x86-64** binary on your `PATH` (`~/.local/bin`):
+
+  - OpenCode and Goose: the `linux-x64` / `x86_64-unknown-linux-gnu` archive from their releases page.
+  - Claude Code, Codex and Open Code Review: `npm install -g --os=linux --cpu=x64 <package>`
+    fetches the Linux binary, but the package's launcher looks for a FreeBSD one and stops; link
+    the Linux binary itself instead (Claude Code's is the `@anthropic-ai/claude-code-linux-x64`
+    package's `claude`, Codex's the `@openai/codex-linux-x64` package's `codex`, Open Code
+    Review's the `@alibaba-group/ocr-linux-x64` package's `opencodereview`, linked as `ocr`).
+
+  A client's next release may ask the compatibility layer for something it lacks: after an
+  upgrade, check it once with `ssai run --sandbox off <client>`.
+- **Not available on FreeBSD** — Aider and Mistral Vibe: dependencies they compile at install time
+  do not build there.
+
+Whichever kind it is, `ssai provision` writes the client's configuration as on Linux, and `ssai run`
+launches it in a jail of its own once the sandbox is set up on the machine
+([The FreeBSD sandbox](#the-freebsd-sandbox)); a client under the Linux binary compatibility runs
+there too.
 
 On Windows, install from PowerShell (Windows PowerShell 5.1 or PowerShell 7) instead; the rest is
 the same:
@@ -565,6 +610,15 @@ Check these before your first `ssai run`; each links to its detail.
   `setx NODE_EXTRA_CA_CERTS <root file>`; and when your administrator allows an internal HTTPS host,
   the hosts its certificate authority publishes revocation lists on must be allowed too.
 
+**FreeBSD (native)**
+
+- **Set up once per machine:** `sudo ssai sandbox setup`, which installs the service that builds each
+  run's jail ([The FreeBSD sandbox](#the-freebsd-sandbox)); run it again when `run` asks, after an update.
+- A kernel with `VIMAGE` (the `GENERIC` kernel has it).
+- A tool published for Linux only needs FreeBSD 15.0 or newer and the Linux binary compatibility
+  ([AI clients on FreeBSD](#ai-clients-on-freebsd)).
+- `--sandbox learn` and the container sandbox are not available.
+
 **Container sandbox (Linux, advanced)**
 
 - Rootless Podman 4.4 or newer, a subordinate id range for your user, cgroup v2 with `memory` and
@@ -632,6 +686,8 @@ the network setting and lists the run has.
   computer's own network addresses counts as local and is not blocked. Tools using Windows' own TLS
   (git, `curl.exe`, .NET) also need the hosts an internal certificate authority publishes revocation
   lists on ([The Windows sandbox](#the-windows-sandbox)).
+- **FreeBSD** — the tool's jail has a network of its own; the run's guard is its only way out
+  ([The FreeBSD sandbox](#the-freebsd-sandbox)).
 - **Container sandbox** — the container has no network: every TCP connection made in it — the
   tool's, the Docker engine's pulls and those of the engine's own containers and builds — is taken
   to the same guard, so plain commands work without a proxy setting. Only TCP and DNS leave
@@ -689,7 +745,8 @@ refused, and so are `--sandbox off` and `--sandbox learn` when the administrator
 sandbox. The sandbox is **fail-closed**: if the machine can't enforce it, `run` refuses rather than
 launch the tool unconfined — use `--sandbox off` to opt out deliberately. This works on Linux and
 WSL2 (the network confinement needs a Linux kernel 6.7 or newer), on macOS (Apple Silicon, via
-the system's built-in Seatbelt) and on Windows (a dedicated sandbox account, below). A tool that
+the system's built-in Seatbelt), on Windows (a dedicated sandbox account, below) and on FreeBSD
+(a jail for each run, below). A tool that
 runs on Node.js (the Continue CLI, Gemini CLI, Qwen Code) needs Node.js
 22.21 or newer inside the sandbox: an older Node.js does not send all of its connections through the
 sandbox's gateway route, and the sandbox refuses them (the Continue CLI then stops with "MCP
@@ -707,7 +764,7 @@ linked worktree's own git folder, which lives in its main repository outside the
 granted, so the agent can commit from the worktree. Git commands that write the repository's
 configuration then fail inside the sandbox — `git push -u` (after the push itself succeeds), a new
 branch that tracks a remote, `git remote add`, `git submodule add`, `git config`: run those yourself.
-This holds on macOS, on Windows and in the
+This holds on macOS, on Windows, on FreeBSD and in the
 container sandbox. **On Linux the native sandbox cannot hold them** (it grants a folder whole), and
 `run` says so when it starts: look at them before you run git or `ssai` there outside the sandbox,
 or use `--sandbox docker`. What is held is what exists when the run starts and what git reads
@@ -871,6 +928,27 @@ whether a server's certificate was revoked, and tools using Windows' own TLS (gi
 .NET) fail when that check cannot reach its servers: if your administrator allows an internal HTTPS
 host (a git server, a registry), the destination list must also allow the hosts its certificate
 authority publishes revocation lists on.
+
+#### The FreeBSD sandbox
+
+On FreeBSD each `ssai run` puts the tool in a **jail** of its own, built when the run starts and
+removed when it ends — or when `ssai` is killed. A service running as root builds it: set it up once
+per machine with `sudo ssai sandbox setup` (it installs the service, enables it at boot and starts
+it); `ssai sandbox setup --check` only checks it, and `sudo ssai sandbox uninstall` removes it.
+After `ssai update`, a run may ask you to run `sudo ssai sandbox setup` again, when the new `ssai`
+needs a newer service. `ssai sandbox revoke` has nothing to do on FreeBSD: no project stays granted.
+
+The project must be yours, not under a system folder (`/usr`, `/etc`, … — the folder holding the
+homes, such as `/usr/home`, excepted) and not inside a folder the
+sandbox shows read-only (`~/bin`, `~/.local/bin`): `run` refuses one the jail cannot give the agent to
+write. Inside the jail the tool runs as you, so the files it writes are yours. It sees the system's programs
+and libraries read-only, a temporary folder `/tmp` of its own, and of your home only what a run
+grants — the project, the tool's own folders and the others listed above; no other user's home is
+there. Its network is the jail's own: the only way out is the gateway route, through the run's guard.
+It gets a terminal of its own, which `ssai` connects to yours; your other terminals are not
+there, and Ctrl-Z does not suspend the tool. A folder or file that is a link (a `~/.claude` kept
+elsewhere, a `~/.gitconfig` from a dotfiles folder) is there at both places. A tool published for Linux only runs
+in the jail under the Linux binary compatibility, which the jail takes from the machine.
 
 ### Advanced: the container sandbox (Linux)
 
@@ -1162,7 +1240,8 @@ no longer touches it and its config file is left exactly as it is for you to tak
 changes on the gateway either: `forget` names the key the tool's config still holds, which stays
 valid — other projects may use it — until you revoke it on the **API keys** page. `ssai update` self-updates the CLI from the gateway
 (checksum-verified; on Windows the running `ssai.exe` is set aside as `ssai.old.exe` and removed the
-next time `ssai` starts). When the gateway serves a newer version, `ssai provision` says so every
+next time `ssai` starts; on FreeBSD it refuses a build made for a newer FreeBSD release than the
+machine runs, naming the release to upgrade to). When the gateway serves a newer version, `ssai provision` says so every
 time and `ssai sync` once a day, naming the `ssai update` to run. Every call `ssai`
 makes to the gateway names its version, its operating system and the machine's host name (its first
 label), which the portal's Home uses to say which of your machines run an older `ssai`. `ssai logout`
@@ -1207,7 +1286,7 @@ one (on `provision`, `sync`, `status`, `forget`, `logout`, `update`, `run` and `
 | `ssai sync` | brings every provisioned configuration up to date ([section 6](#6-keep-your-setup-current)) | `--watch` with `--interval` (5 minutes by default), `--client` / `--skip`, `--key-ttl` for a replacement key, `--yes` |
 | `ssai status` | what you are logged in to, what is provisioned, what was edited since | |
 | `ssai run <tool>` | starts a provisioned tool in the sandbox ([section 5](#5-run-an-agent-in-the-sandbox)) | `--sandbox auto\|native\|docker\|learn\|off`, `--network gateway\|policy`, `--ca-file`, `-e KEY=VALUE`, `--verbose`, `--private-project` (Windows); the tool's own arguments after `--` |
-| `ssai sandbox setup` · `revoke` · `uninstall` | the Windows sandbox account ([The Windows sandbox](#the-windows-sandbox)) | `setup --check`, `revoke [<folder>]`, `revoke --all` |
+| `ssai sandbox setup` · `revoke` · `uninstall` | the Windows sandbox account ([The Windows sandbox](#the-windows-sandbox)); on FreeBSD, the service that builds each run's jail, as root ([The FreeBSD sandbox](#the-freebsd-sandbox)) | `setup --check`, `revoke [<folder>]`, `revoke --all` |
 | `ssai sandbox prepare <tool>` · `status` · `prune` | the container sandbox's images ([Advanced: the container sandbox](#advanced-the-container-sandbox-linux)) | `prune --project [<folder>]` |
 | `ssai forget <tool>` | stops managing a tool, leaving its files as they are | |
 | `ssai restore` | puts back the files a provisioning or a sync changed | `--list`, `--run <timestamp>`, `--global`, `--yes` |

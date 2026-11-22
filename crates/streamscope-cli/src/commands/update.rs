@@ -21,7 +21,7 @@ use crate::state::{sha256_hex, HostsFile};
 use super::session::confirm;
 
 /// Distribution target this build self-updates from. The CLI ships for Linux
-/// x86_64, macOS Apple Silicon and Windows x86_64; other platforms get a clear
+/// x86_64, macOS Apple Silicon, Windows x86_64 and FreeBSD amd64; other platforms get a clear
 /// error.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const SELF_TARGET: Option<&str> = Some("linux-x86_64");
@@ -29,10 +29,13 @@ const SELF_TARGET: Option<&str> = Some("linux-x86_64");
 const SELF_TARGET: Option<&str> = Some("darwin-arm64");
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const SELF_TARGET: Option<&str> = Some("windows-x86_64");
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
+const SELF_TARGET: Option<&str> = Some("freebsd-x86_64");
 #[cfg(not(any(
     all(target_os = "linux", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "windows", target_arch = "x86_64")
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "freebsd", target_arch = "x86_64")
 )))]
 const SELF_TARGET: Option<&str> = None;
 
@@ -83,7 +86,7 @@ pub async fn run(host: Option<&str>, yes: bool) -> Result<()> {
     let Some(self_target) = SELF_TARGET else {
         bail!(
             "self-update is not available for this platform (supported: Linux x86_64, macOS Apple Silicon, \
-             Windows x86_64)"
+             Windows x86_64, FreeBSD amd64)"
         );
     };
     let origin = resolve_origin(host)?;
@@ -128,6 +131,9 @@ pub async fn run(host: Option<&str>, yes: bool) -> Result<()> {
             target.sha256
         );
     }
+
+    #[cfg(target_os = "freebsd")]
+    refuse_a_build_this_freebsd_cannot_run(&bytes)?;
 
     let exe = std::env::current_exe().context("cannot resolve the running executable's path")?;
     replace_exe(&exe, &bytes).with_context(|| {
@@ -193,6 +199,93 @@ fn replace_exe(exe: &std::path::Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+/// The `__FreeBSD_version` a FreeBSD executable was linked against: the
+/// descriptor of its ABI note (owner `FreeBSD`, type 1, 4 bytes), found by
+/// walking the notes of its `PT_NOTE` segments — never by scanning the file,
+/// whose data may hold the same bytes. `None` for anything but a 64-bit
+/// little-endian ELF carrying that note.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code, reason = "read only by the FreeBSD update"))]
+fn freebsd_abi_version(elf: &[u8]) -> Option<u32> {
+    const PT_NOTE: u32 = 4;
+    const NT_FREEBSD_ABI_TAG: u32 = 1;
+    let u16_at = |o: usize| Some(u16::from_le_bytes(elf.get(o..o.checked_add(2)?)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(elf.get(o..o.checked_add(4)?)?.try_into().ok()?));
+    let usize_at = |o: usize| usize::try_from(u64::from_le_bytes(elf.get(o..o.checked_add(8)?)?.try_into().ok()?)).ok();
+    if elf.get(..6)? != [0x7f, b'E', b'L', b'F', 2, 1] {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (usize_at(0x20)?, usize::from(u16_at(0x36)?), usize::from(u16_at(0x38)?));
+    for i in 0..phnum {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if u32_at(ph)? != PT_NOTE {
+            continue;
+        }
+        let mut at = usize_at(ph.checked_add(8)?)?;
+        let end = at.checked_add(usize_at(ph.checked_add(0x20)?)?)?;
+        while at.checked_add(12)? <= end {
+            let namesz = usize::try_from(u32_at(at)?).ok()?;
+            let descsz = usize::try_from(u32_at(at + 4)?).ok()?;
+            let name = at + 12;
+            let desc = name.checked_add(namesz.checked_next_multiple_of(4)?)?;
+            if u32_at(at + 8)? == NT_FREEBSD_ABI_TAG && descsz == 4 && elf.get(name..desc)?.starts_with(b"FreeBSD\0") {
+                return u32_at(desc);
+            }
+            at = desc.checked_add(descsz.checked_next_multiple_of(4)?)?;
+        }
+    }
+    None
+}
+
+/// `(major, minor)` of a FreeBSD release name as `freebsd-version` prints it
+/// (`14.4-RELEASE-p3`, `15.0-CURRENT`); `None` for anything else.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code, reason = "read only by the FreeBSD update"))]
+fn freebsd_release(name: &str) -> Option<(u32, u32)> {
+    let (major, rest) = name.trim().split_once('.')?;
+    let minor = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// Whether a build linked against FreeBSD `abi` (a `__FreeBSD_version`)
+/// runs on a userland at release `host`: one of its own release or later —
+/// an earlier one may lack a symbol it needs.
+#[cfg_attr(not(target_os = "freebsd"), allow(dead_code, reason = "read only by the FreeBSD update"))]
+fn freebsd_build_runs_on(abi: u32, host: (u32, u32)) -> bool {
+    (abi / 100_000, abi / 1_000 % 100) <= host
+}
+
+/// Refuse to install a FreeBSD build this system could not start — the
+/// gateway builds for the oldest FreeBSD release it supports, so a userland
+/// left on a release that support has moved past would otherwise be updated
+/// into a command that no longer runs. The userland's release is what
+/// `freebsd-version -u` reports (in a jail, the jail's own, unlike the kernel's);
+/// without it, the kernel's (`uname -r`) — the installer reads it the same way.
+#[cfg(target_os = "freebsd")]
+fn refuse_a_build_this_freebsd_cannot_run(bytes: &[u8]) -> Result<()> {
+    let read = |program: &str, arg: &str| {
+        std::process::Command::new(program)
+            .arg(arg)
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| freebsd_release(&String::from_utf8_lossy(&out.stdout)))
+    };
+    let host = read("/bin/freebsd-version", "-u")
+        .or_else(|| read("/usr/bin/uname", "-r"))
+        .context("cannot read this system's FreeBSD release (neither freebsd-version -u nor uname -r answered)")?;
+    let abi = freebsd_abi_version(bytes).context("the gateway's FreeBSD build carries no FreeBSD ABI note")?;
+    if !freebsd_build_runs_on(abi, host) {
+        bail!(
+            "the gateway's build needs FreeBSD {}.{} or newer and this system runs FreeBSD {}.{} — upgrade \
+             FreeBSD before updating ssai",
+            abi / 100_000,
+            abi / 1_000 % 100,
+            host.0,
+            host.1
+        );
+    }
+    Ok(())
+}
+
 /// `YYYY.M.MICRO` as a comparable triple; `None` for anything else.
 fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     let field = |p: &str| (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).then(|| p.parse::<u32>().ok()).flatten();
@@ -254,6 +347,82 @@ fn resolve_origin(host: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal ELF64: a `PT_LOAD` header, then a `PT_NOTE` one whose segment
+    /// holds an unrelated note and then the ABI note — and, outside every
+    /// note segment, the ABI note's bytes with another version, as a binary's
+    /// data could carry them.
+    fn elf_with_abi_note(version: u32) -> Vec<u8> {
+        let note = |name: &[u8], ty: u32, desc: &[u8]| {
+            let mut n = Vec::new();
+            n.extend_from_slice(&u32::try_from(name.len()).unwrap().to_le_bytes());
+            n.extend_from_slice(&u32::try_from(desc.len()).unwrap().to_le_bytes());
+            n.extend_from_slice(&ty.to_le_bytes());
+            n.extend_from_slice(name);
+            n.resize(n.len().next_multiple_of(4), 0);
+            n.extend_from_slice(desc);
+            n.resize(n.len().next_multiple_of(4), 0);
+            n
+        };
+        let decoy = note(b"FreeBSD\0", 1, &999_999u32.to_le_bytes());
+        let notes = [note(b"GNU\0", 3, &[1; 20]), note(b"FreeBSD\0", 1, &version.to_le_bytes())].concat();
+        let (phoff, phnum, phentsize) = (64usize, 2u16, 56u16);
+        let decoy_at = phoff + 2 * 56;
+        let notes_at = decoy_at + decoy.len();
+        let mut elf = vec![0u8; notes_at];
+        elf[..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+        elf[0x20..0x28].copy_from_slice(&(phoff as u64).to_le_bytes());
+        elf[0x36..0x38].copy_from_slice(&phentsize.to_le_bytes());
+        elf[0x38..0x3a].copy_from_slice(&phnum.to_le_bytes());
+        elf[phoff..phoff + 4].copy_from_slice(&1u32.to_le_bytes());
+        let ph = phoff + 56;
+        elf[ph..ph + 4].copy_from_slice(&4u32.to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&(notes_at as u64).to_le_bytes());
+        elf[ph + 0x20..ph + 0x28].copy_from_slice(&(notes.len() as u64).to_le_bytes());
+        elf[decoy_at..notes_at].copy_from_slice(&decoy);
+        elf.extend_from_slice(&notes);
+        elf
+    }
+
+    /// The ABI note is read from the note segment — past another note, and
+    /// never from the same bytes elsewhere in the file; a file cut inside the
+    /// segment, or not an ELF64 at all, has no version.
+    #[test]
+    fn the_freebsd_abi_version_is_read_from_the_note_segment() {
+        let elf = elf_with_abi_note(1_404_000);
+        assert_eq!(freebsd_abi_version(&elf), Some(1_404_000));
+        assert_eq!(freebsd_abi_version(&elf[..elf.len() - 2]), None);
+        assert_eq!(freebsd_abi_version(b"\x7fELF no header"), None);
+    }
+
+    /// The test executable itself is a FreeBSD build: the walk finds its note,
+    /// at least the oldest release the CLI is built for.
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn this_build_carries_its_freebsd_abi_note() {
+        let me = std::fs::read(std::env::current_exe().expect("own path")).expect("own bytes");
+        assert!(freebsd_abi_version(&me).is_some_and(|v| v >= 1_400_000));
+    }
+
+    /// A release name gives its major and minor, whatever follows them.
+    #[test]
+    fn a_freebsd_release_name_gives_its_major_and_minor() {
+        assert_eq!(freebsd_release("14.4-RELEASE-p3\n"), Some((14, 4)));
+        assert_eq!(freebsd_release("15.0-CURRENT"), Some((15, 0)));
+        assert_eq!(freebsd_release("15"), None);
+        assert_eq!(freebsd_release("x.1-RELEASE"), None);
+    }
+
+    /// A build runs on its own release and every later one, never on an
+    /// earlier minor or major — the boundary on both sides.
+    #[test]
+    fn a_freebsd_build_runs_on_its_release_and_later_only() {
+        assert!(freebsd_build_runs_on(1_404_000, (14, 4)));
+        assert!(freebsd_build_runs_on(1_404_000, (14, 5)));
+        assert!(freebsd_build_runs_on(1_404_000, (15, 0)));
+        assert!(!freebsd_build_runs_on(1_404_000, (14, 3)));
+        assert!(!freebsd_build_runs_on(1_500_000, (14, 9)));
+    }
 
     /// Only a strictly newer `YYYY.M.MICRO` is announced, compared as
     /// numbers: never an older or equal one, never one that does not parse.

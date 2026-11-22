@@ -41,6 +41,40 @@ pub const CLI_TARGET_DARWIN_ARM64: &str = "darwin-arm64";
 /// to `install.ps1`.
 pub const CLI_TARGET_WINDOWS_X86_64: &str = "windows-x86_64";
 
+/// FreeBSD amd64 target, cross-built in-stage against the oldest supported
+/// FreeBSD release's base system, so it runs on that release and every later
+/// one. Always present in a normal image; served to `install.sh`.
+pub const CLI_TARGET_FREEBSD_X86_64: &str = "freebsd-x86_64";
+
+/// The oldest FreeBSD release the FreeBSD build runs on, `(major, minor)`:
+/// the release whose base system it is linked against
+/// (`FREEBSD_SYSROOT_MAJOR`/`_MINOR` in admin-api's Dockerfile) — keep the two
+/// in step. An older userland may lack a symbol the build needs, so the
+/// installer refuses it up front.
+const FREEBSD_MIN_RELEASE: (u32, u32) = (14, 4);
+
+/// The installer's FreeBSD release check, run after the platform `case`: a
+/// userland older than [`FREEBSD_MIN_RELEASE`] (`freebsd-version -u`, which a
+/// jail reports for itself, unlike the kernel's `uname -r`) is refused with the
+/// supported range instead of being handed a binary that cannot start.
+fn freebsd_release_guard() -> String {
+    let (major, minor) = FREEBSD_MIN_RELEASE;
+    format!(
+        r#"if [ "$os" = FreeBSD ]; then
+  rel=$(freebsd-version -u 2>/dev/null || uname -r)
+  maj=${{rel%%.*}}; min=${{rel#*.}}; min=${{min%%[!0-9]*}}
+  if [ "$maj" -lt {major} ] 2>/dev/null || {{ [ "$maj" -eq {major} ] && [ "$min" -lt {minor} ]; }} 2>/dev/null; then
+    echo "ssai: FreeBSD $rel is not supported (supported: FreeBSD {major}.{minor} and newer)" >&2
+    exit 1
+  fi
+fi
+"#
+    )
+}
+
+/// How many targets [`TARGETS`] lists — also the size of every per-target cache.
+const TARGET_COUNT: usize = 4;
+
 /// A distribution target: the shorthand the routes accept, the in-image path
 /// the binary is baked at (see `docker/Dockerfile.admin-api`), and a lazily
 /// loaded, cached artifact. `None` once loaded means the image carries no
@@ -54,7 +88,7 @@ struct Target {
 }
 
 /// All known targets, in the order `version`/`install.sh` advertise them.
-static TARGETS: [Target; 3] = [
+static TARGETS: [Target; TARGET_COUNT] = [
     Target {
         name: CLI_TARGET_LINUX_X86_64,
         image_path: "/usr/local/bin/ssai",
@@ -71,6 +105,12 @@ static TARGETS: [Target; 3] = [
         name: CLI_TARGET_WINDOWS_X86_64,
         image_path: "/usr/local/share/ssai/ssai-windows-x86_64.exe",
         file_name: "ssai.exe",
+        cell: OnceCell::const_new(),
+    },
+    Target {
+        name: CLI_TARGET_FREEBSD_X86_64,
+        image_path: "/usr/local/share/ssai/ssai-freebsd-x86_64",
+        file_name: "ssai",
         cell: OnceCell::const_new(),
     },
 ];
@@ -143,7 +183,7 @@ async fn artifact(target: &str) -> Result<Option<&'static CliArtifact>, ApiError
 
 /// Whether this gateway serves a CLI of its own release for the operating
 /// system a CLI reports (`std::env::consts::OS`: `linux`, `macos`,
-/// `windows`) — so `ssai update` there would bring a CLI on that version.
+/// `windows`, `freebsd`) — so `ssai update` there would bring a CLI on that version.
 /// False for an OS it serves no binary for, a lagging binary, or one it cannot
 /// read now.
 ///
@@ -152,11 +192,12 @@ async fn artifact(target: &str) -> Result<Option<&'static CliArtifact>, ApiError
 /// so this costs no download cache. A read that fails is not kept: the next
 /// call reads again.
 pub(crate) async fn serves_current_for_os(os: &str) -> bool {
-    static CURRENT: [OnceCell<bool>; 3] = [const { OnceCell::const_new() }; 3];
+    static CURRENT: [OnceCell<bool>; TARGET_COUNT] = [const { OnceCell::const_new() }; TARGET_COUNT];
     let target = match os {
         "linux" => CLI_TARGET_LINUX_X86_64,
         "macos" => CLI_TARGET_DARWIN_ARM64,
         "windows" => CLI_TARGET_WINDOWS_X86_64,
+        "freebsd" => CLI_TARGET_FREEBSD_X86_64,
         _ => return false,
     };
     let Some(i) = TARGETS.iter().position(|t| t.name == target) else { return false };
@@ -242,7 +283,7 @@ pub async fn version() -> Result<axum::Json<CliVersionResponse>, ApiError> {
     path = "/api/v1/cli/download/{target}",
     tag = "CLI Distribution",
     operation_id = "cli_dist_download",
-    params(("target" = String, Path, description = "Distribution target (`linux-x86_64`, `darwin-arm64`, `windows-x86_64`)")),
+    params(("target" = String, Path, description = "Distribution target (`linux-x86_64`, `darwin-arm64`, `windows-x86_64`, `freebsd-x86_64`)")),
     responses(
         (status = 200, description = "The ssai CLI binary", content_type = "application/octet-stream"),
         (status = 404, description = "Unknown target or CLI not available", body = ApiErrorResponse),
@@ -400,6 +441,7 @@ fn target_uname(target: &str) -> Option<(&'static str, &'static str)> {
     match target {
         CLI_TARGET_LINUX_X86_64 => Some(("Linux-x86_64", "Linux x86_64")),
         CLI_TARGET_DARWIN_ARM64 => Some(("Darwin-arm64", "macOS Apple Silicon")),
+        CLI_TARGET_FREEBSD_X86_64 => Some(("FreeBSD-amd64", "FreeBSD amd64")),
         _ => None,
     }
 }
@@ -418,6 +460,7 @@ fn render_install_script(origin: &str, version: &str, targets: &[(&str, &str)]) 
         }
     }
     let supported = supported.join(", ");
+    let freebsd_guard = freebsd_release_guard();
     format!(
         r#"#!/bin/sh
 # Streamscope CLI installer — serves from {origin}
@@ -436,7 +479,7 @@ case "$os-$arch" in
     exit 1
     ;;
 esac
-
+{freebsd_guard}
 dir="${{STREAMSCOPE_INSTALL_DIR:-$HOME/.local/bin}}"
 mkdir -p "$dir"
 tmp=$(mktemp "$dir/.ssai.XXXXXX")
@@ -501,7 +544,7 @@ capture_root() {{
 # Locate the OS's PEM CA bundle so the gateway chain can be APPENDED to it rather
 # than replace it. Prints the path on stdout; returns 1 when none is found.
 find_system_ca_bundle() {{
-  for c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+  for c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem /usr/local/share/certs/ca-root-nss.crt; do
     [ -f "$c" ] && {{ echo "$c"; return 0; }}
   done
   od=$(openssl version -d 2>/dev/null | sed -n 's/.*"\(.*\)".*/\1/p')
@@ -516,8 +559,10 @@ case "$ORIGIN" in
   https://*)
     # Asked of the system store alone: a bundle this installer once printed
     # exports for (CURL_CA_BUNDLE, SSL_CERT_FILE) must not stand in for it, or a
-    # root the CLI has lost is never captured again.
-    if ! env -u CURL_CA_BUNDLE -u SSL_CERT_FILE curl -fsS -o /dev/null "$ORIGIN/api/health" 2>/dev/null; then
+    # root the CLI has lost is never captured again. No `-f`: any HTTP answer
+    # (a 404, a 429 from the pre-login limit, a 502) means the handshake was
+    # trusted; only a TLS or connection failure reads as an untrusted certificate.
+    if ! env -u CURL_CA_BUNDLE -u SSL_CERT_FILE curl -sS -o /dev/null "$ORIGIN/api/v1/cli/version" 2>/dev/null; then
       echo "The gateway's TLS certificate is not trusted by this machine."
       mkdir -p "$CA_DIR"
       # Trust-on-first-use. The TLS handshake never sends the root CA — it
@@ -566,6 +611,9 @@ case "$ORIGIN" in
               sudo cp "$ORIGIN_CA" "/usr/local/share/ca-certificates/streamscope-gateway-$CA_NAME.crt" && sudo update-ca-certificates
             elif command -v update-ca-trust >/dev/null 2>&1 && [ -d /etc/pki/ca-trust/source/anchors ]; then
               sudo cp "$ORIGIN_CA" "/etc/pki/ca-trust/source/anchors/streamscope-gateway-$CA_NAME.crt" && sudo update-ca-trust
+            elif command -v certctl >/dev/null 2>&1; then
+              sudo mkdir -p /usr/local/share/certs && \
+                sudo cp "$ORIGIN_CA" "/usr/local/share/certs/streamscope-gateway-$CA_NAME.pem" && sudo certctl rehash
             elif command -v security >/dev/null 2>&1; then
               sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$ORIGIN_CA"
             else
@@ -577,8 +625,8 @@ case "$ORIGIN" in
         # Confirm the fetched root — it alone, not another gateway's — validates
         # a genuine handshake. This catches a stale/misconfigured published root
         # early; the operator-validated serial/fingerprint above is what defends
-        # against an active MITM.
-        if curl -fsS --cacert "$ORIGIN_CA" -o /dev/null "$ORIGIN/api/v1/cli/version" 2>/dev/null; then
+        # against an active MITM. No `-f`, as above: the handshake is the question.
+        if curl -sS --cacert "$ORIGIN_CA" -o /dev/null "$ORIGIN/api/v1/cli/version" 2>/dev/null; then
           echo "Verified: the gateway certificate validates against the fetched root CA."
         else
           echo "ssai: WARNING — the fetched root CA does not validate a TLS handshake to $ORIGIN." >&2
@@ -713,11 +761,88 @@ mod tests {
     }
 
     #[test]
+    fn install_script_selects_freebsd_by_its_own_uname() {
+        // FreeBSD's `uname -m` says `amd64`, never `x86_64`: an arm keyed on
+        // the Linux spelling would send every FreeBSD machine to the
+        // unsupported-platform message.
+        let s = render_install_script(
+            "https://gw",
+            "2026.5.1",
+            &[("linux-x86_64", "lll"), ("freebsd-x86_64", "fff")],
+        );
+        assert!(s.contains("FreeBSD-amd64) target=\"freebsd-x86_64\"; WANT_SHA=\"fff\""));
+        assert!(s.contains("supported: Linux x86_64, FreeBSD amd64)"));
+        // Its trust store is certctl's: the root goes where `certctl rehash` reads.
+        assert!(s.contains("/usr/local/share/certs/streamscope-gateway-$CA_NAME.pem\" && sudo certctl rehash"));
+    }
+
+    /// The installer's FreeBSD release check, run by `sh` with `uname`
+    /// shadowed by a function and no `freebsd-version` on the PATH: the oldest
+    /// supported release passes, the minor and the major before it are
+    /// refused with the supported range, and another system is never asked.
+    #[cfg(unix)]
+    #[test]
+    fn the_installer_refuses_a_freebsd_release_older_than_its_build() {
+        let script = render_install_script("https://gw", "2026.5.1", &[("freebsd-x86_64", "fff")]);
+        assert!(script.contains(&freebsd_release_guard()));
+        let (major, minor) = FREEBSD_MIN_RELEASE;
+        let run = |os: &str, release: &str| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "set -eu\nuname() {{ echo {release}; }}\nos={os}\n{}echo passed",
+                    freebsd_release_guard()
+                ))
+                .env("PATH", "/nonexistent")
+                .output()
+                .expect("sh")
+        };
+        let passes = |os: &str, release: &str| {
+            let out = run(os, release);
+            String::from_utf8_lossy(&out.stdout) == "passed\n"
+        };
+        assert!(passes("FreeBSD", &format!("{major}.{minor}-RELEASE")));
+        assert!(passes("FreeBSD", &format!("{major}.{}-RELEASE-p3", minor + 1)));
+        assert!(passes("FreeBSD", &format!("{}.0-RELEASE", major + 1)));
+        assert!(passes("FreeBSD", &format!("{}.0-CURRENT", major + 2)));
+        let just_before = match minor.checked_sub(1) {
+            Some(m) => format!("{major}.{m}-RELEASE"),
+            None => format!("{}.9-RELEASE", major - 1),
+        };
+        for older in [just_before, format!("{}.5-RELEASE", major - 1)] {
+            let out = run("FreeBSD", &older);
+            assert!(!out.status.success(), "{older} accepted");
+            assert!(String::from_utf8_lossy(&out.stderr)
+                .contains(&format!("supported: FreeBSD {major}.{minor} and newer")));
+        }
+        assert!(passes("Linux", "6.12.0"));
+    }
+
+    #[test]
+    fn every_target_is_served_to_its_installer() {
+        // A target no installer selects is a binary nobody can install.
+        // Windows is install.ps1's; every other target needs its install.sh arm.
+        for t in &TARGETS {
+            assert!(
+                t.name == CLI_TARGET_WINDOWS_X86_64 || target_uname(t.name).is_some(),
+                "{} has no install.sh arm",
+                t.name
+            );
+        }
+    }
+
+    #[test]
     fn install_script_fetches_and_validates_root_ca() {
         let s = render_install_script("https://gw", "2026.5.1", &[("linux-x86_64", "abc123")]);
         // Trust-on-first-use: fetch the gateway's published ROOT CA (the handshake
         // never sends it) over an as-yet-untrusted connection, and ADD it to the
         // captured roots in gateway-ca.pem, never over another gateway's…
+        // The system-trust check asks a path both origins serve, without `-f`:
+        // an HTTP error status is an answer over a trusted handshake, never a
+        // reason to take the private-CA path.
+        assert!(s.contains(
+            "env -u CURL_CA_BUNDLE -u SSL_CERT_FILE curl -sS -o /dev/null \"$ORIGIN/api/v1/cli/version\""
+        ));
         assert!(s.contains("curl -fsSk \"$ORIGIN/api/v1/cli/ca\" -o \"$FETCHED_FILE\""));
         assert!(s.contains("capture_root \"$FETCHED_FILE\" \"$ORIGIN_CA\""));
         assert!(s.contains("gateway-ca.pem"));
@@ -738,7 +863,7 @@ mod tests {
         assert!(s.contains("export SSL_CERT_FILE=$BUNDLE_FILE"));
         assert!(s.contains("export REQUESTS_CA_BUNDLE=$BUNDLE_FILE"));
         // …confirm a real handshake validates against the fetched root…
-        assert!(s.contains("curl -fsS --cacert \"$ORIGIN_CA\""));
+        assert!(s.contains("curl -sS --cacert \"$ORIGIN_CA\""));
         // No fallback: an untrusted cert with no published root is a hard error,
         // never a silent leaf-pin (the served chain is never captured/trusted).
         assert!(!s.contains("openssl s_client"));

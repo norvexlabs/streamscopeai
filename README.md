@@ -133,11 +133,11 @@ tool rules and the prompt-injection screening, on the record like any other call
 provider or the laptop reaching the web unseen.
 
 **Your coding agents, provisioned in one command, run in a sandbox.** The `ssai` CLI (Linux, macOS,
-Windows) configures Claude Code, Codex CLI, Gemini CLI, OpenCode, Goose, Cline, Aider, Cursor, Zed,
+Windows, FreeBSD) configures Claude Code, Codex CLI, Gemini CLI, OpenCode, Goose, Cline, Aider, Cursor, Zed,
 Crush, Qwen Code, Mistral Vibe and more against the gateway: models, keys and MCP servers, merged
 into each tool's own config with your other settings kept. What each tool is given comes from a
 client template the admin can edit, preview and add to in the console, and the portal's quickstart
-renders the same templates. `ssai run --sandbox` then confines the agent to its project. Inside, it reaches the gateway plus
+renders the same templates. `ssai run --sandbox` then confines the agent to its project (on Linux, macOS, Windows and FreeBSD). Inside, it reaches the gateway plus
 only what the admin's destination lists allow, and it can commit, from a linked worktree too. The
 admin chooses which clients the portal and the CLI offer — one a new release adds arrives switched
 off until enabled — and can require the sandbox, so `ssai run` will not launch an agent unconfined.
@@ -148,6 +148,7 @@ off until enabled — and can require the sandbox, so `ssai run` will not launch
 | Linux, container (`--sandbox docker`, unless an admin turns it off) | a rootless Podman container built from the project's own image or dev container, a Docker engine inside if the project needs one | read-only |
 | macOS | Seatbelt | read-only |
 | Windows | a dedicated local account that reads nothing in your profile but what a run grants it (the tool's folder and configuration, trusted roots, files an `--env` names); `ssai sandbox setup` creates it once, and a project stays granted to it until `ssai sandbox revoke`. Claude Code, Codex, Gemini CLI, OpenCode and Goose run there | read-only |
+| FreeBSD | a jail for each run, built by a service `sudo ssai sandbox setup` installs once: the system read-only, the project and the tool's own folders, a network of its own whose only way out is the gateway route | read-only |
 
 **Multi-tenant from the database up.** Serve many isolated organisations from one deployment, each
 with its own users, sign-in (local accounts or any OIDC provider, Entra ID and AD FS included),

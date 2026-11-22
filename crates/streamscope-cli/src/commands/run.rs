@@ -88,15 +88,27 @@ pub async fn run(args: RunArgs) -> Result<()> {
     }
     // `learn` leaves the filesystem unconfined, so a required sandbox refuses
     // it with `off`.
-    if matches!(choice, SandboxChoice::Off | SandboxChoice::Learn)
-        && access.as_ref().is_some_and(|a| a.sandbox.settings.require_sandbox)
-    {
-        bail!(
-            "your administrator requires the sandbox for this workspace — run without `--sandbox off` or \
-             `--sandbox learn`"
-        );
+    // A system with no sandbox backend can meet neither requirement: say so
+    // rather than point at a mode it does not have.
+    let has_sandbox = cfg!(any(target_os = "linux", target_os = "macos", windows));
+    if access.as_ref().is_some_and(|a| a.sandbox.settings.require_sandbox) {
+        if !has_sandbox {
+            bail!(
+                "your administrator requires the sandbox for this workspace, and this system has none (the \
+                 sandbox runs on Linux, macOS and Windows) — `ssai run` cannot launch a tool here"
+            );
+        }
+        if matches!(choice, SandboxChoice::Off | SandboxChoice::Learn) {
+            bail!(
+                "your administrator requires the sandbox for this workspace — run without `--sandbox off` or \
+                 `--sandbox learn`"
+            );
+        }
     }
     if choice == SandboxChoice::Docker && access.as_ref().is_some_and(|a| !a.sandbox.settings.docker_tier) {
+        if !has_sandbox {
+            bail!("your administrator does not allow the docker sandbox for this workspace, and this system has no other sandbox — use `--sandbox off`");
+        }
         bail!(
             "your administrator does not allow the docker sandbox for this workspace — run with \
              `--sandbox native`"
@@ -583,7 +595,7 @@ fn combined_ca_pem(base: Option<&std::path::Path>, extra: &[PathBuf]) -> Result<
 }
 
 /// The OS trust store as PEM: the bundle file, by convention across distros
-/// (`None` when there is none); on Windows, the user's and machine's root
+/// and the BSDs (`None` when there is none); on Windows, the user's and machine's root
 /// stores, written out.
 #[cfg(not(windows))]
 pub(crate) fn system_ca_pem() -> Result<Option<Vec<u8>>> {
@@ -591,6 +603,7 @@ pub(crate) fn system_ca_pem() -> Result<Option<Vec<u8>>> {
         "/etc/ssl/certs/ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/ssl/cert.pem",
+        "/usr/local/share/certs/ca-root-nss.crt",
     ]
     .iter()
     .map(PathBuf::from)

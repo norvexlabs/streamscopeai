@@ -43,10 +43,14 @@ Each application image builds its checks beside its binary and refuses to build 
 A pull request is expected to build all four. The maintainers also run architectural checks and an
 end-to-end suite before merging; a review may ask for a change those find.
 
-The admin-api image bundles the `ssai` CLI for Linux and for Windows (`ssai.exe`, cross-built with
-mingw-w64; the image lints its Windows-only code). Its tests run on Windows itself: on a Windows 11
+The admin-api image bundles the `ssai` CLI for Linux, for Windows (`ssai.exe`, cross-built with
+mingw-w64; the image lints its Windows-only code) and for FreeBSD amd64 (cross-built with clang and
+lld against the base system of the oldest supported FreeBSD release, linted on its target). The Windows build's tests run on Windows itself: on a Windows 11
 x86_64 machine with the MSVC build tools and Rust, `cargo test -p streamscope-cli`; the image's mingw
-build is then checked by installing it there. The macOS build of the CLI is made
+build is then checked by installing it there. The FreeBSD build's tests are not run by the image: a
+change to the CLI's FreeBSD paths runs `cargo test -p streamscope-cli` on a FreeBSD 14.4 or newer
+machine; a change to its sandbox (the jail and the service that builds it) is also checked by the
+maintainers' sandbox smoke test on a FreeBSD 15.0 or newer machine. The macOS build of the CLI is made
 separately on an Apple Silicon machine: generate its third-party licence list with
 [cargo-about](https://github.com/EmbarkStudios/cargo-about) (`cargo about generate --fail --locked -m
 crates/streamscope-cli/Cargo.toml -c docker/about.toml docker/about.hbs -o licenses.txt`), then

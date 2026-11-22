@@ -2905,8 +2905,8 @@ Open a profile to edit it:
   features) are yours to attach. Add your own internal services (registry, git server, artifact mirror) as a list of
   your own and attach it beside them — and, while **Internal networks** is blocked, remove their
   ranges from it: a block on an address wins over an allowed name. **Require the sandbox** refuses `ssai run --sandbox off` and `--sandbox learn`
-  (which leaves the filesystem unconfined); on Windows the developer first runs `ssai sandbox setup` once
-  (see [The Windows sandbox](PORTAL_GUIDE.md#the-windows-sandbox) in the Portal Guide). **Allow the container sandbox** (on by default) lets developers
+  (which leaves the filesystem unconfined); on Windows and FreeBSD the developer first runs `ssai sandbox setup` once
+  (see [The Windows sandbox](PORTAL_GUIDE.md#the-windows-sandbox) and [The FreeBSD sandbox](PORTAL_GUIDE.md#the-freebsd-sandbox) in the Portal Guide). **Allow the container sandbox** (on by default) lets developers
   run `ssai run --sandbox docker`, which starts the agent in a container on their Linux machine; turned
   off, that run is refused and names `--sandbox native`. While it is on, **Default container image**
   sets what such a run uses in a project with no `.streamscopeai/sandbox.json` of its own: an image

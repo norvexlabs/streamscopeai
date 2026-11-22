@@ -12,6 +12,7 @@ pub struct AgentProfile {
     pub names: &'static [&'static str],
     /// Config/cache/state dirs the client reads AND writes (`~/`-relative).
     #[cfg_attr(not(unix), expect(dead_code, reason = "only the Unix sandbox backends read it"))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows, target_os = "freebsd")), allow(dead_code, reason = "no native sandbox backend on this system"))]
     pub state_dirs: &'static [&'static str],
     /// Extra env to set for the child (e.g. keyring/home overrides).
     pub env: &'static [(&'static str, &'static str)],
@@ -371,7 +372,7 @@ pub const AGENTS: &[AgentProfile] = &[
 /// a path that exists; Seatbelt refuses the `mkdir` of an ungranted parent).
 /// Only at its default place: a cache a variable moves elsewhere is not
 /// followed. The one list of these paths: a toolchain profile never repeats one.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub struct PackageCache {
     pub dir: &'static str,
     pub tools: &'static [&'static str],
@@ -382,7 +383,7 @@ pub struct PackageCache {
 /// folder (the Pythons it installed included). Its `tools` folder, which `uvx`
 /// creates on every run, is in — like npm's cache, whose packages a later
 /// `npx` runs too.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 pub const PACKAGE_CACHES: &[PackageCache] = &[
     PackageCache { dir: "~/.npm", tools: &["npm", "npx"] },
     PackageCache { dir: "~/.cache/uv", tools: &["uv", "uvx"] },
@@ -395,13 +396,13 @@ pub const PACKAGE_CACHES: &[PackageCache] = &[
 /// profile already grants `~/` read via the broader `file-read*` allow and
 /// re-denies SECRET_DENY on top, so the per-toolchain dir list isn't needed
 /// there.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub struct ToolchainProfile {
     pub names: &'static [&'static str],
     pub dirs: &'static [&'static str],
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub const TOOLCHAINS: &[ToolchainProfile] = &[
     ToolchainProfile {
         names: &["node", "npm", "npx", "yarn", "pnpm", "bun", "deno"],
@@ -465,7 +466,7 @@ pub const TOOLCHAINS: &[ToolchainProfile] = &[
 /// coding agent commonly needs (NOT credentials; secrets are denied below).
 /// Read by the Linux backend when it builds the Landlock ruleset; the macOS
 /// Seatbelt profile is generated from its own clauses.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
 pub const BASE_READ: &[&str] = &[
     "~/.gitconfig",
     "~/.config/git",
@@ -503,10 +504,10 @@ pub const BASE_READ: &[&str] = &[
 /// [`USER_TOOL_READ`]: a Python client may write the folder above it, so it is
 /// granted only where it really is (no link inside the home), like a package
 /// cache.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub const UV_PYTHONS: &str = "~/.local/share/uv/python";
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub const USER_TOOL_READ: &[&str] = &[
     "~/.local/bin",
     "~/bin",
@@ -538,6 +539,7 @@ pub const USER_TOOL_READ: &[&str] = &[
 /// version-managed Node under that version's own directory, so the entry has
 /// to name every installed version at once.
 #[cfg_attr(all(not(unix), not(test)), expect(dead_code, reason = "only the Unix sandbox backends read it"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows, target_os = "freebsd")), allow(dead_code, reason = "no native sandbox backend on this system"))]
 pub const SECRET_DENY: &[&str] = &[
     "~/.ssh/id_",   // private keys (id_rsa, id_ed25519, …) — prefix match
     "~/.gnupg",
@@ -626,7 +628,7 @@ pub fn project_config_dir(config: &std::path::Path, project_root: &std::path::Pa
 }
 
 /// Toolchain profile for a runtime command name.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn toolchain_for(name: &str) -> Option<&'static ToolchainProfile> {
     TOOLCHAINS.iter().find(|p| p.names.contains(&name))
 }

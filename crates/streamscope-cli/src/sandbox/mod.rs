@@ -9,6 +9,10 @@ pub mod guard;
 pub mod profiles;
 pub mod protect;
 
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod allowlist;
+#[cfg(any(target_os = "freebsd", all(test, target_os = "linux")))]
+pub mod freebsd;
 #[cfg(target_os = "linux")]
 mod interposer;
 #[cfg(target_os = "linux")]
@@ -17,12 +21,14 @@ mod linux;
 mod macos;
 #[cfg(target_os = "linux")]
 mod podman;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod relay;
 // Windows confines by the account, whose temp folder is its own.
 #[cfg(not(windows))]
 mod scratch;
 #[cfg(any(windows, test))]
 pub mod windows;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod state_dirs;
 
 use std::path::{Path, PathBuf};
@@ -152,6 +158,7 @@ pub struct LaunchSpec {
     /// workspace) whose template is `usable_as_tool`: the agent may run each
     /// as a tool, so the run reaches its config as it reaches the launched
     /// client's.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no native sandbox backend on this system"))]
     pub tool_clients: Vec<ToolClient>,
 }
 
@@ -254,12 +261,16 @@ pub fn select_tier(choice: SandboxChoice) -> Result<Tier> {
                 ensure_native_supported()?;
                 Ok(Tier::Learn)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(any(target_os = "macos", windows, target_os = "freebsd"))]
             {
                 bail!(
                     "--sandbox learn is only supported on Linux — run the confined client with \
                      --sandbox native and add any missing path with `-e KEY=/abs/path`"
                 )
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "freebsd")))]
+            {
+                bail!("--sandbox learn is only supported on Linux — this system has no sandbox: use --sandbox off")
             }
         }
         SandboxChoice::Native => {
@@ -273,9 +284,13 @@ pub fn select_tier(choice: SandboxChoice) -> Result<Tier> {
             {
                 Ok(Tier::Docker)
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(any(target_os = "macos", windows, target_os = "freebsd"))]
             {
                 bail!("--sandbox docker runs on Linux only — on this host use --sandbox native")
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "freebsd")))]
+            {
+                bail!("--sandbox docker runs on Linux only — this system has no sandbox: use --sandbox off")
             }
         }
         SandboxChoice::Auto => {
@@ -319,9 +334,13 @@ fn native_probe() -> std::result::Result<(), String> {
     {
         windows::setup::probe().map(drop)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(target_os = "freebsd")]
     {
-        Err("the native sandbox is implemented on Linux, macOS and Windows only".into())
+        freebsd::probe()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "freebsd")))]
+    {
+        Err("the native sandbox is implemented on Linux, macOS, Windows and FreeBSD only".into())
     }
 }
 
@@ -433,6 +452,50 @@ pub async fn launch(mut spec: LaunchSpec, tier: Tier, verbose: bool) -> Result<i
         Tier::Docker => podman::launch(spec, verbose).await,
         #[cfg(not(target_os = "linux"))]
         Tier::Docker => bail!("--sandbox docker runs on Linux only"),
+    }
+}
+
+/// `ssai __jaild`: the FreeBSD sandbox daemon.
+pub fn jail_daemon() -> Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd::daemon::main()
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        bail!("__jaild runs on FreeBSD only")
+    }
+}
+
+/// `ssai __jail-exec <run> -- <command>`: one process of a FreeBSD run.
+pub fn jail_exec(run: &str, command: &[String]) -> Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        freebsd::exec::main(run, command)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let _ = (run, command);
+        bail!("__jail-exec runs on FreeBSD only")
+    }
+}
+
+/// `ssai __jail-relay <guard socket> <port> [--engine <socket> <port>]`, in
+/// a FreeBSD run's jail.
+pub fn jail_relay(guard: &Path, port: u16, engine: Option<&[String]>) -> Result<()> {
+    #[cfg(target_os = "freebsd")]
+    {
+        let engine = match engine {
+            Some([sock, port]) => Some((Path::new(sock.as_str()), port.parse().context("the engine's port")?)),
+            Some(_) => bail!("--engine takes a socket and a port"),
+            None => None,
+        };
+        freebsd::relay_main(guard, port, engine)
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let _ = (guard, port, engine);
+        bail!("__jail-relay runs on FreeBSD only")
     }
 }
 
@@ -758,6 +821,7 @@ fn null_io() -> windows::launch::Io {
 /// grants and holds ([`protect`]). No `Debug`: on Windows it carries the
 /// account's password.
 #[derive(Clone)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no native sandbox backend on this system"))]
 struct RunGrants {
     connect: Vec<u16>,
     #[cfg(not(windows))]
@@ -766,6 +830,9 @@ struct RunGrants {
     /// Windows: the account the run signs in as.
     #[cfg(windows)]
     account: std::sync::Arc<windows::launch::Account>,
+    /// FreeBSD: the run whose jail its processes start in.
+    #[cfg(target_os = "freebsd")]
+    run: String,
 }
 
 /// A private engine for one run of an engine-backed client (see
@@ -776,6 +843,10 @@ struct EnginePlan {
     port: u16,
     secret: String,
     attach_at: usize,
+    /// FreeBSD: the jail relay's socket the readiness probe dials — the
+    /// engine listens on the jail's own loopback, which the host cannot reach.
+    #[cfg(target_os = "freebsd")]
+    probe_socket: Option<PathBuf>,
 }
 
 impl EnginePlan {
@@ -797,7 +868,26 @@ impl EnginePlan {
             .port();
         let mut bytes = [0u8; 24];
         rand::rng().fill_bytes(&mut bytes);
-        Ok(Some(Self { spec: engine, port, secret: hex::encode(bytes), attach_at }))
+        Ok(Some(Self {
+            spec: engine,
+            port,
+            secret: hex::encode(bytes),
+            attach_at,
+            #[cfg(target_os = "freebsd")]
+            probe_socket: None,
+        }))
+    }
+
+    /// Where the readiness probe connects instead of the loopback port.
+    fn probe_via(&self) -> Option<&Path> {
+        #[cfg(target_os = "freebsd")]
+        {
+            self.probe_socket.as_deref()
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            None
+        }
     }
 
     fn fill(&self, args: &[&str]) -> Vec<String> {
@@ -853,9 +943,9 @@ impl EnginePlan {
             if let Some(status) = child.try_wait()? {
                 bail!("the sandboxed engine exited before it was ready ({status}){}", log_tail(log));
             }
-            match probe_status(self.port, &without).await {
+            match probe_status(self.port, self.probe_via(), &without).await {
                 // Up and asking for a password: ours only if it takes this run's.
-                Some(401) => match probe_status(self.port, &with_secret).await {
+                Some(401) => match probe_status(self.port, self.probe_via(), &with_secret).await {
                     Some(200) => return Ok(()),
                     // Our engine still starting answers something else; only
                     // a refusal of this run's password marks another server.
@@ -888,12 +978,26 @@ impl EnginePlan {
 
 const ENGINE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// One readiness probe: the HTTP status `request` gets on loopback `port`,
-/// `None` when nothing answers in time.
-async fn probe_status(port: u16, request: &str) -> Option<u16> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// One readiness probe: the HTTP status `request` gets on loopback `port`
+/// (on FreeBSD, through the jail relay's socket `via`, which reaches that
+/// port on the jail's loopback), `None` when nothing answers in time.
+async fn probe_status(port: u16, via: Option<&Path>, request: &str) -> Option<u16> {
     let attempt = async {
-        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+        match via {
+            #[cfg(unix)]
+            Some(sock) => exchange(tokio::net::UnixStream::connect(sock).await.ok()?, request).await,
+            #[cfg(not(unix))]
+            Some(_) => None,
+            None => exchange(tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?, request).await,
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), attempt).await.ok().flatten()
+}
+
+/// Send `request` on `stream` and read the status line of the answer.
+async fn exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(mut stream: S, request: &str) -> Option<u16> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    {
         stream.write_all(request.as_bytes()).await.ok()?;
         let mut head = Vec::with_capacity(32);
         let mut buf = [0u8; 32];
@@ -905,8 +1009,7 @@ async fn probe_status(port: u16, request: &str) -> Option<u16> {
             head.extend_from_slice(&buf[..n]);
         }
         status_of(&head)
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(2), attempt).await.ok().flatten()
+    }
 }
 
 /// The status code of an HTTP/1.x status line (`HTTP/1.1 200 OK`).
@@ -952,8 +1055,11 @@ async fn stop_engine(child: &mut ConfinedChild) {
 async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Result<i32> {
     // Once per launch, before any of its confined commands (client, probe,
     // engine) builds a policy that grants them.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     state_dirs::prepare_state_dirs(&spec)?;
+    // FreeBSD: a helper killed in raw mode must not leave the terminal so.
+    #[cfg(target_os = "freebsd")]
+    let _terminal = freebsd::TerminalGuard::save();
     // Windows: the sandbox account, checked; the run adjusted for it; the
     // account granted this project and what the client needs.
     #[cfg(windows)]
@@ -1003,11 +1109,22 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
         gateway: allow_targets(&spec.proxy_origins)?,
         destinations: spec.destinations.clone(),
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "freebsd")))]
     let guard = guard::start(egress, verbose).await?;
+    // FreeBSD: the jail reaches the guard's socket through the relay in it.
+    #[cfg(target_os = "freebsd")]
+    let guard_socket = scratch.path().join("g.sock");
+    #[cfg(target_os = "freebsd")]
+    // SAFETY: geteuid cannot fail.
+    let guard = guard::start_unix(egress, verbose, &guard_socket, guard::Admit { uid: unsafe { libc::geteuid() }, ranges: Vec::new() })
+        .await?;
     // Windows: only the sandbox account's processes may use the guard.
     #[cfg(windows)]
     let guard = guard::start_for_account(egress, verbose, account_sid.clone()).await?;
+    #[cfg(target_os = "freebsd")]
+    let guard_port = freebsd::RELAY_PORT;
+    #[cfg(not(target_os = "freebsd"))]
+    let guard_port = guard.port;
     // This process must outlive the client to stop the engine and whatever
     // else the run left behind, so until the client exits it takes SIGINT /
     // SIGTERM / SIGHUP instead of dying of them (`wait_client`). SIGTERM and
@@ -1016,19 +1133,27 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     // clients that cancel a turn on the first.
     #[cfg(unix)]
     let mut signals = RunSignals::take()?;
-    let mut env = sandbox_env(&spec, guard.port, &|k| inherited_value(&spec.cwd, k));
+    let mut env = sandbox_env(&spec, guard_port, &|k| inherited_value(&spec.cwd, k));
     // (On Windows, resolved and prepared by the grant above.)
     #[cfg(not(windows))]
     let project = {
         let project = protect::resolve(&spec.project_root);
         // Landlock holds nothing inside the project: the empty folders that
         // `prepare` makes to be held would serve no purpose on Linux.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
         project.prepare().context("prepare the project's protected git folders")?;
         project
     };
+    // FreeBSD: the run's jail, held until the run ends.
+    #[cfg(target_os = "freebsd")]
+    let jail = {
+        let project = &project;
+        tokio::task::block_in_place(|| freebsd::Jail::open(&spec, scratch.path(), project))?
+    };
     let mut grants = RunGrants {
-        connect: vec![guard.port],
+        connect: vec![guard_port],
+        #[cfg(target_os = "freebsd")]
+        run: jail.run.clone(),
         #[cfg(not(windows))]
         scratch: scratch.path().to_path_buf(),
         project,
@@ -1048,7 +1173,8 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     // Every learn record of this run, removed whichever way the run ends; on
     // a normal end they are folded into the profile first.
     let mut records = LearnRecords::default();
-    let engine = EnginePlan::for_launch(&spec)?;
+    #[cfg_attr(not(target_os = "freebsd"), allow(unused_mut))]
+    let mut engine = EnginePlan::for_launch(&spec)?;
     let mut client_args = spec.args.clone();
     if let Some(plan) = &engine {
         grants.connect.push(plan.port);
@@ -1063,6 +1189,18 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     // nothing appended to `env` above can override it.
     #[cfg(not(windows))]
     scratch.pin_env(&mut env);
+
+    // FreeBSD: the relay in the jail — the client's way to the guard, and
+    // the host's to the engine's readiness probe — before anything else runs.
+    #[cfg(target_os = "freebsd")]
+    let relay = {
+        let probe = engine.as_ref().map(|plan| (scratch.path().join("e.sock"), plan.port));
+        let relay = start_jail_relay(&spec, &grants, &guard_socket, probe.as_ref()).await?;
+        if let (Some(plan), Some((sock, _))) = (engine.as_mut(), probe) {
+            plan.probe_socket = Some(sock);
+        }
+        relay
+    };
 
     // Everything that can fail is built before the engine starts, so once it
     // runs every path below reaches the teardown.
@@ -1166,6 +1304,14 @@ async fn launch_confined(mut spec: LaunchSpec, verbose: bool, learn: bool) -> Re
     windows_after_run(&spec, &grants, &account_sid, &owner_sid, &hold).await;
     #[cfg(target_os = "linux")]
     records.apply(&spec, &scratch);
+    // FreeBSD: the jail goes, every process left in it with it.
+    #[cfg(target_os = "freebsd")]
+    {
+        drop(relay);
+        if let Err(e) = tokio::task::block_in_place(|| jail.close()) {
+            eprintln!("ssai: {e:#}");
+        }
+    }
 
     // Once the client has the terminal back: what the sandbox refused.
     let refused = guard.refused();
@@ -1484,6 +1630,41 @@ async fn reap_leftovers() {
     let _ = tokio::task::spawn_blocking(linux::reap_orphans).await;
 }
 
+/// FreeBSD: start `ssai __jail-relay` in the run's jail — the jail's loopback
+/// `RELAY_PORT` to the guard's socket, and with an engine, the probe socket
+/// to its port — and wait until it listens. Killed when dropped.
+#[cfg(target_os = "freebsd")]
+async fn start_jail_relay(
+    spec: &LaunchSpec,
+    grants: &RunGrants,
+    guard_socket: &Path,
+    engine: Option<&(PathBuf, u16)>,
+) -> Result<tokio::process::Child> {
+    use tokio::io::AsyncBufReadExt;
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize).context("locate ssai")?;
+    let mut args = vec![
+        "__jail-relay".to_string(),
+        guard_socket.to_string_lossy().into_owned(),
+        freebsd::RELAY_PORT.to_string(),
+    ];
+    if let Some((sock, port)) = engine {
+        args.extend(["--engine".to_string(), sock.to_string_lossy().into_owned(), port.to_string()]);
+    }
+    let mut cmd = freebsd::command(&grants.run, &exe.to_string_lossy(), &args, &spec.cwd, &[])?;
+    // Its own process group: a Ctrl-C at the terminal, sent to the
+    // foreground group, must not end the client's only way out.
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).kill_on_drop(true).process_group(0);
+    let mut child = cmd.spawn().context("start the sandbox's relay")?;
+    let stdout = child.stdout.take().context("the relay's output")?;
+    let mut line = String::new();
+    let mut stdout = tokio::io::BufReader::new(stdout);
+    let read = stdout.read_line(&mut line);
+    match tokio::time::timeout(std::time::Duration::from_secs(15), read).await {
+        Ok(Ok(_)) if line.trim() == "ready" => Ok(child),
+        _ => bail!("the sandbox's relay did not start"),
+    }
+}
+
 /// The command that runs `args` of `spec.command` under the sandbox, with
 /// `env` and the run's `grants`. `record` makes it a learn pass that records the
 /// paths it opens there (Linux).
@@ -1534,10 +1715,15 @@ fn confined_command(
         }
         Ok(cmd)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    #[cfg(target_os = "freebsd")]
+    {
+        let _ = record;
+        freebsd::command(&grants.run, &spec.command, args, &spec.cwd, env)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows, target_os = "freebsd")))]
     {
         let _ = (spec, grants, record, args, env);
-        bail!("the native sandbox is only implemented on Linux, macOS and Windows")
+        bail!("the native sandbox is only implemented on Linux, macOS, Windows and FreeBSD")
     }
 }
 

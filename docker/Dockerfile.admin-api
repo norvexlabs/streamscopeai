@@ -5,7 +5,7 @@
 #   checks   — source + clippy and the advisory audit
 #   licenses — source + the third-party licence list
 #   sbom     — source + the SBOMs of the binaries the image ships
-#   release  — source + the admin binary and the CLI (static Linux, Windows)
+#   release  — source + the admin binary and the CLI (static Linux, Windows, FreeBSD)
 #   winsig-tool — osslsigncode + openssl, pinned once (the signing script builds it too)
 #   winsig   — the signed Windows CLI staged out of band, its signature checked (no source)
 #   staged   — release + the CLI builds staged out of band (macOS; Windows signed),
@@ -29,9 +29,41 @@ RUN rustup component add clippy && cargo install cargo-audit && \
 # cmake + clang to compile for the musl target), and mingw-w64 for the CLI's
 # Windows build (`ssai.exe`, which links no mingw DLL: it runs on a stock
 # Windows) — the reason this builder is Debian while the image it feeds is Alpine.
-RUN apt-get update -qq && apt-get install -y -qq musl-tools cmake clang gcc-mingw-w64-x86-64 && \
+RUN apt-get update -qq && apt-get install -y -qq musl-tools cmake clang lld llvm gcc-mingw-w64-x86-64 && \
     rm -rf /var/lib/apt/lists/* && \
-    rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu
+    rustup target add x86_64-unknown-linux-musl x86_64-pc-windows-gnu x86_64-unknown-freebsd
+
+# The CLI's FreeBSD build (`ssai-freebsd-x86_64`) is cross-compiled by clang and
+# linked by lld against the base system of the OLDEST supported FreeBSD release:
+# its symbol versions are ones every later release keeps, so one binary runs on
+# that release and all newer ones. The sysroot is the base system's libraries
+# and headers, from the release's own archive, verified against the sha256 its
+# release MANIFEST lists. A release past its end of life leaves the mirrors for
+# the project's archive, so the archive is fetched when the mirror has no copy
+# — over plain HTTP, the only way that host serves it with a valid name; the
+# sha256 pin, not the transport, decides the bytes. The release is named once,
+# by its major and minor (the compiler's target names the major); move the pin
+# when the oldest supported release changes — the installer's minimum
+# (FREEBSD_MIN_RELEASE in the CLI distribution routes) moves with it, and the
+# served build's ABI note is checked against it.
+ARG FREEBSD_SYSROOT_MAJOR=14
+ARG FREEBSD_SYSROOT_MINOR=4
+ARG FREEBSD_BASE_SHA256=769f60a6eea2938ad6b7943cfbcc17dfaf7d1f7ba59a32b869a00349302df853
+RUN { curl -fsSL -o /tmp/base.txz \
+          "https://download.freebsd.org/releases/amd64/${FREEBSD_SYSROOT_MAJOR}.${FREEBSD_SYSROOT_MINOR}-RELEASE/base.txz" || \
+      curl -fsSL -o /tmp/base.txz \
+          "http://ftp-archive.freebsd.org/pub/FreeBSD-Archive/old-releases/amd64/${FREEBSD_SYSROOT_MAJOR}.${FREEBSD_SYSROOT_MINOR}-RELEASE/base.txz"; } && \
+    echo "${FREEBSD_BASE_SHA256}  /tmp/base.txz" | sha256sum -c - && \
+    mkdir -p /opt/freebsd-sysroot && \
+    tar -xf /tmp/base.txz -C /opt/freebsd-sysroot --wildcards './lib/*' './usr/lib/*' './usr/include/*' && \
+    rm /tmp/base.txz
+ENV CC_x86_64_unknown_freebsd=clang \
+    CXX_x86_64_unknown_freebsd=clang++ \
+    AR_x86_64_unknown_freebsd=llvm-ar \
+    CFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd${FREEBSD_SYSROOT_MAJOR} --sysroot=/opt/freebsd-sysroot" \
+    CXXFLAGS_x86_64_unknown_freebsd="--target=x86_64-unknown-freebsd${FREEBSD_SYSROOT_MAJOR} --sysroot=/opt/freebsd-sysroot" \
+    CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=clang \
+    CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_RUSTFLAGS="-C link-arg=--target=x86_64-unknown-freebsd${FREEBSD_SYSROOT_MAJOR} -C link-arg=--sysroot=/opt/freebsd-sysroot -C link-arg=-fuse-ld=lld"
 
 WORKDIR /app
 
@@ -66,7 +98,7 @@ RUN mkdir -p crates/streamscope-core/src && echo "pub fn stub() {}" > crates/str
 
 # Pre-build dependencies — once per profile and target the stages below compile
 # in: the admin binary (release, musl), clippy (check, and the CLI's on the Windows
-# target) and the CLI (release, musl and Windows targets). Against the stub sources each builds only third-party crates, so a
+# and FreeBSD targets) and the CLI (release, musl, Windows and FreeBSD targets). Against the stub sources each builds only third-party crates, so a
 # source change recompiles the workspace crates and nothing else. The flags must
 # match the steps below, or the profiles differ and the cache is not the one they
 # read.
@@ -75,6 +107,8 @@ RUN cargo clippy --workspace --all-targets 2>/dev/null || true
 RUN cargo build --release -p streamscope-cli --target x86_64-unknown-linux-musl 2>/dev/null || true
 RUN cargo clippy -p streamscope-cli --all-targets --target x86_64-pc-windows-gnu 2>/dev/null || true
 RUN cargo build --release -p streamscope-cli --target x86_64-pc-windows-gnu 2>/dev/null || true
+RUN cargo clippy -p streamscope-cli --all-targets --target x86_64-unknown-freebsd 2>/dev/null || true
+RUN cargo build --release -p streamscope-cli --target x86_64-unknown-freebsd 2>/dev/null || true
 
 FROM builder AS source
 
@@ -108,6 +142,10 @@ RUN cargo clippy --workspace --all-targets -- -D warnings
 # The CLI's Windows-only code compiles only for its Windows target. Its tests
 # run on Windows itself, out of band (CONTRIBUTING.md).
 RUN cargo clippy -p streamscope-cli --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+# Likewise its FreeBSD build, which has no native sandbox backend: what only the
+# other systems' backends read is dead code there. Its tests are not run here
+# (nothing in this builder executes a FreeBSD binary).
+RUN cargo clippy -p streamscope-cli --all-targets --target x86_64-unknown-freebsd -- -D warnings
 
 # Vulnerability audit — fail build on known advisories.
 # RUSTSEC-2023-0071: rsa timing sidechannel — transitive via sqlx-mysql (not used, no fix available).
@@ -163,7 +201,7 @@ RUN export SOURCE_DATE_EPOCH=0 && \
     cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps \
         --manifest-path crates/streamscope-admin/Cargo.toml --target x86_64-unknown-linux-musl && \
     stamp crates/streamscope-admin/streamscope-admin.cdx.json /streamscopeai-admin.cdx.json && \
-    for t in x86_64-unknown-linux-musl x86_64-pc-windows-gnu aarch64-apple-darwin; do \
+    for t in x86_64-unknown-linux-musl x86_64-pc-windows-gnu x86_64-unknown-freebsd aarch64-apple-darwin; do \
         cargo cyclonedx -q -f json --spec-version 1.5 --no-build-deps --target-in-filename \
             --manifest-path crates/streamscope-cli/Cargo.toml --target "$t" && \
         stamp "crates/streamscope-cli/streamscope-cli_$t.cdx.json" "/ssai-$t.cdx.json" || exit 1; \
@@ -208,7 +246,8 @@ RUN if [ "$COVERAGE" = "1" ]; then \
         cargo build --release -p streamscope-admin --target x86_64-unknown-linux-musl && \
         cargo build --release -p streamscope-cli --target x86_64-unknown-linux-musl; \
     fi && \
-    cargo build --release -p streamscope-cli --target x86_64-pc-windows-gnu
+    cargo build --release -p streamscope-cli --target x86_64-pc-windows-gnu && \
+    cargo build --release -p streamscope-cli --target x86_64-unknown-freebsd
 
 # The signed Windows CLI, staged out of band as artifacts/cli/ssai-windows-x86_64.exe:
 # a release serves ssai.exe signed with the Norvex Labs code-signing certificate
@@ -315,7 +354,7 @@ COPY --from=checks /checks-passed /usr/share/streamscope/checks-passed
 COPY LICENSE NOTICE /usr/share/licenses/streamscopeai/
 COPY --from=licenses /THIRD_PARTY_LICENSES /THIRD_PARTY_LICENSES.ssai /usr/share/licenses/streamscopeai/
 COPY --from=sbom /streamscopeai-admin.cdx.json /ssai-x86_64-unknown-linux-musl.cdx.json \
-     /ssai-x86_64-pc-windows-gnu.cdx.json /usr/share/sbom/
+     /ssai-x86_64-pc-windows-gnu.cdx.json /ssai-x86_64-unknown-freebsd.cdx.json /usr/share/sbom/
 LABEL org.opencontainers.image.title="Streamscope AI control plane" \
       org.opencontainers.image.source="https://github.com/norvexlabs/streamscopeai" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
@@ -333,6 +372,7 @@ RUN addgroup -g 65532 streamscope && adduser -D -H -u 65532 -G streamscope -s /s
 
 COPY --from=release /app/target/x86_64-unknown-linux-musl/release/streamscope-admin /usr/local/bin/streamscopeai-admin
 COPY --from=release /app/target/x86_64-unknown-linux-musl/release/ssai /usr/local/bin/ssai
+COPY --from=release /app/target/x86_64-unknown-freebsd/release/ssai /usr/local/share/ssai/ssai-freebsd-x86_64
 # The Windows and macOS CLIs for the /api/v1/cli/* download surface (the `staged`
 # stage decides which Windows build is served). No --chmod: it would apply to the
 # folder COPY creates as well, and a folder without its execute bit cannot be
