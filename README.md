@@ -288,15 +288,15 @@ docker run --rm ghcr.io/norvexlabs/streamscopeai-installer:latest > streamscopea
 sh streamscopeai.sh
 ```
 
-1. **Answer four questions** — your email (the platform administrator), the organisation's name and
-   short name, and its administrator's email. Pressing Enter keeps the defaults: an organisation
-   `Default`, administered from your own address.
+1. **Answer the questions** — type your email (the platform administrator) and press Enter at the
+   others: the install goes in `./streamscopeai`, serves only on this machine over plain HTTP, and
+   creates an organisation `Default`, administered from your own address.
 2. **Sign in** at <http://127.0.0.1:3000/admin> as the organisation administrator. The installer saved
    both accounts' generated passwords to `streamscopeai/credentials.txt`, readable only by you.
 3. **Set up the organisation in the console**, following the Admin Guide's
    **[Getting started](docs/ADMIN_GUIDE.md#getting-started)**: connect a model provider, allow the
    Default workspace to use it, create an API key, and send a request to the gateway at
-   `http://127.0.0.1:8080/v1`. It appears under **Audit** a moment later.
+   `http://127.0.0.1:8080/v1`. It appears under **Audit Log** a moment later.
 4. **Connect a coding agent** with the `ssai` CLI, as a user you added to the workspace — install
    it from the console (`curl http://127.0.0.1:3000/api/v1/cli/install.sh | sh`; on Windows, in
    PowerShell, `irm http://127.0.0.1:3000/api/v1/cli/install.ps1 | iex`), then

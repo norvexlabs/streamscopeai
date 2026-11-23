@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.82]
+
+### Fixed
+
+- **Windows sandbox: the agent's commits carry your git identity.** They were authored by the sandbox
+  account (`ssai-sbx-…` at the computer's name), or refused for want of one. `ssai run --sandbox native`
+  now gives the agent the `user.name` and `user.email` your global git configuration gives you in the
+  project as its own global configuration, so a repository that sets its own identity keeps it, as on
+  your computer. That configuration is read-only to the agent: its `git config --global` fails, and
+  what the sandbox account's own global configuration held no longer applies. Aider, with an identity
+  in your global git configuration, no longer needs one set in the project, or `--no-git`.
+
+## [2026.11.81]
+
+### Added
+
+- **`ssai sandbox doctor` (Windows) says why the agent cannot open a file, and `--fix` repairs it.**
+  It checks the sandbox account on this computer and, in the project of the current folder (a named
+  one, or every granted one with `--all`), that the project is granted, that a project outside your
+  profile sits in a folder private to you, the folders and files that inherit nothing (copied in
+  with an access list of their own, or locked by a tool), and the files moved into the project after
+  the grant, which keep the access of the folder they came from. It changes nothing unless `--fix`,
+  which lists what it will do and asks (`--yes` to skip the question): it turns inheritance back on
+  for those items, keeping their own entries but those of every account, and applies the project's
+  access again to everything below. It never changes the own access lists of the `.streamscopeai`
+  folder or of the configuration files `ssai` provisioned. It exits 1 when it finds a problem. `ssai run` names what
+  its first grant of a project does not reach, and points to it.
+- **A long sandbox grant, check or repair on Windows shows its progress**: a line counts the files as
+  it goes (a plain line every few seconds when the output is not a terminal), then says how many it
+  covered.
+
+### Changed
+
+- **BREAKING (Windows CLI): a project outside your profile now sits in a folder private to you, made
+  once for every project in it.** `ssai run` makes the folder directly under the drive's root (`C:\Projects`
+  for `C:\Projects\team\app`) — meant to hold only your project data — private to you as a whole, as your
+  profile is, after asking: it stops inheriting from
+  the drive and no longer lets every account read or write it (nor gives whoever creates a file there
+  full control of it, nor keeps an entry of its own giving every account access on an item in it), and the folders and files in it that inherited nothing inherit again. Before,
+  only the project folder was made private, and every account could still read it. A program kept in
+  that folder is reachable by the agent only where a run grants it (the tool's own folder, `ssai`'s);
+  install shared tools for all users instead. A folder that
+  already names none of those is private as it is. `--private-project` is renamed `--private-root`.
+  Under a private root, the agent can no longer change who may open the files it creates. A project
+  folder an earlier `ssai` made private keeps running as it did, with that warning; `ssai sandbox
+  doctor` reports it and `--fix` makes its folder private the new way. A project inside your profile
+  that every account may write, by its own access list or one it inherits, is made private the same
+  way, after asking; so is the project folder itself where you may not change the folder above it
+  (one an administrator made).
+- **The Overview dashboard's attention tiles follow the period you pick.** Alerts, Blocked tools,
+  Guardrail, Errors and Upstream health's refusals counted the last 24 hours whatever the period said;
+  they now count the selected period like every other panel, are labelled with it, and their links
+  open the list on exactly the rows they counted. **BREAKING (API):** `GET
+  /api/v1/admin/analytics/cross/attention` takes the window as `days` or `start`/`end`, like the
+  other dashboard reads (default one day), in place of `window_days`, and returns the window it used
+  as `start`/`end`.
+
+### Fixed
+
+- **`ssai sandbox revoke` with no folder refused a project whose tools were provisioned globally**
+  ("not inside a provisioned project"); it now takes back the project `ssai run` confines to in the
+  current folder, and a project folder deleted since its grant can still be named.
+- **A dashboard period of more days than a date can hold made the request fail** with a server error;
+  `days` above a century is now refused as an invalid window.
+
 ## [2026.11.80]
 
 ### Changed

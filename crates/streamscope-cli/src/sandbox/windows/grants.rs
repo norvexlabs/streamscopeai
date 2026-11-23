@@ -118,8 +118,9 @@ pub struct RunDirs {
     pub state: Vec<PathBuf>,
     /// The folders the client's program and its runtime load from, read and run.
     pub tools: Vec<PathBuf>,
-    /// Single files the client reads, never writes: its trust bundles and
-    /// the files it was provisioned with, which hold its gateway key.
+    /// Single files the client reads, never writes: its trust bundles, the
+    /// account's git identity, and the files it was provisioned with, which
+    /// hold its gateway key.
     pub files: Vec<PathBuf>,
 }
 
@@ -134,8 +135,16 @@ pub fn walled_to_report(mut walled: Vec<PathBuf>, project: &ProjectGrants) -> Ve
 
 /// The entries for a run in the project at `root` (absolute, already
 /// accepted by [`refused_root`]) of the developer whose profile folder is
-/// `profile`.
-pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path) -> Vec<Ace> {
+/// `profile`, with the private roots `private_roots` (each made the
+/// developer's alone, as the profile is: `acl::make_private_root`).
+pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path, private_roots: &[PathBuf]) -> Vec<Ace> {
+    // The folders private to the developer the account reaches into: the
+    // profile and each private root. Under one the developer holds full
+    // control of their own, and the account may not open a folder on the
+    // way down unless it is granted to.
+    let anchors: Vec<&Path> = std::iter::once(profile).chain(private_roots.iter().map(PathBuf::as_path)).collect();
+    // A project that is its own private root is the developer's as well.
+    let in_private = |dir: &Path| anchors.iter().any(|a| below(dir, a).is_some());
     let mut out: Vec<Ace> = Vec::new();
     let mut push = |path: &Path, trustee, kind| {
         let ace = Ace { path: path.to_path_buf(), trustee, kind };
@@ -145,13 +154,13 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     };
     let mut reached: Vec<&Path> = Vec::new();
     // `OWNER RIGHTS` replaces an owner's implied right to change access with
-    // the entry's (Modify, which has none). Inside the profile the developer
-    // keeps that right through their own full-control entry; outside it the
-    // right may come from ownership alone, and the entry would cost them
-    // revoke and the sweep there, so it is not written.
+    // the entry's (Modify, which has none). Inside the profile or a private
+    // root the developer keeps that right through their own full-control
+    // entry; elsewhere the right may come from ownership alone, and the entry
+    // would cost them revoke and the sweep there, so it is not written.
     for dir in std::iter::once(root).chain(project.extra_rw.iter().map(PathBuf::as_path)) {
         push(dir, Trustee::Account, Kind::Modify);
-        if inside(dir, profile) {
+        if in_private(dir) {
             push(dir, Trustee::OwnerRights, Kind::Modify);
         }
         reached.push(dir);
@@ -163,7 +172,7 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     // owner, from changing who may read it.
     for dir in &dirs.state {
         push(dir, Trustee::Account, Kind::Modify);
-        if inside(dir, profile) {
+        if in_private(dir) {
             push(dir, Trustee::OwnerRights, Kind::Modify);
         }
         reached.push(dir);
@@ -176,7 +185,7 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
         push(file, Trustee::Account, Kind::ReadFile);
         // Its folder too, opened and its attributes read, like every folder
         // above a grant.
-        if let Some(parent) = file.parent().filter(|p| below(p, profile).is_some()) {
+        if let Some(parent) = file.parent().filter(|p| anchors.iter().any(|a| below(p, a).is_some())) {
             push(parent, Trustee::Account, Kind::ReadAttributes);
             reached.push(parent);
         }
@@ -188,11 +197,13 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
         push(dir, Trustee::Account, Kind::ReadAttributes);
         reached.push(dir);
     }
-    // Each folder between the profile and a granted one (the profile
-    // included), opened and its attributes read.
+    // Each folder between a private one (the profile, a private root) and a
+    // granted one, the private one included, opened and its attributes read.
+    // A granted folder that IS a private root needs none of its own.
     for dir in reached {
-        if let Some(rest) = below(dir, profile) {
-            let mut at = profile.to_path_buf();
+        for anchor in &anchors {
+            let Some(rest) = below(dir, anchor).filter(|r| !r.as_os_str().is_empty()) else { continue };
+            let mut at = anchor.to_path_buf();
             push(&at, Trustee::Account, Kind::ReadAttributes);
             let parts: Vec<_> = rest.components().collect();
             for part in parts.iter().take(parts.len().saturating_sub(1)) {
@@ -212,10 +223,35 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     out
 }
 
-/// Whether `path` lies below the profile folder `profile` (not the profile
-/// itself), compared without case.
-pub fn inside(path: &Path, profile: &Path) -> bool {
-    below(path, profile).is_some_and(|rest| !rest.as_os_str().is_empty())
+/// Top-level folders of a drive that belong to the system or to every
+/// account: never a private root (lowercase).
+const SYSTEM_FOLDERS: [&str; 7] =
+    ["windows", "program files", "program files (x86)", "programdata", "users", "$recycle.bin", "system volume information"];
+
+/// The private root of `dir`, a granted folder outside the profile `profile`:
+/// the folder directly under its drive's root (`C:\work` for
+/// `C:\work\a\project`), made the developer's alone once for every project
+/// under it. `dir` itself when that folder is the system's or every
+/// account's (`C:\ProgramData`, `C:\Users`) or holds the profile. `None`
+/// for a folder inside the profile, which is private already. Compared
+/// without case, as Windows compares paths.
+pub fn private_root_of(dir: &Path, profile: &Path) -> Option<PathBuf> {
+    if below(dir, profile).is_some() {
+        return None;
+    }
+    let mut top = PathBuf::new();
+    for part in dir.components() {
+        top.push(part);
+        if matches!(part, std::path::Component::Normal(_)) {
+            break;
+        }
+    }
+    // A drive's root has none (a granted folder never is one: `refused_root`).
+    let name = top.file_name()?.to_string_lossy().to_lowercase();
+    if SYSTEM_FOLDERS.contains(&name.as_str()) || below(profile, &top).is_some() {
+        return Some(dir.to_path_buf());
+    }
+    Some(top)
 }
 
 /// What follows `base` in `path` when `path` is `base` or under it, compared
@@ -330,7 +366,7 @@ mod tests {
             tools: vec![PathBuf::from("/Users/dev/AppData/Roaming/npm")],
             files: vec![PathBuf::from("/Users/dev/AppData/Local/streamscopeai/ca/bundle.pem")],
         };
-        let aces = plan(root, &project, &dirs, profile);
+        let aces = plan(root, &project, &dirs, profile, &[]);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
         assert!(has("/Users/dev/src/app", Trustee::Account, Kind::Modify));
         assert!(has("/Users/dev/src/app", Trustee::OwnerRights, Kind::Modify));
@@ -339,7 +375,7 @@ mod tests {
         assert!(has("/Users/dev/.claude", Trustee::OwnerRights, Kind::Modify));
         // Outside the profile no `OWNER RIGHTS` entry: it would take the
         // developer's own right to change access there.
-        let outside = plan(Path::new("/data/app"), &ProjectGrants::default(), &RunDirs::default(), profile);
+        let outside = plan(Path::new("/data/app"), &ProjectGrants::default(), &RunDirs::default(), profile, &[]);
         assert!(outside.iter().any(|a| a.trustee == Trustee::Account && a.kind == Kind::Modify));
         assert!(!outside.iter().any(|a| a.trustee == Trustee::OwnerRights), "{outside:?}");
         assert!(has("/Users/dev/AppData/Roaming/npm", Trustee::Account, Kind::ReadExecute));
@@ -360,6 +396,48 @@ mod tests {
     }
 
     #[test]
+    fn a_project_under_a_private_root_is_granted_as_one_inside_the_profile() {
+        let profile = Path::new("/Users/dev");
+        let roots = [PathBuf::from("/work")];
+        let aces = plan(Path::new("/work/team/app"), &ProjectGrants::default(), &RunDirs::default(), profile, &roots);
+        let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
+        assert!(has("/work/team/app", Trustee::Account, Kind::Modify));
+        // The developer holds full control under it: `OWNER RIGHTS` is written.
+        assert!(has("/work/team/app", Trustee::OwnerRights, Kind::Modify));
+        // Every folder from the root down to the project's parent is opened.
+        assert!(has("/work", Trustee::Account, Kind::ReadAttributes));
+        assert!(has("/work/team", Trustee::Account, Kind::ReadAttributes));
+        assert!(!has("/work/team/app", Trustee::Account, Kind::ReadAttributes));
+        // Positive control: the same project with no private root gets neither.
+        let open = plan(Path::new("/work/team/app"), &ProjectGrants::default(), &RunDirs::default(), profile, &[]);
+        assert!(!open.iter().any(|a| a.trustee == Trustee::OwnerRights || a.kind == Kind::ReadAttributes), "{open:?}");
+        // A project that is its own private root opens nothing above itself.
+        let alone = plan(Path::new("/app"), &ProjectGrants::default(), &RunDirs::default(), profile, &[PathBuf::from("/app")]);
+        assert!(!alone.iter().any(|a| a.kind == Kind::ReadAttributes), "{alone:?}");
+        assert!(alone.iter().any(|a| a.trustee == Trustee::OwnerRights));
+    }
+
+    #[test]
+    fn the_private_root_is_the_folder_under_the_drive_root_unless_it_is_shared() {
+        let profile = Path::new("/Users/dev");
+        let root = |d: &str| private_root_of(Path::new(d), profile);
+        let some = |d: &str| Some(PathBuf::from(d));
+        assert_eq!(root("/work/team/app"), some("/work"));
+        assert_eq!(root("/Work/app"), some("/Work"));
+        assert_eq!(root("/app"), some("/app"));
+        // A drive's root has none.
+        assert_eq!(root("/"), None);
+        // Inside the profile: private already.
+        assert_eq!(root("/Users/dev/src/app"), None);
+        assert_eq!(root("/users/DEV/src/app"), None);
+        // A folder of the system or of every account, or one holding the
+        // profile, is never taken over: the project alone is.
+        assert_eq!(root("/Users/other/app"), some("/Users/other/app"));
+        assert_eq!(root("/ProgramData/tool/app"), some("/ProgramData/tool/app"));
+        assert_eq!(root("/Program Files (x86)/x"), some("/Program Files (x86)/x"));
+    }
+
+    #[test]
     fn a_linked_worktree_is_granted_its_git_dir_and_a_look_at_its_main_checkout() {
         let profile = Path::new("/Users/dev");
         let project = ProjectGrants {
@@ -367,7 +445,7 @@ mod tests {
             stat_only: vec![PathBuf::from("/Users/dev/main")],
             protected: vec![],
         };
-        let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile);
+        let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile, &[]);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
         assert!(has("/Users/dev/main/.git", Trustee::Account, Kind::Modify));
         assert!(has("/Users/dev/main/.git", Trustee::OwnerRights, Kind::Modify));
@@ -380,14 +458,14 @@ mod tests {
             stat_only: vec![PathBuf::from("/Users/dev/code/main")],
             protected: vec![],
         };
-        let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile);
+        let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile, &[]);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
         assert!(has("/Users/dev/code", Trustee::Account, Kind::ReadAttributes));
         // One outside the profile is opened too;
         // a drive root never gets an entry.
         let project =
             ProjectGrants { stat_only: vec![PathBuf::from("/srv/main"), PathBuf::from(r"D:\")], ..Default::default() };
-        let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile);
+        let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile, &[]);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
         assert!(has("/srv/main", Trustee::Account, Kind::ReadAttributes));
         assert!(!aces.iter().any(|a| a.path == Path::new(r"D:\")), "{aces:?}");

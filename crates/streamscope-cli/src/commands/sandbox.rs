@@ -30,6 +30,27 @@ pub enum SandboxCommand {
     /// Windows: take back every grant, then remove the sandbox account, its
     /// profile and its firewall rule. FreeBSD: remove the jail daemon (as root).
     Uninstall,
+    /// Check what the sandbox needs on this computer and in this project (or
+    /// `dir`'s, or every project the sandbox was granted with `--all`), and
+    /// report what would keep the agent out of a file it should reach. Changes
+    /// nothing unless `--fix`. Exits 1 when it finds a problem.
+    Doctor {
+        /// The project folder (default: the project of the current folder, as
+        /// `ssai run` confines to).
+        dir: Option<std::path::PathBuf>,
+        /// Every project the sandbox account was granted.
+        #[arg(long, conflicts_with = "dir")]
+        all: bool,
+        /// Repair what was found, after listing it and asking.
+        #[arg(long)]
+        fix: bool,
+        /// With `--fix`: repair without asking (read the report first).
+        #[arg(long, requires = "fix")]
+        yes: bool,
+        /// List every path found, not the first few.
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// (Re)build this project's image and the agent layer for `client` — after
     /// a change to the image, its Dockerfile's context, or to pick up the
     /// client's latest release. A first `ssai run --sandbox docker` prepares
@@ -87,15 +108,23 @@ pub async fn run(command: SandboxCommand) -> Result<()> {
         }
         #[cfg(windows)]
         SandboxCommand::Revoke { dir, all } => {
-            let root = if all {
-                None
-            } else {
-                match crate::state::resolve_scope(dir.as_deref(), false, false)? {
-                    crate::state::ManifestScope::Project(root) => Some(root),
-                    _ => bail!("not inside a provisioned project (no `.streamscopeai/` above here) — name one, or pass --all"),
-                }
-            };
+            let root = if all { None } else { Some(super::run::sandbox_root(dir.as_deref())?) };
             tokio::task::spawn_blocking(move || crate::sandbox::windows::setup::revoke(root.as_deref())).await?
+        }
+        #[cfg(windows)]
+        SandboxCommand::Doctor { dir, all, fix, yes, verbose } => {
+            let target = if all {
+                crate::sandbox::doctor::Target::All
+            } else {
+                crate::sandbox::doctor::Target::Project(super::run::sandbox_root(dir.as_deref())?)
+            };
+            let options = crate::sandbox::doctor::Options { fix, yes, verbose };
+            tokio::task::spawn_blocking(move || crate::sandbox::windows::doctor::run(target, options)).await?
+        }
+        #[cfg(not(windows))]
+        SandboxCommand::Doctor { .. } => {
+            println!("{}", crate::sandbox::doctor::NOTHING_TO_CHECK);
+            Ok(())
         }
         #[cfg(windows)]
         SandboxCommand::Uninstall => tokio::task::spawn_blocking(crate::sandbox::windows::setup::uninstall).await?,

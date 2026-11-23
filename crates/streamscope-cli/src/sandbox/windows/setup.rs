@@ -191,7 +191,9 @@ pub fn setup() -> Result<()> {
 /// project at `root` (every project when `None`).
 pub fn revoke(root: Option<&Path>) -> Result<()> {
     let record = load_record()?.context("the Windows sandbox account is not set up: there is nothing to revoke")?;
-    let revoked = super::acl::revoke(&super::acl::record_path()?, &record.account_sid, root)?;
+    let progress = crate::progress::Progress::stderr();
+    let revoked = super::acl::revoke(&super::acl::record_path()?, &record.account_sid, root, &progress)?;
+    progress.pause();
     println!("Revoked the sandbox account's access on {} path(s).", revoked.len());
     Ok(())
 }
@@ -204,7 +206,9 @@ pub fn uninstall() -> Result<()> {
     // While the account still exists: an entry for a deleted account stays
     // behind as an unresolvable SID.
     if let Some(record) = load_record().ok().flatten() {
-        let revoked = super::acl::revoke(&super::acl::record_path()?, &record.account_sid, None)?;
+        let progress = crate::progress::Progress::stderr();
+        let revoked = super::acl::revoke(&super::acl::record_path()?, &record.account_sid, None, &progress)?;
+        progress.pause();
         if !revoked.is_empty() {
             println!("  revoked the sandbox account's access on {} path(s)", revoked.len());
         }

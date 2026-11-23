@@ -25,10 +25,11 @@
 	// so the audit/sessions list opens on exactly what this dashboard shows.
 	// Single-request focus links (`request_id`) are exempt — they target one row.
 	const linkScope = $derived(dashboardScopeParams(consoleScope.period, consoleScope.workspace));
-	// Workspace-only scope for surfaces NOT filtered by the header period — the
-	// attention tiles (fixed short backend window) and the persistent notification
-	// feed. Carrying the period there could open a window that excludes the very
-	// rows the count is about, stranding the link on an empty list.
+	// Workspace-only scope for the one surface NOT filtered by the header period:
+	// the persistent notification feed. Carrying the period there could open a
+	// window that excludes the very rows an item is about, stranding the link on
+	// an empty list. The attention tiles count over the period, so their links
+	// carry `linkScope`: the list opens on exactly the rows the tile counted.
 	const linkWorkspace = $derived(dashboardWorkspaceParam(consoleScope.workspace));
 
 	type CrossTimeseriesResponse = components['schemas']['CrossTimeseriesResponse'];
@@ -87,9 +88,7 @@
 		// no longer inflates the attention counts.
 		const params = { ...currentPeriodQuery(), ...currentWorkspaceQuery() };
 		const [att, ts, er, llm, mcp, mcpServers, a2a, llmSpark, mcpSpark, a2aSpark, cacheRes] = await Promise.all([
-			adminApi.GET('/api/v1/admin/analytics/cross/attention', {
-				params: { query: { ...currentWorkspaceQuery() } },
-			}),
+			adminApi.GET('/api/v1/admin/analytics/cross/attention', { params: { query: params } }),
 			adminApi.GET('/api/v1/admin/analytics/cross/timeseries', { params: { query: params } }),
 			adminApi.GET('/api/v1/admin/notifications', {
 				params: { query: { ...currentWorkspaceQuery(), limit: 8 } },
@@ -224,7 +223,9 @@
 			: undefined,
 	);
 
-	const attentionPeriod = $derived(attention ? `${attention.window_days}d` : '');
+	// The activity tiles count over the header period, labelled as every other
+	// period-scoped card of the dashboards is.
+	const attentionPeriod = $derived(`${consoleScope.periodDays}d`);
 
 	// Upstream health — the servers' state NOW (and refusals in the window).
 	// The rule lives in `upstreamAttention`, beside the server health it reads.
@@ -265,8 +266,8 @@
 	// destination list is non-empty. Major wins ties (more actionable).
 	const alertsHref = $derived(
 		attention && attention.alerts.major > 0
-			? thref(slug, sessionsHref({ alert_level: 'major', ...linkWorkspace }))
-			: thref(slug, sessionsHref({ alert_level: 'minor', ...linkWorkspace })),
+			? thref(slug, sessionsHref({ alert_level: 'major', ...linkScope }))
+			: thref(slug, sessionsHref({ alert_level: 'minor', ...linkScope })),
 	);
 
 	// Stacked bar geometry for the timeseries chart.
@@ -371,10 +372,11 @@
 
 <DashboardScaffold title="Overview" subtitle="Cross-protocol health · LLM + MCP + A2A">
 	<!-- Attention queue: 7 tiles linking the operator to where they can act.
-	     Counts come from /analytics/cross/attention and are not period-scoped
-	     (they have their own activity / expiry windows). Each tile shows a
-	     ↑/↓ chip inline with the number when the count moved in the latest
-	     refresh. -->
+	     Counts come from /analytics/cross/attention over the header period, like
+	     every other panel of the page; the tiles that are not about the period
+	     say what they cover instead (credentials expiring ahead, the current
+	     budget day/month, upstream health now). Each tile shows a ↑/↓ chip
+	     inline with the number when the count moved in the latest refresh. -->
 	<MetricGrid class="mb-8">
 		<AttentionCard
 			{loading}
@@ -404,7 +406,7 @@
 			severity={blockedSeverity}
 			subtitle={blockedSubtitle}
 			icon="blocked"
-			href={thref(slug, auditHref({ kind: 'llm', has_blocked: 'true', ...linkWorkspace }))}
+			href={thref(slug, auditHref({ kind: 'llm', has_blocked: 'true', ...linkScope }))}
 		/>
 		<AttentionCard
 			{loading}
@@ -414,7 +416,7 @@
 			severity={guardrailSeverity}
 			subtitle={guardrailSubtitle}
 			icon="shield"
-			href={thref(slug, auditHref({ has_guardrail: 'true', ...linkWorkspace }))}
+			href={thref(slug, auditHref({ has_guardrail: 'true', ...linkScope }))}
 		/>
 		<AttentionCard
 			{loading}
@@ -435,7 +437,7 @@
 			severity={errorsSeverity}
 			subtitle={errorsSubtitle}
 			icon="errorCircle"
-			href={thref(slug, auditHref({ error_category: '_any', ...linkWorkspace }))}
+			href={thref(slug, auditHref({ error_category: '_any', ...linkScope }))}
 		/>
 		<AttentionCard
 			{loading}

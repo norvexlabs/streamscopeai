@@ -534,7 +534,7 @@ beyond `ssai provision` and `ssai run`.
 | Continue | Home-directory configuration only (its editor extension and its CLI read one file). Node.js 22.21 or newer, or the CLI stops with "MCP server(s) failed to load". Its YAML configuration keeps your settings but not your comments. |
 | Codex | Home-directory configuration only. Under the Windows sandbox its own sandbox is turned off; the sandbox account confines it instead. |
 | Crush | Home-directory configuration only. |
-| Aider | Its YAML configuration keeps your settings but not your comments. Under the Windows sandbox, set `user.name` and `user.email` in the project (or run it with `--no-git`). In the container sandbox it must already be in the image. No MCP servers. |
+| Aider | Its YAML configuration keeps your settings but not your comments. Under the Windows sandbox it needs a git identity, global or the project's own (or `--no-git`). In the container sandbox it must already be in the image. No MCP servers. |
 | Goose | Home-directory configuration only; its YAML keeps your settings but not your comments. In the container sandbox it must already be in the image. |
 | Mistral Vibe | Home-directory configuration only. It stops at its first session under the Windows sandbox, and must already be in the image for the container sandbox. |
 | Open Code Review | Home-directory configuration only. On Windows, keep the project outside your profile for its `review`. `ssai run` turns its update check off. |
@@ -592,20 +592,25 @@ Check these before your first `ssai run`; each links to its detail.
   ([The Windows sandbox](#the-windows-sandbox)).
 - **Sign in with your password** — at the desktop, over Remote Desktop, or over SSH with a password:
   from an SSH session signed in with a key, `run` cannot read the sandbox account's password.
-- **Install programs for all users, outside your profile.** The agent runs as the sandbox account,
-  which reads nothing in your profile but what a run grants it: the tool's configuration folder, the
-  folder holding the tool's program (and the one it links to), `ssai`'s folder, and, for a Python tool
-  installed with uv or pipx, its environment and the Python it was made with. A runtime or toolchain
-  installed for you alone, elsewhere in your profile — a per-user Node.js or Python, Rust in
-  `%USERPROFILE%\.cargo` — is out of the agent's reach. Installed outside your profile, every
-  account can already read and run it.
+- **Install programs for all users, outside your profile and outside your project folders.** The
+  agent runs as the sandbox account, which reads nothing in your profile, nor in a folder made private
+  to you (below), but what a run grants it: the tool's configuration folder, the folder holding the
+  tool's program (and the one it links to), `ssai`'s folder, and, for a Python tool installed with uv
+  or pipx, its environment and the Python it was made with — when they are in your profile or in the
+  project's own private folder. A runtime or toolchain installed for you alone — a per-user Node.js
+  or Python, Rust in `%USERPROFILE%\.cargo`, tools kept in a folder made private for another project —
+  is out of the agent's reach. Installed for all users (under `C:\Program Files`, for example), every
+  account can read and run it.
 - **Where the project lives:** not a drive's root, a network share, your profile folder or a folder
-  above it; on a drive that keeps access lists (not FAT or exFAT); and private to you — `run` offers
-  to make it so (`--private-project`). A Go tool resolving a project inside your profile (Open Code
+  above it; on a drive that keeps access lists (not FAT or exFAT); and, outside your profile, in a
+  folder private to you — `run` offers to make the folder under the drive's root private, once for
+  every project in it (`--private-root`). A Go tool resolving a project inside your profile (Open Code
   Review's `review`) needs the project outside your profile.
+- **When the agent cannot open a file:** `ssai sandbox doctor` says why, and `--fix` repairs it
+  ([below](#when-the-agent-cannot-open-a-file)).
 - **What does not run:** OpenCode's desktop app (the command-line agents do), Mistral Vibe (it stops at
   its first session), a login a tool keeps in Windows Credential Manager (it is per account), and
-  `--sandbox learn`. Aider needs `user.name` and `user.email` set in the project (or `--no-git`).
+  `--sandbox learn`. Aider needs a git identity, global or the project's own (or `--no-git`).
 - **A private certificate authority:** point the Node-based tools at its root with
   `setx NODE_EXTRA_CA_CERTS <root file>`; and when your administrator allows an internal HTTPS host,
   the hosts its certificate authority publishes revocation lists on must be allowed too.
@@ -874,30 +879,44 @@ checkout); Claude Code starts past its first-run screen. The grants stay between
 while one project runs, the sandbox account can also write every project it was granted before:
 `ssai sandbox revoke [<folder>]` takes one project's back, and
 `--all` every one (revoking a project that holds another granted project inside it takes that
-folder's entries back too; the inner project's next run grants them again). A folder in the project
-with an access list of its own (one that inherits nothing) is named on the first run: the sandbox's
-grant does not reach into it. Granting a project takes a moment the first time, as every file in it is given
-the account's access; the folders above a grant are opened for the account alone, so your profile's
-other files are never touched. `run` refuses a drive's root, a network share (the sandbox's
-account cannot reach one), your profile folder and any folder above it. A project folder that
-every account on the computer may write — a folder made directly on a drive inherits that
-setting — would let the sandbox's account write it whatever it is granted, so the sandbox runs
-there only once the folder is private to you: `run` explains this and asks whether to make it so
-(it stops instead when nobody can be asked), and `--private-project` makes it so without asking.
-The project folder then stops inheriting from the folder above it: you keep full control, SYSTEM
-and the administrators keep their access, and the groups every account belongs to (Everyone,
-Authenticated Users, Users and the like) keep reading but no longer write it, even where the
-folder named them itself; any other account or group it names keeps what it has. A file or folder
-inside it that lets every account write by its own access list keeps that. A change that was stopped part-way is asked for again on the next
-run. For a linked worktree, the main repository's folder is checked and made private the same
-way. A drive that keeps no access lists (FAT, exFAT) cannot hold a sandboxed project. Revoke
-leaves the folder private; the run that changes it names the command that makes it inherit
-again. A folder above the project that every account may write is named on each run and never
-changed (it may be shared by every account on the computer): the agent can leave there what a
-tool looking upward finds, such as a `node_modules` folder — and so it can at a drive's root,
-where every account may create folders. Outside your profile each run also warns that the agent
-can change who may open the files it creates, and giving them back to you may need an
-administrator. Files the agent creates in the
+folder's entries back too; the inner project's next run grants them again). An item in the project
+the grant does not reach — one that inherits nothing, or one whose access was set before the grant —
+is named on the first run (see [When the agent cannot open a file](#when-the-agent-cannot-open-a-file)).
+Granting a project takes a moment the first time, as every file in it is given the account's access
+(a line counts the files as it goes); the folders above a grant are opened for the account alone, so
+your profile's other files are never touched. `run` refuses a drive's root, a network share (the
+sandbox's account cannot reach one), your profile folder and any folder above it.
+
+A project outside your profile must sit in a folder that is private to you, as your profile is: a
+folder made directly on a drive lets every account on the computer write it (and read it), the
+sandbox's account included, whatever it is granted. So the folder directly under the drive's root
+that holds the project (`C:\Projects` for `C:\Projects\team\app`) is made private to you, once,
+for every project in it. That folder is meant to hold only your project data — any name will do; a
+short path such as `C:\Projects` also spares the tools long paths and spaces — and is made private as
+a whole, so keep there nothing other accounts use (a toolchain, a shared folder): `run` explains this, lists what it will change and asks (it stops instead when nobody
+can be asked), and `--private-root` makes it so without asking. The folder then stops inheriting
+from the drive: you keep full control, SYSTEM and the administrators keep their access, and the
+groups every account belongs to (Everyone, Authenticated Users, Users and the like) are removed from
+it, reading included, as is a CREATOR OWNER entry (which would give whoever creates a file there —
+the agent too — full control of it); the owner of each file is not changed. A folder or file in it
+that gives every account access by an entry of its own loses that entry too. A folder whose access
+list already names none of these is private as it is, and nothing is asked. A folder or file in it that inherited
+nothing inherits again, keeping its own entries but those of every account — except each project's
+`.streamscopeai` folder and the configuration files `ssai` provisioned, which hold your key and stay
+yours alone. A folder of the system or of every account (`C:\Users`, `C:\ProgramData`, `C:\Program
+Files`) is never made private: there the project folder alone is. A change stopped part-way is asked
+for again on the next run. For a linked worktree, the main repository's folder is checked the same
+way. A drive that keeps no access lists (FAT, exFAT) cannot hold a sandboxed project. Revoke leaves
+the folder private; the run that changes it names the command that makes it inherit again
+(`icacls "<folder>" /inheritance:e`). A project folder that every account may still write — by an
+entry of its own, or, inside your profile, one it inherits from a folder above — is made private on
+its own the same way, after asking, and so is the project folder where you may not change who may
+open the folder above it (one an administrator made). A project folder an earlier `ssai` made private on its own
+(every account still reading it) keeps running as it did, with a warning that the agent can change
+who may open the files it creates there; `ssai sandbox doctor` reports it, and `--fix` makes its
+folder private as above. A folder above the project that
+every account may write by an entry of its own is named on each run and never changed. Files the
+agent creates in the
 project are given back to you when a run ends with no other run of yours still going (otherwise
 by the next one that does), so you remain their owner. The tool runs with the
 account's own profile and temporary folder: its history and caches stay there, apart from yours,
@@ -908,9 +927,14 @@ the run, is removed when the run ends and before the next one starts — while y
 sandboxed run open, this waits until the last one ends, so one run never stops another. The
 Windows sandbox runs the command-line agents — Claude Code, Codex, Gemini CLI, Qwen Code, OpenCode,
 Crush, the Continue CLI, Goose, Aider and Open Code Review, with their terminal interfaces — not
-OpenCode's desktop app. Aider writes a git identity into the project's own git configuration when
-it finds none, which the sandbox refuses: set `user.name` and `user.email` in the project (or run it
-with `--no-git`). Mistral Vibe changes the access settings of the folders it creates, which the
+OpenCode's desktop app. The agent's own global git configuration holds the `user.name` and
+`user.email` your global configuration gives you in the project (an `includeIf` for its folder
+included), so its commits carry your identity — a repository's own wherever one sets it, as on your
+computer — not the sandbox account's. Only those two values are carried, resolved once for the run
+(a nested repository that an `includeIf` would give another identity gets the project's), and the agent's
+`git config --global` cannot change that configuration. Aider writes an identity into the
+project when git has none, which the sandbox refuses: set one, globally or in the project (or run
+Aider with `--no-git`). Mistral Vibe changes the access settings of the folders it creates, which the
 sandbox never allows, so it stops at its first session. A Go tool resolving a project inside your
 profile (Open Code Review's `review`) needs to list your profile folder, which the sandbox account
 cannot: keep such a project outside your profile. Aider and Open Code Review's `USERPROFILE` reaches every program the agent starts: one
@@ -928,6 +952,36 @@ whether a server's certificate was revoked, and tools using Windows' own TLS (gi
 .NET) fail when that check cannot reach its servers: if your administrator allows an internal HTTPS
 host (a git server, a registry), the destination list must also allow the hosts its certificate
 authority publishes revocation lists on.
+
+#### When the agent cannot open a file
+
+The sandbox's account reaches a file in the project through what the project grants and the file
+inherits. A file that inherits nothing — copied in with an access list of its own (a backup restore,
+`robocopy /SEC`, an archive that keeps them), or locked by a tool — is out of its reach, and so is a
+file moved into the project after the grant, which keeps the access list of the folder it came from
+(a download moved in, a file a package manager links from its cache). `ssai sandbox doctor` finds
+them, in the project of the current folder (the one `run` confines to), in a named one, or in every
+granted one with `--all`:
+
+```
+ssai sandbox doctor                 # report only; exits 1 when it finds a problem
+ssai sandbox doctor --fix           # repair what it found, after listing it and asking
+ssai sandbox doctor --fix --yes     # repair without asking (read the report first)
+```
+
+It checks the sandbox account on this computer (`ssai sandbox setup` repairs it), and in each
+project: that a project outside your profile sits in a folder private to you, that the project is
+granted, the folders and files that inherit nothing, the items missing the account's access though
+they inherit, and those giving every account access (or whoever creates a file there full control)
+by an entry of their own. `--fix` makes the folder private (as `run` does, above), turns inheritance
+back on for each item that has none — keeping its own entries but those of every account — and
+applies the project's access again to everything below, which reaches the files moved in. Before
+making a folder private it lists every item in it that inherits nothing, which it changes too. It
+never changes the own access lists of a `.streamscopeai` folder or of the configuration files `ssai`
+provisioned, which hold your key, nor those of a project whose record cannot be read (named in the
+report). A long check or repair
+shows the count of files as it goes; a file whose access list you may not change is named after
+the repair.
 
 #### The FreeBSD sandbox
 
@@ -1285,8 +1339,9 @@ one (on `provision`, `sync`, `status`, `forget`, `logout`, `update`, `run` and `
 | `ssai provision` | writes your tools' configurations ([section 4](#4-provision-your-tools)) | `--local` / `--dir <path>` / `--global` (where), `--client <tool>` (which, repeatable), `--workspace` (which workspace's key, asked when you have several), `--provider` (which provider, for every tool or `<tool>=<provider>`), `--mode <tool>=byok` or `--byok` for all (your own provider credential through a `vk-` key; `--mode <tool>=gateway` for one back), `--template <tool>=<variant>`, `--mcp` / `--all-mcp` / `--no-mcp` / `--local-mcp` / `--no-local-mcp`, `--key-name`, `--key-ttl`, `--dry-run` (show, write nothing), `--print` (the configs to the terminal), `--yes`, `--verbose` |
 | `ssai sync` | brings every provisioned configuration up to date ([section 6](#6-keep-your-setup-current)) | `--watch` with `--interval` (5 minutes by default), `--client` / `--skip`, `--key-ttl` for a replacement key, `--yes` |
 | `ssai status` | what you are logged in to, what is provisioned, what was edited since | |
-| `ssai run <tool>` | starts a provisioned tool in the sandbox ([section 5](#5-run-an-agent-in-the-sandbox)) | `--sandbox auto\|native\|docker\|learn\|off`, `--network gateway\|policy`, `--ca-file`, `-e KEY=VALUE`, `--verbose`, `--private-project` (Windows); the tool's own arguments after `--` |
+| `ssai run <tool>` | starts a provisioned tool in the sandbox ([section 5](#5-run-an-agent-in-the-sandbox)) | `--sandbox auto\|native\|docker\|learn\|off`, `--network gateway\|policy`, `--ca-file`, `-e KEY=VALUE`, `--verbose`, `--private-root` (Windows); the tool's own arguments after `--` |
 | `ssai sandbox setup` · `revoke` · `uninstall` | the Windows sandbox account ([The Windows sandbox](#the-windows-sandbox)); on FreeBSD, the service that builds each run's jail, as root ([The FreeBSD sandbox](#the-freebsd-sandbox)) | `setup --check`, `revoke [<folder>]`, `revoke --all` |
+| `ssai sandbox doctor` | checks what the sandbox needs on this computer and in a project, and repairs it ([When the agent cannot open a file](#when-the-agent-cannot-open-a-file)) | `[<folder>]`, `--all`, `--fix`, `--yes`, `--verbose` |
 | `ssai sandbox prepare <tool>` · `status` · `prune` | the container sandbox's images ([Advanced: the container sandbox](#advanced-the-container-sandbox-linux)) | `prune --project [<folder>]` |
 | `ssai forget <tool>` | stops managing a tool, leaving its files as they are | |
 | `ssai restore` | puts back the files a provisioning or a sync changed | `--list`, `--run <timestamp>`, `--global`, `--yes` |

@@ -9,6 +9,8 @@ pub mod cmdline;
 pub mod frame;
 #[cfg(windows)]
 pub mod acl;
+#[cfg(windows)]
+pub mod doctor;
 pub mod grants;
 #[cfg(windows)]
 pub mod host;

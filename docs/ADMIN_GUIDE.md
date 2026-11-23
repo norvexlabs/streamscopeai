@@ -227,8 +227,8 @@ gateway within a couple of seconds.
    every URL. *(Optional, later: switch the organization to single sign-on — see step 1, **Auth &
    identity**.)*
 
-2. **Connect a provider.** **LLM Gateway → New Upstream Server** — pick the provider (OpenAI,
-   Anthropic, Gemini, Ollama, …), paste its API key, and leave **Auto-sync** on. Within a moment the
+2. **Connect a provider.** **Gateways → LLM**, **+ Add Server** — pick the provider (OpenAI,
+   Anthropic, Gemini, Ollama, …), paste its API key, and leave model discovery on. Within a moment the
    server is reachability-checked, its models are discovered, and a matching **downstream provider**
    (your menu of model aliases) appears. The provider key is encrypted at rest and never shown to
    users again. A provider on a private network (a self-hosted vLLM or Ollama server) is refused
@@ -236,13 +236,14 @@ gateway within a couple of seconds.
    section **A**, *Egress*. *(Detail: step 2, **Providers**.)*
 
 3. **Grant the provider to a workspace.** **Governance → Workspaces** — open the seeded **Default**
-   workspace and add the provider you just connected to its allowlist. This is the step new admins
+   workspace and, on its **Access** tab, add the provider you just connected to its **LLM
+   providers**. This is the step new admins
    miss: a workspace reaches **nothing** until you grant it, and there is no wildcard. While you're
    here you can set an optional budget and RPM/TPM ceiling. *(Detail: step 3, **Workspaces**.)*
 
 4. **Decide who mints keys — you, or your users.** Two patterns, pick per team:
-   - **You provision** — **Keys** page: add the people who need access, put them in the workspace,
-     and mint a gateway key for each. Copy each key once (it's shown only once). Best for a handful
+   - **You provision** — **Governance → Keys**: add the people who need access, put them in the
+     workspace (a key is minted only for a member of its workspace), and mint a gateway key for each. Copy each key once (it's shown only once). Best for a handful
      of service accounts or a locked-down rollout. *(Detail: step 4, **Users & keys**.)*
    - **They self-serve** — hand users the **portal** (`…/portal/login/<organization>`). Once they're
      in a workspace they mint their own keys and run the **Quickstart** wizard, which prints the exact
@@ -256,7 +257,7 @@ gateway within a couple of seconds.
    [Configure a client by hand](PORTAL_GUIDE.md#configure-a-client-by-hand). Send one real request.
 
 6. **Watch it land.** Back in the console, the **Dashboard** shows the request (tokens, cost,
-   latency, status); **Sessions** replays it turn-by-turn, and **Audit** holds the per-request row.
+   latency, status); **Sessions** replays it turn-by-turn, and **Audit Log** holds the per-request row.
    If a request is rejected, the most common cause is step 3 — the workspace isn't granted the
    provider the model belongs to. *(Detail: step 9, **Observe & investigate**.)*
 
@@ -2333,7 +2334,7 @@ while pages went past it unread. And if you switch on **notify on detection** in
 Guardrail tab, the gateway raises a once-a-day operator alert when injection is caught —
 naming where it was seen (an inbound prompt vs fetched web content) and linking straight
 to the flagged request — so you learn an attack was caught without having to watch the
-dashboard. The tile follows the Overview's workspace filter (which excludes the Agent
+dashboard. The tile follows the Overview's period and workspace filter (which excludes the Agent
 workspace by default); the alert deliberately does not — an injection in a page the
 assistant's own agent fetched is a security event worth surfacing, not background noise to
 filter out.
@@ -2596,7 +2597,7 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
     Content Logging is on — there is no separate toggle.
   - **Agent** — the expert loop's cadence (interval, session cooldown) and run window; the
     judge model lives on the expert profiles (Experts → Profiles).
-  - **Advanced** (super-admin) — the process-settings catalog with central edge overrides, and
+  - **System** (super-admin) — the process-settings catalog with central edge overrides, and
     **Trusted CAs**: a PEM CA bundle trusted for all of the gateway's outbound HTTPS (upstream
     providers, the liveness probe, model discovery, OIDC, MCP, web fetch, the guardrail
     classifier) on top of the system
@@ -2639,7 +2640,7 @@ admin-console only (read-only accounts see them too).
   nothing (every gateway that sends to it has taken every enabled replica out of rotation — a
   gateway that has not sent to the server in the last ten minutes has no say), amber while one is
   degraded (some gateway has some replica out, and the rest carry the traffic), requests were refused for
-  want of capacity in the window (a refusal a fallback then absorbed included), or an engine whose
+  want of capacity in the Overview's period (a refusal a fallback then absorbed included), or an engine whose
   queue bound depends on its metrics has stopped reporting (an engine read only for its charts shows
   as *Silent* on its server's page instead); it opens the server that is down, or the Servers view. A
   breaker opening also posts a notification — the tile is the state now, the notification the

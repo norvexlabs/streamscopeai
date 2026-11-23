@@ -1214,6 +1214,31 @@ impl Manifest {
         }
     }
 
+    /// Every file the manifest at `path` records writing, each `~/…` expanded
+    /// and spelled real as on disk (a file not there kept as written); `None`
+    /// when there is no manifest; an error when it does not read as this
+    /// version's. A project's manifest can come with its sources: a reader
+    /// uses this list only to leave files alone, never to reach one.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "read by the Windows sandbox's doctor and takeover"))]
+    pub fn recorded_files(path: &Path) -> Result<Option<Vec<PathBuf>>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let manifest = Self::read(path)?.map_err(|e| unreadable_manifest(path, &e))?;
+        Ok(Some(
+            manifest
+                .hosts
+                .values()
+                .flat_map(|ws| ws.clients.iter())
+                .flat_map(|client| client.files.iter())
+                .filter_map(|file| {
+                    let path = expand_tilde(&file.path).ok()?;
+                    Some(dunce::canonicalize(&path).unwrap_or(path))
+                })
+                .collect(),
+        ))
+    }
+
     /// The manifest at `path` — empty when there is none — or why its bytes do
     /// not parse; an error reading the file is the outer one.
     fn read(path: &Path) -> Result<std::result::Result<Self, serde_json::Error>> {

@@ -344,9 +344,8 @@ export function dashboardScopeParams(
 /**
  * The workspace half of {@link dashboardScopeParams}, without the period. Use
  * for deep-links off a surface whose figures are NOT scoped by the header
- * period — a persistent notification feed, or the attention tiles' fixed
- * short backend window — where carrying the period would open a window that
- * excludes the very rows the count is about. A pinned workspace is carried; the
+ * period — the persistent notification feed — where carrying the period would
+ * open a window that excludes the very rows an item is about. A pinned workspace is carried; the
  * `'all'` aggregate is left off (it maps to the page default).
  */
 export function dashboardWorkspaceParam(w: WorkspaceValue): { workspace_ids?: string } {

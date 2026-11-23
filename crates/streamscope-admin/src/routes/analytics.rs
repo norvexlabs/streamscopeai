@@ -3678,8 +3678,14 @@ pub(crate) fn build_bucket_axis(start: DateTime<Utc>, end: DateTime<Utc>, interv
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct CrossAttentionQuery {
-    /// Activity lookback for alerts / blocked / auth failures, in days. Default 1.
-    pub window_days: Option<i32>,
+    /// Rolling lookback in days for the activity tiles (alerts, blocked tool
+    /// calls, guardrail, errors, upstream refusals) — the dashboard's period.
+    /// Mutually exclusive with `start`/`end`. Default 1.
+    pub days: Option<i32>,
+    /// Inclusive window start (RFC3339).
+    pub start: Option<DateTime<Utc>>,
+    /// Exclusive window end (RFC3339).
+    pub end: Option<DateTime<Utc>>,
     /// Forward window for credential expiry warnings, in days. Default 7.
     pub expiry_window_days: Option<i32>,
     /// Comma-separated workspace ids to include (UUIDs). Omit for all workspaces.
@@ -3987,8 +3993,9 @@ pub struct AttentionResponse {
     pub budget: AttentionBudget,
     pub upstreams: AttentionUpstreams,
     pub generated_at: DateTime<Utc>,
-    /// Echoed window so the UI can label "in last Nd" without re-computing.
-    pub window_days: i32,
+    /// The activity window the counts cover, as resolved from the request.
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
     pub expiry_window_days: i32,
 }
 
@@ -3998,7 +4005,8 @@ pub struct AttentionResponse {
     tag = "Analytics",
     params(CrossAttentionQuery),
     responses(
-        (status = 200, description = "Attention queue: counts of items needing operator action — flagged sessions, blocked tool calls, expiring credentials, and authentication failures. Each tile on the Dashboard Overview reads from a field on this response and deep-links into the corresponding management surface.", body = AttentionResponse),
+        (status = 200, description = "Attention queue: counts of items needing operator action over the requested window — flagged sessions, blocked tool calls, guardrail findings, errors, upstream refusals — plus credentials expiring within `expiry_window_days`, the budget scopes of the current day/month and the upstreams' health now. Each tile on the Dashboard Overview reads from a field on this response and deep-links into the corresponding management surface.", body = AttentionResponse),
+        (status = 400, description = "Invalid time window", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -4009,9 +4017,9 @@ pub async fn cross_attention(
     Query(query): Query<CrossAttentionQuery>,
 ) -> Result<Json<AttentionResponse>, ApiError> {
     let tenant_id = db.tenant_uuid();
-    let window_days = query.window_days.unwrap_or(1).clamp(1, 30);
+    let window = TimeWindow { days: query.days, start: query.start, end: query.end }.resolve(DEFAULT_USAGE_DAYS)?;
     let expiry_window_days = query.expiry_window_days.unwrap_or(7).clamp(1, 90);
-    tools_store::cross_attention(&mut db, tenant_id, window_days, expiry_window_days, &query).await.map(Json)
+    tools_store::cross_attention(&mut db, tenant_id, window, expiry_window_days, &query).await.map(Json)
 }
 
 #[cfg(test)]

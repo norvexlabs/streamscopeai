@@ -43,7 +43,8 @@ the container images, the installer, the Helm chart, the VM's OS bundle and its 
 the same version (`v<version>`, never rewritten). Every package is public: nothing needs an account
 or a sign-in to install.
 
-In this guide `<registry>` stands for `ghcr.io/norvexlabs`, or for your own mirror of it (below).
+The commands in this guide read `ghcr.io/norvexlabs`. A site that installs from its own mirror
+(below) puts the mirror's prefix in its place, written `<registry>` where a command names it.
 
 ### What you need
 
@@ -55,7 +56,7 @@ In this guide `<registry>` stands for `ghcr.io/norvexlabs`, or for your own mirr
 ### Getting the installer
 
 ```bash
-docker run --rm <registry>/streamscopeai-installer:latest > streamscopeai.sh
+docker run --rm ghcr.io/norvexlabs/streamscopeai-installer:latest > streamscopeai.sh
 sh streamscopeai.sh …                # Docker install; `k8s …` and `vm create …` for the other shapes
 ```
 
@@ -875,7 +876,7 @@ replication.
   content logging, rate limits, web search, feature toggles). Covered in the
   [Admin Guide](ADMIN_GUIDE.md).
 - **Process settings** — the ~80 edge/proxy tuning knobs are surfaced in the admin
-  **Settings → Advanced** tab (super-admin), centrally editable; overrides apply on the next
+  **Settings → System** tab (super-admin), centrally editable; overrides apply on the next
   restart. That tab is the supported route for all of them, on every deployment shape. A minority
   are read once at startup and so cannot be changed there. Of those, the ones with a legitimate
   reason to differ per deployment are **advanced settings** of the installer — never asked, set
@@ -944,8 +945,8 @@ Fetch an extension's installer exactly as you fetch the product's (§ A, *Gettin
 with its app name:
 
 ```bash
-docker run --rm <registry>/ssai-searxng-installer:latest > ssai-searxng.sh
-docker run --rm <registry>/ssai-protectai-installer:latest > ssai-protectai.sh
+docker run --rm ghcr.io/norvexlabs/ssai-searxng-installer:latest > ssai-searxng.sh
+docker run --rm ghcr.io/norvexlabs/ssai-protectai-installer:latest > ssai-protectai.sh
 ```
 
 An extension is connected in the console, not at install:
@@ -1054,7 +1055,7 @@ Prefer host names and narrow prefixes over `*`.
 
 Private services usually present certificates from an internal CA: import it in the *Trusted CAs*
 panel of Settings → System (SYSTEM super-admin). The console's own checks use it at once; a running
-gateway uses it after its next restart.
+gateway uses it after its next restart (on Docker, `ssai-stow restart proxy`).
 
 **The gateway's allowed browser origins** (`PROXY_CORS_ORIGIN`, default empty: any origin) and the
 **log filter** (`RUST_LOG`) are advanced settings on the VM and Docker; on Kubernetes the log filters
@@ -1246,7 +1247,7 @@ no limit of their own: they are kept while their client session is held or in us
 notification streams have a limit of their own, logged when reached. Past a limit the calls still
 succeed — some slower; a log level a client sets may not be kept, and a refused client session's
 calls reach their server without the protocol version it agreed — until an idle entry expires (`MCP_SESSION_IDLE_TTL_SECS`, 30 minutes). A rising count means the gateway
-serves more MCP users within that window than the cap allows: raise it in **Settings → Advanced**;
+serves more MCP users within that window than the cap allows: raise it in **Settings → System**;
 each gateway reads the new value when it restarts.
 `streamscope_proxy_outbox_shipped_records_total` counts the audit records the console has answered
 for; beside `streamscope_proxy_pending_audit_records` it shows whether the backlog is draining.
@@ -1256,7 +1257,7 @@ to a buffer on its own disk before sending them to the console. An unreachable c
 this down: the buffer keeps filling (see the database outage note below). A gateway serving more
 requests than its own disk writes can take in, for example hundreds of agents working without pause,
 fills the few records it queues in memory in front of the buffer (`AUDIT_CHANNEL_CAPACITY`, 1,000 per
-kind of record). `AUDIT_FAIL_MODE` (**Settings → Advanced**, read by each gateway when it restarts)
+kind of record). `AUDIT_FAIL_MODE` (**Settings → System**, read by each gateway when it restarts)
 decides what happens then (an unreadable value is read as `closed`):
 - `closed` (the default): the gateway holds each new request until the queue has room. No request's
   record is dropped in front of the buffer, and the gateway serves at the rate its audit trail
@@ -1727,7 +1728,7 @@ enforcement before relying on them.
   serving the traffic of every key they already know, with the configuration they hold; budgets and
   rate limits are still enforced, against the last fleet-wide totals plus each gateway's own usage
   since. Each gateway holds its audit records until the control plane is back — up to 1 GiB per
-  gateway by default (`EDGE_OUTBOX_MAX_MB`, Settings → Advanced; past it the oldest records are
+  gateway by default (`EDGE_OUTBOX_MAX_MB`, Settings → System; past it the oldest records are
   dropped and logged) — and the *pending locally-buffered audit records* metric shows how much is
   waiting. That buffer is the gateway pod's temporary storage: a gateway pod replaced, drained or
   scaled in while the control plane is unreachable loses the audit it still holds (with the control
@@ -1789,12 +1790,15 @@ anything you configure afterwards is identical.
 ### Step 1 — Install
 
 ```bash
-docker run --rm <registry>/streamscopeai-installer:latest > streamscopeai.sh && sh streamscopeai.sh
+docker run --rm ghcr.io/norvexlabs/streamscopeai-installer:latest > streamscopeai.sh && sh streamscopeai.sh
 ```
 
-It asks where to install (default `./streamscopeai`), checks Docker, Compose and the ports, asks how to
-serve (loopback by default), then a handful of questions — the install answers of § E, all of which
-have sensible answers already filled in — and shows them for review. Then it:
+It asks where to install (default `./streamscopeai`) and how to serve (default: only on this
+machine, plain HTTP on a loopback address), then the install answers of § E: the platform
+administrator's email — the one answer with no default — the organisation's name (`Default`) and
+short name (`default`), its administrator's email (the platform administrator's), and the addresses
+allowed to scrape metrics (none). It shows them for review, checks Docker, Compose and the ports,
+then:
 
 - writes the deployment into the install directory,
 - generates the encryption key, the signing secret and the database passwords,
@@ -1802,15 +1806,17 @@ have sensible answers already filled in — and shows them for review. Then it:
 - creates a platform administrator and an organisation with its own administrator,
 - and saves their credentials to `streamscopeai/credentials.txt` (readable only by you).
 
-Pressing Enter at every question gives an organisation named `Default`, whose administrator uses the
-platform administrator's email address. They are separate accounts, each with its own generated
-password.
+Typing your email and pressing Enter at every other question gives an organisation named `Default`,
+whose administrator uses the platform administrator's email address. They are separate accounts,
+each with its own generated password.
 
-When it finishes it prints the console host's address: by default `http://127.0.0.1:3000` (the
-users' portal at `/`, the organisation's console at `/admin`, the platform's at `/system`) and the
-gateway on `http://127.0.0.1:8080/v1`. `ssai-stow status` prints every route's URL.
+When it finishes it prints the console's address, by default `http://127.0.0.1:3000`: the users'
+portal at `/`, the organisation's console at `/admin`, the platform's at `/system`. The gateway is
+on `http://127.0.0.1:8080/v1` and the admin API on `http://127.0.0.1:9090`;
+`streamscopeai/ssai-stow status` prints every route's URL.
 
-To install without being asked anything, add `--no-input` and give the answers with `--set KEY=VALUE`
+To install without being asked anything, add `--no-input` and give at least the administrator's
+email, `--set SETUP_ADMIN_EMAIL=you@example.com`; give other answers with `--set KEY=VALUE`
 or `--answers answers.yaml` (a YAML map, `KEY: value`, with an optional `tls` section — `mode`, `cert`,
 `key`, `ca`, paths relative to the file — so one file describes the whole install), or `--given FILE|-`
 (the same answers and TLS material as PEM, from a file or standard input: § D); add `--no-provision`
@@ -1841,7 +1847,7 @@ sh streamscopeai.sh --ports console=3100
 
 **Without registry access**, prefer a mirror (§ A). Otherwise, load the release's images on the host
 (`docker load`, keeping the release's tags — including the TLS front end's,
-`<registry>/streamscopeai-front:<tag>`) and install with `--offline`: each image is checked against
+`ghcr.io/norvexlabs/streamscopeai-front:v<version>`) and install with `--offline`: each image is checked against
 the release, and any that is missing is named. Make the archive on a host with the same kind of
 Docker image store as the target.
 
@@ -1850,10 +1856,12 @@ Docker image store as the target.
 Sign in at `http://127.0.0.1:3000/admin` as the organisation administrator from `credentials.txt`, then,
 as the Admin Guide's *Getting started* describes:
 
-1. add your model provider under **Providers** — its API key, or the address of a self-hosted
-   server;
-2. allow the **Default** workspace to use it;
-3. add yourself (or your users) to the workspace and create an **API key**.
+1. add your model provider: **Gateways → LLM**, **+ Add Server** — its API key, or the address of
+   a self-hosted server;
+2. allow the **Default** workspace to use it: **Governance → Workspaces**, **Default**, its
+   **Access** tab;
+3. add yourself (or your users) to that workspace and create an **API key** for each, on the
+   **Keys** page — a key is minted only for a member of the workspace.
 
 A provider on your own network — a vLLM or Ollama server on the LAN, say — is a private address,
 which the platform refuses until it is listed: sign in as the platform administrator at
@@ -1869,7 +1877,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"model":"<a model listed in the console>","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The request appears in the console under **Audit** within a second or two, with its cost, its tokens
+The request appears in the console under **Audit Log** within a second or two, with its cost, its tokens
 and the policy decisions that were applied to it.
 
 ### Step 4 — Connect a coding agent or the CLI
@@ -1932,8 +1940,10 @@ Each change is logged; the values it replaced are kept, so a re-run giving them 
 a domain, update the same URL in the console under **Settings → Defaults**.
 
 The installer also runs the stack's services one at a time — `ps`, `logs <service>`, `restart`,
-`stop` and `start <service>`, `exec <service> -- <command>` — and `uninstall` removes the stack's
-containers, keeping its data and the install directory for a later install. `uninstall --data` also
+`stop` and `start <service>`, `exec <service> -- <command>`. There is no command that stops the
+whole stack: `uninstall` takes it down, removing its containers and networks and keeping its data
+and the install directory, and running `streamscopeai/ssai-stow --dir ./streamscopeai` again brings
+it back on that data, with the same accounts and keys. `uninstall --data` also
 deletes the data **and the install directory** — its secrets (the encryption key included), the
 snapshots and the release kept for rollback: copy off what you want to keep first.
 
@@ -1951,7 +1961,7 @@ many connections (the `network` profile); on a host shared with other work, a re
 # (read from the install's registry, signed by a key the install trusts; --json for a script).
 streamscopeai/ssai-stow updates --dir ./streamscopeai [--channel C] [--version V]
 streamscopeai/ssai-stow upgrade --dir ./streamscopeai --version <release>
-# or: docker run --rm <registry>/streamscopeai-installer:latest > streamscopeai.sh && sh streamscopeai.sh upgrade --dir ./streamscopeai
+# or: docker run --rm ghcr.io/norvexlabs/streamscopeai-installer:latest > streamscopeai.sh && sh streamscopeai.sh upgrade --dir ./streamscopeai
 ```
 
 `<release>` is the version you are moving to, e.g. `2026.11.1`; read the changelog of every release
@@ -2006,8 +2016,8 @@ and its `--stage` / `--finish` passes (see *Rotating `AUTH_SECRET`*, § B).
 ### Hardening
 
 - **Keep it on loopback, or put it behind TLS.** There is no third option that is safe.
-- **Move the credentials off the host.** `credentials.txt` holds the account passwords, an API key
-  and the automation keys. Record them wherever you keep secrets and delete the file.
+- **Move the credentials off the host.** `credentials.txt` holds the two accounts' passwords and
+  their automation keys (the platform's operator key and the organisation's). Record them wherever you keep secrets and delete the file.
 - **Export the secrets.** The encryption key cannot be rotated once provider credentials have been
   stored; it is generated for you and kept in the install directory. Keep an encrypted copy off the
   host: `streamscopeai/ssai-stow secrets export --dir ./streamscopeai --recipient age1…`.

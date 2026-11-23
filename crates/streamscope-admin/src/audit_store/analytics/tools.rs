@@ -14,7 +14,8 @@ use uuid::Uuid;
 use crate::audit_store::AuditScope;
 use crate::audit_store::tool_activity::ToolCallScan;
 use crate::audit_store::filters::{
-    AUDIT_LOG_JOIN, AUDIT_LOG_TURN_WINDOW, AUDIT_LOG_WINDOW, AnalyticsFilterBuilder, WEB_AUDIT_JOIN, window_sql,
+    AUDIT_LOG_JOIN, AUDIT_LOG_TURN_WINDOW, AUDIT_LOG_WINDOW, AnalyticsFilterBuilder, WEB_AUDIT_JOIN, WEB_AUDIT_WINDOW,
+    window_sql,
 };
 use crate::db::tenant::{Scoped, TenantConn};
 use crate::sql_pattern::contains_pattern;
@@ -813,22 +814,25 @@ pub(crate) async fn transform_stats(
     })
 }
 
-/// The attention queue: the counts behind each tile over the last
-/// `window_days`, keys expiring within `expiry_window_days`, the budget scopes
-/// and the live server load.
+/// The attention queue: the counts behind each activity tile over `window`
+/// (the dashboard's period — the same window every other panel of the page
+/// reads), keys expiring within `expiry_window_days`, the budget scopes and the
+/// live server load.
 pub(crate) async fn cross_attention(
     db: &mut TenantConn,
     tenant_id: Uuid,
-    window_days: i32,
+    window: (DateTime<Utc>, DateTime<Utc>),
     expiry_window_days: i32,
     query: &CrossAttentionQuery,
 ) -> Result<AttentionResponse, ApiError> {
-    // The workspace filter binds at $2. The two day counts reach the SQL as
-    // `INTERVAL` literals via `interval_days` (Postgres takes no bind inside an
+    // An activity tile's statement binds the tenant at $1, the window at $2/$3
+    // and the workspace filter at $4; the expiring-credentials tile (no window)
+    // binds the workspace at $2. The expiry day count reaches the SQL as an
+    // `INTERVAL` literal via `interval_days` (Postgres takes no bind inside an
     // INTERVAL literal); that helper's `i32` parameter is what keeps it safe. The
-    // expiring-credentials tile scopes its `api_keys` side via `$2` and drops the
-    // workspace-less `mcp_user_credentials` union when a workspace is set.
-    let window_interval = interval_days(window_days);
+    // expiring-credentials tile drops the workspace-less `mcp_user_credentials`
+    // union when a workspace is set.
+    let (start, end) = window;
     let expiry_sql = interval_days(expiry_window_days);
     let workspace_ids = parse_workspace_ids(&query.workspace_ids);
     // The budget tile's shared evaluator filters by a single workspace. The
@@ -841,20 +845,31 @@ pub(crate) async fn cross_attention(
         _ => None,
     };
     let ws_alerts = if workspace_ids.is_some() {
-        " AND sessions.workspace_id = ANY($2)"
+        " AND sessions.workspace_id = ANY($4)"
     } else {
         ""
     };
     let ws_blocked = if workspace_ids.is_some() {
-        " AND g.workspace_id = ANY($2)"
+        " AND g.workspace_id = ANY($4)"
     } else {
         ""
     };
     let ws_errors = if workspace_ids.is_some() {
-        " AND workspace_id = ANY($2)"
+        " AND workspace_id = ANY($4)"
     } else {
         ""
     };
+
+    // Each fact a statement reads states the window on itself (Postgres prunes a
+    // partitioned table only by a condition on that table); `turn_window` sits in
+    // its outer join's ON clause. A session is in the window when it was active
+    // in it (`updated_at`), as the Sessions list reads its period, so a tile and
+    // the list it links to count the same rows.
+    let sessions_window = window_sql(&["updated_at"], 2, 3);
+    let audit_window = window_sql(AUDIT_LOG_WINDOW, 2, 3);
+    let web_window = window_sql(WEB_AUDIT_WINDOW, 2, 3);
+    let turn_window = window_sql(&["ct.timestamp"], 2, 3);
+    let own_window = window_sql(&["timestamp"], 2, 3);
 
     // 1. Alerts — sessions flagged by the agent in the activity window.
     //    Uses the partial index idx_sessions_alert WHERE alert_level IN
@@ -867,10 +882,10 @@ pub(crate) async fn cross_attention(
          FROM sessions \
          WHERE tenant_id = $1 \
            AND alert_level IN ('minor', 'major') \
-           AND updated_at >= NOW() - {window_interval}{ws_alerts}"
+           {sessions_window}{ws_alerts}"
     );
     let alerts: (Option<i64>, Option<i64>, Option<i64>) = {
-        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*alerts_sql)).bind(tenant_id);
+        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*alerts_sql)).bind(tenant_id).bind(start).bind(end);
         if let Some(ref ws) = workspace_ids {
             q = q.bind(ws.clone());
         }
@@ -892,13 +907,12 @@ pub(crate) async fn cross_attention(
                 FROM {AUDIT_LOG_JOIN} \
                 LEFT JOIN conversation_turns ct \
                     ON ct.request_id = a.request_id AND ct.timestamp = a.timestamp \
-                   AND ct.timestamp >= NOW() - {window_interval}, \
+                   {turn_window}, \
                     jsonb_array_elements( \
                         COALESCE(ct.transform_diff->'response_blocked_tools', '[]'::jsonb) \
                     ) AS elem \
                 WHERE g.tenant_id = $1 \
-                  AND a.timestamp >= NOW() - {window_interval} \
-                  AND g.timestamp >= NOW() - {window_interval} \
+                  {audit_window} \
                   AND {blocked_filter}{ws_blocked} \
                 GROUP BY elem->>'id' \
                 ORDER BY COUNT(*) DESC, elem->>'id' \
@@ -906,12 +920,11 @@ pub(crate) async fn cross_attention(
             ) AS top_rule_id \
          FROM {AUDIT_LOG_JOIN} \
          WHERE g.tenant_id = $1 \
-           AND a.timestamp >= NOW() - {window_interval} \
-           AND g.timestamp >= NOW() - {window_interval} \
+           {audit_window} \
            AND {blocked_filter}{ws_blocked}"
     );
     let blocked: (Option<i64>, Option<String>) = {
-        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*blocked_sql)).bind(tenant_id);
+        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*blocked_sql)).bind(tenant_id).bind(start).bind(end);
         if let Some(ref ws) = workspace_ids {
             q = q.bind(ws.clone());
         }
@@ -938,25 +951,22 @@ pub(crate) async fn cross_attention(
             ( \
                 (SELECT COUNT(*) FROM {AUDIT_LOG_JOIN} \
                  WHERE g.tenant_id = $1 \
-                   AND a.timestamp >= NOW() - {window_interval} \
-                   AND g.timestamp >= NOW() - {window_interval} \
+                   {audit_window} \
                    AND {llm_guardrail}{ws_blocked}) \
                 + \
                 (SELECT COUNT(*) FROM {WEB_AUDIT_JOIN} \
                  WHERE g.tenant_id = $1 \
-                   AND w.timestamp >= NOW() - {window_interval} \
-                   AND g.timestamp >= NOW() - {window_interval} \
+                   {web_window} \
                    AND {web_guardrail}{ws_blocked}) \
             )::bigint AS total, \
             (SELECT COUNT(*) FROM {AUDIT_LOG_JOIN} \
              WHERE g.tenant_id = $1 \
-               AND a.timestamp >= NOW() - {window_interval} \
-               AND g.timestamp >= NOW() - {window_interval} \
+               {audit_window} \
                AND a.badges @> '[{{\"code\":\"guardrail\",\"action\":\"block\"}}]'::jsonb{ws_blocked} \
             )::bigint AS blocked"
     );
     let guardrail: (Option<i64>, Option<i64>) = {
-        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*guardrail_sql)).bind(tenant_id);
+        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*guardrail_sql)).bind(tenant_id).bind(start).bind(end);
         if let Some(ref ws) = workspace_ids {
             q = q.bind(ws.clone());
         }
@@ -1028,7 +1038,7 @@ pub(crate) async fn cross_attention(
                 SELECT error_category FROM gateway_audit \
                 WHERE tenant_id = $1 \
                   AND error_category IS NOT NULL \
-                  AND timestamp >= NOW() - {window_interval}{ws_errors} \
+                  {own_window}{ws_errors} \
                 GROUP BY error_category \
                 ORDER BY COUNT(*) DESC, error_category \
                 LIMIT 1 \
@@ -1036,10 +1046,10 @@ pub(crate) async fn cross_attention(
          FROM gateway_audit \
          WHERE tenant_id = $1 \
            AND error_category IS NOT NULL \
-           AND timestamp >= NOW() - {window_interval}{ws_errors}"
+           {own_window}{ws_errors}"
     );
     let errors: (Option<i64>, Option<String>) = {
-        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*errors_sql)).bind(tenant_id);
+        let mut q = sqlx::query_as(sqlx::AssertSqlSafe(&*errors_sql)).bind(tenant_id).bind(start).bind(end);
         if let Some(ref ws) = workspace_ids {
             q = q.bind(ws.clone());
         }
@@ -1107,15 +1117,15 @@ pub(crate) async fn cross_attention(
     let refused_sql = format!(
         "SELECT (SELECT COUNT(*) FROM llm_audit \
                   WHERE tenant_id = $1 AND gate_refusal IS NOT NULL AND upstream_server_id IS NOT NULL \
-                    AND timestamp >= NOW() - {window_interval}{ws_errors}) \
+                    {own_window}{ws_errors}) \
               + (SELECT COUNT(*) FROM llm_audit \
                   CROSS JOIN LATERAL jsonb_to_recordset(moved_on_from) AS m(server_id uuid, outcome text) \
                   WHERE tenant_id = $1 AND moved_on_from IS NOT NULL AND m.outcome = 'refused' \
                     AND m.server_id IS NOT NULL \
-                    AND timestamp >= NOW() - {window_interval}{ws_errors})"
+                    {own_window}{ws_errors})"
     );
     let refused: i64 = {
-        let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(&*refused_sql)).bind(tenant_id);
+        let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(&*refused_sql)).bind(tenant_id).bind(start).bind(end);
         if let Some(ref ws) = workspace_ids {
             q = q.bind(ws.clone());
         }
@@ -1176,7 +1186,8 @@ pub(crate) async fn cross_attention(
         budget,
         upstreams,
         generated_at: Utc::now(),
-        window_days,
+        start,
+        end,
         expiry_window_days,
     })
 }

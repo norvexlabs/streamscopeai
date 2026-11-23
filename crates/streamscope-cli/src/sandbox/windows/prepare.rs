@@ -31,6 +31,17 @@ pub struct Host<'a> {
     pub own_dir: Option<&'a Path>,
     /// The file the client's command runs as, found as the launch finds it.
     pub program: Option<&'a Path>,
+    /// Whether a private folder of the developer's other than the profile
+    /// holds `path` — a private root, which no other account reads — so a
+    /// tool or file there is granted as one in the profile is.
+    pub private: &'a dyn Fn(&Path) -> bool,
+    /// The developer's global git identity (`user.name`, `user.email`,
+    /// each when set), as their global configuration and its includes give
+    /// it in the project.
+    pub git_identity: &'a [(&'static str, String)],
+    /// The folder the account's global git configuration holding that
+    /// identity is placed in; `None`: none is.
+    pub git_global: Option<&'a Path>,
 }
 
 /// Adjust `spec` for the sandbox account and return what it must be granted:
@@ -46,15 +57,18 @@ pub struct Host<'a> {
 /// - git trusts the project root and a linked worktree's common git folder
 ///   and every repository under the root, a submodule's checkout included
 ///   (`safe.directory`, appended after any `GIT_CONFIG_COUNT` the run sets);
+/// - git commits as the developer: their global identity, handed to the
+///   account as its global configuration ([`commit_as_developer`]);
 /// - `tools`: the folder of `ssai` and of the client's program (and the
 ///   folder it resolves to, when another), and the cross-agent skills store
-///   when it exists; `files`: the CA files and the
+///   when it exists; `files`: the CA files, the git identity file and the
 ///   files the client was provisioned with (readable by the developer alone,
 ///   so the grant on their folder misses them). Each only
-///   inside the profile: outside it, only an administrator could grant one,
-///   and what is there is readable by every account already — but for a
-///   provisioned file in the project, which is the developer's own to grant
-///   wherever the project is.
+///   inside the developer's private folders — the profile, a private root
+///   (`Host::private`) — which no other account reads: elsewhere what is
+///   there is readable by every account already, and only an administrator
+///   could grant one — but for a provisioned file in the project, which is
+///   the developer's own to grant wherever the project is.
 pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host) -> Result<RunDirs> {
     let mut dirs = RunDirs::default();
     if let Some(agent) = agent {
@@ -96,6 +110,7 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
     }
     let tool_files = reach_tools(spec, host, &mut dirs)?;
     trust_in_git(spec)?;
+    commit_as_developer(spec, host, &mut dirs);
     carry_node_ca(spec, host);
     let found = host
         .own_dir
@@ -109,15 +124,16 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
     // folder does not follow). Granted as it is on disk, and only when it
     // exists and lies inside the profile.
     let skills = dunce::canonicalize(host.profile.join(SHARED_SKILLS)).ok().filter(|d| d.is_dir());
+    let mine = |p: &Path| under(p, host.profile) || (host.private)(p);
     for dir in found.chain(skills) {
-        if under(&dir, host.profile) && !dirs.tools.contains(&dir) {
+        if mine(&dir) && !dirs.tools.contains(&dir) {
             dirs.tools.push(dir);
         }
     }
     // Each file as it is on disk (a junction or a short name followed), as
     // the profile and the root are.
     let real = |f: &PathBuf| dunce::canonicalize(f).ok().filter(|r| r.is_file());
-    let ca = spec.ca_files.iter().filter_map(real).filter(|f| under(f, host.profile));
+    let ca = spec.ca_files.iter().filter_map(real).filter(|f| mine(f));
     // A client file is the canonical path the run resolved: one that now
     // resolves elsewhere (a link swapped in since) is not granted.
     let provisioned = spec
@@ -125,7 +141,7 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
         .iter()
         .chain(&tool_files)
         .filter_map(|f| real(f).filter(|r| r == f))
-        .filter(|f| under(f, host.profile) || under(f, &spec.project_root));
+        .filter(|f| mine(f) || under(f, &spec.project_root));
     for file in ca.chain(provisioned) {
         if !dirs.files.contains(&file) {
             dirs.files.push(file);
@@ -369,7 +385,7 @@ fn seed(path: &Path, key: &str) -> Result<()> {
 /// trust the project root, every repository under it (`<root>/*`: a
 /// submodule's checkout — git 2.46 and later read the wildcard) and a linked
 /// worktree's common git folder for this run, through the `GIT_CONFIG_*`
-/// variables — no gitconfig is written — appended after the entries the run
+/// variables — no gitconfig is written for it — appended after the entries the run
 /// already sets. The trust is the sandbox account's alone, in a project it
 /// may write.
 fn trust_in_git(spec: &mut LaunchSpec) -> Result<()> {
@@ -389,6 +405,118 @@ fn trust_in_git(spec: &mut LaunchSpec) -> Result<()> {
     }
     spec.env.push(("GIT_CONFIG_COUNT".to_string(), (start + trusted.len()).to_string()));
     Ok(())
+}
+
+/// The account's own global git configuration is empty, so git would make
+/// its commits' identity from the account's name and the host's, or refuse
+/// to commit: the developer's global identity (`Host::git_identity`) is
+/// written to a file in `Host::git_global` and handed to the account as its
+/// global configuration (`GIT_CONFIG_GLOBAL`), granted to read — an empty
+/// one when they have none, so the account's global configuration is a
+/// read-only file for every developer. Global, so every repository's own
+/// identity is read over it, as on the host. Nothing when the run names its
+/// own global configuration.
+///
+/// The file is named by its text and never rewritten: a run's agent reads
+/// git's configuration again on every command, so another run — another
+/// project, another identity — must neither change the file it holds nor
+/// replace it (and with it the entry granting it). Not essential to the run:
+/// a file that cannot be placed is warned of, and the run goes on without it.
+fn commit_as_developer(spec: &mut LaunchSpec, host: &Host, dirs: &mut RunDirs) {
+    let Some(dir) = host.git_global else { return };
+    if last(&spec.env, "GIT_CONFIG_GLOBAL").is_some() {
+        return;
+    }
+    match host.git_identity {
+        [] => crate::ui::warn(
+            "",
+            "your global git configuration sets no user.name or user.email: where the repository sets none either, git makes the agent's identity up from the sandbox account and this computer, or refuses to commit",
+        ),
+        [(key, _)] => crate::ui::warn(
+            "",
+            format_args!("your global git configuration sets {key} alone: git makes up the other from the sandbox account and this computer"),
+        ),
+        _ => {}
+    }
+    if !(under(dir, host.profile) || (host.private)(dir)) {
+        crate::ui::warn(
+            "",
+            format_args!(
+                "{} is outside your profile, where the sandbox account is not granted it: the agent commits under the account's own git identity",
+                dir.display()
+            ),
+        );
+        return;
+    }
+    let placed = place_named(dir, "gitconfig", gitconfig(host.git_identity).as_bytes())
+        .and_then(|f| dunce::canonicalize(&f).with_context(|| format!("resolve {}", f.display())));
+    let real = match placed {
+        Ok(file) => file,
+        Err(e) => {
+            crate::ui::warn("", format_args!("{e:#}: the agent commits under the sandbox account's git identity"));
+            return;
+        }
+    };
+    // Only inside the developer's private folders, as every other file of
+    // the run is granted.
+    if !(under(&real, host.profile) || (host.private)(&real)) {
+        crate::ui::warn(
+            "",
+            format_args!(
+                "{} is outside your profile, where the sandbox account is not granted it: the agent commits under the account's own git identity",
+                real.display()
+            ),
+        );
+        return;
+    }
+    spec.env.push(("GIT_CONFIG_GLOBAL".to_string(), real.to_string_lossy().into_owned()));
+    if !dirs.files.contains(&real) {
+        dirs.files.push(real);
+    }
+}
+
+/// The file in `dir` named by `bytes` (`<sha>.<ext>`) and holding them,
+/// placed when absent: written aside and hard-linked into place, which fails
+/// rather than replace a file another run placed first — a replaced file
+/// would lose the read entry that run granted on it, while it reads on. One
+/// found holding anything else (a write cut short) is refused, never used.
+pub(super) fn place_named(dir: &Path, ext: &str, bytes: &[u8]) -> Result<PathBuf> {
+    use sha2::Digest as _;
+    let name = hex::encode(&sha2::Sha256::digest(bytes)[..12]);
+    let file = dir.join(format!("{name}.{ext}"));
+    if !file.is_file() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        let part = dir.join(format!("{name}.{}.part", std::process::id()));
+        let placed = std::fs::write(&part, bytes).and_then(|()| std::fs::hard_link(&part, &file));
+        let _ = std::fs::remove_file(&part);
+        if let Err(e) = placed
+            && !file.is_file()
+        {
+            return Err(e).with_context(|| format!("write {}", file.display()));
+        }
+    }
+    let held = std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+    if held != bytes {
+        bail!("{} does not hold what its name says (remove it)", file.display());
+    }
+    Ok(file)
+}
+
+/// `entries` (`section.name`, value) as a git configuration file, each value
+/// quoted and escaped as git reads it back.
+fn gitconfig(entries: &[(&'static str, String)]) -> String {
+    let mut out = String::new();
+    let mut section = "";
+    for (key, value) in entries {
+        let (sec, name) = key.split_once('.').unwrap_or(("user", key));
+        if sec != section {
+            out.push_str(&format!("[{sec}]\n"));
+            section = sec;
+        }
+        let quoted = value.replace('\\', r"\\").replace('"', r#"\""#).replace('\n', r"\n");
+        out.push_str(&format!("\t{name} = \"{quoted}\"\n"));
+    }
+    out
 }
 
 /// A folder as git writes it, which is what `safe.directory` is compared
@@ -502,7 +630,7 @@ mod tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         };
@@ -511,7 +639,7 @@ mod tests {
 
     fn run(spec: &mut LaunchSpec, profile: &Path) -> RunDirs {
         let agent = agent_for(&spec.command);
-        prepare(spec, agent, &Host { profile, appdata: None, node_ca: None, own_dir: None, program: None }).unwrap()
+        prepare(spec, agent, &Host { profile, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None }).unwrap()
     }
 
     fn json(path: &Path) -> serde_json::Value {
@@ -548,7 +676,7 @@ mod tests {
             std::fs::create_dir_all(root.parent().unwrap()).unwrap();
             std::fs::write(&root, "pem").unwrap();
             adjust(&mut spec);
-            let host = Host { profile: &profile, appdata: None, node_ca: Some(&root), own_dir: None, program: None };
+            let host = Host { profile: &profile, appdata: None, node_ca: Some(&root), own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None };
             let dirs = prepare(&mut spec, None, &host).unwrap();
             let carried = last(&spec.env, "NODE_EXTRA_CA_CERTS").map(str::to_string);
             let granted = dirs.files.contains(&root);
@@ -597,14 +725,14 @@ mod tests {
     fn goose_gets_its_root_in_the_roaming_folder() {
         let (profile, mut spec) = setup("goose", "goose", &[]);
         let appdata = profile.join("Roaming");
-        let dirs = prepare(&mut spec, agent_for("goose"), &Host { profile: &profile, appdata: Some(&appdata), node_ca: None, own_dir: None, program: None })
+        let dirs = prepare(&mut spec, agent_for("goose"), &Host { profile: &profile, appdata: Some(&appdata), node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None })
             .unwrap();
         let root = appdata.join("Block").join("goose");
         assert_eq!(spec.env[0], ("GOOSE_PATH_ROOT".to_string(), root.to_string_lossy().into_owned()));
         assert_eq!(dirs.state, vec![root.clone()]);
         assert!(root.is_dir());
         let (profile2, mut spec) = setup("goose-noappdata", "goose", &[]);
-        let err = prepare(&mut spec, agent_for("goose"), &Host { profile: &profile2, appdata: None, node_ca: None, own_dir: None, program: None })
+        let err = prepare(&mut spec, agent_for("goose"), &Host { profile: &profile2, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None })
             .unwrap_err();
         assert!(err.to_string().contains("GOOSE_PATH_ROOT"), "{err}");
         for dir in [profile, profile2] {
@@ -661,7 +789,7 @@ mod tests {
         assert!(!profile.join(".claude").exists());
         // A relative folder is refused, by name.
         let (profile2, mut spec) = setup("userenv-rel", "claude", &[("claude_config_dir", "cfg")]);
-        let err = prepare(&mut spec, agent_for("claude"), &Host { profile: &profile2, appdata: None, node_ca: None, own_dir: None, program: None })
+        let err = prepare(&mut spec, agent_for("claude"), &Host { profile: &profile2, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None })
             .unwrap_err();
         assert!(err.to_string().contains("CLAUDE_CONFIG_DIR"), "{err}");
         for dir in [profile, profile2, mine.parent().unwrap().to_path_buf()] {
@@ -675,7 +803,7 @@ mod tests {
     fn a_refused_config_folder_is_never_seeded() {
         let (profile, mut spec) = setup("refused-cfg", "claude", &[]);
         spec.env.push(("CLAUDE_CONFIG_DIR".into(), profile.to_string_lossy().into_owned()));
-        let err = prepare(&mut spec, agent_for("claude"), &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None })
+        let err = prepare(&mut spec, agent_for("claude"), &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None })
             .unwrap_err();
         assert!(err.to_string().contains("refuses the client's folder"), "{err}");
         assert!(!profile.join(".claude.json").exists(), "the profile was seeded before the refusal");
@@ -880,7 +1008,7 @@ mod tests {
         std::fs::write(aider.join("pyvenv.cfg"), format!("home = {}\nversion = 3.12\n", python.display())).unwrap();
         std::fs::write(pipx.join("pyvenv.cfg"), "home = C:\\Program Files\\Python312\n").unwrap();
         let program = bin.join("aider.exe");
-        let host = Host { profile: &profile, appdata: Some(&appdata), node_ca: None, own_dir: None, program: Some(&program) };
+        let host = Host { profile: &profile, appdata: Some(&appdata), node_ca: None, own_dir: None, program: Some(&program), private: &|_| false, git_identity: &[], git_global: None };
         let dirs = prepare(&mut spec, agent_for("aider"), &host).unwrap();
         assert_eq!(dirs.tools, vec![bin.clone(), aider.clone(), python.clone(), pipx.clone()]);
         // A `home` without the interpreter in it is not granted.
@@ -925,9 +1053,88 @@ mod tests {
         assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("2"));
         // Not a count: refused.
         let (profile3, mut spec) = setup("gitbad", "opencode", &[("GIT_CONFIG_COUNT", "x")]);
-        let err = prepare(&mut spec, None, &Host { profile: &profile3, appdata: None, node_ca: None, own_dir: None, program: None }).unwrap_err();
+        let err = prepare(&mut spec, None, &Host { profile: &profile3, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None }).unwrap_err();
         assert!(err.to_string().contains("GIT_CONFIG_COUNT"), "{err}");
         for dir in [profile, profile2, profile3] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn git_commits_as_the_developer_through_a_global_config_of_their_identity() {
+        let identity = [("user.name", r#"Dev "Q" Eloper\x"#.to_string()), ("user.email", "dev@example.com".to_string())];
+        let host = |profile: &'static Path, dir: &'static Path, identity: &'static [(&'static str, String)]| Host {
+            profile,
+            appdata: None,
+            node_ca: None,
+            own_dir: None,
+            program: None,
+            private: &|_| false,
+            git_identity: identity,
+            git_global: Some(dir),
+        };
+        let leak = |p: PathBuf| -> &'static Path { Box::leak(p.into_boxed_path()) };
+        let identity: &'static [(&'static str, String)] = Box::leak(Box::new(identity));
+        let handed = |spec: &LaunchSpec| last(&spec.env, "GIT_CONFIG_GLOBAL").map(PathBuf::from);
+        // Placed, handed as the account's global configuration, granted to read;
+        // the trust entries are untouched.
+        let (profile, mut spec) = setup("gitid", "opencode", &[]);
+        let profile = leak(profile);
+        let dir = leak(profile.join("cfg").join("sandbox-git"));
+        let dirs = prepare(&mut spec, None, &host(profile, dir, identity)).unwrap();
+        let file = handed(&spec).unwrap();
+        assert_eq!(file.parent(), Some(dunce::canonicalize(dir).unwrap().as_path()));
+        assert!(dirs.files.contains(&file), "{:?}", dirs.files);
+        assert_eq!(last(&spec.env, "GIT_CONFIG_COUNT"), Some("2"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "[user]\n\tname = \"Dev \\\"Q\\\" Eloper\\\\x\"\n\temail = \"dev@example.com\"\n");
+        // Git reads each value back as it was.
+        let read = |key: &str| {
+            let out = std::process::Command::new("git").args(["config", "--file"]).arg(&file).args(["--get", key]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim_end().to_string()
+        };
+        assert_eq!(read("user.name"), identity[0].1);
+        assert_eq!(read("user.email"), identity[1].1);
+        // The same identity: the same file. Another: a file of its own, the
+        // first left as it was (a run holding it reads it on).
+        let (other, mut again) = setup("gitid-again", "opencode", &[]);
+        prepare(&mut again, None, &host(profile, dir, identity)).unwrap();
+        assert_eq!(handed(&again).as_ref(), Some(&file));
+        let (other2, mut third) = setup("gitid-third", "opencode", &[]);
+        let new_email: &'static [(&'static str, String)] = Box::leak(Box::new([("user.email", "new@example.com".to_string())]));
+        prepare(&mut third, None, &host(profile, dir, new_email)).unwrap();
+        let second = handed(&third).unwrap();
+        assert_ne!(second, file);
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "[user]\n\temail = \"new@example.com\"\n");
+        assert_eq!(read("user.email"), identity[1].1);
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2, "nothing left beside them");
+        // One holding anything but what its name says (a write cut short) is not handed.
+        std::fs::write(&second, "").unwrap();
+        let (other3, mut cut) = setup("gitid-cut", "opencode", &[]);
+        let dirs = prepare(&mut cut, None, &host(profile, dir, new_email)).unwrap();
+        assert_eq!(handed(&cut), None);
+        assert!(!dirs.files.contains(&second));
+        // None: an empty one, still the account's global configuration.
+        let (profile2, mut spec) = setup("gitidnone", "opencode", &[]);
+        let profile2 = leak(profile2);
+        let dirs = prepare(&mut spec, None, &host(profile2, leak(profile2.join("g")), &[])).unwrap();
+        let none = handed(&spec).unwrap();
+        assert_eq!(std::fs::read_to_string(&none).unwrap(), "");
+        assert!(dirs.files.contains(&none));
+        // A run naming its own global configuration keeps it.
+        let (profile3, mut spec) = setup("gitidown", "opencode", &[("GIT_CONFIG_GLOBAL", "C:/bot.gitconfig")]);
+        let profile3 = leak(profile3);
+        let own = leak(profile3.join("g"));
+        let dirs = prepare(&mut spec, None, &host(profile3, own, identity)).unwrap();
+        assert_eq!(last(&spec.env, "GIT_CONFIG_GLOBAL"), Some("C:/bot.gitconfig"));
+        assert!(!own.exists() && dirs.files.is_empty());
+        // Outside the developer's private folders: not handed, as it would not be granted.
+        let outside = leak(scratch("gitid-outside"));
+        let (profile4, mut spec) = setup("gitidout", "opencode", &[]);
+        let profile4 = leak(profile4);
+        let dirs = prepare(&mut spec, None, &host(profile4, outside, identity)).unwrap();
+        assert_eq!(last(&spec.env, "GIT_CONFIG_GLOBAL"), None);
+        assert!(dirs.files.is_empty(), "{:?}", dirs.files);
+        for dir in [profile, profile2, profile3, profile4, outside, other.as_path(), other2.as_path(), other3.as_path()] {
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -979,7 +1186,7 @@ mod tests {
         std::fs::write(&away, "{}").unwrap();
         spec.ca_files = vec![ca.clone()];
         spec.client_files = vec![project.clone(), home.clone(), away.clone(), ca.clone(), profile.join("gone.json")];
-        let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None }).unwrap();
+        let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None }).unwrap();
         assert_eq!(dirs.files, vec![ca, project, home.clone()]);
         // A project outside the profile: its
         // provisioned file is the developer's to grant; a CA file beside it
@@ -991,14 +1198,14 @@ mod tests {
         spec.project_root = outside_project;
         spec.ca_files = vec![away.clone()];
         spec.client_files = vec![in_project.clone(), home.clone(), away];
-        let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None }).unwrap();
+        let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: None, program: None, private: &|_| false, git_identity: &[], git_global: None }).unwrap();
         assert_eq!(dirs.files, vec![in_project, home]);
         let _ = std::fs::remove_dir_all(&profile);
         let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
-    fn tools_and_files_are_granted_only_inside_the_profile() {
+    fn tools_and_files_are_granted_only_inside_the_developers_private_folders() {
         let (profile, mut spec) = setup("tools", "opencode", &[]);
         let outside = scratch("tools-outside");
         let bin = profile.join("AppData/Roaming/npm");
@@ -1012,14 +1219,23 @@ mod tests {
         let own = profile.join("ssai");
         let program = bin.join("opencode.cmd");
         std::fs::write(&program, "").unwrap();
-        let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: Some(&own), program: Some(&program) })
+        let dirs = prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: Some(&own), program: Some(&program), private: &|_| false, git_identity: &[], git_global: None })
             .unwrap();
         assert_eq!(dirs.tools, vec![own.clone(), bin.clone()]);
         assert_eq!(dirs.files, vec![ca]);
         // Outside the profile: neither.
         let dirs =
-            prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: Some(&outside), program: None }).unwrap();
+            prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: Some(&outside), program: None, private: &|_| false, git_identity: &[], git_global: None }).unwrap();
         assert!(dirs.tools.is_empty());
+        // Under a private root (no other account reads it): both, as in the
+        // profile.
+        let outside_ca = outside.join("ca.pem");
+        spec.ca_files = vec![outside_ca.clone()];
+        let private = |p: &Path| p.starts_with(&outside);
+        let dirs =
+            prepare(&mut spec, None, &Host { profile: &profile, appdata: None, node_ca: None, own_dir: Some(&outside), program: None, private: &private, git_identity: &[], git_global: None }).unwrap();
+        assert_eq!(dirs.tools, vec![outside.clone()]);
+        assert_eq!(dirs.files, vec![dunce::canonicalize(&outside_ca).unwrap()]);
         for dir in [profile, outside] {
             let _ = std::fs::remove_dir_all(dir);
         }

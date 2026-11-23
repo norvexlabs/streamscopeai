@@ -987,7 +987,7 @@ mod tests {
             ca_bundle: None,
             home_files,
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         }

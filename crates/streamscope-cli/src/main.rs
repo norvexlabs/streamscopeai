@@ -16,6 +16,7 @@ mod commands;
 mod oauth;
 mod opencode_global;
 mod program;
+mod progress;
 mod sandbox;
 mod state;
 mod ui;

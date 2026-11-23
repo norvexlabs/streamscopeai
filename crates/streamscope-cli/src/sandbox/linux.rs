@@ -670,7 +670,7 @@ mod learn_tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         };
@@ -749,7 +749,7 @@ mod learn_tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         };
@@ -812,7 +812,7 @@ mod learn_tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients,
         };
@@ -866,7 +866,7 @@ mod learn_tests {
                 ca_bundle: None,
                 home_files: vec![],
                 client_files: vec![],
-                private_project: false,
+                private_root: false,
                 opencode: None,
                 tool_clients: Vec::new(),
             };
@@ -924,7 +924,7 @@ mod learn_tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         };
@@ -980,7 +980,7 @@ mod learn_tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         };

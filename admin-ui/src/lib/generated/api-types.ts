@@ -7065,6 +7065,8 @@ export interface components {
             alerts: components["schemas"]["AttentionAlerts"];
             blocked: components["schemas"]["AttentionBlocked"];
             budget: components["schemas"]["AttentionBudget"];
+            /** Format: date-time */
+            end: string;
             errors: components["schemas"]["AttentionErrors"];
             expiring: components["schemas"]["AttentionExpiring"];
             /** Format: int32 */
@@ -7072,12 +7074,12 @@ export interface components {
             /** Format: date-time */
             generated_at: string;
             guardrail: components["schemas"]["AttentionGuardrail"];
-            upstreams: components["schemas"]["AttentionUpstreams"];
             /**
-             * Format: int32
-             * @description Echoed window so the UI can label "in last Nd" without re-computing.
+             * Format: date-time
+             * @description The activity window the counts cover, as resolved from the request.
              */
-            window_days: number;
+            start: string;
+            upstreams: components["schemas"]["AttentionUpstreams"];
         };
         /**
          * @description Whether the tenant's LLM upstream servers can serve traffic now, and whether
@@ -25917,8 +25919,16 @@ export interface operations {
     cross_attention: {
         parameters: {
             query?: {
-                /** @description Activity lookback for alerts / blocked / auth failures, in days. Default 1. */
-                window_days?: number;
+                /**
+                 * @description Rolling lookback in days for the activity tiles (alerts, blocked tool
+                 *     calls, guardrail, errors, upstream refusals) — the dashboard's period.
+                 *     Mutually exclusive with `start`/`end`. Default 1.
+                 */
+                days?: number;
+                /** @description Inclusive window start (RFC3339). */
+                start?: string;
+                /** @description Exclusive window end (RFC3339). */
+                end?: string;
                 /** @description Forward window for credential expiry warnings, in days. Default 7. */
                 expiry_window_days?: number;
                 /** @description Comma-separated workspace ids to include (UUIDs). Omit for all workspaces. */
@@ -25930,13 +25940,22 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Attention queue: counts of items needing operator action — flagged sessions, blocked tool calls, expiring credentials, and authentication failures. Each tile on the Dashboard Overview reads from a field on this response and deep-links into the corresponding management surface. */
+            /** @description Attention queue: counts of items needing operator action over the requested window — flagged sessions, blocked tool calls, guardrail findings, errors, upstream refusals — plus credentials expiring within `expiry_window_days`, the budget scopes of the current day/month and the upstreams' health now. Each tile on the Dashboard Overview reads from a field on this response and deep-links into the corresponding management surface. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["AttentionResponse"];
+                };
+            };
+            /** @description Invalid time window */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
             /** @description Unauthorized */

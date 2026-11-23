@@ -5,6 +5,7 @@
 //! zero-prerequisite in-process path (Landlock + seccomp + a loopback egress
 //! guard). Fail-closed.
 
+pub mod doctor;
 pub mod guard;
 pub mod profiles;
 pub mod protect;
@@ -145,10 +146,11 @@ pub struct LaunchSpec {
     /// so the account's grant on their folder does not reach them.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub client_files: Vec<PathBuf>,
-    /// Windows: make a project folder every local account may write private
-    /// to the developer without asking (`--private-project`).
+    /// Windows: make the private root of a project outside the profile (the
+    /// folder under the drive's root it sits in) the developer's alone
+    /// without asking (`--private-root`).
     #[cfg_attr(not(windows), allow(dead_code))]
-    pub private_project: bool,
+    pub private_root: bool,
     /// An OpenCode client's gateway provider key and provisioned main config,
     /// for the launch to be judged ([`crate::opencode_global::at_launch`]): by
     /// `ssai run` itself, or under the docker tier by the agent in the
@@ -1816,7 +1818,7 @@ mod tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         }
@@ -1842,7 +1844,7 @@ mod tests {
             ca_bundle: None,
             home_files: vec![],
             client_files: vec![],
-            private_project: false,
+            private_root: false,
             opencode: None,
             tool_clients: Vec::new(),
         };

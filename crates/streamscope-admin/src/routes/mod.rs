@@ -1800,6 +1800,9 @@ pub const MAX_LIMIT: i64 = 500;
 // store, whose `AnalyticsFilterBuilder` composes the SQL.
 // ---------------------------------------------------------------------------
 
+/// The longest rolling window `days` may ask for.
+pub const MAX_WINDOW_DAYS: i32 = 36_500;
+
 /// Rolling-or-absolute time window. Either `days` (rolling lookback ending
 /// "now") OR `start`/`end` (RFC3339). Mixing the two is rejected at resolve
 /// time; that's the explicit policy choice — no precedence ambiguity.
@@ -1836,8 +1839,10 @@ impl TimeWindow {
             (s, e)
         } else {
             let d = self.days.unwrap_or(default_days);
-            if d <= 0 {
-                return Err(ApiError::bad_request("`days` must be a positive integer")
+            // Past the bound `now - days` leaves the range a timestamp holds
+            // (and panics): a century is far beyond any period a reader asks.
+            if !(1..=MAX_WINDOW_DAYS).contains(&d) {
+                return Err(ApiError::bad_request(format!("`days` must be an integer from 1 to {MAX_WINDOW_DAYS}"))
                     .code(ApiErrorCode::TimeWindowInvalid));
             }
             (now - chrono::Duration::days(d as i64), now)
@@ -3414,11 +3419,15 @@ mod time_window_tests {
     }
 
     #[test]
-    fn zero_or_negative_days_rejected() {
-        for d in [0, -1, -100] {
+    fn days_outside_one_to_a_century_rejected() {
+        for d in [0, -1, -100, MAX_WINDOW_DAYS + 1, i32::MAX] {
             let w = TimeWindow { days: Some(d), ..Default::default() };
-            let err = w.resolve(7).expect_err("non-positive days rejected");
+            let err = w.resolve(7).expect_err("days out of range rejected");
             assert_matches!(err.code, ApiErrorCode::TimeWindowInvalid);
+        }
+        // Both bounds themselves resolve.
+        for d in [1, MAX_WINDOW_DAYS] {
+            assert!(TimeWindow { days: Some(d), ..Default::default() }.resolve(7).is_ok(), "{d}");
         }
     }
 

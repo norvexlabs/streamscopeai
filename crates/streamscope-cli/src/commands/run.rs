@@ -52,12 +52,14 @@ pub struct RunArgs {
     /// entry is also exposed read-only inside the sandbox.
     #[arg(long = "env", short = 'e')]
     pub env: Vec<String>,
-    /// Windows: when every account on this computer may write the project
-    /// folder (a folder made under a drive's root inherits that), make it
-    /// private to you so the native sandbox can confine its writes there,
-    /// without asking. Without it, ssai asks at a terminal and stops elsewhere.
+    /// Windows: make the folder the project needs private to you, as
+    /// your profile is, without asking — for a project outside your profile
+    /// the folder it sits in under the drive's root (`C:\work` for
+    /// `C:\work\app`, once for every project under it), else a project folder
+    /// every account may write. Without it, ssai asks at a terminal and stops
+    /// elsewhere.
     #[arg(long)]
-    pub private_project: bool,
+    pub private_root: bool,
     /// Arguments forwarded verbatim to the client (everything after `--`).
     #[arg(last = true)]
     pub client_args: Vec<String>,
@@ -235,7 +237,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         ca_bundle,
         home_files: resolved.home_files,
         client_files: resolved.client_files,
-        private_project: args.private_project,
+        private_root: args.private_root,
         opencode: resolved.opencode,
         tool_clients,
     };
@@ -560,6 +562,31 @@ fn resolve_real_root(p: PathBuf) -> Result<PathBuf> {
         .with_context(|| format!("resolve real path for {}", p.display()))
 }
 
+/// The folder `ssai run` confines a sandboxed client to, from `dir` (the
+/// current folder when `None`): the provisioned project it is in, else the
+/// folder itself (a client provisioned globally confines to where it runs) —
+/// spelled real, as the run's root is. `ssai sandbox revoke` and `doctor`
+/// name a project by it.
+#[cfg_attr(not(windows), allow(dead_code, reason = "the Windows sandbox's commands name a project by it"))]
+pub(crate) fn sandbox_root(dir: Option<&Path>) -> Result<PathBuf> {
+    root_of_scope(resolve_scope(dir, false, false)?, cwd_or_friendly_error)
+}
+
+/// [`sandbox_root`] for the scope `scope`, the current folder from `cwd`. A
+/// folder no longer on disk (a project deleted or moved since its grant) is
+/// named as recorded, absolute, so its grant can still be taken back.
+#[cfg_attr(not(windows), allow(dead_code, reason = "the Windows sandbox's commands name a project by it"))]
+fn root_of_scope(scope: ManifestScope, cwd: impl FnOnce() -> Result<PathBuf>) -> Result<PathBuf> {
+    let folder = match scope {
+        ManifestScope::Project(root) => root,
+        ManifestScope::Global => cwd()?,
+    };
+    match resolve_real_root(folder.clone()) {
+        Ok(real) => Ok(real),
+        Err(_) => Ok(std::path::absolute(&folder)?),
+    }
+}
+
 /// Read the current working directory, attaching the same actionable hint the
 /// resolve-real-root call sites use. `std::env::current_dir()` fails when the
 /// shell's cwd has been deleted/renamed underneath the process — surface that
@@ -842,6 +869,20 @@ mod tests {
         let pem = String::from_utf8(combined_ca_pem(Some(&base), &[extra]).unwrap()).unwrap();
         assert!(pem.contains("BASE") && pem.contains("EXTRA"), "{pem}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_global_provision_names_the_current_folder_and_a_gone_one_as_recorded() {
+        let here = std::env::temp_dir().join(format!("ssai-root-here-{}", std::process::id()));
+        std::fs::create_dir_all(&here).unwrap();
+        // Provisioned globally: the folder `run` confines to, the current one,
+        // which a revoke with no folder names.
+        let got = root_of_scope(ManifestScope::Global, || Ok(here.clone())).unwrap();
+        assert_eq!(got, resolve_real_root(here.clone()).unwrap());
+        // A project gone from disk is still named, absolute, as recorded.
+        let gone = here.join("gone");
+        assert_eq!(root_of_scope(ManifestScope::Project(gone.clone()), || unreachable!()).unwrap(), gone);
+        let _ = std::fs::remove_dir_all(&here);
     }
 
     #[test]
