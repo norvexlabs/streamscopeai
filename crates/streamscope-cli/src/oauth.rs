@@ -38,12 +38,16 @@ pub fn parse_portal_url(input: &str) -> Result<(String, Option<String>)> {
 ///
 /// The one place plaintext is defensible: nothing leaves the machine, so there
 /// is no path for anyone to sit on. It is also how the gateway is developed
-/// against, so refusing it would make the CLI untestable locally.
+/// against, so refusing it would make the CLI untestable locally. Every address
+/// of `127.0.0.0/8` is loopback, not only `127.0.0.1`: an install served on
+/// another one of them is just as local.
 fn is_loopback_origin(origin: &str) -> bool {
-    url::Url::parse(origin)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_string))
-        .is_some_and(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h == "::1")
+    url::Url::parse(origin).ok().is_some_and(|u| match u.host() {
+        Some(url::Host::Domain(d)) => d == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    })
 }
 
 /// Check an origin the CLI discovered rather than one the user typed.
@@ -283,4 +287,28 @@ mod tests {
         assert_eq!(pkce.verifier.len(), 43);
     }
 
+    #[test]
+    fn every_loopback_address_and_only_those_is_a_loopback_origin() {
+        for origin in [
+            "http://localhost:9090",
+            "http://127.0.0.1:9090",
+            "http://127.0.0.9:9090",
+            "http://127.255.255.254",
+            "http://[::1]:9090",
+        ] {
+            assert!(is_loopback_origin(origin), "{origin} is loopback");
+        }
+        for origin in [
+            "http://126.255.255.255",
+            "http://128.0.0.1",
+            "http://10.0.0.1:9090",
+            "http://[::2]",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "http://gw.example.com",
+            "not a url",
+        ] {
+            assert!(!is_loopback_origin(origin), "{origin} is not loopback");
+        }
+    }
 }

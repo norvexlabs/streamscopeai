@@ -86,7 +86,11 @@ pub fn prepare(root: &Path, config: &DockerConfig, command: &str, npm: Option<&s
         eprintln!("ssai: entry {i} of the image {}'s devcontainer.metadata is skipped — {e:#}", config.source_name())
     })
     .then(config.lifecycle.clone());
-    let image = if npm.is_some() || config.docker { agent_layer(&base_id, npm, config.docker, force)? } else { base_id.clone() };
+    let image = if npm.is_some() || config.docker {
+        agent_layer(&base_id, npm, config.docker, config.compose.as_ref().is_some_and(|c| !c.side.is_empty()), force)?
+    } else {
+        base_id.clone()
+    };
     let env = image_env(&inspect(&image, "{{json .Config.Env}}")?);
     let container_root = super::sweep::Root::for_agent(user.uid, user.gid);
     Ok(Prepared { image, user, env, container_root, base: base_id, lifecycle })
@@ -98,7 +102,8 @@ pub fn prepare(root: &Path, config: &DockerConfig, command: &str, npm: Option<&s
 fn engine_turned_on(before: Option<&Record>, engine: bool, command: &str, force: bool) -> Result<()> {
     if !force && engine && before.is_some_and(|b| !b.engine) {
         bail!(
-            "an engine inside (`\"docker\": true` in sandbox.json, or in your organisation's default image) is new \
+            "an engine inside (`\"docker\": true` in sandbox.json, a devcontainer's `dockerComposeFile`, or your organisation's \
+             default image) is new \
              since the project's last run (an engine runs privileged) — check it, then run \
              `ssai sandbox prepare {command}`"
         );
@@ -417,11 +422,12 @@ fn build_hash(root: &Path, config: &DockerConfig) -> Result<String> {
 /// The agent layer on the base: Docker Engine when `engine` and the image
 /// has none, and the client `npm` (with the Node runtime it runs on); tagged
 /// by the base's id and the recipe, built when absent (or `force`).
-fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> Result<String> {
+fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, compose: bool, force: bool) -> Result<String> {
     let node = match npm {
         Some(_) => Some(NodeDist::for_image(base_id)?),
         None => None,
     };
+    let compose = if compose { Some(ComposeDist::new(std::env::consts::ARCH)?) } else { None };
     // The host's store for the client's `npm install` (a TLS-inspecting
     // proxy's root is in it). Best effort: none readable, none passed — nor
     // one whose path podman's comma-separated `--secret` could not carry.
@@ -432,15 +438,17 @@ fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> R
         }
         _ => None,
     };
-    let recipe = layer_dockerfile(base_id, npm.zip(node.as_ref()), engine, host_ca.is_some());
+    let recipe = layer_dockerfile(base_id, npm.zip(node.as_ref()), engine, compose.as_ref(), host_ca.is_some());
     let tag = layer_tag(npm, engine, base_id, &recipe);
     if !force && exists(&tag)? {
         return Ok(tag);
     }
-    let what: Vec<&str> = [engine.then_some("Docker Engine (when the image has none)"), npm].into_iter().flatten().collect();
+    let what: Vec<&str> =
+        [engine.then_some("Docker Engine (when the image has none)"), compose.as_ref().map(|_| "compose"), npm].into_iter().flatten().collect();
     eprintln!("ssai: installing {} into the docker sandbox's image", what.join(" and "));
     // An empty, private context (the Dockerfile comes on stdin): created
-    // new, never one that already exists. It holds only the Node archive.
+    // new, never one that already exists. It holds only the Node archive and
+    // the compose CLI.
     let context = private_build_dir("layer")?;
     // The secret's source sits beside the context, never in it.
     let secret = context.with_extension("host-ca.pem");
@@ -448,6 +456,10 @@ fn agent_layer(base_id: &str, npm: Option<&str>, engine: bool, force: bool) -> R
         if let Some(node) = &node {
             let archive = node.fetch()?;
             std::fs::copy(&archive, context.join(node.file())).context("put the Node archive in the build context")?;
+        }
+        if let Some(compose) = &compose {
+            let binary = compose.fetch()?;
+            std::fs::copy(&binary, context.join(compose.file())).context("put the compose CLI in the build context")?;
         }
         if let Some(pem) = &host_ca {
             std::fs::write(&secret, pem).context("write the host's CA store for the build")?;
@@ -564,42 +576,94 @@ impl NodeDist {
     /// The archive, from this machine's cache or downloaded into it; its
     /// checksum verified either way.
     fn fetch(&self) -> Result<PathBuf> {
-        let dir = crate::state::cache_dir()?.join("sandbox-node");
-        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        let path = dir.join(self.file());
-        if let Ok(bytes) = std::fs::read(&path)
-            && hex::encode(Sha256::digest(&bytes)) == self.sha256
-        {
-            return Ok(path);
-        }
-        eprintln!("ssai: downloading Node {NODE_VERSION} for the docker sandbox ({})", self.url());
-        let url = self.url();
-        let bytes = std::thread::spawn(move || -> Result<Vec<u8>> {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            rt.block_on(async {
-                let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()?;
-                let mut resp = client.get(&url).send().await?.error_for_status()?;
-                let mut body = Vec::new();
-                while let Some(chunk) = resp.chunk().await? {
-                    if body.len() + chunk.len() > NODE_ARCHIVE_CAP {
-                        bail!("{url} is larger than any Node archive");
-                    }
-                    body.extend_from_slice(&chunk);
+        fetch_pinned("sandbox-node", &self.file(), &self.url(), self.sha256, NODE_ARCHIVE_CAP, &format!("Node {NODE_VERSION}"))
+    }
+}
+
+/// `file`, from this machine's cache dir `cache` or downloaded from `url`
+/// into it (at most `cap` bytes); its SHA-256 checked against `sha256`
+/// either way, a mismatch never used.
+fn fetch_pinned(cache: &str, file: &str, url: &str, sha256: &str, cap: usize, what: &str) -> Result<PathBuf> {
+    let dir = crate::state::cache_dir()?.join(cache);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(file);
+    if let Ok(bytes) = std::fs::read(&path)
+        && hex::encode(Sha256::digest(&bytes)) == sha256
+    {
+        return Ok(path);
+    }
+    eprintln!("ssai: downloading {what} for the docker sandbox ({url})");
+    let owned = url.to_string();
+    let bytes = std::thread::spawn(move || -> Result<Vec<u8>> {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        rt.block_on(async {
+            let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300)).build()?;
+            let mut resp = client.get(&owned).send().await?.error_for_status()?;
+            let mut body = Vec::new();
+            while let Some(chunk) = resp.chunk().await? {
+                if body.len() + chunk.len() > cap {
+                    bail!("{owned} is larger than the file it should be");
                 }
-                Ok(body)
-            })
+                body.extend_from_slice(&chunk);
+            }
+            Ok(body)
         })
-        .join()
-        .map_err(|_| anyhow::anyhow!("the Node download stopped"))?
-        .with_context(|| format!("download {}", self.url()))?;
-        let got = hex::encode(Sha256::digest(&bytes));
-        if got != self.sha256 {
-            bail!("{} does not match its pinned checksum (got {got}) — not used", self.url());
-        }
-        let part = dir.join(format!("{}.part-{}", self.file(), std::process::id()));
-        std::fs::write(&part, &bytes).with_context(|| format!("write {}", part.display()))?;
-        std::fs::rename(&part, &path).with_context(|| format!("write {}", path.display()))?;
-        Ok(path)
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("the download of {what} stopped"))?
+    .with_context(|| format!("download {url}"))?;
+    let got = hex::encode(Sha256::digest(&bytes));
+    if got != sha256 {
+        bail!("{url} does not match its pinned checksum (got {got}) — not used");
+    }
+    let part = dir.join(format!("{file}.part-{}", std::process::id()));
+    std::fs::write(&part, &bytes).with_context(|| format!("write {}", part.display()))?;
+    std::fs::rename(&part, &path).with_context(|| format!("write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Where the agent layer installs the compose CLI a compose-based
+/// devcontainer's side services are started with — the layer's own, pinned:
+/// a distribution's may be compose v1, or none. Also Docker's CLI plugin
+/// (`docker compose`), ahead of a distribution's.
+pub const COMPOSE_BIN: &str = "/opt/ssai-agent/compose/docker-compose";
+const COMPOSE_PLUGIN: &str = "/usr/local/lib/docker/cli-plugins/docker-compose";
+const COMPOSE_VERSION: &str = "v5.7.1";
+/// The publisher's static Linux builds, with their SHA-256 as it lists them.
+const COMPOSE_BINARIES: [(&str, &str); 2] = [
+    ("x86_64", "af426722a8af5de812fcee30cc1c39f0639f5f723cbadefb25e5d4db054064cf"),
+    ("aarch64", "f2f49f903240895fa764c0dca3a14548b754ad9426f6b609ccaf55ec5a3aa2a5"),
+];
+/// The largest binary accepted (they are ~35 MB).
+const COMPOSE_CAP: usize = 128 << 20;
+
+/// The compose binary for this machine's architecture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComposeDist {
+    arch: &'static str,
+    sha256: &'static str,
+}
+
+impl ComposeDist {
+    fn new(arch: &str) -> Result<Self> {
+        let (arch, sha256) = COMPOSE_BINARIES
+            .iter()
+            .copied()
+            .find(|(a, _)| *a == arch)
+            .with_context(|| format!("the docker sandbox has no compose CLI for {arch} — start the services yourself in a lifecycle command"))?;
+        Ok(Self { arch, sha256 })
+    }
+
+    fn file(&self) -> String {
+        format!("docker-compose-linux-{}", self.arch)
+    }
+
+    fn url(&self) -> String {
+        format!("https://github.com/docker/compose/releases/download/{COMPOSE_VERSION}/{}", self.file())
+    }
+
+    fn fetch(&self) -> Result<PathBuf> {
+        fetch_pinned("sandbox-compose", &format!("{}-{COMPOSE_VERSION}", self.file()), &self.url(), self.sha256, COMPOSE_CAP, &format!("compose {COMPOSE_VERSION}"))
     }
 }
 
@@ -685,10 +749,19 @@ const HOST_CA_SECRET: &str = "ssai-host-ca";
 /// system store, handed in as the [`HOST_CA_SECRET`] build secret — never a
 /// layer of the image — beside the image's own `NODE_EXTRA_CA_CERTS`, which
 /// Node would otherwise drop (it reads one such file).
-fn layer_dockerfile(base_id: &str, client: Option<(&str, &NodeDist)>, engine: bool, host_trust: bool) -> String {
+fn layer_dockerfile(base_id: &str, client: Option<(&str, &NodeDist)>, engine: bool, compose: Option<&ComposeDist>, host_trust: bool) -> String {
     let mut df = format!("FROM {base_id}\nUSER root\n");
     if engine {
         df.push_str(&format!("RUN set -e; {ENGINE_INSTALL}\n"));
+    }
+    if let Some(c) = compose {
+        df.push_str(&format!(
+            "# compose {sha}\nCOPY {file} {COMPOSE_BIN}\n\
+             RUN set -e; chmod 755 {COMPOSE_BIN}; mkdir -p {plugins}; ln -sf {COMPOSE_BIN} {COMPOSE_PLUGIN}\n",
+            sha = c.sha256,
+            file = c.file(),
+            plugins = Path::new(COMPOSE_PLUGIN).parent().map(|p| p.display().to_string()).unwrap_or_default(),
+        ));
     }
     if let Some((package, node)) = client {
         let musl = if node.libc.is_empty() { "" } else { "command -v apk >/dev/null 2>&1 && apk add --no-cache libstdc++ libgcc; " };
@@ -1014,13 +1087,13 @@ mod tests {
     #[test]
     fn the_layers_npm_install_trusts_the_hosts_store_beside_the_images_own() {
         let node = NodeDist::new("x86_64", false).unwrap();
-        let df = layer_dockerfile("sha256:aa", Some(("x", &node)), false, true);
+        let df = layer_dockerfile("sha256:aa", Some(("x", &node)), false, None, true);
         assert!(df.contains("RUN --mount=type=secret,id=ssai-host-ca set -e; "), "{df}");
         // A newline between the two: a file ending without one would hide the next certificate.
         assert!(df.contains(r#"{ cat "$NODE_EXTRA_CA_CERTS"; echo; cat "$ca"; } > /tmp/ssai-node-ca.pem"#), "{df}");
         assert!(df.contains("NODE_EXTRA_CA_CERTS=$ca PATH=/opt/ssai-agent/node/bin:$PATH npm install"), "{df}");
         assert!(df.contains("rm -f /tmp/ssai-node-ca.pem"), "{df}");
-        let without = layer_dockerfile("sha256:aa", Some(("x", &node)), false, false);
+        let without = layer_dockerfile("sha256:aa", Some(("x", &node)), false, None, false);
         assert!(!without.contains("secret") && !without.contains("NODE_EXTRA_CA_CERTS"), "{without}");
         // Trust changes the recipe, so the two are distinct layers.
         assert_ne!(layer_tag(Some("x"), false, "sha256:aa", &df), layer_tag(Some("x"), false, "sha256:aa", &without));
@@ -1029,7 +1102,7 @@ mod tests {
     #[test]
     fn the_agent_layer_is_tagged_by_its_base_and_installs_the_latest_package() {
         let node = NodeDist::new("x86_64", false).unwrap();
-        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", Some(("@anthropic-ai/claude-code", &node)), false, false);
+        let recipe = layer_dockerfile("sha256:0123456789abcdef0123", Some(("@anthropic-ai/claude-code", &node)), false, None, false);
         let tag = layer_tag(Some("@anthropic-ai/claude-code"), false, "sha256:0123456789abcdef0123", &recipe);
         let named = "localhost/ssai-agent-anthropic-ai-claude-code:0123456789ab-";
         assert!(tag.starts_with(named) && tag.len() == named.len() + 8, "{tag}");
@@ -1054,20 +1127,33 @@ mod tests {
         assert!(df.ends_with("\nENV PATH=/opt/ssai-agent/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:/opt/ssai-agent/node/bin\n"), "{df}");
         assert!(!df.contains("dockerd"), "no engine unless asked: {df}");
         // The engine alone, and with the client: each its own recipe.
-        let engine = layer_dockerfile("sha256:aa", None, true, false);
+        let engine = layer_dockerfile("sha256:aa", None, true, None, false);
         assert!(engine.contains("command -v dockerd") && engine.contains("docker.io iptables") && !engine.contains("npm"), "{engine}");
-        let both = layer_dockerfile("sha256:aa", Some(("@anthropic-ai/claude-code", &node)), true, false);
+        let both = layer_dockerfile("sha256:aa", Some(("@anthropic-ai/claude-code", &node)), true, None, false);
         assert!(both.contains("command -v dockerd") && both.contains("npm install"), "{both}");
         // A musl image gets the musl build, and the C++ runtime it needs.
         let musl = NodeDist::new("x86_64", true).unwrap();
-        let df = layer_dockerfile("sha256:aa", Some(("x", &musl)), false, false);
+        let df = layer_dockerfile("sha256:aa", Some(("x", &musl)), false, None, false);
         assert!(df.contains("-linux-x64-musl.tar.gz") && df.contains("apk add --no-cache libstdc++"), "{df}");
         assert!(musl.url().starts_with("https://unofficial-builds.nodejs.org/"));
         assert!(node.url().starts_with("https://nodejs.org/dist/"));
         // The pin is in the recipe: a new pin is a new layer.
-        assert!(layer_dockerfile("sha256:aa", Some(("x", &node)), false, false).contains(node.sha256));
+        assert!(layer_dockerfile("sha256:aa", Some(("x", &node)), false, None, false).contains(node.sha256));
         assert!(NodeDist::new("riscv64", false).is_err());
         assert_eq!(NodeDist::new("aarch64", false).unwrap().arch, "arm64");
+    }
+
+    #[test]
+    fn a_compose_project_layer_installs_the_pinned_compose_cli_as_the_plugin_too() {
+        let c = ComposeDist::new("x86_64").unwrap();
+        let df = layer_dockerfile("sha256:aa", None, true, Some(&c), false);
+        assert!(df.contains(c.sha256), "the pin is in the recipe, so a new pin is a new layer");
+        assert!(df.contains(&format!("COPY docker-compose-linux-x86_64 {COMPOSE_BIN}")), "{df}");
+        assert!(df.contains(&format!("ln -sf {COMPOSE_BIN} {COMPOSE_PLUGIN}")), "{df}");
+        assert!(!layer_dockerfile("sha256:aa", None, true, None, false).contains(COMPOSE_BIN));
+        assert_eq!(ComposeDist::new("aarch64").unwrap().file(), "docker-compose-linux-aarch64");
+        assert!(ComposeDist::new("riscv64").is_err());
+        assert!(c.url().ends_with(&format!("/{COMPOSE_VERSION}/docker-compose-linux-x86_64")));
     }
 
 

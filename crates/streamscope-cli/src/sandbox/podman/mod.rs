@@ -9,7 +9,9 @@
 //! guard on the run's socket; run the container — its init relays the guard
 //! and starts the agent; then sweep the project and remove the run's files.
 
+pub mod compose;
 pub mod config;
+mod engine;
 mod images;
 pub mod init;
 mod plan;
@@ -32,6 +34,8 @@ const RELAY_PORT: u16 = 3128;
 /// Node's additive trust variable: the one a docker run may set for the
 /// host's store without dropping the image's own roots.
 const NODE_CA_VAR: &str = "NODE_EXTRA_CA_CERTS";
+/// The compose overlay's name in the run dir.
+const COMPOSE_OVERLAY: &str = "compose-overlay.json";
 
 /// The host's system store, in the run dir.
 const HOST_CA_FILE: &str = "host-ca.pem";
@@ -133,7 +137,83 @@ fn read_config(
         ),
         Err(e) => return Err(e).with_context(|| format!("read {}", file.display())),
     };
-    config::resolve(root, &text, &|p| std::fs::read_to_string(p).map_err(Into::into))
+    config::resolve(root, &text, &|p| read_in_project(root, p))
+}
+
+/// `names` added to every proxy exemption the run's environment holds:
+/// `NO_PROXY` / `no_proxy` (comma-separated) and the JVM's
+/// `-Dhttp.nonProxyHosts` in `JAVA_TOOL_OPTIONS` (`|`-separated) — a client
+/// reading either reaches them directly, never through the guard.
+fn exempt_from_proxy(env: &mut Vec<(String, String)>, names: &[&str]) {
+    // None named yet (every loopback name is the gateway's): the names alone.
+    if !names.is_empty() && !env.iter().any(|(k, _)| k == "NO_PROXY" || k == "no_proxy") {
+        for k in ["NO_PROXY", "no_proxy"] {
+            env.push((k.to_string(), names.join(",")));
+        }
+    }
+    for (k, v) in env.iter_mut() {
+        match k.as_str() {
+            "NO_PROXY" | "no_proxy" => {
+                for name in names {
+                    if !v.split(',').any(|e| e.trim() == *name) {
+                        v.push(',');
+                        v.push_str(name);
+                    }
+                }
+            }
+            "JAVA_TOOL_OPTIONS" => {
+                *v = v
+                    .split(' ')
+                    .map(|t| match t.strip_prefix("-Dhttp.nonProxyHosts=") {
+                        Some(list) => {
+                            let mut list = list.to_string();
+                            for name in names {
+                                if !list.split('|').any(|e| e == *name) {
+                                    list.push('|');
+                                    list.push_str(name);
+                                }
+                            }
+                            format!("-Dhttp.nonProxyHosts={list}")
+                        }
+                        None => t.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The largest configuration file read (a `devcontainer.json`, a compose
+/// file, a `.env`).
+const CONFIG_FILE_CAP: u64 = 4 << 20;
+
+/// `path`, a file the project's configuration names, read only when it is
+/// inside the project through every symlink: its values reach the container
+/// (a `.env` linked to a credentials file of the home would hand it over). A
+/// missing file is the `NotFound` it is.
+fn read_in_project(root: &Path, path: &Path) -> Result<String> {
+    let real = path.canonicalize()?;
+    let root_real = root.canonicalize().with_context(|| format!("resolve {}", root.display()))?;
+    if !real.starts_with(&root_real) {
+        bail!(
+            "{} leads outside the project (to {}) — the sandbox reads its configuration from the project only",
+            path.display(),
+            real.display()
+        );
+    }
+    // A FIFO or a device would block the open, or never end.
+    if !std::fs::metadata(&real)?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::Read::take(std::fs::File::open(&real)?, CONFIG_FILE_CAP + 1), &mut text)
+        .with_context(|| format!("read {}", path.display()))?;
+    if text.len() as u64 > CONFIG_FILE_CAP {
+        bail!("{} is larger than any configuration file the sandbox reads ({CONFIG_FILE_CAP} bytes)", path.display());
+    }
+    Ok(text)
 }
 
 impl config::DockerConfig {
@@ -428,6 +508,16 @@ async fn run_container(
             *v = to;
         }
     }
+    // A compose service is reached directly, by its name (the stub answers it
+    // with its own address): a client honouring the proxy variables would
+    // otherwise send `http://api:8080` to the guard, never to the service.
+    if let Some(c) = &config.compose
+        && !c.side.is_empty()
+    {
+        let names: Vec<&str> =
+            c.names.iter().chain(std::iter::once(&c.service).filter(|n| compose::local_name(n))).map(String::as_str).collect();
+        exempt_from_proxy(&mut env, &names);
+    }
     // A config the container does not have is reported by init as one OpenCode
     // does not load there.
     let opencode = spec.opencode.as_ref().map(|launch| {
@@ -489,6 +579,50 @@ async fn run_container(
     // own variables (the proxy, the client's) over the project's.
     let env: Vec<(String, String)> = user_env.iter().cloned().chain(env).collect();
 
+    // A compose-based devcontainer: its side services, started by init in the
+    // engine; the overlay (the service sharing the primary's network, on the
+    // sandbox's own) in the run dir, after the project's files.
+    let compose = match &config.compose {
+        None => None,
+        Some(c) => {
+            // A service named as the gateway's host would take that name from
+            // the agent: exempt from the proxy, answered by the engine.
+            let gateway_hosts: Vec<String> = spec
+                .proxy_origins
+                .iter()
+                .filter_map(|o| url::Url::parse(o).ok()?.host_str().map(str::to_ascii_lowercase))
+                .collect();
+            if !c.side.is_empty()
+                && let Some(name) =
+                    c.names.iter().chain(std::iter::once(&c.service)).find(|n| gateway_hosts.contains(&n.to_ascii_lowercase()))
+            {
+                bail!("the devcontainer's service `{name}` is named as the gateway's host — rename the service");
+            }
+            let overlay = format!("{}/{COMPOSE_OVERLAY}", plan::RUN_MOUNT);
+            match c.up_argv(prepare::COMPOSE_BIN, root, &workspace, &overlay) {
+                // No side service: nothing to start, and an `up` naming none
+                // would start the primary inside the engine.
+                None => None,
+                Some((config_argv, argv)) => {
+                    std::fs::write(run.run.join(COMPOSE_OVERLAY), serde_json::to_vec_pretty(&c.overlay())?)
+                        .context("write the compose overlay")?;
+                    Some(init::ComposeUp {
+                        config_argv,
+                        argv,
+                        primary: c.service.clone(),
+                        project: compose::PROJECT_NAME.to_string(),
+                        services: c.side.clone(),
+                        must_exit: c.must_exit.clone(),
+                        // The primary (the sandbox itself) and the service on
+                        // its network are at loopback.
+                        hosts: std::iter::once(&c.service).chain(&c.host_mode).filter(|n| compose::local_name(n)).cloned().collect(),
+                        lookup: c.names.iter().chain(std::iter::once(&c.service).filter(|n| compose::local_name(n))).cloned().collect(),
+                    })
+                }
+            }
+        }
+    };
+
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let exit_file = run.sock.join("exit");
     let start = init::Start {
@@ -509,6 +643,7 @@ async fn run_container(
         exit_file: format!("{}/exit", plan::SOCK_MOUNT),
         tty,
         opencode,
+        compose,
     };
     let start_file = run.run.join(plan::START_FILE);
     {
@@ -958,6 +1093,60 @@ pub fn prune() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compose_service_is_exempt_from_every_proxy_the_run_names() {
+        let mut env: Vec<(String, String)> = [
+            ("NO_PROXY", "127.0.0.1,localhost"),
+            ("no_proxy", "127.0.0.1,localhost,db"),
+            ("JAVA_TOOL_OPTIONS", "-Xmx1g -Dhttp.proxyHost=100.100.100.53 -Dhttp.nonProxyHosts=127.0.0.1|localhost|[::1]"),
+            ("HTTPS_PROXY", "http://100.100.100.53:3128"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .to_vec();
+        exempt_from_proxy(&mut env, &["db", "api"]);
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str()).unwrap();
+        assert_eq!(get("NO_PROXY"), "127.0.0.1,localhost,db,api");
+        assert_eq!(get("no_proxy"), "127.0.0.1,localhost,db,api", "a name already there is not added twice");
+        assert_eq!(get("JAVA_TOOL_OPTIONS"), "-Xmx1g -Dhttp.proxyHost=100.100.100.53 -Dhttp.nonProxyHosts=127.0.0.1|localhost|[::1]|db|api");
+        assert_eq!(get("HTTPS_PROXY"), "http://100.100.100.53:3128", "the proxy itself is left as it is");
+        // No exemption yet: one is made, holding the names.
+        let mut bare = vec![("HTTPS_PROXY".to_string(), "http://x:1".to_string())];
+        exempt_from_proxy(&mut bare, &["db"]);
+        assert!(bare.contains(&("NO_PROXY".into(), "db".into())) && bare.contains(&("no_proxy".into(), "db".into())));
+    }
+
+    #[test]
+    fn a_configuration_file_is_read_only_inside_the_project_through_its_symlinks() {
+        let base = std::env::temp_dir().join(format!("ssai-read-in-project-{}-{}", std::process::id(), rand::random::<u32>()));
+        let (root, outside) = (base.join("project"), base.join("home"));
+        std::fs::create_dir_all(root.join(".devcontainer")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("credentials"), "aws_secret_access_key=s3cret\n").unwrap();
+        std::fs::write(root.join(".devcontainer/own.env"), "A=1\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("credentials"), root.join(".devcontainer/.env")).unwrap();
+        std::os::unix::fs::symlink("own.env", root.join(".devcontainer/inside.env")).unwrap();
+        let err = format!("{:#}", read_in_project(&root, &root.join(".devcontainer/.env")).unwrap_err());
+        assert!(err.contains("leads outside the project"), "{err}");
+        // Positive control: a file of the project, and a link that stays in it.
+        assert_eq!(read_in_project(&root, &root.join(".devcontainer/own.env")).unwrap(), "A=1\n");
+        assert_eq!(read_in_project(&root, &root.join(".devcontainer/inside.env")).unwrap(), "A=1\n");
+        // A missing file is the NotFound a reader takes as absent.
+        let missing = read_in_project(&root, &root.join(".devcontainer/none.env")).unwrap_err();
+        assert!(missing.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound));
+        // Only a regular file: a FIFO would block the open.
+        let fifo = root.join("fifo.env");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo on a path we own, a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(format!("{:#}", read_in_project(&root, &fifo).unwrap_err()).contains("not a regular file"));
+        // Bounded, on both sides of the cap.
+        std::fs::write(root.join("cap.json"), vec![b' '; CONFIG_FILE_CAP as usize]).unwrap();
+        assert!(read_in_project(&root, &root.join("cap.json")).is_ok());
+        std::fs::write(root.join("big.json"), vec![b' '; CONFIG_FILE_CAP as usize + 1]).unwrap();
+        assert!(read_in_project(&root, &root.join("big.json")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn a_host_path_is_found_where_the_container_has_it() {

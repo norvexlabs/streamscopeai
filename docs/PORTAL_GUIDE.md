@@ -877,7 +877,8 @@ repository another account owns, trusts the project for the run without a change
 configuration (and, with Git for Windows 2.46 or later, every repository in it — a submodule's
 checkout); Claude Code starts past its first-run screen. The grants stay between runs (granting a large project again each time would cost seconds), so
 while one project runs, the sandbox account can also write every project it was granted before:
-`ssai sandbox revoke [<folder>]` takes one project's back, and
+`ssai sandbox status` lists them (with `-v`, every other path whose access each grant changed: the
+folders above it, the tool's, the holds on its git folder), `ssai sandbox revoke [<folder>]` takes one project's back, and
 `--all` every one (revoking a project that holds another granted project inside it takes that
 folder's entries back too; the inner project's next run grants them again). An item in the project
 the grant does not reach — one that inherits nothing, or one whose access was set before the grant —
@@ -1127,6 +1128,73 @@ connection — the agent's, the engine's pulls, and those of the containers the 
 through the guard and follows the network setting. One such run per project at a time: a second
 stops with `another --sandbox docker run is live on this project`.
 
+#### A dev container with docker compose
+
+A `devcontainer.json` that names `dockerComposeFile` and `service` — the shape a project with a database or
+a queue beside it uses — runs as it is:
+
+```jsonc
+// .devcontainer/devcontainer.json
+{ "dockerComposeFile": "docker-compose.yml", "service": "app",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}" }
+```
+
+The `service` (here `app`) is the sandbox: its `image` or `build` gives the container, built on your
+machine as a `build` in `devcontainer.json` is, and the agent runs in it at the `workspaceFolder`. The other
+services run in a Docker engine inside the sandbox — `"docker": true` is implied when there are any — started before the
+lifecycle commands, each waited for until it runs (until it is healthy, when it has a healthcheck; one
+that exits 0 is done, and one `service` waits on with `condition: service_completed_successfully` — a
+migration — is waited for until it has exited 0). Their images are pulled through the
+sandbox's allowed destinations, so the registry needs to be one (`registry-1.docker.io`,
+`auth.docker.io`, `production.cloudfront.docker.com` and `production.cloudflare.docker.com` for Docker Hub). A service the wait finds
+failed (exited with another status, unhealthy), or not ready within ten minutes of being started (pulling
+and building them is not timed), stops the run before the
+tool starts, naming it with its last log lines (one a restart policy keeps restarting is named, restarting, when
+the ten minutes are up). The wait reads each service until it runs once: one that crashes a moment after, or a
+restart loop found running, is the agent's to see. If moving a
+project to compose turns its engine on, the first run asks for `ssai sandbox prepare` first. Their data (a database's
+volume) is kept between runs, with the engine's cache; `ssai sandbox prune --project` removes it.
+
+- **By name.** The agent reaches a service by its name (`redis:6379`, `http://api:8080` — the service names
+  are exempt from the proxy), and its own container by the name of `service`; a service reaches the agent's
+  container by that name too (`app:3000`), which needs the agent's server to listen on all
+  addresses (`0.0.0.0`), not only `localhost`.
+- **At `localhost`.** With `network_mode: service:db` on `service` — the dev container templates' way to
+  reach their database at `localhost` — `db` runs on the sandbox's own network: the agent reaches it at
+  `localhost:5432`, and another service reaches it by its name too (one that `extends` another or shares another's
+  network does not). `db` may not set `networks`, `network_mode` or `links` of its own. A service may not be
+  named as the gateway's host.
+- **Several files.** An array of files (a project's own `docker-compose.yml` and the dev container's
+  additions) is read as compose reads it: a later file adds to `service`'s settings and overrides them.
+
+Of `service`'s settings, the sandbox applies `image` (a short name such as `python:3.12` is Docker Hub's, as
+compose reads it), `build` (`context`, `dockerfile`, `target`, `args`), `user`, `environment`, `env_file`
+(inside the project), `depends_on` (what it names starts first), the project's own folder in `volumes`, and
+`network_mode: service:…`. Variables in them are filled from the project's `.env` file and their
+defaults (`${TAG:-1}`) only, never from your environment (a `.env` value may name one above it, and a value
+that comes out naming `${localEnv:…}` is refused): an
+`environment` value naming a variable neither sets is left unset, said, and any other setting naming one is
+refused. In `volumes`, a
+folder around the project (`../..:/workspaces`) mounts only the project, at the `workspaceFolder`; a named
+volume (a `node_modules` cache) is not kept; `/var/run/docker.sock` and a file or folder under `~/.ssh`,
+`~/.gitconfig` or `~/.aws` are not mounted, since the sandbox hands the agent none of your credentials —
+`run` names each; a variable that fills a volume's name (`${NM:-nm}:/w/node_modules`) is such a volume. Any other
+folder in `volumes` — of your machine, or of the project at another path (it is in the sandbox already, under the
+`workspaceFolder`) — is refused, as are `devices`, `extends`,
+`secrets`, `configs`, `volumes_from`, `extra_hosts`, `dns`, `sysctls`, `ulimits`, `pid`, `ipc`,
+`platform`, a `network_mode` other than `service:…`, a top-level `include`, and any key the sandbox does
+not know. `command`, `entrypoint`, `ports`, `restart`, `profiles`, `cap_add`, `privileged` and the like are not applied
+(the sandbox starts the tool itself, and its container already has what its engine needs), and `run`
+names each. The other services' settings are compose's to apply, inside the sandbox: none of them reaches
+your machine. A service that names `service` in its `depends_on`, `links` or `volumes_from`, or as
+`service:…` in its `network_mode`, `pid` or `ipc` — directly or through another — is
+refused, since it would start `service` inside the engine: compose itself, inside the sandbox, says what
+starting the services would start, every variable and `extends` resolved, before anything starts. The
+compose steps talk to the sandbox's own engine, whatever `DOCKER_HOST` or a Docker context in the agent's
+environment names, and read the files' variables from the project's `.env` and their defaults (and
+compose's own `COMPOSE_*` settings there). What a service writes into
+the project is handed back as for any container the agent starts ([below](#container-sandbox-reference)).
+
 #### When the image changes
 
 A run never rebuilds the image on its own — the agent works in your project, so a changed recipe may
@@ -1150,7 +1218,7 @@ A run never removes an image: an image replaced by a rebuild or another referenc
 remove it.
 
 ```sh
-ssai sandbox status                       # each project's image, tool layers and volumes, with sizes
+ssai sandbox status                       # the native sandbox's state, then each project's image, tool layers and volumes, with sizes
 ssai sandbox prune --project [<folder>]   # one project's (the project at or above the folder, the current one by default)
 ssai sandbox prune                        # every image and volume the container sandbox made
 ```
@@ -1181,15 +1249,16 @@ The keys of a sandbox in `.streamscopeai/sandbox.json` (`{"sandboxes": {"default
 | Key | Meaning |
 |---|---|
 | `image` | an image reference from a registry, e.g. `"mcr.microsoft.com/devcontainers/base:ubuntu-24.04"` (a local archive or folder — `oci-archive:`, `dir:` — is refused). A dev container image's own metadata applies: its user, its variables, and its features' lifecycle commands (below) |
-| `devcontainer` | instead of `image`: the path of a `devcontainer.json` inside the project (its `image`, or `build` with `dockerfile`, `context`, `target` and `args`; its `remoteUser` or `containerUser`; its `workspaceFolder`. `${localWorkspaceFolder}` and `${localWorkspaceFolderBasename}` are expanded in `workspaceFolder`, the users and `build.args`, and `${containerWorkspaceFolder}` in the last two; `${localEnv:…}` is refused, since it would carry your environment into the build) |
+| `devcontainer` | instead of `image`: the path of a `devcontainer.json` inside the project (its `image`, or `build` with `dockerfile`, `context`, `target` and `args`; its `remoteUser` or `containerUser`; its `workspaceFolder`; or `dockerComposeFile` and `service`, [above](#a-dev-container-with-docker-compose). `${localWorkspaceFolder}` and `${localWorkspaceFolderBasename}` are expanded in `workspaceFolder`, the users and `build.args`, and `${containerWorkspaceFolder}` in the last two; `${localEnv:…}` is refused, since it would carry your environment into the build) |
 | `docker` | `true` starts a Docker engine inside the container, its image cache kept between runs (needs `/dev/fuse`). An image without Docker Engine gets one from its distribution (Debian, Ubuntu, Alpine, Fedora) |
 | `network` | `"gateway"` limits this project's container-sandbox runs to the gateway alone; `"policy"` (the default) takes the profile's network. `ssai run --network` wins over it, and narrows a native run too |
 | `memory`, `cpus`, `pids` | the container's limits, e.g. `"6g"`, `3`; `pids` defaults to 16384, at least 64 |
 
 A `devcontainer.json` that sets `runArgs`, `mounts`, `workspaceMount`, `privileged`, `capAdd`,
-`securityOpt`, `dockerComposeFile`, `build.options` or the legacy `dockerFile`/`context` is refused, since each would widen what the
+`securityOpt`, `build.options` or the legacy `dockerFile`/`context` is refused, since each would widen what the
 container or its build reaches — and so is a `build` whose Dockerfile or context leads outside the
-project, through a symlink included;
+project, through a symlink included; the `devcontainer.json`, the compose files, `.env` and an `env_file`
+are read only when they resolve inside the project, through every symlink;
 `initializeCommand` (it would run on your machine), `forwardPorts` and `appPort` are not applied, and
 `run` names each one it finds.
 

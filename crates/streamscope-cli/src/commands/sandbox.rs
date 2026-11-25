@@ -1,4 +1,4 @@
-//! `ssai sandbox` — the Windows sandbox account and the FreeBSD jail daemon
+//! `ssai sandbox` — the Windows sandbox account and its grants, the FreeBSD jail daemon
 //! (`ssai run --sandbox native` there), and the docker sandbox's images and volumes
 //! (`ssai run --sandbox docker`).
 
@@ -64,9 +64,17 @@ pub enum SandboxCommand {
         #[arg(long)]
         host: Option<String>,
     },
-    /// The docker sandbox's images and volumes on this machine, per project,
-    /// with their sizes.
-    Status,
+    /// Whether the native sandbox is ready on this computer and what it keeps
+    /// between runs (on Windows, every project its account was granted), and
+    /// on Linux the docker sandbox's images and volumes, per project, with
+    /// their sizes.
+    Status {
+        /// Windows: list every other path whose access each project's grant
+        /// changed (the folders above it, the tool's, the holds on its git
+        /// folder), not only how many.
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Remove every docker-sandbox image and volume of yours (the agents'
     /// homes and the engines' caches go with them), or with `--project` one
     /// project's only.
@@ -88,7 +96,7 @@ pub async fn run(command: SandboxCommand) -> Result<()> {
             let (root, command, default_image) = super::run::sandbox_target(&client, host.as_deref()).await?;
             tokio::task::spawn_blocking(move || crate::sandbox::podman_prepare(&root, &command, default_image.as_ref())).await?
         }
-        SandboxCommand::Status => tokio::task::spawn_blocking(crate::sandbox::podman_status).await?,
+        SandboxCommand::Status { verbose } => tokio::task::spawn_blocking(move || crate::sandbox::status(verbose)).await?,
         SandboxCommand::Prune { project: None } => tokio::task::spawn_blocking(|| crate::sandbox::podman_prune(None)).await?,
         SandboxCommand::Prune { project: Some(dir) } => {
             // The root a run there confines to: the provisioned project at or

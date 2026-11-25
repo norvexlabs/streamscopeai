@@ -10,9 +10,12 @@
 //!   on it, so a connect to a public address reaches the nat hook instead of
 //!   failing with "network unreachable" (nothing leaves through it: what is
 //!   not redirected is dropped there);
-//! - a DNS stub on that address answering every A question with a fake
-//!   address from `198.18.0.0/15`, remembered against the name; AAAA and
-//!   every other type answered empty;
+//! - a DNS stub on that address answering an A question with a fake address
+//!   from `198.18.0.0/15`, remembered against the name — but a compose
+//!   service's name, answered with the private address the engine reports for
+//!   it, or none (the names at the sandbox's loopback are in its /etc/hosts,
+//!   which the engine's containers do not read); AAAA and every other type
+//!   answered empty;
 //! - nat rules (the image's `iptables`, which the engine needs anyway): a
 //!   private, CGNAT or link-local destination left as it is; DNS to any other
 //!   address → the stub; TCP leaving by `ssai0` (the agent) or arriving from
@@ -57,7 +60,7 @@ const DIRECT: [&str; 6] = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.16
 /// Set the routing up and start the stub and the listener; `guard` is the
 /// guard's socket. A failure stops the run: without it nothing in the
 /// container (the agent included, which has no proxy variable) reaches out.
-pub fn start(guard: &str) -> Result<()> {
+pub fn start(guard: &str, services: Option<Services>) -> Result<()> {
     link().context("create the sandbox's routing device")?;
     rules().context("install the sandbox's routing rules")?;
     let names = Arc::new(Mutex::new(FakeNames::default()));
@@ -70,13 +73,59 @@ pub fn start(guard: &str) -> Result<()> {
     // resolver directory the container does not have.
     let _ = std::fs::remove_file("/etc/resolv.conf");
     std::fs::write("/etc/resolv.conf", format!("nameserver {STUB}\n")).context("write /etc/resolv.conf")?;
+    let services = services.map(Arc::new);
+    let (n, s) = (names.clone(), services.clone());
+    std::thread::spawn(move || dns_udp(udp, n, s));
     let n = names.clone();
-    std::thread::spawn(move || dns_udp(udp, n));
-    let n = names.clone();
-    std::thread::spawn(move || dns_tcp(tcp, n));
+    std::thread::spawn(move || dns_tcp(tcp, n, services));
     let guard = guard.to_string();
     std::thread::spawn(move || listen(listener, names, guard));
     Ok(())
+}
+
+/// How long the stub waits for the engine to name a service's address.
+const SERVICE_LOOKUP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A compose project's services, run in the engine: a single-label A
+/// question (`db`) is answered with the service's own address on its network,
+/// read from the engine when asked, so a restarted service's new address is
+/// the one answered (TTL is the pool's). resolv.conf names no search domain,
+/// so `db` is asked as it is written.
+pub struct Services {
+    pub socket: String,
+    pub project: String,
+    /// The project's service names (lowercase): only they are asked of the
+    /// engine, and one with no running container is answered with no address,
+    /// never a fake one (it would send the agent's connection to the guard).
+    pub names: std::collections::BTreeSet<String>,
+}
+
+impl Services {
+    /// For an A question about one of the project's service names (`None`
+    /// otherwise): the address its running container holds, or none.
+    fn address_for(&self, query: &[u8]) -> Option<Option<Ipv4Addr>> {
+        // Only a query `answer` answers as an A question: never a response,
+        // another opcode or several questions.
+        let head = query.get(..12)?;
+        let flags = u16::from_be_bytes([head[2], head[3]]);
+        if flags & 0x8000 != 0 || (flags >> 11) & 0xf != 0 || u16::from_be_bytes([head[4], head[5]]) != 1 {
+            return None;
+        }
+        let (Some(name), end) = question_name(query)? else { return None };
+        let tail = query.get(end..end + 4)?;
+        let (qtype, qclass) = (u16::from_be_bytes([tail[0], tail[1]]), u16::from_be_bytes([tail[2], tail[3]]));
+        if qtype != 1 || qclass != 1 || !self.names.contains(&name) {
+            return None;
+        }
+        let filter = serde_json::json!({
+            "label": [format!("com.docker.compose.project={}", self.project)],
+            "status": ["running"],
+        })
+        .to_string();
+        let path = format!("/containers/json?filters={}", super::engine::encode(&filter));
+        let list = super::engine::get_within(&self.socket, &path, SERVICE_LOOKUP).ok();
+        Some(list.and_then(|l| super::engine::service_address(&l, &self.project, &name)))
+    }
 }
 
 /// Every name asked, by its fake address and back; bounded by the pool: the
@@ -115,9 +164,11 @@ fn in_pool(addr: Ipv4Addr) -> bool {
 /// The answer to one DNS query (`None`: not a query, nothing is sent). A
 /// name is kept only when every label is letters, digits, `-` or `_` — it is
 /// written into the `CONNECT` line, so nothing else may reach it — and is
-/// kept lowercase. Such a name's A question gets its fake address; any other
+/// kept lowercase. Such a name's A question gets — for a compose service
+/// (`service` set) — the engine's address for it or none, else its fake
+/// address; any other
 /// question about it an empty answer; a malformed or refused name `REFUSED`.
-pub(crate) fn answer(query: &[u8], names: &mut FakeNames) -> Option<Vec<u8>> {
+pub(crate) fn answer(query: &[u8], names: &mut FakeNames, service: Option<Option<Ipv4Addr>>) -> Option<Vec<u8>> {
     if query.len() < 12 {
         return None;
     }
@@ -155,8 +206,11 @@ pub(crate) fn answer(query: &[u8], names: &mut FakeNames) -> Option<Vec<u8>> {
     let Some(name) = name else { return Some(reply(5, question, None)) };
     let (qtype, qclass) = (u16::from_be_bytes([tail[0], tail[1]]), u16::from_be_bytes([tail[2], tail[3]]));
     if qtype == 1 && qclass == 1 && !name.is_empty() {
-        let a = names.address_for(&name);
-        return Some(reply(0, question, Some(a)));
+        let a = match service {
+            Some(found) => found,
+            None => Some(names.address_for(&name)),
+        };
+        return Some(reply(0, question, a));
     }
     Some(reply(0, question, None))
 }
@@ -189,15 +243,19 @@ fn question_name(query: &[u8]) -> Option<(Option<String>, usize)> {
     Some((name, i))
 }
 
-fn dns_udp(sock: UdpSocket, names: Arc<Mutex<FakeNames>>) {
+fn dns_udp(sock: UdpSocket, names: Arc<Mutex<FakeNames>>, services: Option<Arc<Services>>) {
     let mut buf = [0u8; 1500];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf) else {
             std::thread::sleep(std::time::Duration::from_millis(100));
             continue;
         };
+        // Asked of the engine before the map is locked, so a TCP question is
+        // never held up by it; UDP questions are answered one at a time, so a
+        // slow engine holds them up for at most SERVICE_LOOKUP each.
+        let found = services.as_ref().and_then(|s| s.address_for(&buf[..n]));
         let out = match names.lock() {
-            Ok(mut names) => answer(&buf[..n], &mut names),
+            Ok(mut names) => answer(&buf[..n], &mut names, found),
             Err(_) => return,
         };
         if let Some(out) = out {
@@ -210,7 +268,7 @@ fn dns_udp(sock: UdpSocket, names: Arc<Mutex<FakeNames>>) {
 /// backlog (resolvers use UDP; TCP is the rare fallback).
 const DNS_TCP_MAX: usize = 32;
 
-fn dns_tcp(listener: TcpListener, names: Arc<Mutex<FakeNames>>) {
+fn dns_tcp(listener: TcpListener, names: Arc<Mutex<FakeNames>>, services: Option<Arc<Services>>) {
     let open = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(mut conn) = conn else {
@@ -221,7 +279,7 @@ fn dns_tcp(listener: TcpListener, names: Arc<Mutex<FakeNames>>) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         open.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let (names, open) = (names.clone(), open.clone());
+        let (names, open, services) = (names.clone(), open.clone(), services.clone());
         let held = open.clone();
         let spawned = std::thread::Builder::new().spawn(move || {
             struct Release(Arc<std::sync::atomic::AtomicUsize>);
@@ -241,7 +299,8 @@ fn dns_tcp(listener: TcpListener, names: Arc<Mutex<FakeNames>>) {
                 if conn.read_exact(&mut q).is_err() {
                     return;
                 }
-                let Some(out) = names.lock().ok().and_then(|mut n| answer(&q, &mut n)) else { return };
+                let found = services.as_ref().and_then(|s| s.address_for(&q));
+                let Some(out) = names.lock().ok().and_then(|mut n| answer(&q, &mut n, found)) else { return };
                 let Ok(n) = u16::try_from(out.len()) else { return };
                 if conn.write_all(&n.to_be_bytes()).and_then(|()| conn.write_all(&out)).is_err() {
                     return;
@@ -490,24 +549,88 @@ mod tests {
     #[test]
     fn an_a_question_gets_a_fake_address_that_reads_back_as_its_name() {
         let mut names = FakeNames::default();
-        let r = answer(&query("Registry.NPMjs.org", 1), &mut names).unwrap();
+        let r = answer(&query("Registry.NPMjs.org", 1), &mut names, None).unwrap();
         assert_eq!(&r[..2], &[0x12, 0x34], "the id");
         assert_eq!(r[3] & 0x0f, 0, "NOERROR");
         let a = answered_address(&r).unwrap();
         assert!(in_pool(a));
         assert_eq!(names.name_of(a), Some("registry.npmjs.org"));
         // Asked again: the same address.
-        assert_eq!(answered_address(&answer(&query("registry.npmjs.org", 1), &mut names).unwrap()), Some(a));
+        assert_eq!(answered_address(&answer(&query("registry.npmjs.org", 1), &mut names, None).unwrap()), Some(a));
         // Another name: another address.
-        let b = answered_address(&answer(&query("pypi.org", 1), &mut names).unwrap()).unwrap();
+        let b = answered_address(&answer(&query("pypi.org", 1), &mut names, None).unwrap()).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_service_address_from_the_engine_is_answered_and_never_enters_the_pool() {
+        let mut names = FakeNames::default();
+        let at = Ipv4Addr::new(172, 18, 0, 2);
+        assert_eq!(answered_address(&answer(&query("db", 1), &mut names, Some(Some(at))).unwrap()), Some(at));
+        assert_eq!(names.name_of(at), None);
+        // A compose service with no running container: no address, never a fake one.
+        let r = answer(&query("db", 1), &mut names, Some(None)).unwrap();
+        assert_eq!((r[3] & 0x0f, answered_address(&r)), (0, None));
+        assert!(names.name_of(Ipv4Addr::new(198, 18, 0, 1)).is_none(), "nothing entered the pool");
+        // Positive control: a name no service holds still gets a fake address.
+        assert!(answered_address(&answer(&query("db.example", 1), &mut names, None).unwrap()).is_some_and(in_pool));
+    }
+
+    /// A fake engine on a socket in a fresh dir: answers every request with
+    /// `body` (HTTP/1.0, then closes), recording each request line.
+    fn fake_engine(body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let dir = std::env::temp_dir().join(format!("ssai-fake-engine-{}-{}", std::process::id(), rand::random::<u32>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("docker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let mut conn = conn;
+                let mut req = Vec::new();
+                let mut byte = [0u8; 1];
+                while !req.ends_with(b"\r\n\r\n") && conn.read(&mut byte).unwrap_or(0) == 1 {
+                    req.push(byte[0]);
+                }
+                log.lock().unwrap().push(String::from_utf8_lossy(&req).lines().next().unwrap_or_default().to_string());
+                let _ = conn.write_all(format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{body}").as_bytes());
+            }
+        });
+        (path.to_string_lossy().into_owned(), seen)
+    }
+
+    #[test]
+    fn a_single_label_a_question_is_asked_of_the_engine_and_nothing_else_is() {
+        let (socket, seen) = fake_engine(
+            r#"[{"Labels": {"com.docker.compose.project": "ssai-devcontainer", "com.docker.compose.service": "db"},
+                 "NetworkSettings": {"Networks": {"ssai-devcontainer_default": {"IPAddress": "172.18.0.2"}}}}]"#,
+        );
+        let names = ["db", "cache"].map(String::from).into();
+        let services = Services { socket, project: "ssai-devcontainer".into(), names };
+        assert_eq!(services.address_for(&query("db", 1)), Some(Some(Ipv4Addr::new(172, 18, 0, 2))));
+        let asked = seen.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].starts_with("GET /containers/json?filters=") && asked[0].contains("ssai-devcontainer"), "{asked:?}");
+        // Not one of the project's names, another type, a response: never asked.
+        let mut response = query("db", 1);
+        response[2] |= 0x80;
+        for q in [query("db.example.com", 1), query("web", 1), query("db", 28), response] {
+            assert_eq!(services.address_for(&q), None);
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "only the first question reached the engine");
+        // A service of the project with no running container: no address.
+        assert_eq!(services.address_for(&query("cache", 1)), Some(None));
+        // No engine: no address, and quickly.
+        let gone = Services { socket: "/nonexistent/docker.sock".into(), project: "p".into(), names: ["db".to_string()].into() };
+        assert_eq!(gone.address_for(&query("db", 1)), Some(None));
     }
 
     #[test]
     fn any_other_question_gets_an_empty_answer() {
         let mut names = FakeNames::default();
         for qtype in [28u16, 15, 16, 255] {
-            let r = answer(&query("pypi.org", qtype), &mut names).unwrap();
+            let r = answer(&query("pypi.org", qtype), &mut names, None).unwrap();
             assert_eq!(r[3] & 0x0f, 0);
             assert_eq!(answered_address(&r), None, "type {qtype}");
         }
@@ -522,7 +645,7 @@ mod tests {
             q.push(bad.len() as u8);
             q.extend_from_slice(bad.as_bytes());
             q.extend_from_slice(&[0, 0, 1, 0, 1]);
-            let r = answer(&q, &mut names).unwrap();
+            let r = answer(&q, &mut names, None).unwrap();
             assert_eq!(r[3] & 0x0f, 5, "{bad:?} refused");
             assert_eq!(answered_address(&r), None);
         }
@@ -535,19 +658,19 @@ mod tests {
         // A compression pointer in the question.
         let mut q = query("a.example", 1);
         q[12] = 0xc0;
-        assert_eq!(answer(&q, &mut names).unwrap()[3] & 0x0f, 1);
+        assert_eq!(answer(&q, &mut names, None).unwrap()[3] & 0x0f, 1);
         // A label past the end.
         let q = [0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 9, b'a'];
-        assert_eq!(answer(&q, &mut names).unwrap()[3] & 0x0f, 1);
+        assert_eq!(answer(&q, &mut names, None).unwrap()[3] & 0x0f, 1);
         // Two questions.
         let mut q = query("a.example", 1);
         q[5] = 2;
-        assert_eq!(answer(&q, &mut names).unwrap()[3] & 0x0f, 1);
+        assert_eq!(answer(&q, &mut names, None).unwrap()[3] & 0x0f, 1);
         // A response.
         let mut q = query("a.example", 1);
         q[2] |= 0x80;
-        assert!(answer(&q, &mut names).is_none());
-        assert!(answer(&[0; 11], &mut names).is_none());
+        assert!(answer(&q, &mut names, None).is_none());
+        assert!(answer(&[0; 11], &mut names, None).is_none());
     }
 
     #[test]
@@ -578,7 +701,7 @@ mod tests {
         #[test]
         fn any_bytes_are_answered_and_only_a_plain_name_is_remembered(q in proptest::collection::vec(any::<u8>(), 0..300)) {
             let mut names = FakeNames::default();
-            let _ = answer(&q, &mut names);
+            let _ = answer(&q, &mut names, None);
             for name in names.by_name.keys() {
                 prop_assert!(name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.'));
             }
@@ -590,7 +713,7 @@ mod tests {
         fn a_plain_name_reads_back(labels in proptest::collection::vec("[A-Za-z0-9_-]{1,20}", 1..5)) {
             let name = labels.join(".");
             let mut names = FakeNames::default();
-            let r = answer(&query(&name, 1), &mut names).unwrap();
+            let r = answer(&query(&name, 1), &mut names, None).unwrap();
             let a = answered_address(&r).unwrap();
             prop_assert!(in_pool(a));
             let lower = name.to_ascii_lowercase();

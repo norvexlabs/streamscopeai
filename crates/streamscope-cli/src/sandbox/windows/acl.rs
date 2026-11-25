@@ -440,14 +440,36 @@ pub fn holds(path: &Path, account_sid: &str, kind: Kind) -> Result<bool> {
 
 /// The projects the record holds grants for.
 pub fn granted_projects(record_file: &Path) -> Result<Vec<PathBuf>> {
+    Ok(granted(record_file)?.into_iter().filter_map(|g| g.root).collect())
+}
+
+/// One entry of the grant record, as `ssai sandbox status` lists it.
+pub struct Granted {
+    /// The project folder, by its own recorded path (the one the record's
+    /// key is made from). `None` when a partial revoke took the project's
+    /// own grant back and left only paths it could not.
+    pub root: Option<PathBuf>,
+    /// The record's key: the project folder, lowercased.
+    pub key: String,
+    /// Every other path whose access its grants changed (the folders above
+    /// it, the tool's and its configuration's, and the holds — denies — on
+    /// its git and `.streamscopeai` folders), sorted.
+    pub others: Vec<PathBuf>,
+}
+
+/// Every entry the record holds, in the record's (key) order. Reads without
+/// the record's lock: the record is replaced whole, never written in place.
+pub fn granted(record_file: &Path) -> Result<Vec<Granted>> {
     let record = GrantRecord::load(record_file)?;
-    // A project is named by its own recorded path, the one its key is made
-    // from; a record a partial revoke left holds only other paths (a client's
-    // folder, a tool's), which are no project.
     Ok(record
         .projects
-        .iter()
-        .filter_map(|(root, paths)| paths.iter().find(|p| p.path.to_lowercase() == *root).map(|p| PathBuf::from(&p.path)))
+        .into_iter()
+        .map(|(key, paths)| {
+            let (own, others): (Vec<_>, Vec<_>) = paths.into_iter().partition(|p| p.path.to_lowercase() == key);
+            let mut others: Vec<PathBuf> = others.into_iter().map(|p| PathBuf::from(p.path)).collect();
+            others.sort();
+            Granted { root: own.into_iter().next().map(|p| PathBuf::from(p.path)), key, others }
+        })
         .collect())
 }
 
@@ -1469,6 +1491,31 @@ mod tests {
         assert!(!private_alone(&record, &base).unwrap(), "pending");
         let _ = std::fs::remove_dir_all(&record_dir);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `status` names each project by its own recorded path with the rest
+    /// apart, and keeps an entry a partial revoke left without its project's
+    /// own path (still granted), which `granted_projects` leaves out.
+    #[test]
+    fn the_listing_names_each_project_and_keeps_what_a_revoke_left() {
+        let record_dir = std::env::temp_dir().join(format!("ssai-acl-listing-record-{}", std::process::id()));
+        let record = record_dir.join("grants.json");
+        let entry = |path: &str| GrantedPath { path: path.into(), owner_rights: false, inheritable: false };
+        let mut held = GrantRecord::default();
+        held.projects.insert(r"c:\users\me\app".into(), vec![entry(r"C:\Users\me"), entry(r"C:\Users\Me\App"), entry(r"C:\Tools\ssai")]);
+        held.projects.insert(r"c:\users\me\gone".into(), vec![entry(r"C:\Tools\aider")]);
+        held.save(&record).unwrap();
+        let listed = granted(&record).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].root.as_deref(), Some(Path::new(r"C:\Users\Me\App")));
+        assert_eq!(listed[0].others, [PathBuf::from(r"C:\Tools\ssai"), PathBuf::from(r"C:\Users\me")], "sorted");
+        assert_eq!(listed[1].root, None);
+        assert_eq!(listed[1].key, r"c:\users\me\gone");
+        assert_eq!(listed[1].others, [PathBuf::from(r"C:\Tools\aider")]);
+        assert_eq!(granted_projects(&record).unwrap(), [PathBuf::from(r"C:\Users\Me\App")]);
+        // No record: nothing granted, not an error.
+        let _ = std::fs::remove_dir_all(&record_dir);
+        assert!(granted(&record).unwrap().is_empty());
     }
 
     /// What a scan of a granted project finds out of the grant's reach, and

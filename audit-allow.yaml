@@ -106,6 +106,12 @@
   reason: "the Go standard library in the official postgres image's gosu 1.19 (go1.24.6); gosu 1.20 is out, not yet in the image. The deployment starts the server as its own user with every capability dropped, so gosu never runs"
   expires: 2027-01-01
 - id: GO-2026-5026
+  artifact: os
+  package: golang.org/x/net
+  path: /usr/bin/runc
+  reason: "golang.org/x/net v0.55.0 in runc v1.5.3, the runc of Docker's latest containerd.io (2.4.2-4) for Ubuntu 26.04 and runc's latest release; no build with x/net 0.57.0 yet (checked 2026-11-25). The VM's engine runs only the stack's own images"
+  expires: 2026-11-27
+- id: GO-2026-5026
   artifact: postgres
   package: stdlib
   path: /usr/local/bin/gosu

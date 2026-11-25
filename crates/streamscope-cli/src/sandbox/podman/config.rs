@@ -39,7 +39,6 @@ const REFUSED_KEYS: &[(&str, &str)] = &[
     ("privileged", "use `\"docker\": true` in sandbox.json for an engine inside"),
     ("capAdd", "the sandbox sets the container's capabilities"),
     ("securityOpt", "the sandbox sets the container's security options"),
-    ("dockerComposeFile", "compose-based dev containers are not supported"),
     ("dockerFile", "use `build.dockerfile`, which the sandbox confines to the project"),
     ("context", "use `build.context`, which the sandbox confines to the project"),
 ];
@@ -131,6 +130,9 @@ pub struct DockerConfig {
     /// `network`: `gateway` narrows the run to the gateway alone.
     pub network: Option<crate::sandbox::NetworkChoice>,
     pub limits: Limits,
+    /// A compose-based devcontainer: the side services init starts in the
+    /// engine inside (`docker` is then on).
+    pub compose: Option<super::compose::ComposeRun>,
     /// The lifecycle commands and the environment it sets.
     pub lifecycle: Lifecycle,
     /// One line per key read but not acted on, for the run to print.
@@ -298,6 +300,7 @@ pub fn from_profile_default(default: &sandbox_image::DefaultImage) -> Result<Doc
         docker: default.docker,
         network: None,
         limits: Limits { memory: default.memory.clone(), cpus: default.cpus, pids: DEFAULT_PIDS },
+        compose: None,
         lifecycle: Lifecycle::default(),
         notes: Vec::new(),
     })
@@ -321,6 +324,7 @@ fn resolve_one(root: &Path, file: SandboxFile, read: &dyn Fn(&Path) -> Result<St
                 docker: file.docker,
                 network: file.network,
                 limits,
+                compose: None,
                 lifecycle: Lifecycle::default(),
                 notes: Vec::new(),
             })
@@ -329,7 +333,7 @@ fn resolve_one(root: &Path, file: SandboxFile, read: &dyn Fn(&Path) -> Result<St
             let path = inside(root, &rel).with_context(|| format!("{SANDBOX_FILE}: `devcontainer`"))?;
             let text = read(&path).with_context(|| format!("read {}", path.display()))?;
             let value = crate::writer::json::parse_jsonc(&text).with_context(|| format!("parse {}", path.display()))?;
-            devcontainer(root, &path, &value, file.docker, limits).map(|c| DockerConfig { network: file.network, ..c })
+            devcontainer(root, &path, &value, file.docker, limits, read).map(|c| DockerConfig { network: file.network, ..c })
         }
         (Some(_), Some(_)) => bail!("{SANDBOX_FILE}: set `image` or `devcontainer`, not both"),
         (None, None) => bail!("{SANDBOX_FILE}: set `image` (an image reference) or `devcontainer` (a devcontainer.json path)"),
@@ -363,7 +367,14 @@ fn inside(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(root.join(p))
 }
 
-fn devcontainer(root: &Path, path: &Path, value: &Value, docker: bool, limits: Limits) -> Result<DockerConfig> {
+fn devcontainer(
+    root: &Path,
+    path: &Path,
+    value: &Value,
+    docker: bool,
+    limits: Limits,
+    read: &dyn Fn(&Path) -> Result<String>,
+) -> Result<DockerConfig> {
     let obj = value.as_object().with_context(|| format!("{}: not a JSON object", path.display()))?;
     let shown = path.display();
     // The developer's environment never reaches the build — nor the Dev
@@ -419,12 +430,31 @@ fn devcontainer(root: &Path, path: &Path, value: &Value, docker: bool, limits: L
     let expand_here = |text: &str, key: &str| {
         expand(text, root, Some(&container_workspace)).with_context(|| format!("{shown}: `{key}`"))
     };
-    let source = match (string("image")?, obj.get("build")) {
-        (Some(image), None) if !sandbox_image::image_reference(&image) => bail!("{shown}: `image` must be an image reference, got {image:?}"),
-        (Some(image), None) => ImageSource::Image(registry_reference(&image)),
-        (None, Some(build)) => build_source(root, dir, build, &expand_here).with_context(|| format!("{shown}: `build`"))?,
-        (Some(_), Some(_)) => bail!("{shown}: set `image` or `build`, not both"),
-        (None, None) => bail!("{shown}: set `image` or `build.dockerfile`"),
+    // A compose-based devcontainer: its primary service gives the image, the
+    // container's user and variables; its other services run in the engine
+    // inside (`compose.rs`).
+    let compose = match obj.get("dockerComposeFile") {
+        None => None,
+        Some(_) if obj.contains_key("image") || obj.contains_key("build") => {
+            bail!("{shown}: set `image`, `build` or `dockerComposeFile`, one of them")
+        }
+        Some(_) => {
+            let w = workspace_folder
+                .as_deref()
+                .with_context(|| format!("{shown}: `dockerComposeFile` needs `workspaceFolder`, where the project is mounted"))?;
+            Some(super::compose::read(root, path, obj, w, read)?)
+        }
+    };
+    let (compose, primary) = compose.unzip();
+    let source = match (&primary, string("image")?, obj.get("build")) {
+        (Some(p), _, _) => p.source.clone(),
+        (None, Some(image), None) if !sandbox_image::image_reference(&image) => {
+            bail!("{shown}: `image` must be an image reference, got {image:?}")
+        }
+        (None, Some(image), None) => ImageSource::Image(registry_reference(&image)),
+        (None, None, Some(build)) => build_source(root, dir, build, &expand_here).with_context(|| format!("{shown}: `build`"))?,
+        (None, Some(_), Some(_)) => bail!("{shown}: set `image` or `build`, not both"),
+        (None, None, None) => bail!("{shown}: set `image`, `build.dockerfile` or `dockerComposeFile`"),
     };
     if let Some(w) = &workspace_folder
         && SYSTEM_PATHS
@@ -466,19 +496,35 @@ fn devcontainer(root: &Path, path: &Path, value: &Value, docker: bool, limits: L
     if features.as_ref().is_some_and(|f| Value::Object(f.clone()).to_string().contains("${env:")) {
         bail!("{shown}: `${{env:…}}` is refused in `features` — the Dev Container CLI that builds them would read it from your environment");
     }
-    let lifecycle = lifecycle_of(obj, &|key, text| {
+    let mut lifecycle = lifecycle_of(obj, &|key, text| {
         expand_lenient(text, root, &container_workspace).with_context(|| format!("{shown}: `{key}`"))
     })?;
+    // The service's variables are the container's, under `containerEnv`.
+    if let Some(p) = &primary {
+        lifecycle.container_env.splice(0..0, p.env.iter().cloned());
+        notes.extend(p.notes.iter().cloned());
+    }
+    // An engine only when there is a service to run in it.
+    let engine_needed = compose.as_ref().is_some_and(|c| !c.side.is_empty());
+    if engine_needed && !docker {
+        notes.push(format!(
+            "{shown}: `dockerComposeFile` runs its other services in an engine inside the sandbox — `\"docker\": true` is implied"
+        ));
+    }
     Ok(DockerConfig {
         source,
         devcontainer: Some(path.to_path_buf()),
         features,
         remote_user: string("remoteUser")?.map(|u| expand_here(&u, "remoteUser")).transpose()?,
-        container_user: string("containerUser")?.map(|u| expand_here(&u, "containerUser")).transpose()?,
+        container_user: string("containerUser")?
+            .map(|u| expand_here(&u, "containerUser"))
+            .transpose()?
+            .or_else(|| primary.and_then(|p| p.user)),
         workspace_folder,
-        docker,
+        docker: docker || engine_needed,
         network: None,
         limits,
+        compose,
         lifecycle,
         notes,
     })
@@ -509,7 +555,7 @@ pub fn container_path(path: &str) -> bool {
 /// `rel` (relative to the devcontainer.json's `dir`) as a path that stays in
 /// the project: what podman builds from is sent with the network open, before
 /// any guard runs.
-fn in_project(root: &Path, dir: &Path, rel: &str, key: &str) -> Result<PathBuf> {
+pub(super) fn in_project(root: &Path, dir: &Path, rel: &str, key: &str) -> Result<PathBuf> {
     let mut out = PathBuf::new();
     for c in dir.join(rel).components() {
         match c {
@@ -521,7 +567,7 @@ fn in_project(root: &Path, dir: &Path, rel: &str, key: &str) -> Result<PathBuf> 
         }
     }
     if !out.starts_with(root) {
-        bail!("`{key}` {rel:?} is outside the project — the image is built from the project only");
+        bail!("`{key}` {rel:?} is outside the project — the sandbox reads and builds only from the project");
     }
     Ok(out)
 }
@@ -553,7 +599,7 @@ pub fn expand_lenient(text: &str, root: &Path, workspace: &str) -> Result<String
 
 /// Whether `text` names the developer's environment: `${localEnv:NAME}`, or
 /// its alias `${env:NAME}` — not the shell's `${env:-default}`.
-fn names_local_env(text: &str) -> bool {
+pub(super) fn names_local_env(text: &str) -> bool {
     text.contains("${localEnv:")
         || text.match_indices("${env:").any(|(at, m)| {
             text[at + m.len()..].chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
@@ -806,6 +852,48 @@ mod tests {
         // Each kept as it is: which wins is decided with the image's metadata.
         let c = resolve_entry(Path::new("/p"), DC, &with(r#"{"image": "a", "containerUser": "dev"}"#)).unwrap();
         assert_eq!((c.remote_user.as_deref(), c.container_user.as_deref()), (None, Some("dev")));
+    }
+
+    #[test]
+    fn a_compose_devcontainer_runs_its_primary_service_with_an_engine_inside() {
+        let read = |p: &Path| -> Result<String> {
+            if p.ends_with(".devcontainer/devcontainer.json") {
+                Ok(r#"{"dockerComposeFile": "compose.yml", "service": "app", "workspaceFolder": "/workspaces/p",
+                       "containerEnv": {"B": "dc"}, "remoteUser": "vscode"}"#
+                    .into())
+            } else if p.ends_with(".devcontainer/compose.yml") {
+                Ok("services:\n  app:\n    image: mcr.microsoft.com/devcontainers/python:3\n    user: dev\n    environment: {A: '1', B: compose}\n  db:\n    image: postgres:16\n".into())
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "none").into())
+            }
+        };
+        let c = resolve_entry(Path::new("/p"), DC, &read).unwrap();
+        assert_eq!(c.source, ImageSource::Image("mcr.microsoft.com/devcontainers/python:3".into()));
+        assert!(c.docker, "compose implies an engine inside");
+        assert!(c.notes.iter().any(|n| n.contains("is implied")), "{:?}", c.notes);
+        assert_eq!(c.compose.as_ref().map(|r| r.side.clone()), Some(vec!["db".to_string()]));
+        // The service's variables lie under the devcontainer's `containerEnv`.
+        assert_eq!(c.lifecycle.container_env, [("A", "1"), ("B", "compose"), ("B", "dc")].map(|(k, v)| (k.to_string(), v.to_string())));
+        assert_eq!((c.remote_user.as_deref(), c.container_user.as_deref()), (Some("vscode"), Some("dev")));
+        // With `"docker": true` already, nothing to say.
+        let c = resolve(Path::new("/p"), &example(r#"{"devcontainer": ".devcontainer/devcontainer.json", "docker": true}"#), &read).unwrap();
+        assert!(!c.notes.iter().any(|n| n.contains("is implied")));
+        // With no other service, no engine is implied.
+        let lone = |p: &Path| -> Result<String> {
+            if p.ends_with(".devcontainer/compose.yml") { Ok("services:\n  app:\n    image: a\n".into()) } else { read(p) }
+        };
+        let c = resolve_entry(Path::new("/p"), DC, &lone).unwrap();
+        assert!(!c.docker && c.compose.is_some_and(|r| r.side.is_empty()));
+        // Plain images keep no compose run.
+        assert!(resolve_entry(Path::new("/p"), r#"{"image": "a"}"#, &no_file).unwrap().compose.is_none());
+        for (dc, says) in [
+            (r#"{"dockerComposeFile": "compose.yml", "service": "app"}"#, "needs `workspaceFolder`"),
+            (r#"{"dockerComposeFile": "compose.yml", "service": "app", "workspaceFolder": "/w", "image": "a"}"#, "one of them"),
+            (r#"{"dockerComposeFile": "compose.yml", "service": "app", "workspaceFolder": "/w", "mounts": []}"#, "`mounts` is refused"),
+        ] {
+            let err = format!("{:#}", resolve_entry(Path::new("/p"), DC, &with(Box::leak(dc.to_string().into_boxed_str()))).unwrap_err());
+            assert!(err.contains(says), "{dc}: {err}");
+        }
     }
 
     #[test]

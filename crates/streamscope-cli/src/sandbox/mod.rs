@@ -585,16 +585,35 @@ pub fn podman_prune(project: Option<&Path>) -> Result<()> {
     }
 }
 
-/// `ssai sandbox status`: the docker sandbox's images and volumes, per project.
-pub fn podman_status() -> Result<()> {
+/// `ssai sandbox status`: the native sandbox on this host and what it keeps
+/// between runs (on Windows the projects its account was granted; elsewhere
+/// nothing), then, on Linux, the docker sandbox's images and volumes per
+/// project. Reads only.
+pub fn status(verbose: bool) -> Result<()> {
+    println!("Native sandbox (`--sandbox native`):");
+    #[cfg(windows)]
+    windows::setup::status(verbose)?;
+    #[cfg(not(windows))]
+    {
+        let _ = verbose;
+        match native_probe() {
+            Ok(()) => println!("Ready on this host; it keeps nothing between runs"),
+            Err(reason) => println!("Not available: {reason}"),
+        }
+    }
     #[cfg(target_os = "linux")]
     {
-        podman::status()
+        println!();
+        println!("Docker sandbox (`--sandbox docker`):");
+        // Without podman there is nothing to list, and nothing to report as
+        // a failure: a run says what it needs.
+        if crate::program::find_on("podman", None, None).is_none() {
+            println!("podman is not installed: nothing is kept");
+        } else {
+            podman::status()?;
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        bail!("the docker sandbox runs on Linux only")
-    }
+    Ok(())
 }
 
 async fn spawn_unconfined(spec: &LaunchSpec) -> Result<i32> {

@@ -8,7 +8,9 @@
 //! way out); with an engine inside, route every connection to the guard
 //! (`routing.rs`) and listen on the routing stub's address too (the proxy
 //! the variables name, which the engine's containers reach), give the engine
-//! its own cgroup and start `dockerd`; run the project's lifecycle commands as the image's user (the
+//! its own cgroup and start `dockerd`; for a compose-based devcontainer, start its
+//! side services in that engine (as the agent) and wait until each is ready;
+//! run the project's lifecycle commands as the image's user (the
 //! create ones only when this home has not run them on this image); start
 //! the agent as that user; then reap every child
 //! until the agent exits, and exit with its status, written to the exit file
@@ -67,6 +69,35 @@ pub struct Start {
     pub tty: bool,
     /// An OpenCode agent's gateway, for init to judge what OpenCode loads here.
     pub opencode: Option<OpencodeCheck>,
+    /// A compose-based devcontainer's side services, started in the engine
+    /// before the lifecycle commands.
+    pub compose: Option<ComposeUp>,
+}
+
+/// What init starts in the engine for a compose-based devcontainer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ComposeUp {
+    /// `docker compose … config --format json <services>`: what compose
+    /// resolves for them, read before anything starts.
+    pub config_argv: Vec<String>,
+    /// `docker compose … up --detach <services>`, run as the agent in the
+    /// workspace.
+    pub argv: Vec<String>,
+    /// The primary service: the sandbox itself, never started in the engine.
+    pub primary: String,
+    /// The compose project the services run as (its containers' label).
+    pub project: String,
+    /// The services waited on: each running (healthy, with a healthcheck) or
+    /// done (exited 0) before the lifecycle commands.
+    pub services: Vec<String>,
+    /// Of them, those the primary waits on to finish: ready only once exited 0.
+    pub must_exit: Vec<String>,
+    /// Names at the sandbox's own loopback — the primary, and the service on
+    /// the sandbox's network — written to its /etc/hosts, which the engine's
+    /// containers do not read.
+    pub hosts: Vec<String>,
+    /// Every service name, which the DNS stub asks the engine for.
+    pub lookup: Vec<String>,
 }
 
 /// What an OpenCode agent was provisioned with: the gateway's provider key and
@@ -81,7 +112,6 @@ pub struct OpencodeCheck {
 
 /// How long the engine may take to answer on its socket.
 const ENGINE_READY: std::time::Duration = std::time::Duration::from_secs(30);
-const ENGINE_SOCKET: &str = "/var/run/docker.sock";
 const ENGINE_LOG: &str = "/tmp/ssai-dockerd.log";
 /// How long the engine has to stop its containers before it is killed: its
 /// cache (`/var/lib/docker`) is a volume the next run starts from.
@@ -98,7 +128,15 @@ pub fn main(path: &Path) -> Result<()> {
     let signals = SignalSet::take(start.tty)?;
     relay(std::net::Ipv4Addr::LOCALHOST, start.relay_port, start.guard_socket.clone())?;
     if start.engine {
-        super::routing::start(&start.guard_socket)?;
+        let services = start
+            .compose
+            .as_ref()
+            .map(|c| super::routing::Services {
+                socket: super::engine::SOCKET.to_string(),
+                project: c.project.clone(),
+                names: c.lookup.iter().map(|n| n.to_ascii_lowercase()).collect(),
+            });
+        super::routing::start(&start.guard_socket, services)?;
         // The proxy the variables name with an engine inside: the engine's
         // containers reach this address, never the container's loopback.
         relay(super::routing::STUB, start.relay_port, start.guard_socket.clone())?;
@@ -109,6 +147,10 @@ pub fn main(path: &Path) -> Result<()> {
     let agent = match prepare_home(&start)
         .and_then(|()| {
             if Path::new(&start.cwd).is_dir() { Ok(()) } else { bail!("the working directory {} is not in the sandbox", start.cwd) }
+        })
+        .and_then(|()| match &start.compose {
+            Some(up) => compose_up(&start, up, &signals, &mut engine),
+            None => Ok(()),
         })
         .and_then(|()| lifecycle(&start, &signals, &mut engine))
         .map(|()| report_opencode(&start, &signals, &mut engine))
@@ -310,7 +352,7 @@ fn start_engine(start: &Start) -> Result<libc::pid_t> {
         })?;
     let pid = child.id() as libc::pid_t;
     let deadline = std::time::Instant::now() + ENGINE_READY;
-    while UnixStream::connect(ENGINE_SOCKET).is_err() {
+    while UnixStream::connect(super::engine::SOCKET).is_err() {
         let mut status = 0;
         // SAFETY: a non-blocking wait on our own child.
         if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
@@ -489,14 +531,234 @@ fn lock_workspace(lock: &std::fs::File, signals: &SignalSet, engine: &mut Option
     }
 }
 
+/// How long a compose-based devcontainer's services may take to be ready once
+/// `up` has pulled, built and started them (their healthchecks passing, what
+/// the primary waits on finishing). `up` itself is not timed: a pull or build
+/// takes what it takes, and a stop ends it.
+const COMPOSE_READY: std::time::Duration = std::time::Duration::from_secs(600);
+/// How many of a failed service's last log lines the run shows.
+const LOG_TAIL: u32 = 20;
+
+/// Start the side services (`up.argv`, as the agent: a lifecycle command of
+/// its own), then wait for each to be ready — bounded, and ended by a stop
+/// like a lifecycle command. `up --wait` is not used: it fails a one-shot
+/// service (a migration) that exits 0. First, compose's own resolution of the
+/// side services (`config`, under the very environment `up` gets) must not
+/// hold the primary: starting them would start it inside the engine. Both
+/// steps start from an empty environment — its `PATH`, the agent's home, the
+/// engine's socket — so they read the same files the same way, and talk to the
+/// sandbox's own engine, which the wait reads, whatever `DOCKER_HOST` or a
+/// Docker context the agent's environment names.
+fn compose_up(start: &Start, up: &ComposeUp, signals: &SignalSet, engine: &mut Option<libc::pid_t>) -> Result<()> {
+    use super::engine::{self, Readiness};
+    if !up.hosts.is_empty() {
+        // Appended in place: podman mounts the file, a rename would not reach it;
+        // on a line of its own, whether or not the file ends with one.
+        let ends_a_line = std::fs::read("/etc/hosts").map(|b| b.last().is_none_or(|c| *c == b'\n')).unwrap_or(true);
+        let mut hosts = std::fs::OpenOptions::new().append(true).open("/etc/hosts").context("open /etc/hosts")?;
+        let lead = if ends_a_line { "" } else { "\n" };
+        writeln!(hosts, "{lead}127.0.0.1\t{}", up.hosts.join(" ")).context("name the devcontainer's services in /etc/hosts")?;
+    }
+    let step = Step { hook: "dockerComposeFile".into(), argv: up.argv.clone() };
+    let path = start
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    let own_engine = |cmd: &mut std::process::Command| {
+        cmd.env_clear()
+            .env("PATH", &path)
+            .env("HOME", &start.home)
+            .env("PWD", &start.workspace)
+            .env("DOCKER_HOST", format!("unix://{}", engine::SOCKET));
+    };
+    let config_step = Step { hook: "dockerComposeFile (config)".into(), argv: up.config_argv.clone() };
+    let resolved = capture_step(start, &config_step, signals, engine, &own_engine)?;
+    let resolved: serde_json::Value =
+        serde_json::from_slice(&resolved).context("read what compose resolved for the devcontainer's services")?;
+    match super::compose::starting_the_primary(&resolved, &up.primary)? {
+        None => {}
+        Some(by) if by == up.primary => bail!(
+            "starting the devcontainer's services would start `{by}`, the service the sandbox is, inside its engine — \
+             compose starts it with them"
+        ),
+        Some(by) => bail!(
+            "starting the devcontainer's services would start `{p}`, the service the sandbox is, inside its engine — `{by}` \
+             depends on it (its `depends_on`, `links`, `volumes_from` or a `service:{p}` namespace); take it out of \
+             that service",
+            p = up.primary
+        ),
+    }
+    let filter = serde_json::json!({ "label": [format!("com.docker.compose.project={}", up.project)] }).to_string();
+    let list_path = format!("/containers/json?all=1&filters={}", engine::encode(&filter));
+    let tail_of = |id: &str| {
+        engine::log_tail(engine::SOCKET, id, LOG_TAIL)
+            .map(|t| if t.trim().is_empty() { String::new() } else { format!(" — its last lines:\n{t}") })
+            .unwrap_or_default()
+    };
+    // `up` fails on its own when a service another waits on fails: what
+    // failed is named, as the wait below names it — only a container this `up`
+    // created or started (a container an earlier run left, untouched, is no
+    // cause), told by its id and start time, read before.
+    let started_at = |id: &str| {
+        engine::get(engine::SOCKET, &format!("/containers/{id}/json")).ok().and_then(|i| i["State"]["StartedAt"].as_str().map(str::to_string))
+    };
+    let before: Vec<(String, Option<String>)> = engine::get(engine::SOCKET, &list_path)
+        .ok()
+        .and_then(|l| l.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c["Id"].as_str().filter(|id| engine::container_id(id)).map(|id| (id.to_string(), started_at(id))))
+        .collect();
+    if let Err(e) = run_step_with(start, &step, signals, engine, &own_engine) {
+        let failed: Vec<String> = engine::get(engine::SOCKET, &list_path)
+            .ok()
+            .and_then(|l| l.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter(|c| c["Labels"]["com.docker.compose.oneoff"].as_str() != Some("True"))
+            .filter_map(|c| Some((c["Labels"]["com.docker.compose.service"].as_str()?.to_string(), c["Id"].as_str()?.to_string())))
+            .filter(|(svc, _)| resolved.get("services").and_then(|s| s.get(svc.as_str())).is_some())
+            .filter(|(_, id)| engine::container_id(id))
+            .filter(|(_, id)| before.iter().find(|(b, _)| b == id).is_none_or(|(_, at)| *at != started_at(id)))
+            .filter_map(|(svc, id)| match engine::get(engine::SOCKET, &format!("/containers/{id}/json")).map(|i| engine::readiness(&i, false)) {
+                Ok(Readiness::Failed(what)) => Some(format!("service `{svc}` {what}{}", tail_of(&id))),
+                _ => None,
+            })
+            .collect();
+        return Err(if failed.is_empty() { e } else { e.context(failed.join("\n")) });
+    }
+    let deadline = std::time::Instant::now() + COMPOSE_READY;
+    let mut said = false;
+    loop {
+        if signals.stop_pending(engine) {
+            bail!("the run was stopped while the devcontainer's services started — the agent was not started");
+        }
+        if engine.is_none() {
+            bail!("the sandbox's docker engine stopped while the devcontainer's services started (its log: {ENGINE_LOG})");
+        }
+        // The engine busy (extracting a large image) or a container gone
+        // between the list and its inspect: asked again, until the deadline.
+        let list = match engine::get(engine::SOCKET, &list_path) {
+            Ok(list) => list,
+            Err(e) => serde_json::json!({ "busy": format!("{e:#}") }),
+        };
+        let mut pending: Vec<String> = list.get("busy").and_then(|b| b.as_str()).map(|b| format!("the engine ({b})")).into_iter().collect();
+        for svc in &up.services {
+            // A `compose run` container is not the service's: one left from an
+            // earlier run (it outlives the run, with the engine's volume) never
+            // decides this one. A service with no container (scaled to 0) has
+            // nothing to wait for.
+            let ids: Vec<&str> = list
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|c| c["Labels"]["com.docker.compose.service"].as_str() == Some(svc.as_str()))
+                .filter(|c| c["Labels"]["com.docker.compose.oneoff"].as_str() != Some("True"))
+                .filter_map(|c| c["Id"].as_str())
+                .collect();
+            let must_exit = up.must_exit.contains(svc);
+            for id in ids {
+                if !engine::container_id(id) {
+                    bail!("the engine named a container {id:?}, which is not an id");
+                }
+                let Ok(inspect) = engine::get(engine::SOCKET, &format!("/containers/{id}/json")) else {
+                    pending.push(format!("{svc} (not answered)"));
+                    continue;
+                };
+                match engine::readiness(&inspect, must_exit) {
+                    Readiness::Ready => {}
+                    Readiness::Pending(what) => pending.push(format!("{svc} ({what})")),
+                    Readiness::Failed(what) => {
+                        bail!("the devcontainer's service `{svc}` {what} — the agent was not started{}", tail_of(id))
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "the devcontainer's services were not ready within {}s: {} — the agent was not started",
+                COMPOSE_READY.as_secs(),
+                pending.join(", ")
+            );
+        }
+        if !said {
+            eprintln!("ssai: waiting for the devcontainer's services: {}", pending.join(", "));
+            said = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
 /// One lifecycle command, as the agent in the workspace, waited on through
 /// the signal loop (a signal reaches it as it would the agent).
 fn run_step(start: &Start, step: &Step, signals: &SignalSet, engine: &mut Option<libc::pid_t>) -> Result<()> {
+    run_step_with(start, step, signals, engine, &|_| {})
+}
+
+/// The most a captured step's output may hold.
+const CAPTURE_CAP: u64 = 16 << 20;
+
+/// [`run_step_with`], its standard output captured (read while it runs, so a
+/// large one never blocks it), at most [`CAPTURE_CAP`].
+fn capture_step(
+    start: &Start,
+    step: &Step,
+    signals: &SignalSet,
+    engine: &mut Option<libc::pid_t>,
+    adjust: &dyn Fn(&mut std::process::Command),
+) -> Result<Vec<u8>> {
+    if signals.stop_pending(engine) {
+        bail!("the run was stopped before the devcontainer's `{}` — the agent was not started", step.hook);
+    }
+    let mut cmd = agent_command(start, &step.argv, &start.workspace)?;
+    adjust(&mut cmd);
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| spawn_error(e, &step.argv[0], &start.workspace))?;
+    let out = child.stdout.take().context("the step's output")?;
+    // Past the cap the rest is drained, never left in the pipe: the step
+    // would block writing it, and the run with it.
+    let reader = std::thread::spawn(move || {
+        let mut out = out;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(std::io::Read::by_ref(&mut out), CAPTURE_CAP + 1), &mut buf)?;
+        std::io::copy(&mut out, &mut std::io::sink())?;
+        Ok::<_, std::io::Error>(buf)
+    });
+    let code = signals.wait_for(child.id() as libc::pid_t, engine);
+    let captured = reader.join().map_err(|_| anyhow::anyhow!("the step's output reader stopped"))??;
+    if signals.stopping.get() {
+        bail!("the run was stopped during the devcontainer's `{}` — the agent was not started", step.hook);
+    }
+    if code != 0 {
+        bail!("the devcontainer's `{}` failed (exit {code}) — the agent was not started", step.hook);
+    }
+    if captured.len() as u64 > CAPTURE_CAP {
+        bail!("the devcontainer's `{}` wrote more than {CAPTURE_CAP} bytes", step.hook);
+    }
+    Ok(captured)
+}
+
+/// [`run_step`], its command adjusted by `adjust` before it starts.
+fn run_step_with(
+    start: &Start,
+    step: &Step,
+    signals: &SignalSet,
+    engine: &mut Option<libc::pid_t>,
+    adjust: &dyn Fn(&mut std::process::Command),
+) -> Result<()> {
     if signals.stop_pending(engine) {
         bail!("the run was stopped before the devcontainer's `{}` — the agent was not started", step.hook);
     }
     eprintln!("ssai: running {} in the sandbox", step.hook);
     let mut cmd = agent_command(start, &step.argv, &start.workspace)?;
+    adjust(&mut cmd);
     cmd.stdin(std::process::Stdio::null());
     let child = cmd.spawn().map_err(|e| spawn_error(e, &step.argv[0], &start.workspace))?;
     let code = signals.wait_for(child.id() as libc::pid_t, engine);
@@ -621,6 +883,16 @@ mod tests {
             exit_file: "/run/ssai-sock/exit".into(),
             tty: true,
             opencode: None,
+            compose: Some(ComposeUp {
+                config_argv: vec!["/opt/ssai-agent/compose/docker-compose".into(), "config".into()],
+                argv: vec!["/opt/ssai-agent/compose/docker-compose".into(), "up".into()],
+                primary: "app".into(),
+                project: "ssai-devcontainer".into(),
+                services: vec!["db".into()],
+                must_exit: vec!["migrate".into()],
+                hosts: vec!["app".into(), "db".into()],
+                lookup: vec!["app".into(), "db".into(), "redis".into()],
+            }),
         };
         let back: Start = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
@@ -681,6 +953,7 @@ mod tests {
             exit_file: String::new(),
             tty: false,
             opencode: None,
+            compose: None,
         };
         let (dir, marker) = create_marker(&h, "k");
         // `~/.ssai` a symlink the agent left: refused, its target untouched.

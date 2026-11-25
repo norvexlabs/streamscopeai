@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.84]
+
+### Added
+
+- **The container sandbox runs a dev container that uses docker compose.** A `devcontainer.json` naming
+  `dockerComposeFile` and `service` was refused; `ssai run --sandbox docker` now runs it. The `service` is
+  the sandbox: the agent runs in it, in the `workspaceFolder`. The other services (a database, a cache, a
+  queue) run in a Docker engine inside the sandbox, started before the lifecycle commands and waited for
+  until they run or are healthy; their data is kept between runs. The agent reaches each by its name, or
+  at `localhost` with the dev container templates' `network_mode: service:db`; a service reaches the
+  agent's container by the name of `service`. Several compose files are read as compose reads them. Of
+  `service`'s settings, the sandbox applies the image or build, the user, the variables and the project's
+  own folder; variables are filled from the project's `.env` and their defaults, never from your
+  environment; `~/.ssh`, `~/.gitconfig`, `~/.aws` and the Docker socket are not mounted, and `run` names
+  each setting it leaves out. Any other folder of your machine, and the settings that would widen what the
+  container reaches (`devices`, `secrets`, `extends`, …), are refused by name. The sandbox installs its own
+  compose CLI, so an image whose distribution ships an old one works too.
+
+### Changed
+
+- **The container sandbox reads its dev container files from the project only.** A `devcontainer.json`
+  (or the folder holding it) that is a symbolic link to a place outside the project was read; it is now
+  refused, naming where it leads, as are compose files, a `.env` and an `env_file` that do: what they hold
+  reaches the container, and a link must not hand it a file of your home.
+
+## [2026.11.83]
+
+### Added
+
+- **`ssai sandbox status` covers the native sandbox on every system.** It first says whether the native
+  sandbox is ready on this computer and what it keeps between runs. On Windows that is the projects the
+  sandbox account was granted: the grants stay between runs, so the account can write every project it
+  ran in until they are revoked, and `status` now names each (with `-v`, every other path whose access
+  its grant changed: the folders above it, the tool's, the holds on its git folder), and what a revoke
+  left behind when it took a project's own folder back but not every other path. On Linux, macOS and
+  FreeBSD the native sandbox keeps nothing. On Linux the container sandbox's images and volumes follow,
+  as before; without podman installed, `status` says so instead of failing. It changes no access and no
+  file.
+
 ## [2026.11.82]
 
 ### Fixed

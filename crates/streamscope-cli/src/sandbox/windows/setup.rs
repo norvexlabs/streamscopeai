@@ -198,6 +198,52 @@ pub fn revoke(root: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// `ssai sandbox status`, the native section: whether the account is set up,
+/// then every project it was granted (the grants stay between runs), then
+/// what a revoke left: paths still recorded under a project whose own folder
+/// it took back. With `verbose`, every other path whose access each
+/// project's grants changed (a grant or a hold). Changes no access and no file.
+pub fn status(verbose: bool) -> Result<()> {
+    match probe() {
+        Ok(ready) => println!(
+            "Ready: account {} ({}), its egress blocked but for loopback",
+            ready.record.account, ready.record.account_sid
+        ),
+        Err(reason) => println!("Not ready: {reason}"),
+    }
+    let entries = super::acl::granted(&super::acl::record_path()?)?;
+    let (projects, left): (Vec<_>, Vec<_>) = entries.iter().partition(|g| g.root.is_some());
+    if projects.is_empty() {
+        println!("No project is granted to the sandbox account");
+    } else {
+        println!("Projects the sandbox account was granted ({}), kept between runs:", projects.len());
+    }
+    for (granted, root) in projects.iter().filter_map(|g| g.root.as_ref().map(|r| (g, r))) {
+        println!("{}", root.display());
+        if verbose {
+            for other in &granted.others {
+                println!("  {}", other.display());
+            }
+        } else if !granted.others.is_empty() {
+            println!("  and {} other path(s) whose access its grant changed (`-v` lists them)", granted.others.len());
+        }
+    }
+    // Still granted: always named in full, whatever `verbose`.
+    if !left.is_empty() {
+        println!("Left by a revoke that took a project's own folder back but not these (`ssai sandbox revoke --all` tries again):");
+        for granted in &left {
+            println!("{}", granted.key);
+            for other in &granted.others {
+                println!("  {}", other.display());
+            }
+        }
+    }
+    if !entries.is_empty() {
+        println!("`ssai sandbox revoke [<folder>]` takes one project's access back, `--all` every one's.");
+    }
+    Ok(())
+}
+
 /// `ssai sandbox uninstall`: take back every grant, remove the account, its
 /// profile and its rule, then the record.
 pub fn uninstall() -> Result<()> {
