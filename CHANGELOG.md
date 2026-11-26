@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.87]
+
+### Added
+
+- **Agent loop guard.** When a coding agent keeps making the same tool call and getting the same result,
+  the gateway now notices it in the request's history and shows a **Tool loop** badge on the request,
+  naming the tools and how many times the cycle repeated (cycles of up to five steps, such as edit →
+  build → same error, are recognised). By default it only records (**Observe**). An organisation can
+  choose **Nudge**, which adds a short note to the last tool result asking the model to change approach,
+  or **Stop**, which also refuses tool calls for that one reply so the model answers in text with what
+  it tried and what it needs. The organisation's choice is under **Settings → Budget**; each workspace
+  can keep it or set its own on its **Limits**. A poll whose answer changes is never acted on (one
+  whose answer stays the same counts as a repeat), a client that requires a tool call gets the note
+  instead of a stop, and the Agent workspace is never guarded.
+
+### Fixed
+
+- **An LLM server's QoS tab shows what was just saved.** After **Save QoS settings**, the form went back
+  to the previous values until the page was left and opened again, so a second save wrote those
+  previous values back. The tab now shows the settings as stored as soon as the save answers.
+
+## [2026.11.86]
+
+### Fixed
+
+- **Windows sandbox: OpenCode finds your shared skills.** OpenCode looked for `.agents\skills` in the
+  sandbox account's profile, where there are none, so the skills kept in yours were missing from a
+  sandboxed run. `ssai run` now names your shared skills folder to OpenCode 2 — launched, or offered to
+  another agent as a tool — adding to the skill folders its own configuration lists; a run that sets
+  `OPENCODE_CONFIG_CONTENT` itself keeps its value and is told the folder was not added. Codex also
+  looks only in the sandbox account's profile and has no setting to point it elsewhere: keep the skills
+  it needs in `%USERPROFILE%\.codex\skills`.
+
+## [2026.11.85]
+
+### Added
+
+- **Web search can use Staan, a European web search API.** Under MCP Gateway → Web, pick **Staan** as the
+  search backend and paste its API key: it is stored encrypted, never shown again, and only ever sent to
+  Staan's own API. Staan cannot be selected without a key; choosing another backend removes it, and
+  selecting Staan again asks for it. Optionally pick the market results are ranked for — France, Germany,
+  the United States, the United Kingdom and other English-speaking markets — otherwise the market a model's
+  language hint names, otherwise Staan's default (France). Each search returns up to 10 results and is
+  recorded in the audit trail like a SearXNG one; whether a key is stored shows on the settings' audit
+  row, the key never.
+
+### Removed
+
+- **BREAKING (admin API): the web settings no longer carry `engine_id`, and the search backends and fetch
+  providers that could never be selected are gone.** `backend` is `searxng` or `staan`, `fetch_provider` is
+  `builtin`; Brave, Tavily, Google Custom Search and Serper — shown as "coming soon" in the Web tab and
+  always refused — are no longer listed, and an `engine_id` sent is ignored.
+
 ## [2026.11.84]
 
 ### Added

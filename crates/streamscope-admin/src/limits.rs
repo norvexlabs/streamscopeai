@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use streamscope_core::auth::member_limits::MemberLimits;
 use streamscope_core::auth::RateLimitConfig;
+use streamscope_core::config::loop_guard::{LoopGuardMode, LoopGuardSettings};
 use uuid::Uuid;
 use crate::db::tenant::Scoped;
 
@@ -61,6 +62,99 @@ pub async fn load_tenant_budget_settings(conn: &mut Scoped) -> Result<TenantBudg
         org_alert_only: s.get("tenant_budget_mode").and_then(|v| v.as_str()) == Some("alert_only"),
         default: TenantBudgetDefault { daily: num("default_daily_budget"), monthly: num("default_monthly_budget") },
     })
+}
+
+/// The `system_settings` keys holding the tenant's default agent loop guard.
+pub const LOOP_GUARD_KEYS: [&str; 3] = ["loop_guard_mode", "loop_guard_nudge_at", "loop_guard_stop_at"];
+
+/// The tenant's default agent loop guard. Every reader of its keys goes
+/// through here.
+pub async fn load_tenant_loop_guard(conn: &mut Scoped) -> Result<LoopGuardSettings, sqlx::Error> {
+    Ok(tenant_loop_guard_from(&read_settings(&mut *conn, &LOOP_GUARD_KEYS).await?))
+}
+
+/// The tenant default from its stored keys: an unset key takes the built-in
+/// default's value. A combination that fails [`LoopGuardSettings::validate`]
+/// (the settings API refuses one, so only a hand-written row) is read as the
+/// built-in default whole, never as a pair the guard cannot honour.
+pub fn tenant_loop_guard_from(s: &HashMap<String, serde_json::Value>) -> LoopGuardSettings {
+    let d = LoopGuardSettings::default();
+    let count = |k: &str, dflt: u32| {
+        s.get(k).and_then(|v| v.as_u64()).and_then(|n| u32::try_from(n).ok()).unwrap_or(dflt)
+    };
+    let read = LoopGuardSettings {
+        mode: s
+            .get("loop_guard_mode")
+            .and_then(|v| v.as_str())
+            .and_then(LoopGuardMode::parse)
+            .unwrap_or(d.mode),
+        nudge_at: count("loop_guard_nudge_at", d.nudge_at),
+        stop_at: count("loop_guard_stop_at", d.stop_at),
+    };
+    match read.validate() {
+        Ok(()) => read,
+        Err(e) => {
+            tracing::warn!(error = e, "stored tenant loop guard is invalid; the built-in default applies");
+            d
+        }
+    }
+}
+
+/// A workspace's own loop guard from its three `workspace_rate_limits`
+/// columns: `None` (inherit the tenant default) when the mode is unset. The
+/// table's CHECKs hold the three set together, a known mode and the bounds, so
+/// a row that still reads as invalid is read as inheriting.
+pub fn own_loop_guard(mode: Option<&str>, nudge_at: Option<i32>, stop_at: Option<i32>) -> Option<LoopGuardSettings> {
+    let mode = mode?;
+    let own = LoopGuardSettings {
+        mode: LoopGuardMode::parse(mode)?,
+        nudge_at: u32::try_from(nudge_at?).ok()?,
+        stop_at: u32::try_from(stop_at?).ok()?,
+    };
+    match own.validate() {
+        Ok(()) => Some(own),
+        Err(e) => {
+            tracing::warn!(error = e, mode, "stored workspace loop guard is invalid; the tenant default applies");
+            None
+        }
+    }
+}
+
+/// The guard of each workspace whose guard differs from `tenant`: its own
+/// setting, or [`LoopGuardSettings::OFF`] for the Agent workspace, whose
+/// analysis traffic is never guarded whatever is stored. `rows` are
+/// `(workspace, is_agent, own)`.
+pub fn resolve_workspace_loop_guards(
+    rows: impl IntoIterator<Item = (Uuid, bool, Option<LoopGuardSettings>)>,
+    tenant: LoopGuardSettings,
+) -> HashMap<Uuid, LoopGuardSettings> {
+    rows.into_iter()
+        .filter_map(|(ws, is_agent, own)| {
+            let g = if is_agent { LoopGuardSettings::OFF } else { own.unwrap_or(tenant) };
+            (g != tenant).then_some((ws, g))
+        })
+        .collect()
+}
+
+/// Every workspace's loop guard that differs from `tenant` (see
+/// [`resolve_workspace_loop_guards`]).
+pub async fn load_workspace_loop_guards(
+    conn: &mut Scoped,
+    tenant: LoopGuardSettings,
+) -> Result<HashMap<Uuid, LoopGuardSettings>, sqlx::Error> {
+    type Row = (Uuid, bool, Option<String>, Option<i32>, Option<i32>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT w.id, w.role = 'agent', r.loop_guard_mode, r.loop_guard_nudge_at, r.loop_guard_stop_at \
+           FROM workspaces w \
+           LEFT JOIN workspace_rate_limits r ON r.workspace_id = w.id",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(resolve_workspace_loop_guards(
+        rows.into_iter()
+            .map(|(ws, is_agent, mode, nudge, stop)| (ws, is_agent, own_loop_guard(mode.as_deref(), nudge, stop))),
+        tenant,
+    ))
 }
 
 /// Several `system_settings` values of this tenant in one read.
@@ -711,6 +805,69 @@ mod tests {
     use super::*;
 
     const DEFAULT: TenantBudgetDefault = TenantBudgetDefault { daily: 10.0, monthly: 100.0 };
+
+    fn keys(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn an_unset_tenant_loop_guard_is_the_built_in_default() {
+        assert_eq!(tenant_loop_guard_from(&HashMap::new()), LoopGuardSettings::default());
+        // One key set: the others keep their default.
+        let g = tenant_loop_guard_from(&keys(&[("loop_guard_mode", serde_json::json!("stop"))]));
+        assert_eq!(g, LoopGuardSettings { mode: LoopGuardMode::Stop, ..LoopGuardSettings::default() });
+        let g = tenant_loop_guard_from(&keys(&[
+            ("loop_guard_mode", serde_json::json!("nudge")),
+            ("loop_guard_nudge_at", serde_json::json!(5)),
+            ("loop_guard_stop_at", serde_json::json!(20)),
+        ]));
+        assert_eq!(g, LoopGuardSettings { mode: LoopGuardMode::Nudge, nudge_at: 5, stop_at: 20 });
+    }
+
+    #[test]
+    fn an_invalid_stored_tenant_loop_guard_reads_as_the_default_whole() {
+        let g = tenant_loop_guard_from(&keys(&[
+            ("loop_guard_mode", serde_json::json!("stop")),
+            ("loop_guard_nudge_at", serde_json::json!(7)),
+        ]));
+        // nudge_at 7 against the default stop_at 8 breaks the gap.
+        assert_eq!(g, LoopGuardSettings::default());
+    }
+
+    #[test]
+    fn a_workspace_loop_guard_is_own_only_with_a_mode() {
+        assert_eq!(own_loop_guard(None, None, None), None);
+        assert_eq!(
+            own_loop_guard(Some("off"), Some(3), Some(8)),
+            Some(LoopGuardSettings { mode: LoopGuardMode::Off, nudge_at: 3, stop_at: 8 })
+        );
+        assert_eq!(own_loop_guard(Some("loud"), Some(3), Some(8)), None);
+        assert_eq!(own_loop_guard(Some("stop"), Some(-1), Some(8)), None);
+        assert_eq!(own_loop_guard(Some("stop"), Some(3), Some(4)), None);
+    }
+
+    #[test]
+    fn only_workspaces_differing_from_the_tenant_are_listed_and_the_agent_is_off() {
+        let tenant = LoopGuardSettings { mode: LoopGuardMode::Stop, nudge_at: 3, stop_at: 8 };
+        let own = LoopGuardSettings { mode: LoopGuardMode::Nudge, nudge_at: 2, stop_at: 6 };
+        let [inherit, same, mine, agent] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let m = resolve_workspace_loop_guards(
+            [
+                (inherit, false, None),
+                (same, false, Some(tenant)),
+                (mine, false, Some(own)),
+                // An own value stored on the Agent workspace does not apply.
+                (agent, true, Some(own)),
+            ],
+            tenant,
+        );
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&mine), Some(&own));
+        assert_eq!(m.get(&agent), Some(&LoopGuardSettings::OFF));
+        // A tenant already off with the same thresholds needs no Agent entry.
+        let m = resolve_workspace_loop_guards([(agent, true, None)], LoopGuardSettings::OFF);
+        assert!(m.is_empty());
+    }
 
     /// A workspace that never saved its limits is held to the tenant default
     /// budget exactly like one that saved them blank.

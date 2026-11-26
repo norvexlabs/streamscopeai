@@ -28,7 +28,7 @@ use axum::{Extension, Json, extract::State};
 use serde::{Deserialize, Serialize};
 use streamscope_core::web::{
     BUILTIN_WEB_UPSTREAM_NAME, FetchProvider, SearchRequest, SearchResult,
-    WebAuditRecord, WebContext, WebProvider, WebSettings, WebSurface,
+    StaanMarket, WebAuditRecord, WebContext, WebProvider, WebSettings, WebSurface,
 };
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -58,13 +58,16 @@ pub struct WebSettingsResponse {
 }
 
 /// Body for `PATCH /api/v1/admin/settings/web`. Settings fields are
-/// optional — partial updates are the norm. The `credential` field is
-/// write-only:
+/// optional — partial updates are the norm. The `credential` field is the
+/// Staan key, write-only, stored encrypted on the `builtin-web` row (each
+/// change bumps `cred_version` so the gateways pick it up):
 ///
-/// - `Some("...")` (non-empty) → encrypt and store on the `builtin-web` row,
-///   bumping `cred_version` so the proxy's hot path picks the change up.
-/// - `Some("")` → clear the credential (sets `encrypted_credential = NULL`).
-/// - `None` → leave the existing credential in place.
+/// - `Some("...")` (non-empty, visible ASCII) → stored; only with
+///   `backend = staan`.
+/// - `Some("")` → cleared; refused while Staan stays selected, which cannot
+///   be left without a key.
+/// - `None` → kept. A request selecting Staan when it was not selected
+///   carries a new key: a stored one is never reused for it.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct UpdateWebSettingsRequest {
     /// Tri-state: absent leaves the search backend alone, `null` removes it
@@ -72,14 +75,16 @@ pub struct UpdateWebSettingsRequest {
     #[serde(default, deserialize_with = "super::double_option::deserialize")]
     #[schema(value_type = Option<WebProvider>)]
     pub backend: Option<Option<WebProvider>>,
-    /// Tri-state like `backend`: absent leaves it, `null` or `""` clears it.
+    /// The SearXNG instance's URL. Tri-state like `backend`: absent leaves
+    /// it, `null` or `""` clears it. Staan does not read it.
     #[serde(default, deserialize_with = "super::double_option::deserialize")]
     #[schema(value_type = Option<String>)]
     pub endpoint: Option<Option<String>>,
-    /// Tri-state like `backend`: absent leaves it, `null` or `""` clears it.
+    /// Staan's search market. Tri-state like `backend`: absent leaves it,
+    /// `null` clears it (Staan's own default), a value sets it.
     #[serde(default, deserialize_with = "super::double_option::deserialize")]
-    #[schema(value_type = Option<String>)]
-    pub engine_id: Option<Option<String>>,
+    #[schema(value_type = Option<StaanMarket>)]
+    pub market: Option<Option<StaanMarket>>,
     #[serde(default)]
     pub fetch_provider: Option<FetchProvider>,
     #[serde(default)]
@@ -98,8 +103,10 @@ pub struct UpdateWebSettingsRequest {
     pub substitution_history_max_bytes: Option<u64>,
     #[serde(default)]
     pub mixed_pending_cache_ttl_seconds: Option<u64>,
-    /// Backend API key plaintext. Encrypted at rest with AES-256-GCM.
-    /// A write-only secret: absent or `null` keeps the stored one, `""` clears it.
+    /// The Staan API key, plaintext. Encrypted at rest with AES-256-GCM.
+    /// A write-only secret: absent or `null` keeps the stored one, `""` clears
+    /// it. Stored only with `backend = staan`, which cannot be left without
+    /// one; a request switching to Staan carries a new one.
     #[serde(default)]
     pub credential: Option<String>,
     /// The destination lists the Web tool attaches, each once as allow or
@@ -195,8 +202,15 @@ pub async fn update_web_settings(
         tracing::error!("deserialize merged web settings: {e}");
         ApiError::internal("failed to update settings")
     })?;
+    let before: WebSettings = old.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
 
     validate_web_settings(&current)?;
+    let credential = match body.credential.as_deref() {
+        Some(plain) => Some(normalize_credential(plain)?),
+        None => None,
+    };
+    credential_fits_backend(&current, credential.as_deref())?;
+    require_key_on_entering(&before, &current, credential.as_deref())?;
 
     let lists_before = super::destination_lists::web_attachments(&mut tx).await?;
     if let Some(lists) = &body.destination_lists {
@@ -204,23 +218,32 @@ pub async fn update_web_settings(
     }
 
     // Credential rotation rides on the synthetic `builtin-web` row.
-    if let Some(plain) = body.credential.as_deref() {
+    let key_before = builtin_has_credential(&mut tx).await?;
+    if let Some(plain) = key_rotation(credential.as_deref(), key_before) {
         rotate_builtin_credential(&mut tx, tenant_id, plain).await?;
     }
+    let key_after = builtin_has_credential(&mut tx).await?;
+    // A keyed backend with no key would answer every search with an error:
+    // refused here, on the state this transaction commits.
+    require_credential(&current, key_after)?;
 
     tx.commit().await.map_err(|e| {
         tracing::error!("commit web settings tx: {e}");
         ApiError::internal("failed to update settings")
     })?;
 
-    let before: WebSettings = old.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-
     let destination_lists = super::destination_lists::web_attachments(db.conn()).await?;
-    // Diff the effective settings and the attached lists (the rotated
-    // credential is never part of either, so nothing secret rides here).
+    // Diff the effective settings, the attached lists and whether a key is
+    // stored — its presence only, never the key — so storing or removing one
+    // shows on the row. Named `key_stored`: the central redaction hides any
+    // field whose name holds `credential`.
     audit_sink.record(
-        Some(&serde_json::json!({ "settings": before, "destination_lists": lists_before })),
-        Some(&serde_json::json!({ "settings": current, "destination_lists": destination_lists })),
+        Some(&serde_json::json!({
+            "settings": before, "destination_lists": lists_before, "key_stored": key_before,
+        })),
+        Some(&serde_json::json!({
+            "settings": current, "destination_lists": destination_lists, "key_stored": key_after,
+        })),
     );
 
     let has_credential = builtin_has_credential(db.conn()).await?;
@@ -231,38 +254,90 @@ pub async fn update_web_settings(
 /// endpoint passes the write-time SSRF check (`extension_http::validate_endpoint`:
 /// an http(s) URL with a host, never the metadata address, an internal IP
 /// literal only when the platform's `extensions` egress list lists it; a host
-/// name is resolved only at call time), SearXNG needs one, and the
-/// paid backends + Tavily fetch
-/// are not yet implemented. Refusing here avoids committing a row that would
-/// 400 every dispatch; called on the post-merge value so a partial PATCH can't
-/// land an invalid combination.
+/// name is resolved only at call time), and SearXNG needs one. Refusing here
+/// avoids committing a row that would fail every dispatch; called on the
+/// post-merge value so a partial PATCH can't land an invalid combination.
 fn validate_web_settings(current: &WebSettings) -> Result<(), ApiError> {
-    if let Some(endpoint) = current.endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty())
+    // Only SearXNG reads the endpoint: one left from it is checked again only
+    // when SearXNG is selected, so it cannot block another backend's saves.
+    if current.backend == Some(WebProvider::Searxng)
+        && let Some(endpoint) = current.endpoint.as_deref().map(str::trim).filter(|e| !e.is_empty())
         && let Err(reason) = streamscope_core::extension_http::validate_endpoint(endpoint)
     {
         return Err(ApiError::bad_request(format!("endpoint {reason}")));
     }
-    match current.backend {
-        Some(WebProvider::Searxng)
-            if current.endpoint.as_deref().map(str::trim).unwrap_or("").is_empty() =>
-        {
-            return Err(ApiError::bad_request("backend `searxng` requires an endpoint URL"));
-        }
-        Some(
-            WebProvider::Brave | WebProvider::Tavily | WebProvider::GoogleCse | WebProvider::Serper,
-        ) => {
-            return Err(ApiError::bad_request(
-                "paid web backends are not yet implemented — use `searxng` or leave the backend unset",
-            ));
-        }
-        _ => {}
-    }
-    if matches!(current.fetch_provider, FetchProvider::Tavily) {
-        return Err(ApiError::bad_request(
-            "fetch_provider `tavily` is not yet implemented — use `builtin`",
-        ));
+    if current.backend == Some(WebProvider::Searxng)
+        && current.endpoint.as_deref().map(str::trim).unwrap_or("").is_empty()
+    {
+        return Err(ApiError::bad_request("backend `searxng` requires an endpoint URL"));
     }
     Ok(())
+}
+
+/// A backend that needs a key ([`WebProvider::requires_credential`]) is
+/// selected only with one stored, read after this request's own rotation.
+fn require_credential(current: &WebSettings, has_credential: bool) -> Result<(), ApiError> {
+    match current.backend {
+        Some(provider) if provider.requires_credential() && !has_credential => Err(ApiError::bad_request(
+            format!("backend `{provider}` requires an API key"),
+        )
+        .code(ApiErrorCode::WebCredentialRequired)),
+        _ => Ok(()),
+    }
+}
+
+/// The key as stored: surrounding whitespace removed (a pasted key often
+/// carries a newline). Only a literal `""` clears; one that is blank once
+/// trimmed is refused, as is one holding anything but visible ASCII — a
+/// space, a control or a zero-width character no bearer token carries.
+fn normalize_credential(plain: &str) -> Result<String, ApiError> {
+    let key = plain.trim();
+    if key.is_empty() && !plain.is_empty() {
+        return Err(ApiError::bad_request("credential must not be blank — send \"\" to clear it"));
+    }
+    if !key.chars().all(|c| c.is_ascii_graphic()) {
+        return Err(ApiError::bad_request("credential must be visible ASCII characters only"));
+    }
+    Ok(key.to_string())
+}
+
+/// A key is stored only for a backend that sends one, so a stored key is
+/// always that backend's: one saved beside SearXNG would later go to Staan.
+fn credential_fits_backend(current: &WebSettings, new_credential: Option<&str>) -> Result<(), ApiError> {
+    let keyed = current.backend.is_some_and(|b| b.requires_credential());
+    if new_credential.is_some_and(|k| !k.is_empty()) && !keyed {
+        return Err(ApiError::bad_request("an API key is stored only with a backend that uses one (staan)"));
+    }
+    Ok(())
+}
+
+/// What the request writes to the stored key: its own value, except a clear
+/// (`""`) of a key there is none of. Absent or `null` never touches it.
+fn key_rotation(credential: Option<&str>, stored: bool) -> Option<&str> {
+    credential.filter(|k| !k.is_empty() || stored)
+}
+
+/// A request that selects a keyed backend the settings did not have before
+/// carries its key: a key stored earlier (beside another backend, or before
+/// a switch away) is never sent to it as if it were its own.
+fn require_key_on_entering(
+    before: &WebSettings,
+    current: &WebSettings,
+    credential: Option<&str>,
+) -> Result<(), ApiError> {
+    match current.backend {
+        Some(provider)
+            if provider.requires_credential()
+                && before.backend != current.backend
+                && credential.is_none_or(str::is_empty) =>
+        {
+            Err(ApiError::bad_request(format!(
+                "selecting backend `{provider}` needs its API key in the same request"
+            ))
+            .code(ApiErrorCode::WebCredentialRequired))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Partial JSON patch of only the fields the caller set, normalized exactly as
@@ -283,8 +358,8 @@ fn web_patch_json(body: &UpdateWebSettingsRequest) -> serde_json::Value {
     if let Some(e) = &body.endpoint {
         p.insert("endpoint".into(), cleared_or_set(e));
     }
-    if let Some(e) = &body.engine_id {
-        p.insert("engine_id".into(), cleared_or_set(e));
+    if let Some(v) = &body.market {
+        p.insert("market".into(), serde_json::to_value(v).unwrap_or(serde_json::Value::Null));
     }
     if let Some(v) = &body.fetch_provider {
         p.insert("fetch_provider".into(), serde_json::to_value(v).unwrap_or(serde_json::Value::Null));
@@ -468,8 +543,22 @@ pub async fn test_web(
                 error_category = category,
                 "admin test search failed: {e:?}"
             );
+            // The status of a refusal is the backend's, never its body: a 401
+            // or 403 is the key, any other 4xx the request (a market the
+            // backend does not serve) — both the administrator's to fix.
+            let reason = match &e {
+                streamscope_core::web::WebError::UpstreamError { status: Some(401 | 403), .. }
+                    if settings.backend.is_some_and(|b| b.requires_credential()) =>
+                {
+                    " — the backend refused the API key".to_string()
+                }
+                streamscope_core::web::WebError::UpstreamError { status: Some(s @ 400..=499), .. } => {
+                    format!(" — the backend refused the request (HTTP {s})")
+                }
+                _ => String::new(),
+            };
             let public = format!(
-                "test search failed ({category}); see web_audit for the row"
+                "test search failed ({category}){reason}; see web_audit for the row"
             );
             // Operator-config issues (no backend, missing credential, invalid
             // config / URL, scheme refused, filter denied) → 400. Upstream
@@ -639,10 +728,77 @@ mod tests {
             assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST, "{bad}");
             assert_eq!(err.code, ApiErrorCode::ValidationFailed, "{bad}");
         }
-        // Validated whatever the backend: an endpoint left on an unset backend
-        // is still a URL the next backend switch would dispatch to.
+        // Checked only with SearXNG, the one backend reading it: one left on
+        // an unset backend is checked again when SearXNG is selected.
         let unset = WebSettings { endpoint: Some("nope".into()), ..Default::default() };
-        assert!(validate_web_settings(&unset).is_err());
+        assert!(validate_web_settings(&unset).is_ok());
+    }
+
+    #[test]
+    fn a_keyed_backend_needs_a_stored_key_and_searxng_does_not() {
+        let staan = WebSettings { backend: Some(WebProvider::Staan), ..Default::default() };
+        let refused = require_credential(&staan, false).expect_err("staan without a key");
+        assert_eq!(refused.code, ApiErrorCode::WebCredentialRequired);
+        assert!(require_credential(&staan, true).is_ok());
+        // Staan needs no endpoint, and one left from SearXNG is not its.
+        assert!(validate_web_settings(&staan).is_ok());
+        let stale = WebSettings { endpoint: Some("nope".into()), ..staan.clone() };
+        assert!(validate_web_settings(&stale).is_ok());
+        assert!(validate_web_settings(&WebSettings { backend: Some(WebProvider::Searxng), ..stale }).is_err());
+        for keyless in [searxng_at("https://searx.example"), WebSettings::default()] {
+            assert!(require_credential(&keyless, false).is_ok());
+        }
+    }
+
+    fn staan_at(endpoint: Option<&str>) -> WebSettings {
+        WebSettings { backend: Some(WebProvider::Staan), endpoint: endpoint.map(Into::into), ..Default::default() }
+    }
+
+    #[test]
+    fn only_a_clear_or_a_new_key_touches_the_stored_one() {
+        assert_eq!(key_rotation(None, true), None);
+        assert_eq!(key_rotation(Some("stn_new"), true), Some("stn_new"));
+        assert_eq!(key_rotation(Some(""), true), Some(""));
+        // Clearing a key there is none of writes nothing.
+        assert_eq!(key_rotation(Some(""), false), None);
+        assert_eq!(key_rotation(Some("stn_new"), false), Some("stn_new"));
+    }
+
+    #[test]
+    fn selecting_staan_needs_its_key_in_the_same_request() {
+        let searx = searxng_at("https://searx.example");
+        let staan = staan_at(None);
+        let refused = require_key_on_entering(&searx, &staan, None).expect_err("entering without a key");
+        assert_eq!(refused.code, ApiErrorCode::WebCredentialRequired);
+        assert!(require_key_on_entering(&WebSettings::default(), &staan, Some("")).is_err());
+        assert!(require_key_on_entering(&searx, &staan, Some("stn_new")).is_ok());
+        // Staying on Staan, or leaving it, asks nothing.
+        assert!(require_key_on_entering(&staan, &staan, None).is_ok());
+        assert!(require_key_on_entering(&staan, &searx, None).is_ok());
+    }
+
+    #[test]
+    fn a_key_is_stored_only_with_a_backend_that_sends_one() {
+        let searx = searxng_at("https://searx.example");
+        assert!(credential_fits_backend(&searx, Some("k")).is_err());
+        assert!(credential_fits_backend(&WebSettings::default(), Some("k")).is_err());
+        assert!(credential_fits_backend(&staan_at(None), Some("k")).is_ok());
+        // Clearing, or leaving the key alone, fits any backend.
+        assert!(credential_fits_backend(&searx, Some("")).is_ok());
+        assert!(credential_fits_backend(&searx, None).is_ok());
+    }
+
+    #[test]
+    fn a_pasted_key_is_trimmed_and_a_control_character_refused() {
+        assert_eq!(normalize_credential(" stn_abc\n").unwrap(), "stn_abc");
+        assert_eq!(normalize_credential("").unwrap(), "");
+        assert!(normalize_credential("  ").is_err());
+        assert!(normalize_credential("\n").is_err());
+        assert!(normalize_credential("stn_a\nb").is_err());
+        assert!(normalize_credential("stn_a\u{7f}b").is_err());
+        assert!(normalize_credential("stn_abc\u{200b}").is_err());
+        assert!(normalize_credential("stn a").is_err());
+        assert_eq!(normalize_credential("stn_A-b.c~9").unwrap(), "stn_A-b.c~9");
     }
 
     #[test]
@@ -660,9 +816,9 @@ mod tests {
     #[test]
     fn web_patch_round_trips_every_field() {
         let body = UpdateWebSettingsRequest {
-            backend: Some(Some(WebProvider::Searxng)),
+            backend: Some(Some(WebProvider::Staan)),
             endpoint: Some(Some("https://searx.example".into())),
-            engine_id: Some(Some("cx-123".into())),
+            market: Some(Some(StaanMarket::EnGb)),
             fetch_provider: Some(FetchProvider::Builtin),
             max_results: Some(42),
             fetch_max_bytes: Some(1234),
@@ -679,9 +835,9 @@ mod tests {
         let merged = super::super::default_merged::<WebSettings>(&patch);
         let got: WebSettings = serde_json::from_value(merged).expect("merged base must deserialize");
 
-        assert_eq!(got.backend, Some(WebProvider::Searxng));
+        assert_eq!(got.backend, Some(WebProvider::Staan));
         assert_eq!(got.endpoint.as_deref(), Some("https://searx.example"));
-        assert_eq!(got.engine_id.as_deref(), Some("cx-123"));
+        assert_eq!(got.market, Some(StaanMarket::EnGb));
         assert_eq!(got.fetch_provider, FetchProvider::Builtin);
         assert_eq!(got.max_results, 42);
         assert_eq!(got.fetch_max_bytes, 1234);
@@ -721,15 +877,18 @@ mod tests {
     }
 
     #[test]
-    fn web_patch_clears_empty_endpoint_and_engine_id() {
+    fn web_patch_clears_empty_endpoint_and_null_market() {
         let body = UpdateWebSettingsRequest {
             endpoint: Some(Some(String::new())),
-            engine_id: Some(Some(String::new())),
+            market: Some(None),
             ..Default::default()
         };
         let patch = web_patch_json(&body);
         assert_eq!(patch.get("endpoint"), Some(&serde_json::Value::Null));
-        assert_eq!(patch.get("engine_id"), Some(&serde_json::Value::Null));
+        assert_eq!(patch.get("market"), Some(&serde_json::Value::Null));
+        // A value outside its enum is refused by the parser (the request a 422).
+        assert!(serde_json::from_str::<UpdateWebSettingsRequest>(r#"{"market": "es-es"}"#).is_err());
+        assert!(serde_json::from_str::<UpdateWebSettingsRequest>(r#"{"backend": "unknown"}"#).is_err());
         // `credential` is write-only and never enters the settings patch.
         let body = UpdateWebSettingsRequest {
             credential: Some("sk-secret".into()),

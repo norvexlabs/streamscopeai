@@ -15,19 +15,12 @@ use utoipa::ToSchema;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WebProvider {
-    /// SearXNG meta-search (free, self-hosted, no API key). Default for the
-    /// dev stack and the only provider shipped in v1.
+    /// SearXNG meta-search (free, self-hosted, no API key): the tenant's own
+    /// instance, at its `endpoint`.
     Searxng,
-    /// Brave Search API. Paid, free tier 2k/mo. Independent index.
-    Brave,
-    /// Tavily — LLM-optimised search and content extraction. Paid, free tier
-    /// 1k/mo.
-    Tavily,
-    /// Google Custom Search Engine (CSE). 100 queries/day free. Requires both
-    /// an API key and a CSE engine ID.
-    GoogleCse,
-    /// Serper.dev — Google-results proxy. Paid.
-    Serper,
+    /// Staan web search API (EU, keyed): `GET /v2/search/web` with the tenant's
+    /// key as a bearer token.
+    Staan,
 }
 
 impl WebProvider {
@@ -36,10 +29,7 @@ impl WebProvider {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Searxng => "searxng",
-            Self::Brave => "brave",
-            Self::Tavily => "tavily",
-            Self::GoogleCse => "google_cse",
-            Self::Serper => "serper",
+            Self::Staan => "staan",
         }
     }
 
@@ -49,18 +39,83 @@ impl WebProvider {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "searxng" | "searx" => Some(Self::Searxng),
-            "brave" => Some(Self::Brave),
-            "tavily" => Some(Self::Tavily),
-            "google_cse" | "google" | "cse" => Some(Self::GoogleCse),
-            "serper" => Some(Self::Serper),
+            "staan" => Some(Self::Staan),
             _ => None,
         }
     }
 
-    /// Whether this provider requires a credential. SearXNG is the only
-    /// no-auth backend; everything else needs a key.
+    /// Whether this provider requires a credential: Staan's key; SearXNG has
+    /// none.
     pub fn requires_credential(&self) -> bool {
         !matches!(self, Self::Searxng)
+    }
+}
+
+/// Staan's search market: the locale its results are ranked for, the closed
+/// set its API reference lists for `market`. An unset market sends none, and
+/// Staan applies its own default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub enum StaanMarket {
+    #[serde(rename = "fr-fr")]
+    FrFr,
+    #[serde(rename = "de-de")]
+    DeDe,
+    #[serde(rename = "en-us")]
+    EnUs,
+    #[serde(rename = "en-gb")]
+    EnGb,
+    #[serde(rename = "en-fr")]
+    EnFr,
+    #[serde(rename = "en-ca")]
+    EnCa,
+    #[serde(rename = "en-au")]
+    EnAu,
+    #[serde(rename = "en-in")]
+    EnIn,
+    #[serde(rename = "en-ie")]
+    EnIe,
+    #[serde(rename = "en-nz")]
+    EnNz,
+    #[serde(rename = "en-sg")]
+    EnSg,
+    #[serde(rename = "en-za")]
+    EnZa,
+}
+
+impl StaanMarket {
+    /// The wire value Staan reads.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::FrFr => "fr-fr",
+            Self::DeDe => "de-de",
+            Self::EnUs => "en-us",
+            Self::EnGb => "en-gb",
+            Self::EnFr => "en-fr",
+            Self::EnCa => "en-ca",
+            Self::EnAu => "en-au",
+            Self::EnIn => "en-in",
+            Self::EnIe => "en-ie",
+            Self::EnNz => "en-nz",
+            Self::EnSg => "en-sg",
+            Self::EnZa => "en-za",
+        }
+    }
+
+    /// The market a caller's language hint names: a market's own tag
+    /// (`en-GB`, `en_gb`), else the hint's language (`fr-BE` → French) when
+    /// it has one market — French and German have one each, English takes the
+    /// United States one. Any other hint names none.
+    pub fn for_language(language: &str) -> Option<Self> {
+        let tag = language.trim().to_ascii_lowercase().replace('_', "-");
+        if let Ok(market) = serde_json::from_value(serde_json::Value::String(tag.clone())) {
+            return Some(market);
+        }
+        match tag.split('-').next().unwrap_or_default() {
+            "fr" => Some(Self::FrFr),
+            "de" => Some(Self::DeDe),
+            "en" => Some(Self::EnUs),
+            _ => None,
+        }
     }
 }
 
@@ -584,10 +639,7 @@ mod tests {
     fn provider_parse_round_trip() {
         for v in [
             WebProvider::Searxng,
-            WebProvider::Brave,
-            WebProvider::Tavily,
-            WebProvider::GoogleCse,
-            WebProvider::Serper,
+            WebProvider::Staan,
         ] {
             let parsed = WebProvider::parse(v.code());
             assert_eq!(parsed, Some(v), "round-trip for {}", v.code());
@@ -600,11 +652,20 @@ mod tests {
             WebProvider::parse("SEARX"),
             Some(WebProvider::Searxng)
         );
-        assert_eq!(
-            WebProvider::parse("google"),
-            Some(WebProvider::GoogleCse)
-        );
+        assert_eq!(WebProvider::parse(" Staan "), Some(WebProvider::Staan));
         assert_eq!(WebProvider::parse("nonsense"), None);
+        // A code outside the enum is unknown.
+        for unknown in ["", "staan2", "searxng-x"] {
+            assert_eq!(WebProvider::parse(unknown), None, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn a_staan_markets_code_is_its_wire_value() {
+        use StaanMarket::*;
+        for m in [FrFr, DeDe, EnUs, EnGb, EnFr, EnCa, EnAu, EnIn, EnIe, EnNz, EnSg, EnZa] {
+            assert_eq!(serde_json::to_value(m).unwrap(), serde_json::json!(m.code()), "{m:?}");
+        }
     }
 
     #[test]
@@ -613,15 +674,8 @@ mod tests {
     }
 
     #[test]
-    fn paid_providers_require_credential() {
-        for p in [
-            WebProvider::Brave,
-            WebProvider::Tavily,
-            WebProvider::GoogleCse,
-            WebProvider::Serper,
-        ] {
-            assert!(p.requires_credential(), "{p:?} should need a key");
-        }
+    fn staan_requires_credential() {
+        assert!(WebProvider::Staan.requires_credential());
     }
 
     /// Every failure, on either call, lands on a code of the closed set, and
@@ -632,7 +686,7 @@ mod tests {
         use crate::config::tool_rules::WebInterceptKind::{Fetch, Search};
         let all = [
             WebError::NoBackend,
-            WebError::MissingCredential { backend: WebProvider::Brave },
+            WebError::MissingCredential { backend: WebProvider::Staan },
             WebError::InvalidConfig("x".into()),
             WebError::InvalidUrl("x".into()),
             WebError::SsrfRefused("x".into()),

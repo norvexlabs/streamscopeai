@@ -119,7 +119,7 @@ pub(crate) trait WithoutContent: Sized {
 }
 
 /// A badge says THAT something happened and how often; the three tool-block
-/// badges also name the tools, and a tool's name is text the client's request
+/// badges and the tool-loop badge also name the tools, and a tool's name is text the client's request
 /// defined (its tool definitions are content), so the names go and the count
 /// stays. Every other payload is the gateway's own vocabulary: a phase, a
 /// count, a reason it wrote, a rule or program an administrator named, a
@@ -129,7 +129,8 @@ fn badges_without_content(badges: &mut [AuditBadge]) {
         match badge {
             AuditBadge::ToolBlocked { names, .. }
             | AuditBadge::ToolBlockedOverflow { names, .. }
-            | AuditBadge::ToolBlockNotApplied { names, .. } => names.clear(),
+            | AuditBadge::ToolBlockNotApplied { names, .. }
+            | AuditBadge::ToolLoop { tools: names, .. } => names.clear(),
             AuditBadge::Modified
             | AuditBadge::ModifiedNotApplied
             | AuditBadge::Compressed

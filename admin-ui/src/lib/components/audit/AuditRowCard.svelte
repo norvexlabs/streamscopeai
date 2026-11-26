@@ -15,7 +15,7 @@
   import TagBadge from '#lib/components/TagBadge.svelte';
   import Badge from '#lib/components/Badge.svelte';
   import { m } from '#lib/paraglide/messages.js';
-  import { ATTENTION_BADGE_CODES, dedupeBadgesByCode } from '#lib/badges.js';
+  import { dedupeBadgesByCode, needsAttention } from '#lib/badges.js';
   import { auditKindColor, auditKindLabel, type AuditKind } from '#lib/colormaps/audit_kinds.js';
 
   const NIL_UUID = '00000000-0000-0000-0000-000000000000';
@@ -47,7 +47,7 @@
   // …) on the collapsed row so a flagged record is visible without expanding.
   // The full badge set still renders in the kind-specific detail below.
   const attentionBadges = $derived(
-    dedupeBadgesByCode((row.badges ?? []).filter((b) => ATTENTION_BADGE_CODES.has(b.code)))
+    dedupeBadgesByCode((row.badges ?? []).filter(needsAttention))
   );
 </script>
 

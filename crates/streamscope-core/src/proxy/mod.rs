@@ -1457,6 +1457,7 @@ async fn proxy_handler_inner(
         (mixed_pending_splice_outcome.spliced_count == 0 && mixed_pending_splice_outcome.failed_count == 0)
             .then_some(&pre_content),
         Some(session_info.session_id),
+        &ctx.config.loop_guard_for(Some(ctx.user.workspace_id)),
     )
     .await
     {

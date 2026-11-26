@@ -154,6 +154,8 @@ pub static SETTINGS_CATALOG: &[SettingMeta] = &[
         "The largest media blob, in MiB, a gateway captures for the audit trail and admin-api accepts from it. A tenant's own media blob cap is held to it; a larger blob is recorded as stripped."),
     meta!("WEB_FETCH_TIMEOUT_SECS", Core, "Egress", Integer, "30", true,
         "Total HTTP timeout for the built-in web-fetch tool, in seconds."),
+    meta!("WEB_SEARCH_STAAN_URL", Core, "Egress", Url, "https://api.staan.ai", false,
+        "Origin of the Staan search API the Web tool calls when an organisation selects Staan; its key is sent only there. A value that is not an http(s) URL without credentials makes every Staan search fail."),
 
     // ── Proxy ───────────────────────────────────────────────────────────────
     meta!("PORT", Proxy, "Networking", Integer, "8080", false,

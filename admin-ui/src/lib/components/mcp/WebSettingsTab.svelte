@@ -13,19 +13,20 @@
   type SearchResult = components['schemas']['SearchResult'];
   type WebProvider = components['schemas']['WebProvider'];
   type FetchProvider = components['schemas']['FetchProvider'];
+  type StaanMarket = components['schemas']['StaanMarket'];
   type DestinationList = components['schemas']['DestinationList'];
 
   /** Defaults mirror `WebSettings::default()` in core. Used when the
    * tenant has nothing configured yet so the form renders sensible
    * placeholders rather than blank/zero fields. */
-  const DEFAULTS: Required<Omit<WebSettings, 'backend' | 'endpoint' | 'engine_id'>> & {
+  const DEFAULTS: Required<Omit<WebSettings, 'backend' | 'endpoint' | 'market'>> & {
     backend: WebProvider | '';
     endpoint: string;
-    engine_id: string;
+    market: StaanMarket | '';
   } = {
     backend: '',
     endpoint: '',
-    engine_id: '',
+    market: '',
     fetch_provider: 'builtin' as FetchProvider,
     max_results: 5,
     fetch_max_bytes: 10 * 1024 * 1024,
@@ -37,12 +38,32 @@
     mixed_pending_cache_ttl_seconds: 3600,
   };
 
-  // Form state — `backend`/`endpoint`/`engine_id` are typed strings here
+  /** Staan's markets, as its API lists them; '' sends none (Staan's default). */
+  const STAAN_MARKETS: { value: StaanMarket; label: string }[] = [
+    { value: 'fr-fr', label: 'France (French)' },
+    { value: 'de-de', label: 'Germany (German)' },
+    { value: 'en-us', label: 'United States (English)' },
+    { value: 'en-gb', label: 'United Kingdom (English)' },
+    { value: 'en-fr', label: 'France (English)' },
+    { value: 'en-ca', label: 'Canada (English)' },
+    { value: 'en-au', label: 'Australia (English)' },
+    { value: 'en-in', label: 'India (English)' },
+    { value: 'en-ie', label: 'Ireland (English)' },
+    { value: 'en-nz', label: 'New Zealand (English)' },
+    { value: 'en-sg', label: 'Singapore (English)' },
+    { value: 'en-za', label: 'South Africa (English)' },
+  ];
+
+  // Form state — `backend`/`endpoint`/`market` are typed strings here
   // (Option<X> on the wire). Empty string = unset, sent as `null` on PATCH,
   // which CLEARS the stored value (an absent field would leave it unchanged).
   let backend = $state<WebProvider | ''>('');
   let endpoint = $state('');
-  let engineId = $state('');
+  let market = $state<StaanMarket | ''>('');
+  // The backend as stored: selecting Staan when it was not stored needs a new
+  // key (a stored one is never reused), so the key field opens for it.
+  let storedBackend = $state<WebProvider | ''>('');
+  const enteringStaan = $derived(backend === 'staan' && storedBackend !== 'staan');
   let fetchProvider = $state<FetchProvider>('builtin');
   let maxResults = $state(5);
   // The destination lists the Web tool attaches; saved on their own, at once.
@@ -75,7 +96,8 @@
   function applySettings(s: WebSettings) {
     backend = s.backend ?? '';
     endpoint = s.endpoint ?? '';
-    engineId = s.engine_id ?? '';
+    market = s.market ?? '';
+    storedBackend = backend;
     fetchProvider = s.fetch_provider ?? 'builtin';
     maxResults = s.max_results ?? DEFAULTS.max_results;
     fetchMaxBytes = s.fetch_max_bytes ?? DEFAULTS.fetch_max_bytes;
@@ -123,8 +145,9 @@
   function buildBody(): components['schemas']['UpdateWebSettingsRequest'] {
     return {
       backend: backend === '' ? null : backend,
-      endpoint: endpoint.trim() === '' ? null : endpoint.trim(),
-      engine_id: engineId.trim() === '' ? null : engineId.trim(),
+      // SearXNG's alone: left out (kept as stored) while another backend is chosen.
+      endpoint: backend !== 'searxng' ? undefined : endpoint.trim() === '' ? null : endpoint.trim(),
+      market: market === '' ? null : market,
       fetch_provider: fetchProvider,
       max_results: maxResults,
       fetch_max_bytes: fetchMaxBytes,
@@ -134,9 +157,15 @@
       substitution_round_max_bytes: substitutionRoundMaxBytes,
       substitution_history_max_bytes: substitutionHistoryMaxBytes,
       mixed_pending_cache_ttl_seconds: mixedPendingCacheTtlSeconds,
-      // Credential is write-only; null = leave existing in place. Empty
-      // string clears the stored ciphertext (handled by the admin endpoint).
-      credential: rotateCredential ? credentialDraft : null,
+      // The Staan key is write-only; null keeps the stored one. While Staan
+      // is selected it is sent only when typed (a blank field keeps the stored
+      // key); saving another backend clears a stored one (""), which no
+      // backend but Staan ever sends.
+      credential: backend !== 'staan'
+        ? (hasCredential ? '' : null)
+        : (rotateCredential || !hasCredential || enteringStaan) && credentialDraft.trim() !== ''
+          ? credentialDraft.trim()
+          : null,
     };
   }
 
@@ -199,19 +228,25 @@
       <h3 class="text-sm font-semibold text-(--text-primary)">Search Backend</h3>
       <p class="text-xs text-(--text-secondary) mb-3">
         Pick a search provider for the built-in <code class="font-mono bg-(--bg-primary) px-1 py-0.5 rounded-sm text-xs">/mcp/web</code> tools.
-        SearXNG is the only no-credential option; everything else needs an API key. Page fetch
+        SearXNG is your own instance and needs no key; Staan is a European search API that needs one. Page fetch
         (<code class="font-mono bg-(--bg-primary) px-1 py-0.5 rounded-sm text-xs">web_fetch</code>) needs no provider and is served to every
         workspace granted the web server — withhold that grant to keep a workspace off the web.
       </p>
       <label class="block">
         <span class="text-[10px] text-(--text-secondary) uppercase tracking-wider">Backend</span>
-        <SelectInput bind:value={backend} class="mt-1">
+        <SelectInput
+          bind:value={backend}
+          class="mt-1"
+          onchange={(e) => {
+            if (e.currentTarget.value !== 'staan') {
+              credentialDraft = '';
+              rotateCredential = false;
+            }
+          }}
+        >
           <option value="">None — page fetch only</option>
           <option value="searxng">SearXNG (self-hosted, free)</option>
-          <option value="brave" disabled>Brave Search (coming soon)</option>
-          <option value="tavily" disabled>Tavily (coming soon)</option>
-          <option value="google_cse" disabled>Google Custom Search (coming soon)</option>
-          <option value="serper" disabled>Serper.dev (coming soon)</option>
+          <option value="staan">Staan (European search API, needs a key)</option>
         </SelectInput>
       </label>
 
@@ -221,10 +256,32 @@
         </p>
       {/if}
 
-      {#if backend === 'searxng' || backend === 'brave' || backend === 'tavily' || backend === 'serper'}
+      {#if storedBackend === 'staan' && backend !== 'staan' && hasCredential}
+        <p class="text-xs text-(--warning-text) mt-2">
+          Saving removes the stored Staan key: selecting Staan again will ask for it.
+        </p>
+      {/if}
+
+      {#if backend === 'staan'}
+        <p class="text-xs text-(--text-secondary) mt-2">
+          Queries are sent to Staan's API with the key below; each search returns up to 10 results.
+          Choosing another backend and saving removes the key; selecting Staan again asks for it.
+        </p>
+        <label class="block mt-3">
+          <span class="text-[10px] text-(--text-secondary) uppercase tracking-wider">Market</span>
+          <SelectInput bind:value={market} class="mt-1">
+            <option value="">Staan's default — or the language a model asks for</option>
+            {#each STAAN_MARKETS as m (m.value)}
+              <option value={m.value}>{m.label} · {m.value}</option>
+            {/each}
+          </SelectInput>
+        </label>
+      {/if}
+
+      {#if backend === 'searxng'}
         <label class="block mt-3">
           <span class="text-[10px] text-(--text-secondary) uppercase tracking-wider">
-            Endpoint URL{backend === 'searxng' ? ' (required)' : ' (optional override)'}
+            Endpoint URL (required)
           </span>
           <input
             type="url"
@@ -235,17 +292,6 @@
         </label>
       {/if}
 
-      {#if backend === 'google_cse'}
-        <label class="block mt-3">
-          <span class="text-[10px] text-(--text-secondary) uppercase tracking-wider">CSE Engine ID (cx)</span>
-          <input
-            type="text"
-            bind:value={engineId}
-            placeholder="012345678901234567890:abcdefg"
-            class="w-full mt-1 px-2.5 py-1.5 bg-(--bg-primary) border border-(--border) rounded-lg text-sm font-mono text-(--text-primary) focus:outline-hidden focus:border-(--accent) transition-colors"
-          />
-        </label>
-      {/if}
     </div>
 
     <!-- Credential -->
@@ -253,9 +299,9 @@
       <div class="bg-(--bg-card) rounded-xl border border-(--border) p-5">
         <h3 class="text-sm font-semibold text-(--text-primary)">Credential</h3>
         <p class="text-xs text-(--text-secondary) mb-3">
-          API key for the selected backend. Encrypted at rest with AES-256-GCM (HKDF-SHA256 from <code>ENCRYPTION_KEY</code>); never echoed back.
+          Your Staan API key. Encrypted at rest with AES-256-GCM (HKDF-SHA256 from <code>ENCRYPTION_KEY</code>); never echoed back.
         </p>
-        {#if hasCredential && !rotateCredential}
+        {#if hasCredential && !rotateCredential && !enteringStaan}
           <div class="flex items-center gap-3">
             <span class="inline-flex items-center gap-1.5 px-2.5 py-1 bg-(--success-bg) text-(--success-text) border border-(--success-border) rounded-md text-xs font-medium">
               ✓ Credential configured
@@ -264,27 +310,27 @@
               type="button"
               onclick={() => { rotateCredential = true; credentialDraft = ''; }}
               class="px-3 py-1.5 text-xs font-medium text-(--accent) hover:underline"
-            >Rotate or clear</button>
+            >Replace key</button>
           </div>
         {:else}
           <label class="block">
             <span class="text-[10px] text-(--text-secondary) uppercase tracking-wider">
-              {hasCredential ? 'New credential (leave blank and save to clear)' : 'Credential'}
+              {hasCredential ? 'New key' : 'Key'}
             </span>
             <input
               type="password"
               bind:value={credentialDraft}
-              placeholder="sk-…"
+              placeholder="stn_…"
               autocomplete="new-password"
               class="w-full mt-1 px-2.5 py-1.5 bg-(--bg-primary) border border-(--border) rounded-lg text-sm font-mono text-(--text-primary) focus:outline-hidden focus:border-(--accent) transition-colors"
             />
           </label>
-          {#if hasCredential}
+          {#if hasCredential && !enteringStaan}
             <button
               type="button"
               onclick={() => { rotateCredential = false; credentialDraft = ''; }}
               class="mt-2 px-3 py-1.5 text-xs font-medium text-(--text-secondary) hover:underline"
-            >Cancel rotation</button>
+            >Keep the stored key</button>
           {/if}
         {/if}
       </div>
@@ -320,8 +366,7 @@
           <span class="text-[10px] text-(--text-secondary) uppercase tracking-wider">Fetch Provider</span>
           <span class="block text-xs text-(--text-secondary) mt-0.5 normal-case tracking-normal">Where `web_fetch` extracts content from</span>
           <SelectInput bind:value={fetchProvider} class="mt-1.5">
-            <option value="builtin">Builtin (HTML → markdown, SSRF-guarded)</option>
-            <option value="tavily" disabled>Tavily extract API (coming soon)</option>
+            <option value="builtin">Built-in (page text, SSRF-guarded)</option>
           </SelectInput>
         </label>
       </div>

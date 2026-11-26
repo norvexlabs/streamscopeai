@@ -61,8 +61,10 @@ pub struct Host<'a> {
 ///   account as its global configuration ([`commit_as_developer`]);
 /// - `tools`: the folder of `ssai` and of the client's program (and the
 ///   folder it resolves to, when another), and the cross-agent skills store
-///   when it exists; `files`: the CA files, the git identity file and the
-///   files the client was provisioned with (readable by the developer alone,
+///   when it exists — named to a client that looks for it only under its
+///   home in its `windows_skills` variable, unless the run sets that;
+///   `files`: the CA files, the git identity file and the files the client
+///   was provisioned with (readable by the developer alone,
 ///   so the grant on their folder misses them). Each only
 ///   inside the developer's private folders — the profile, a private root
 ///   (`Host::private`) — which no other account reads: elsewhere what is
@@ -121,10 +123,37 @@ pub fn prepare(spec: &mut LaunchSpec, agent: Option<&AgentProfile>, host: &Host)
     // The cross-agent skills store, read by every client: the skills CLI
     // keeps a skill installed for several clients there once, and links each
     // client's own skills folder entry to it (a junction the grant on that
-    // folder does not follow). Granted as it is on disk, and only when it
-    // exists and lies inside the profile.
+    // folder does not follow): a client pointed at its own folder among the
+    // developer's reaches the store through those entries. Granted as it is
+    // on disk, and only when it exists and lies inside the profile.
     let skills = dunce::canonicalize(host.profile.join(SHARED_SKILLS)).ok().filter(|d| d.is_dir());
     let mine = |p: &Path| under(p, host.profile) || (host.private)(p);
+    // A client that looks for the store only under its home (the account's)
+    // is handed the granted one by name — the launched client, or one it may
+    // run as a tool, which inherits the variable; a run that sets the
+    // variable keeps its own value. `skills.paths` is the form every OpenCode
+    // major reads (2.x also takes a bare list; 1.x refuses one, and its
+    // inline paths replace its files' rather than add to them).
+    let store = skills.as_deref().filter(|d| mine(d)).and_then(Path::to_str);
+    let mut vars: Vec<&'static str> = Vec::new();
+    for var in agent.into_iter().chain(spec.tool_clients.iter().map(|t| t.profile)).filter_map(|a| a.windows_skills) {
+        if !vars.contains(&var) {
+            vars.push(var);
+        }
+    }
+    if let Some(store) = store {
+        for var in vars {
+            if last(&spec.env, var).is_some() {
+                crate::ui::warn(
+                    "",
+                    format_args!("{var} is set for this run: the skills in {store} are not added to it"),
+                );
+            } else {
+                let inline = serde_json::json!({ "skills": { "paths": [store] } });
+                spec.env.insert(0, (var.to_string(), inline.to_string()));
+            }
+        }
+    }
     for dir in found.chain(skills) {
         if mine(&dir) && !dirs.tools.contains(&dir) {
             dirs.tools.push(dir);
@@ -613,7 +642,12 @@ mod tests {
 
     /// A profile holding a project, and a spec for `command` in it.
     fn setup(name: &str, command: &str, env: &[(&str, &str)]) -> (PathBuf, LaunchSpec) {
-        let profile = scratch(name);
+        setup_in(&scratch(name), command, env)
+    }
+
+    /// [`setup`] in an existing profile, keeping what it holds.
+    fn setup_in(profile: &Path, command: &str, env: &[(&str, &str)]) -> (PathBuf, LaunchSpec) {
+        let profile = profile.to_path_buf();
         let root = profile.join("project");
         std::fs::create_dir_all(&root).unwrap();
         let spec = LaunchSpec {
@@ -1258,6 +1292,67 @@ mod tests {
             std::os::unix::fs::symlink(&outside, &skills).unwrap();
             let dirs = run(&mut spec, &profile);
             assert!(!dirs.tools.iter().any(|d| d == &skills || d == &outside), "{:?}", dirs.tools);
+            let _ = std::fs::remove_dir_all(outside);
+        }
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// OpenCode looks for the store only under the account's home: it is
+    /// named to it in its inline configuration when granted — launched or
+    /// offered as a tool, never when absent or linked out of the profile —
+    /// and a run setting the variable keeps its own value. Claude reaches the
+    /// store through its own folder and is handed nothing.
+    #[test]
+    fn opencode_is_named_the_granted_skills_store_in_its_inline_configuration() {
+        const VAR: &str = "OPENCODE_CONFIG_CONTENT";
+        let inline = |spec: &LaunchSpec| spec.env.iter().filter(|(k, _)| k == VAR).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+        let (profile, mut spec) = setup("skills-opencode", "opencode", &[]);
+        let skills = profile.join(".agents/skills");
+        run(&mut spec, &profile);
+        assert!(inline(&spec).is_empty(), "absent: nothing named");
+
+        std::fs::create_dir_all(skills.join("writing-guidelines")).unwrap();
+        let (_, mut spec) = setup_in(&profile, "opencode", &[]);
+        let dirs = run(&mut spec, &profile);
+        assert!(dirs.tools.contains(&skills));
+        let named = inline(&spec);
+        assert_eq!(named.len(), 1, "{named:?}");
+        // The store as granted: the path on disk, in the host's separators.
+        let granted = dunce::canonicalize(&skills).unwrap();
+        let expected = serde_json::json!({ "skills": { "paths": [granted.to_str().unwrap()] } });
+        let doc: serde_json::Value = serde_json::from_str(&named[0]).unwrap();
+        assert_eq!(doc, expected);
+
+        // The run's own value is kept, alone.
+        let (_, mut spec) = setup_in(&profile, "opencode", &[(VAR, r#"{"model":"x"}"#)]);
+        run(&mut spec, &profile);
+        assert_eq!(inline(&spec), [r#"{"model":"x"}"#]);
+
+        // Claude reads the store through its own folder's entries.
+        let (_, mut spec) = setup_in(&profile, "claude", &[]);
+        assert!(run(&mut spec, &profile).tools.contains(&skills));
+        assert!(inline(&spec).is_empty());
+
+        // OpenCode offered to Claude as a tool inherits the variable.
+        let (_, mut spec) = setup_in(&profile, "claude", &[]);
+        spec.tool_clients.push(crate::sandbox::ToolClient {
+            client_id: "opencode".into(),
+            profile: agent_for("opencode").unwrap(),
+            files: vec![],
+        });
+        run(&mut spec, &profile);
+        let named = inline(&spec);
+        assert_eq!(named.len(), 1, "{named:?}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&named[0]).unwrap(), expected);
+
+        #[cfg(unix)]
+        {
+            let outside = scratch("skills-opencode-outside");
+            std::fs::remove_dir_all(&skills).unwrap();
+            std::os::unix::fs::symlink(&outside, &skills).unwrap();
+            let (_, mut spec) = setup_in(&profile, "opencode", &[]);
+            run(&mut spec, &profile);
+            assert!(inline(&spec).is_empty(), "linked out of the profile: nothing named");
             let _ = std::fs::remove_dir_all(outside);
         }
         let _ = std::fs::remove_dir_all(&profile);

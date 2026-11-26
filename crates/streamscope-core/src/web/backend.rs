@@ -5,6 +5,7 @@
 //! [`crate::web::service`] layer handles policy, filtering, and audit.
 
 use crate::web::providers::searxng::SearxngBackend;
+use crate::web::providers::staan::StaanBackend;
 use crate::web::settings::WebSettings;
 use crate::web::types::{
     SearchRequest, SearchResult, WebError, WebProvider,
@@ -14,15 +15,15 @@ use crate::web::types::{
 #[derive(Debug, Clone)]
 pub enum Backend {
     Searxng(SearxngBackend),
-    // Brave/Tavily/GoogleCse/Serper land in phase 2.
+    Staan(StaanBackend),
 }
 
 impl Backend {
     /// Build the configured backend from tenant settings + decrypted
     /// credential. Returns [`WebError::NoBackend`] if unconfigured,
-    /// [`WebError::MissingCredential`] when a paid backend lacks one.
+    /// [`WebError::MissingCredential`] when a keyed backend lacks one.
     ///
-    /// `credential` is the per-tenant decrypted API key (None for SearXNG).
+    /// `credential` is the per-tenant decrypted API key (unused by SearXNG).
     pub fn from_settings(
         settings: &WebSettings,
         credential: Option<&str>,
@@ -37,18 +38,18 @@ impl Backend {
             WebProvider::Searxng => Ok(Self::Searxng(SearxngBackend::new(
                 settings.endpoint.clone(),
             )?)),
-            WebProvider::Brave
-            | WebProvider::Tavily
-            | WebProvider::GoogleCse
-            | WebProvider::Serper => Err(WebError::InvalidConfig(format!(
-                "paid backend `{provider}` is not yet implemented — configure `searxng` instead"
-            ))),
+            WebProvider::Staan => {
+                let key = credential.ok_or(WebError::MissingCredential { backend: provider })?;
+                let base = &crate::settings::core_settings().web_search_staan_url;
+                Ok(Self::Staan(StaanBackend::new(base, key, settings.market)?))
+            }
         }
     }
 
     pub fn provider(&self) -> WebProvider {
         match self {
             Self::Searxng(_) => WebProvider::Searxng,
+            Self::Staan(_) => WebProvider::Staan,
         }
     }
 
@@ -64,6 +65,7 @@ impl Backend {
     ) -> Result<BackendSearchOutcome, WebError> {
         match self {
             Self::Searxng(b) => b.search(clients, req).await,
+            Self::Staan(b) => b.search(clients, req).await,
         }
     }
 }

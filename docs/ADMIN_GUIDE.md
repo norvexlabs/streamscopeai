@@ -1242,6 +1242,31 @@ A workspace is where access, budget, and key issuance come together.
    **Notifications feed on the dashboard Overview** (scoped to the selected workspace, newest
    first; each row links to where you act on it) and in the operator log; deliverable channels
    (webhook, email) are on the roadmap.
+
+   **Agent loop guard.** An agent can get stuck calling the same tool with the same arguments
+   and getting the same result, turn after turn, spending tokens without progress. The gateway
+   notices when a request's history repeats such a cycle and counts the repetitions. What it does
+   then is the guard's **mode**:
+   - *Off* — nothing is detected or recorded.
+   - *Observe* (the default) — the request goes through as sent; its audit entry is badged so you
+     can find stuck agents on the Sessions and Requests pages.
+   - *Nudge* — as Observe, and from the **note threshold** on, a short note is added to the
+     request asking the model to change approach.
+   - *Stop* — as Nudge, and from the **refusal threshold** on, the model is asked to answer in
+     text for that turn instead of calling another tool.
+
+   Both thresholds count how many times in a row the cycle ran. The note threshold is at least 2
+   (default 3); the refusal threshold is at least two more than the note's and at most 50
+   (default 8). Only a cycle whose results repeat too is
+   acted on — a status check whose answer changes each time is recorded, never rewritten — and a
+   client that requires a tool call gets the note instead of the refusal. A status check whose
+   answer stays the same (a build still pending) does count as a repeat: for agents that wait on
+   long jobs, keep *Observe* or *Nudge*, or raise the refusal threshold. The organisation default is set under
+   **Settings → Budget → Agent Loop Guard**, saved as a whole; a workspace runs it unless it sets its own under
+   **Agent loop guard** on its **Limits** tab, where *Inherit organisation default* shows what it
+   would run. Turning *Inherit* back on makes the workspace follow the organisation default
+   again, including later changes to it. The built-in **Agent** workspace, which carries the
+   gateway's own analysis traffic, is never guarded.
 7. **Priority under load** — limits decide what a caller may use; **priority** decides who goes
    first when the model itself is full. It only ever engages when an upstream has no capacity
    free: with room to spare, every request goes straight out and the setting changes nothing.
@@ -2162,7 +2187,7 @@ call and never follows a redirect.
 ### 6. Web search & fetch — **MCP Gateway → Web** tab
 
 Every tenant has a built-in `/mcp/web` virtual server exposing `web_search` and
-`web_fetch`. Configure the backend (SearXNG is the supported backend; set `endpoint` — your installation may have set it for you, and you can change it; an endpoint you enter must be a public `http`/`https` URL, only the one your installation was given may be internal),  its
+`web_fetch`. Configure the search backend — **SearXNG**, your own instance (set `endpoint` — your installation may have set it for you, and you can change it; an endpoint you enter must be a public `http`/`https` URL, only the one your installation was given may be internal), or **Staan**, a European web search API (paste your Staan API key; it is stored encrypted and never shown again, and Staan cannot be selected without one or left without one; optionally pick a **Market** — the country and language results are ranked for — else the market a model's language hint names for French, German or English, else Staan's own default, France (`fr-fr`); each search returns at most 10 results; the queries leave your installation for Staan's service. Staan has no endpoint to set: the key is only ever sent to Staan's own API. **Replace key** swaps it; choosing SearXNG or no backend and saving removes it, and selecting Staan again always asks for a key) —  its
 **Destination lists** (§ 9c: a list attached as **allow** narrows the URLs the tools consider — search
 hits and fetch targets — to what it names, and an allowed list with no entries lets nothing through;
 a list attached as **block** removes what it names, and a block always wins; with no allowed list

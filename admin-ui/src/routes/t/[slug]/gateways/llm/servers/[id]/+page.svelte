@@ -280,7 +280,8 @@
 
   // --- QoS ------------------------------------------------------------------
   // What the gateway does with this server's traffic under load, and whether it
-  // reads the engines' own metrics. Seeded once per server, so a sibling reload
+  // reads the engines' own metrics. Seeded from the first read of each server
+  // and from a save's own answer — never from a reload, so a sibling reload
   // cannot clobber an unsaved edit.
   let schedSeededId = $state('');
   let schedMode = $state<QosMode>('off');
@@ -314,17 +315,29 @@
   let savingSched = $state(false);
   let gatewayReplicas = $state<number | null>(null);
 
+  // The QoS fields of a stored server, in either shape the API answers with:
+  // the page's own read or a write's echo.
+  type StoredScheduling = Pick<
+    Server,
+    'id' | 'scheduling_dialect' | 'gated' | 'max_in_flight' | 'waiting_threshold'
+      | 'engine_metrics' | 'adaptive_concurrency' | 'adaptive_itl_target'
+  >;
+
+  function seedScheduling(s: StoredScheduling) {
+    schedSeededId = s.id;
+    schedMode = qosModeOf(s);
+    schedPriority = s.scheduling_dialect === 'vllm_priority';
+    schedMaxInFlight = s.max_in_flight ?? undefined;
+    schedWaiting = s.waiting_threshold ?? undefined;
+    schedEngineMetrics = s.engine_metrics;
+    schedCapacity = s.adaptive_concurrency ? 'learned' : 'fixed';
+    schedItlMode = s.adaptive_itl_target.type;
+    schedItlTarget = s.adaptive_itl_target.type === 'fixed' ? s.adaptive_itl_target.ms : undefined;
+  }
+
   $effect(() => {
     if (server && schedSeededId !== server.id) {
-      schedSeededId = server.id;
-      schedMode = qosModeOf(server);
-      schedPriority = server.scheduling_dialect === 'vllm_priority';
-      schedMaxInFlight = server.max_in_flight ?? undefined;
-      schedWaiting = server.waiting_threshold ?? undefined;
-      schedEngineMetrics = server.engine_metrics;
-      schedCapacity = server.adaptive_concurrency ? 'learned' : 'fixed';
-      schedItlMode = server.adaptive_itl_target.type;
-      schedItlTarget = server.adaptive_itl_target.type === 'fixed' ? server.adaptive_itl_target.ms : undefined;
+      seedScheduling(server);
       probe = null;
       void loadReplicas();
     }
@@ -380,7 +393,7 @@
     // bounds, in the same transaction server-side. What the switch showed is
     // what is stored — shown on because a queue bound forces it, it stays on
     // once the bound is removed.
-    const { error } = await adminApi.PATCH('/api/v1/admin/servers/{id}', {
+    const { data, error } = await adminApi.PATCH('/api/v1/admin/servers/{id}', {
       params: { path: { id } },
       body: {
         ...fields,
@@ -402,12 +415,16 @@
       },
     });
     savingSched = false;
-    if (error) {
+    if (error || !data) {
       schedError = extractError(error, 'Failed to save the QoS settings');
       return;
     }
     toast.success('QoS settings saved');
-    schedSeededId = '';
+    // Re-seed from the WRITE'S OWN ANSWER, never by re-arming the seeding
+    // effect: that runs before the reload below lands, against the row read
+    // before the save, and would show — and a second save write back — the
+    // previous values.
+    seedScheduling(data);
     await load(id);
   }
 
@@ -951,7 +968,9 @@
           </div>
         </div>
       {:else if active === 'scheduling'}
-        <div class="space-y-4 max-w-3xl" data-qos-tab>
+        <!-- Frozen while a save is in flight: its answer re-seeds every field, so
+             anything typed meanwhile would be discarded without ever being sent. -->
+        <fieldset class="space-y-4 max-w-3xl min-w-0" disabled={savingSched} data-qos-tab>
           <div class="bg-(--bg-card) rounded-xl border border-(--border) p-5 space-y-4">
             <div>
               <h3 class="text-sm font-semibold text-(--text-primary)">Under load</h3>
@@ -1192,7 +1211,7 @@
           >
             {savingSched ? 'Saving…' : 'Save QoS settings'}
           </button>
-        </div>
+        </fieldset>
       {/if}
     {/snippet}
   </TabbedPage>

@@ -1,5 +1,4 @@
-//! Backend implementations. Phase 1 ships SearXNG only; the other four
-//! providers (Brave, Tavily, Google CSE, Serper) land in phase 2 with the
-//! same `Backend` enum dispatch in [`super::backend`].
+//! Search backend implementations, dispatched by [`super::backend::Backend`].
 
 pub mod searxng;
+pub mod staan;

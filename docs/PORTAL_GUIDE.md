@@ -921,7 +921,12 @@ agent creates in the
 project are given back to you when a run ends with no other run of yours still going (otherwise
 by the next one that does), so you remain their owner. The tool runs with the
 account's own profile and temporary folder: its history and caches stay there, apart from yours,
-except for the configuration folder above. Codex's own sandbox is turned off inside it (it cannot
+except for the configuration folder above. Your shared skills folder `%USERPROFILE%\.agents\skills`
+is readable by the sandbox account when it leads to a folder in your profile or in a folder made
+private to you: an agent whose own skills folder links into it reads those skills, and OpenCode is
+pointed at it (unless you set `OPENCODE_CONFIG_CONTENT` for the run yourself). Any other agent that
+looks for that folder under its home finds the sandbox account's — Codex among them, so keep the
+skills Codex needs in `%USERPROFILE%\.codex\skills`. Codex's own sandbox is turned off inside the sandbox (it cannot
 run under another account; the sandbox account confines Codex instead). Every process of the run
 ends with it, and whatever the agent scheduled to run later as the account, or left running outside
 the run, is removed when the run ends and before the next one starts — while you have another

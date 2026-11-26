@@ -217,8 +217,8 @@ fn is_text(ct: &str) -> bool {
 
 /// Cheap HTML→text extraction. Strips `<script>` and `<style>` blocks,
 /// removes all remaining tags, decodes a small set of HTML entities, and
-/// normalises whitespace. Good enough for a phase-1 default; Tavily's
-/// `extract` API or a real readability port lands in phase 2.
+/// normalises whitespace. Navigation, footers and links are not told apart
+/// from the page's own content.
 pub fn extract_text_from_html(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes).into_owned();
 

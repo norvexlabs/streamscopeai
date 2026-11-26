@@ -908,6 +908,15 @@ pub enum ApiErrorCode {
     /// as they are, so a match inside a sub-agent is never folded under a
     /// parent the search did not return. Append-only.
     TopLevelUnsupportedWithSearch,
+    /// The Web tool's settings select a keyed search backend (Staan) with no
+    /// API key stored, or clear the key it uses. Append-only.
+    WebCredentialRequired,
+    /// An agent loop guard whose thresholds break a bound: the note's count
+    /// below 2, the refusal's less than two past it, or past 50. Append-only.
+    InvalidLoopGuard,
+    /// An own agent loop guard on the Agent workspace, whose analysis traffic
+    /// is never guarded. Append-only.
+    LoopGuardNotAllowed,
 }
 
 /// Structured error response body matching the proxy's `ErrorResponse` format.

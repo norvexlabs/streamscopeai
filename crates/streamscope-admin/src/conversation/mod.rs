@@ -511,7 +511,7 @@ pub enum ConversationEvent {
         /// `"mcp"` (direct `/mcp/web` traffic), `"substitution"` (agent loop),
         /// or `"admin_test"` (operator probe).
         surface: String,
-        /// Configured backend code (`"searxng"` | `"brave"` | ...).
+        /// Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`).
         backend: String,
         /// search → query string; fetch → URL.
         #[serde(skip_serializing_if = "Option::is_none")]

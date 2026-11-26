@@ -27,8 +27,7 @@ use crate::audit::badge::AuditBadge;
 pub enum WebProviderResponse {
     Stripped(StrippedProviderResponse),
     /// Raw provider body, kept as `serde_json::Value` because the shape is
-    /// backend-specific (SearXNG wraps results, Brave/Tavily/etc each have
-    /// their own envelope).
+    /// backend-specific (SearXNG and Staan each have their own envelope).
     Captured(serde_json::Value),
 }
 
@@ -96,7 +95,7 @@ pub struct WebAuditRecord {
     pub upstream_server_id: Uuid,
     /// `"search"` or `"fetch"`.
     pub operation: String,
-    /// Configured backend code (`"searxng"` | `"brave"` | …).
+    /// Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`).
     pub backend: String,
     /// search → query string; fetch → URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]

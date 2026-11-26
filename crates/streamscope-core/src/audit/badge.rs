@@ -467,6 +467,43 @@ pub enum AuditBadge {
     /// at read time from the session's alert columns — never stored on the row
     /// (audit rows are never rewritten).
     SessionAlert { experts: Vec<String>, level: AlertLevel },
+
+    /// The request's history ends in a cycle of tool calls repeated
+    /// `streak` times, each repetition getting the same results (the agent
+    /// loop guard). `call_streak` counts the calls alone, results aside.
+    /// `action` is what the guard did; in observe mode it is `detected`, and
+    /// `would` names what a rewriting mode would have done. `tools` are the
+    /// cycle's tool names.
+    ToolLoop {
+        streak: u32,
+        call_streak: u32,
+        cycle_len: u32,
+        tools: Vec<String>,
+        action: ToolLoopAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        would: Option<ToolLoopAction>,
+        /// The history repeats the cycle further back than the guard reads:
+        /// the counts are a floor.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        capped: bool,
+    },
+}
+
+/// What the agent loop guard did to a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolLoopAction {
+    /// Recorded only.
+    Detected,
+    /// A note was appended to the last tool result, asking the model to
+    /// change approach.
+    Nudged,
+    /// Tool calls were refused for this reply, and the model asked to
+    /// answer in text.
+    Stopped,
+    /// The stop was due, but the client forced a tool call, which a
+    /// text-only reply would break: nudged instead.
+    StopSkipped,
 }
 
 impl AuditBadge {
@@ -501,6 +538,7 @@ impl AuditBadge {
             Self::Queued { .. } => "queued",
             Self::Spilled => "spilled",
             Self::Unpriced => "unpriced",
+            Self::ToolLoop { .. } => "tool_loop",
             Self::UpstreamAdapted { .. } => "upstream_adapted",
             Self::WebBlocked => "web_blocked",
             Self::WebUrlFiltered { .. } => "web_url_filtered",
@@ -623,6 +661,8 @@ pub struct BadgeBuilder {
     /// routed to.
     spilled: bool,
     unpriced: bool,
+    /// The agent loop guard's finding (one per request).
+    tool_loop: Option<AuditBadge>,
 }
 
 impl BadgeBuilder {
@@ -850,6 +890,9 @@ impl BadgeBuilder {
             AuditBadge::Unpriced => {
                 self.unpriced = true;
             }
+            badge @ AuditBadge::ToolLoop { .. } => {
+                self.tool_loop = Some(badge);
+            }
             AuditBadge::UpstreamAdapted { dialect, adapted, not_carried } => {
                 self.add_upstream_adapted(dialect, adapted, not_carried);
             }
@@ -894,6 +937,14 @@ impl BadgeBuilder {
         if self.modified {
             self.modified = false;
             self.modified_not_applied = true;
+        }
+        // The loop guard's rewrite did not reach the wire either: recorded as
+        // what it would have done.
+        if let Some(AuditBadge::ToolLoop { action, would, .. }) = &mut self.tool_loop
+            && *action != ToolLoopAction::Detected
+        {
+            *would = Some(*action);
+            *action = ToolLoopAction::Detected;
         }
     }
 
@@ -1223,6 +1274,9 @@ impl BadgeBuilder {
         if other.spilled {
             self.spilled = true;
         }
+        if let Some(tool_loop) = other.tool_loop {
+            self.tool_loop = Some(tool_loop);
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1274,6 +1328,7 @@ impl BadgeBuilder {
             && self.queued_wait_ms.is_none()
             && !self.spilled
             && !self.unpriced
+            && self.tool_loop.is_none()
     }
 
     /// Drain into the final ordered badge vector for the audit record.
@@ -1466,6 +1521,9 @@ impl BadgeBuilder {
         }
         if self.unpriced {
             out.push(AuditBadge::Unpriced);
+        }
+        if let Some(tool_loop) = self.tool_loop {
+            out.push(tool_loop);
         }
         if let Some(dialect) = self.upstream_adapted {
             out.push(AuditBadge::UpstreamAdapted {
@@ -1783,6 +1841,7 @@ mod tests {
             AuditBadge::Queued { .. } => {}
             AuditBadge::Spilled => {}
             AuditBadge::Unpriced => {}
+            AuditBadge::ToolLoop { .. } => {}
             AuditBadge::UpstreamAdapted { .. } => {}
             AuditBadge::LlmSyntheticSampling => {}
             AuditBadge::WebBlocked => {}
@@ -1921,6 +1980,15 @@ mod tests {
             AuditBadge::Queued { wait_ms: 1_500 },
             AuditBadge::Spilled,
             AuditBadge::Unpriced,
+            AuditBadge::ToolLoop {
+                streak: 3,
+                call_streak: 3,
+                cycle_len: 1,
+                tools: vec!["bash".into()],
+                action: ToolLoopAction::Detected,
+                would: Some(ToolLoopAction::Nudged),
+                capped: false,
+            },
             AuditBadge::UpstreamAdapted {
                 dialect: "mistral".into(),
                 adapted: vec!["seed sent as random_seed".into()],
@@ -2245,6 +2313,15 @@ mod tests {
             queued_wait_ms: Some(1_234),
             spilled: true,
             unpriced: true,
+            tool_loop: Some(AuditBadge::ToolLoop {
+                streak: 3,
+                call_streak: 3,
+                cycle_len: 1,
+                tools: vec!["bash".into()],
+                action: ToolLoopAction::Nudged,
+                would: None,
+                capped: true,
+            }),
             upstream_adapted: Some("mistral".into()),
             upstream_adapted_changes: vec!["seed sent as random_seed".into()],
             upstream_not_carried: vec!["parameter user".into()],

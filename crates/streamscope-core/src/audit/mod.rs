@@ -249,7 +249,7 @@ pub mod badge;
 pub mod blob_type;
 pub mod mcp;
 pub use badge::{
-    AlertLevel, AuditBadge, BadgeBuilder, BlockKind, GuardrailAction, Phase,
+    AlertLevel, AuditBadge, BadgeBuilder, BlockKind, GuardrailAction, Phase, ToolLoopAction,
 };
 pub use blob_type::{BlobRef, BlobType};
 pub use mcp::McpAuditRecord;

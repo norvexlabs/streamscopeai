@@ -630,6 +630,7 @@ async fn analyze_request(
         ctx.config.rhai_fail_mode_enum(),
         Some(&pre_content),
         Some(session_info.session_id),
+        &ctx.config.loop_guard_for(Some(ctx.user.workspace_id)),
     )
     .await;
     let mut phase = match phase {

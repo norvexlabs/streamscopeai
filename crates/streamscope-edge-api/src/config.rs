@@ -115,6 +115,13 @@ pub struct ConfigResponse {
     /// a Layered profile as `Default ⊕ own` vs a Standalone as `own`. The Default
     /// profile itself is `standalone = true` (it is the base).
     pub profile_modes: Vec<(uuid::Uuid, streamscope_core::config::ProfileKind, bool)>,
+    /// The tenant's default agent loop guard (its `system_settings` keys,
+    /// resolved; an unset key takes the built-in default).
+    pub loop_guard: streamscope_core::config::loop_guard::LoopGuardSettings,
+    /// Each workspace whose guard differs from [`Self::loop_guard`]: its own
+    /// setting, or the Agent workspace, which is never guarded. A workspace
+    /// absent here runs the tenant default.
+    pub workspace_loop_guard: HashMap<uuid::Uuid, streamscope_core::config::loop_guard::LoopGuardSettings>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -541,6 +548,8 @@ mod tests {
             "workspace_profiles": [[uuid(2), "tools", null], [uuid(1), "tools", uuid(5)], [uuid(1), "guardrail", null]],
             "default_profiles": [["tools", uuid(7)], ["guardrail", uuid(6)]],
             "profile_modes": [[uuid(5), "tools", true], [uuid(4), "tools", false]],
+            "loop_guard": { "mode": "observe", "nudge_at": 3, "stop_at": 8 },
+            "workspace_loop_guard": { uuid(2).to_string(): { "mode": "off", "nudge_at": 3, "stop_at": 8 } },
             "qos": { "route_classes": { uuid(1).to_string(): [uuid(3), uuid(1), uuid(2)] } },
             "web_destinations": { "allow": ["b.lan:443", "a.lan:443"], "block": ["c.lan:443"] },
         });

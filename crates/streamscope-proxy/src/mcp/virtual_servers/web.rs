@@ -3,8 +3,8 @@
 //! Exposes two tools to MCP clients mounted on `/mcp/web` (the default
 //! tenant slug):
 //!
-//! - **`web_search`** — query the configured search backend (SearXNG / Brave
-//!   / Tavily / Google CSE / Serper). Returns ranked hits with snippets.
+//! - **`web_search`** — query the configured search backend (SearXNG or
+//!   Staan). Returns ranked hits with snippets.
 //! - **`web_fetch`** — retrieve a URL through the SSRF-guarded fetcher and
 //!   return the extracted text. Honours per-tenant URL-filter chain.
 //!
@@ -242,8 +242,8 @@ async fn handle_tools_call(
         .unwrap_or_else(|| json!({}));
 
     // Decrypt the upstream's stored credential ahead of context construction
-    // so its plaintext lifetime is bound to this stack frame; paid backends
-    // need it via `ctx.credential`.
+    // so its plaintext lifetime is bound to this stack frame; Staan reads it
+    // via `ctx.credential`.
     let credential = upstream
         .encrypted_credential
         .as_deref()

@@ -785,6 +785,7 @@ mod learn_tests {
             windows_config: &[],
             windows_args: &[],
             windows_seed: &[],
+            windows_skills: None,
         };
         let home = std::env::temp_dir().join(format!("ss-tool-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);

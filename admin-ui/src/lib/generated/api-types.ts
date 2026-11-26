@@ -4189,6 +4189,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/admin/workspaces/{id}/loop-guard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_loop_guard"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_loop_guard"];
+        trace?: never;
+    };
     "/api/v1/admin/workspaces/{id}/mcp-local-servers": {
         parameters: {
             query?: never;
@@ -6576,7 +6592,7 @@ export interface components {
          *     never on the message.
          * @enum {string}
          */
-        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden" | "sandbox_default_image_invalid" | "top_level_unsupported_with_search";
+        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden" | "sandbox_default_image_invalid" | "top_level_unsupported_with_search" | "web_credential_required" | "invalid_loop_guard" | "loop_guard_not_allowed";
         /** @description Structured error response body matching the proxy's `ErrorResponse` format. */
         ApiErrorResponse: {
             error: components["schemas"]["ApiErrorBody"];
@@ -7350,6 +7366,23 @@ export interface components {
             code: "session_alert";
             experts: string[];
             level: components["schemas"]["AlertLevel"];
+        } | {
+            action: components["schemas"]["ToolLoopAction"];
+            /** Format: int32 */
+            call_streak: number;
+            /**
+             * @description The history repeats the cycle further back than the guard reads:
+             *     the counts are a floor.
+             */
+            capped?: boolean;
+            /** @enum {string} */
+            code: "tool_loop";
+            /** Format: int32 */
+            cycle_len: number;
+            /** Format: int32 */
+            streak: number;
+            tools: string[];
+            would?: components["schemas"]["ToolLoopAction"] | null;
         };
         /**
          * @description Discriminator for the `/audit` endpoint's row families. Defaults to
@@ -7817,7 +7850,7 @@ export interface components {
         }) | ({
             /** @description Three-tier app id (mirrors LLM rows). */
             app_id?: string | null;
-            /** @description Configured backend code (`"searxng"` | `"brave"` | …). */
+            /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
             backend: string;
             badges: components["schemas"]["AuditBadge"][];
             /** Format: int64 */
@@ -9623,7 +9656,7 @@ export interface components {
             upstream_server_name?: string | null;
             virtual_server_slug?: string | null;
         } | {
-            /** @description Configured backend code (`"searxng"` | `"brave"` | ...). */
+            /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
             backend: string;
             /** @description Stamped audit badges for this call. */
             badges?: components["schemas"]["AuditBadge"][];
@@ -12071,7 +12104,7 @@ export interface components {
          * @description Where the `web_fetch` tool extracts content from.
          * @enum {string}
          */
-        FetchProvider: "builtin" | "tavily";
+        FetchProvider: "builtin";
         /**
          * @description Maps a raw `(tool_name, app_id|mcp_server)` to a canonical `tool_id`,
          *     and per-arg `field` to the wire field + normaliser. Operators register
@@ -13195,6 +13228,28 @@ export interface components {
             changelog_pending: boolean;
             token: string;
             user: components["schemas"]["AdminAccountResponse"];
+        };
+        /**
+         * @description What the guard does when a request's history repeats a tool-call cycle.
+         * @enum {string}
+         */
+        LoopGuardMode: "off" | "observe" | "nudge" | "stop";
+        /**
+         * @description The guard's mode and its two thresholds, counted in repetitions of the
+         *     cycle.
+         */
+        LoopGuardSettings: {
+            mode: components["schemas"]["LoopGuardMode"];
+            /**
+             * Format: int32
+             * @description Repetitions of the cycle at which the note is added (at least 2).
+             */
+            nudge_at: number;
+            /**
+             * Format: int32
+             * @description Repetitions at which tool calls are refused (at least nudge_at + 2, at most 50).
+             */
+            stop_at: number;
         };
         MatchCondition: {
             op: components["schemas"]["Op"];
@@ -14818,7 +14873,7 @@ export interface components {
             }) | ({
                 /** @description Three-tier app id (mirrors LLM rows). */
                 app_id?: string | null;
-                /** @description Configured backend code (`"searxng"` | `"brave"` | …). */
+                /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
                 backend: string;
                 badges: components["schemas"]["AuditBadge"][];
                 /** Format: int64 */
@@ -16476,7 +16531,7 @@ export interface components {
             }) | ({
                 /** @description Three-tier app id (mirrors LLM rows). */
                 app_id?: string | null;
-                /** @description Configured backend code (`"searxng"` | `"brave"` | …). */
+                /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
                 backend: string;
                 badges: components["schemas"]["AuditBadge"][];
                 /** Format: int64 */
@@ -16817,7 +16872,7 @@ export interface components {
             items: {
                 /** @description Three-tier app id (mirrors LLM rows). */
                 app_id?: string | null;
-                /** @description Configured backend code (`"searxng"` | `"brave"` | …). */
+                /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
                 backend: string;
                 badges: components["schemas"]["AuditBadge"][];
                 /** Format: int64 */
@@ -20285,6 +20340,13 @@ export interface components {
             unit: string;
         };
         /**
+         * @description Staan's search market: the locale its results are ranked for, the closed
+         *     set its API reference lists for `market`. An unset market sends none, and
+         *     Staan applies its own default.
+         * @enum {string}
+         */
+        StaanMarket: "fr-fr" | "de-de" | "en-us" | "en-gb" | "en-fr" | "en-ca" | "en-au" | "en-in" | "en-ie" | "en-nz" | "en-sg" | "en-za";
+        /**
          * @description Initial content for a new profile. `blank` = empty; `seed` = a fresh copy of
          *     the kind's built-in defaults; `copy` = a deep copy of another profile's own
          *     content.
@@ -20624,6 +20686,21 @@ export interface components {
              * @default null
              */
             log_level: string | null;
+            /** @default null */
+            loop_guard_mode: components["schemas"]["LoopGuardMode"] | null;
+            /**
+             * Format: int32
+             * @description Repetitions of the cycle at which the note is added (≥ 2).
+             * @default null
+             */
+            loop_guard_nudge_at: number | null;
+            /**
+             * Format: int32
+             * @description Repetitions at which tool calls are refused (≥ `loop_guard_nudge_at` +
+             *     2, ≤ 50).
+             * @default null
+             */
+            loop_guard_stop_at: number | null;
             /**
              * Format: int64
              * @default null
@@ -21109,7 +21186,7 @@ export interface components {
         }) | ({
             /** @description Three-tier app id (mirrors LLM rows). */
             app_id?: string | null;
-            /** @description Configured backend code (`"searxng"` | `"brave"` | …). */
+            /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
             backend: string;
             badges: components["schemas"]["AuditBadge"][];
             /** Format: int64 */
@@ -21339,6 +21416,11 @@ export interface components {
              */
             user_email?: string | null;
         };
+        /**
+         * @description What the agent loop guard did to a request.
+         * @enum {string}
+         */
+        ToolLoopAction: "detected" | "nudged" | "stopped" | "stop_skipped";
         /**
          * @description The `risk` a tool-inventory list can narrow to.
          * @enum {string}
@@ -23827,21 +23909,26 @@ export interface components {
         };
         /**
          * @description Body for `PATCH /api/v1/admin/settings/web`. Settings fields are
-         *     optional — partial updates are the norm. The `credential` field is
-         *     write-only:
+         *     optional — partial updates are the norm. The `credential` field is the
+         *     Staan key, write-only, stored encrypted on the `builtin-web` row (each
+         *     change bumps `cred_version` so the gateways pick it up):
          *
-         *     - `Some("...")` (non-empty) → encrypt and store on the `builtin-web` row,
-         *       bumping `cred_version` so the proxy's hot path picks the change up.
-         *     - `Some("")` → clear the credential (sets `encrypted_credential = NULL`).
-         *     - `None` → leave the existing credential in place.
+         *     - `Some("...")` (non-empty, visible ASCII) → stored; only with
+         *       `backend = staan`.
+         *     - `Some("")` → cleared; refused while Staan stays selected, which cannot
+         *       be left without a key.
+         *     - `None` → kept. A request selecting Staan when it was not selected
+         *       carries a new key: a stored one is never reused for it.
          */
         UpdateWebSettingsRequest: {
             /** Format: int64 */
             audit_provider_response_max_kb?: number | null;
             backend?: components["schemas"]["WebProvider"] | null;
             /**
-             * @description Backend API key plaintext. Encrypted at rest with AES-256-GCM.
-             *     A write-only secret: absent or `null` keeps the stored one, `""` clears it.
+             * @description The Staan API key, plaintext. Encrypted at rest with AES-256-GCM.
+             *     A write-only secret: absent or `null` keeps the stored one, `""` clears
+             *     it. Stored only with `backend = staan`, which cannot be left without
+             *     one; a request switching to Staan carries a new one.
              */
             credential?: string | null;
             /**
@@ -23849,13 +23936,15 @@ export interface components {
              *     block — the whole set. Absent leaves them as they are.
              */
             destination_lists?: components["schemas"]["DestinationAttachment"][] | null;
-            /** @description Tri-state like `backend`: absent leaves it, `null` or `""` clears it. */
+            /**
+             * @description The SearXNG instance's URL. Tri-state like `backend`: absent leaves
+             *     it, `null` or `""` clears it. Staan does not read it.
+             */
             endpoint?: string | null;
-            /** @description Tri-state like `backend`: absent leaves it, `null` or `""` clears it. */
-            engine_id?: string | null;
             /** Format: int64 */
             fetch_max_bytes?: number | null;
             fetch_provider?: components["schemas"]["FetchProvider"] | null;
+            market?: components["schemas"]["StaanMarket"] | null;
             /** Format: int32 */
             max_results?: number | null;
             /** Format: int64 */
@@ -23868,6 +23957,10 @@ export interface components {
             substitution_max_parallel?: number | null;
             /** Format: int64 */
             substitution_round_max_bytes?: number | null;
+        };
+        /** @description The change to a workspace's agent loop guard. */
+        UpdateWorkspaceLoopGuard: {
+            loop_guard?: components["schemas"]["LoopGuardSettings"] | null;
         };
         UpdateWorkspaceRequest: {
             /**
@@ -24235,7 +24328,7 @@ export interface components {
         WebAuditLogEntry: {
             /** @description Three-tier app id (mirrors LLM rows). */
             app_id?: string | null;
-            /** @description Configured backend code (`"searxng"` | `"brave"` | …). */
+            /** @description Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`). */
             backend: string;
             badges: components["schemas"]["AuditBadge"][];
             /** Format: int64 */
@@ -24407,7 +24500,7 @@ export interface components {
          *     shorthand forms.
          * @enum {string}
          */
-        WebProvider: "searxng" | "brave" | "tavily" | "google_cse" | "serper";
+        WebProvider: "searxng" | "staan";
         /**
          * @description Audit-side discriminator for the upstream provider's raw response. The
          *     service layer caps oversized payloads at the configured KB limit; this
@@ -24431,16 +24524,11 @@ export interface components {
             audit_provider_response_max_kb?: number;
             backend?: components["schemas"]["WebProvider"] | null;
             /**
-             * @description Custom upstream endpoint URL. Required for SearXNG (operator-supplied
-             *     instance), optional for paid providers (override their well-known URL
-             *     — useful for regional endpoints or pen-tests against a sandbox).
+             * @description The SearXNG instance's URL, required for SearXNG. Staan does not read
+             *     it: its origin is the platform's `WEB_SEARCH_STAAN_URL`, so a tenant
+             *     cannot send its key anywhere else.
              */
             endpoint?: string | null;
-            /**
-             * @description Google CSE engine ID (`cx`). Required when backend is
-             *     [`WebProvider::GoogleCse`].
-             */
-            engine_id?: string | null;
             /**
              * Format: int64
              * @description Maximum bytes the built-in fetcher will read from a single response.
@@ -24449,6 +24537,7 @@ export interface components {
             fetch_max_bytes?: number;
             /** @description Which extractor `web_fetch` uses. */
             fetch_provider?: components["schemas"]["FetchProvider"];
+            market?: components["schemas"]["StaanMarket"] | null;
             /**
              * Format: int32
              * @description Default maximum hits returned by `web_search` when the caller doesn't
@@ -24519,9 +24608,9 @@ export interface components {
              *     dispatches in parallel within a single round. Caps the
              *     `futures::stream::buffer_unordered` concurrency. Without this bound,
              *     a model emitting 20+ tool_uses in one round would spawn 20+
-             *     concurrent SearXNG / paid-backend HTTP calls. Default `8` — tuned
-             *     for the SearXNG dev container's modest concurrency budget; raise
-             *     for paid backends with higher rate limits.
+             *     concurrent search-backend HTTP calls. Default `8` — tuned for a
+             *     SearXNG instance's modest concurrency budget; Staan accepts 20
+             *     requests a second.
              */
             substitution_max_parallel?: number;
             /**
@@ -24720,6 +24809,9 @@ export interface components {
         WorkspaceLimitsOverview: {
             /** Format: int64 */
             exception_count: number;
+            loop_guard?: components["schemas"]["LoopGuardSettings"] | null;
+            /** @description False on the Agent workspace, which is never guarded. */
+            loop_guard_allowed: boolean;
             /** Format: int64 */
             member_count: number;
             member_defaults: components["schemas"]["MemberLimitDefaults"];
@@ -24736,8 +24828,24 @@ export interface components {
              *     tenant's accounting currency (`0` = none).
              */
             tenant_default_daily_budget: number;
+            /** @description The tenant default agent loop guard an inheriting workspace runs. */
+            tenant_default_loop_guard: components["schemas"]["LoopGuardSettings"];
             /** Format: double */
             tenant_default_monthly_budget: number;
+        };
+        /**
+         * @description A workspace's agent loop guard: its own setting, and the tenant default it
+         *     runs while it has none.
+         */
+        WorkspaceLoopGuard: {
+            /**
+             * @description False on the Agent workspace, which is never guarded and takes no own
+             *     setting.
+             */
+            allowed: boolean;
+            loop_guard?: components["schemas"]["LoopGuardSettings"] | null;
+            /** @description The tenant default an inheriting workspace runs. */
+            tenant_default: components["schemas"]["LoopGuardSettings"];
         };
         /** @description A local MCP server granted to a workspace. */
         WorkspaceMcpLocalServer: {
@@ -42144,6 +42252,101 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["WorkspaceLimitsOverview"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    get_loop_guard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The workspace's own agent loop guard (null = the tenant default) and the tenant default */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceLoopGuard"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Internal server error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    update_loop_guard: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Workspace id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateWorkspaceLoopGuard"];
+            };
+        };
+        responses: {
+            /** @description Agent loop guard updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkspaceLoopGuard"];
+                };
+            };
+            /** @description A threshold out of bounds, or an own guard on the Agent workspace */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
             /** @description Not found */

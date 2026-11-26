@@ -9,6 +9,7 @@
 pub mod a2a;
 pub mod credentials;
 pub mod endpoints;
+pub mod loop_guard;
 pub mod qos;
 pub mod mcp;
 pub mod model_map;
@@ -423,6 +424,14 @@ pub struct TenantConfig {
     pub keys: HashMap<[u8; 32], std::sync::Arc<crate::auth::UserContext>>,
     /// Each upstream server's stored credential, opened, by server id.
     pub credentials: crate::config::credentials::ServerCredentials,
+    /// The tenant's default agent loop guard. Read through
+    /// [`Self::loop_guard_for`], never directly.
+    pub loop_guard: crate::config::loop_guard::LoopGuardSettings,
+    /// The workspaces whose guard differs from [`Self::loop_guard`]: an own
+    /// setting, or the Agent workspace baked to
+    /// [`LoopGuardSettings::OFF`](crate::config::loop_guard::LoopGuardSettings::OFF).
+    /// Read through [`Self::loop_guard_for`], never directly.
+    pub workspace_loop_guard: HashMap<uuid::Uuid, crate::config::loop_guard::LoopGuardSettings>,
 }
 
 impl Default for TenantConfig {
@@ -469,6 +478,8 @@ impl Default for TenantConfig {
             default_workspace_id: None,
             keys: HashMap::new(),
             credentials: crate::config::credentials::ServerCredentials::default(),
+            loop_guard: crate::config::loop_guard::LoopGuardSettings::default(),
+            workspace_loop_guard: HashMap::new(),
         }
     }
 }
@@ -479,6 +490,13 @@ impl TenantConfig {
     /// `ScriptFailMode::Open` — safer default, preserves request flow.
     pub fn rhai_fail_mode_enum(&self) -> crate::scripting::ScriptFailMode {
         crate::scripting::ScriptFailMode::parse(&self.rhai_fail_mode)
+    }
+
+    /// The guard for a request of this workspace — its override, else the tenant default.
+    pub fn loop_guard_for(&self, workspace_id: Option<uuid::Uuid>) -> crate::config::loop_guard::LoopGuardSettings {
+        workspace_id
+            .and_then(|ws| self.workspace_loop_guard.get(&ws).copied())
+            .unwrap_or(self.loop_guard)
     }
 
     /// The org-total budget ceiling that applies to a request from `workspace_id`
@@ -993,6 +1011,48 @@ mod tenant_budget_scope_tests {
         let ws = uuid::Uuid::new_v4();
         assert!(config_with(false, &[]).tenant_budget_for(ws).is_none());
         assert!(config_with(false, &[ws]).tenant_budget_for(ws).is_none());
+    }
+}
+
+#[cfg(test)]
+mod loop_guard_tests {
+    use super::*;
+    use crate::config::loop_guard::{LoopGuardMode, LoopGuardSettings};
+
+    fn config(own: &[(uuid::Uuid, LoopGuardSettings)]) -> TenantConfig {
+        TenantConfig {
+            loop_guard: LoopGuardSettings { mode: LoopGuardMode::Nudge, nudge_at: 4, stop_at: 9 },
+            workspace_loop_guard: own.iter().copied().collect(),
+            ..TenantConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_workspace_with_its_own_setting_gets_it() {
+        let ws = uuid::Uuid::new_v4();
+        let own = LoopGuardSettings { mode: LoopGuardMode::Stop, nudge_at: 2, stop_at: 5 };
+        assert_eq!(config(&[(ws, own)]).loop_guard_for(Some(ws)), own);
+    }
+
+    #[test]
+    fn a_workspace_without_one_gets_the_tenant_default() {
+        let ws = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let cfg = config(&[(other, LoopGuardSettings::OFF)]);
+        assert_eq!(cfg.loop_guard_for(Some(ws)), cfg.loop_guard);
+        assert_eq!(cfg.loop_guard_for(Some(other)), LoopGuardSettings::OFF);
+    }
+
+    #[test]
+    fn a_request_with_no_workspace_gets_the_tenant_default() {
+        let ws = uuid::Uuid::new_v4();
+        let cfg = config(&[(ws, LoopGuardSettings::OFF)]);
+        assert_eq!(cfg.loop_guard_for(None), cfg.loop_guard);
+    }
+
+    #[test]
+    fn the_default_config_observes() {
+        assert_eq!(TenantConfig::default().loop_guard_for(None), LoopGuardSettings::default());
     }
 }
 

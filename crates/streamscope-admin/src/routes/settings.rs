@@ -85,6 +85,18 @@ pub struct TenantSettings {
     /// without blocking.
     pub tenant_budget_mode: Option<String>,
 
+    // --- Agent loop guard (the tenant default; a workspace may set its own) ---
+    /// What the gateway does when a request's history repeats a tool-call
+    /// cycle: `off`, `observe` (badge only), `nudge` (add a note to the
+    /// request), `stop` (nudge, then refuse tool calls at
+    /// `loop_guard_stop_at`).
+    pub loop_guard_mode: Option<streamscope_core::config::loop_guard::LoopGuardMode>,
+    /// Repetitions of the cycle at which the note is added (≥ 2).
+    pub loop_guard_nudge_at: Option<u32>,
+    /// Repetitions at which tool calls are refused (≥ `loop_guard_nudge_at` +
+    /// 2, ≤ 50).
+    pub loop_guard_stop_at: Option<u32>,
+
     // --- Media blob storage ---
     pub media_blob_storage_enabled: Option<bool>,
     pub media_blob_max_size_mb: Option<u64>,
@@ -194,6 +206,9 @@ impl TenantSettings {
             tenant_daily_budget: Some(0.0),
             tenant_monthly_budget: Some(0.0),
             tenant_budget_mode: Some("enforce".to_string()),
+            loop_guard_mode: Some(cfg.loop_guard.mode),
+            loop_guard_nudge_at: Some(cfg.loop_guard.nudge_at),
+            loop_guard_stop_at: Some(cfg.loop_guard.stop_at),
             media_blob_storage_enabled: Some(cfg.media_blob_storage_enabled),
             media_blob_max_size_mb: Some(cfg.media_blob_max_size_mb),
             admin_group: Some(String::new()),
@@ -223,6 +238,28 @@ static CLEARABLE_SETTING_KEYS: std::sync::LazyLock<std::collections::HashSet<Str
             .collect(),
         _ => std::collections::HashSet::new(),
     });
+
+/// Whether a settings save may write the tenant's agent loop guard: it names
+/// none of its keys, or all three — set and valid together, or all `null`.
+fn loop_guard_save(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    payload: &TenantSettings,
+) -> Result<(), &'static str> {
+    let named = crate::limits::LOOP_GUARD_KEYS.iter().filter(|k| raw.contains_key(**k)).count();
+    if named == 0 {
+        return Ok(());
+    }
+    if named != crate::limits::LOOP_GUARD_KEYS.len() {
+        return Err("its mode and two thresholds are saved together");
+    }
+    match (payload.loop_guard_mode, payload.loop_guard_nudge_at, payload.loop_guard_stop_at) {
+        (None, None, None) => Ok(()),
+        (Some(mode), Some(nudge_at), Some(stop_at)) => {
+            streamscope_core::config::loop_guard::LoopGuardSettings { mode, nudge_at, stop_at }.validate()
+        }
+        _ => Err("its mode and two thresholds are all set, or all null"),
+    }
+}
 
 #[cfg(test)]
 mod tenant_settings_tests {
@@ -275,6 +312,24 @@ mod tenant_settings_tests {
         assert_eq!(partial.healing_enabled, Some(true));
         assert_eq!(partial.log_level.as_deref(), Some("debug"));
         assert!(partial.debug_mode.is_none());
+    }
+
+    /// A loop-guard save names all three keys or none.
+    #[test]
+    fn a_loop_guard_save_names_all_three_keys_or_none() {
+        let save = |body: serde_json::Value| {
+            let payload: TenantSettings = serde_json::from_value(body.clone()).expect("body");
+            loop_guard_save(body.as_object().expect("object"), &payload)
+        };
+        assert_eq!(save(serde_json::json!({})), Ok(()));
+        assert_eq!(save(serde_json::json!({ "loop_guard_mode": "stop", "loop_guard_nudge_at": 3, "loop_guard_stop_at": 8 })), Ok(()));
+        assert_eq!(save(serde_json::json!({ "loop_guard_mode": null, "loop_guard_nudge_at": null, "loop_guard_stop_at": null })), Ok(()));
+        // A part of it, or a mix of values and nulls: refused.
+        assert!(save(serde_json::json!({ "loop_guard_stop_at": 30 })).is_err());
+        assert!(save(serde_json::json!({ "loop_guard_mode": null, "loop_guard_nudge_at": 3, "loop_guard_stop_at": 8 })).is_err());
+        // Whole but out of bounds: refused, and its boundary accepted.
+        assert!(save(serde_json::json!({ "loop_guard_mode": "stop", "loop_guard_nudge_at": 3, "loop_guard_stop_at": 4 })).is_err());
+        assert_eq!(save(serde_json::json!({ "loop_guard_mode": "stop", "loop_guard_nudge_at": 3, "loop_guard_stop_at": 5 })), Ok(()));
     }
 
     /// `api_public_url` round-trips through the typed shape alongside the
@@ -448,6 +503,15 @@ async fn load_merged_settings(
     // row; surface the live (non-suppressed) set so the GET reflects current
     // state (the PATCH round-trips through it).
     settings.app_registry = Some(crate::routes::analytics::load_apps_snapshot(conn, tenant_id).await);
+    // The agent loop guard as the gateways run it: a stored combination that
+    // fails validation runs the built-in default whole, and is shown so.
+    let guard = crate::limits::load_tenant_loop_guard(conn).await.map_err(|e| {
+        tracing::error!("failed to load the agent loop guard: {e}");
+        ApiError::internal("internal error")
+    })?;
+    settings.loop_guard_mode = Some(guard.mode);
+    settings.loop_guard_nudge_at = Some(guard.nudge_at);
+    settings.loop_guard_stop_at = Some(guard.stop_at);
     Ok(settings)
 }
 
@@ -569,6 +633,14 @@ pub async fn update_settings(
         ))
         .code(super::ApiErrorCode::SettingInvalid));
     }
+
+    // The agent loop guard's three keys are one setting, saved whole: all
+    // three set (validated together) or all three `null` (cleared together,
+    // back to the built-in default). A save never merges over what is stored,
+    // so no read stands between two saves.
+    loop_guard_save(raw_map, &payload).map_err(|e| {
+        ApiError::bad_request(format!("agent loop guard: {e}")).code(super::ApiErrorCode::InvalidLoopGuard)
+    })?;
 
     // SYSTEM-tenant write guard: SYSTEM never proxies traffic, so most
     // per-tenant settings are no-ops there. Reject any key outside the

@@ -47,6 +47,13 @@ pub struct AgentProfile {
     /// first-run state the client otherwise asks for interactively.
     #[cfg_attr(not(windows), allow(dead_code, reason = "the Windows column, for the run as the sandbox account"))]
     pub windows_seed: &'static [(&'static str, &'static str)],
+    /// Windows: the variable holding an inline JSON configuration whose
+    /// `skills.paths` the client adds skill folders from, for a client that
+    /// looks for the cross-agent skills store (`~/.agents/skills`) only under
+    /// its home — the sandbox account's. The run sets it to the store the
+    /// grant gives the account, unless the run sets the variable itself.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "the Windows column, for the run as the sandbox account"))]
+    pub windows_skills: Option<&'static str>,
 }
 
 /// One configuration variable of the Windows column: `var` is set to
@@ -209,6 +216,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "CLAUDE_CONFIG_DIR", value: "~/.claude", granted: "" }],
         windows_args: &[],
         windows_seed: &[(".claude.json", "hasCompletedOnboarding")],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["codex"],
@@ -224,6 +232,7 @@ pub const AGENTS: &[AgentProfile] = &[
         // `.cmd` launcher can carry it.
         windows_args: &["-c", "sandbox_mode=danger-full-access"],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["gemini", "gemini-cli"],
@@ -236,6 +245,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "GEMINI_CLI_HOME", value: "~", granted: ".gemini" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["qwen", "qwen-code"],
@@ -248,6 +258,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "QWEN_HOME", value: "~/.qwen", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["opencode"],
@@ -272,6 +283,11 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "OPENCODE_CONFIG_DIR", value: "~/.config/opencode", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
+        // OpenCode finds `~/.agents/skills` from the account's own home, not
+        // from its configuration folder; an inline configuration's skill
+        // paths add to the ones its files give (2.x — 1.x, which runs here
+        // only for the commands that start no engine, takes them in place).
+        windows_skills: Some("OPENCODE_CONFIG_CONTENT"),
     },
     AgentProfile {
         names: &["goose"],
@@ -293,6 +309,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "GOOSE_PATH_ROOT", value: "%APPDATA%/Block/goose", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         // Open Code Review keeps its config, sessions and rules under one
@@ -309,6 +326,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "USERPROFILE", value: "~", granted: ".opencodereview" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["aider"],
@@ -323,6 +341,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "USERPROFILE", value: "~", granted: ".aider" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         // The Continue CLI (`cn`). Its hub call (api.continue.dev) is refused by
@@ -338,6 +357,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "CONTINUE_GLOBAL_DIR", value: "~/.continue", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["crush"],
@@ -350,6 +370,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "CRUSH_GLOBAL_CONFIG", value: "~/.config/crush", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
     AgentProfile {
         names: &["vibe"],
@@ -361,6 +382,7 @@ pub const AGENTS: &[AgentProfile] = &[
         windows_config: &[WindowsConfig { var: "VIBE_HOME", value: "~/.vibe", granted: "" }],
         windows_args: &[],
         windows_seed: &[],
+        windows_skills: None,
     },
 ];
 

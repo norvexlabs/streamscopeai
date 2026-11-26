@@ -21,6 +21,16 @@ export type BadgeContext = {
   catchall?: { method?: string | null; path?: string | null };
 };
 
+/** Whether `b` is surfaced on the collapsed audit row: its code is an
+ *  attention code, and a tool loop only once it repeated with the same results
+ *  or the gateway acted on it — the same calls with results that changed (a
+ *  poll still moving) are recorded, not flagged. */
+export function needsAttention(b: AuditBadge): boolean {
+  if (!ATTENTION_BADGE_CODES.has(b.code)) return false;
+  if (b.code === 'tool_loop') return b.action !== 'detected' || b.streak >= 2;
+  return true;
+}
+
 type BadgeRegistryEntry = {
   /** Short user-facing label rendered in the chip. */
   label: string;
@@ -96,11 +106,14 @@ export function severityBucket(confidence: number): string {
  *  names, …) stay in the expanded detail only so the list keeps scanning fast.
  *  Append-only alongside the registry — every code here MUST exist in
  *  BADGE_REGISTRY below. */
-export const ATTENTION_BADGE_CODES: ReadonlySet<AuditBadge['code']> = new Set([
+const ATTENTION_BADGE_CODES: ReadonlySet<AuditBadge['code']> = new Set([
   // An unpriced row records a floor of zero, which in a list of costs is
   // indistinguishable from a request that was genuinely free — the one place
   // the difference has to be visible without opening the row.
   'unpriced',
+  // An agent stuck repeating the same tool calls burns turns until something
+  // stops it.
+  'tool_loop',
   'guardrail',
   'guardrail_error',
   'modified_not_applied',
@@ -726,6 +739,39 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
       'Something this request consumed had no rate, or its cost could not be stated in the accounting currency — so the recorded cost is a floor of zero, which is not the same as free. A zero-cost request never accrues against a budget, so any budget covering it will not enforce. Set a price list on the model under its provider (or link it to a catalog entry), and add a conversion rate under Settings → Accounting for any currency it is priced in.',
     classes: 'bg-(--tag-amber-bg) text-(--tag-amber-text) border border-(--warning)/30',
     iconName: 'alert',
+  },
+  tool_loop: {
+    label: 'Tool loop',
+    tooltip: (b) => {
+      if (b.code !== 'tool_loop') return '';
+      const tools = b.tools.length ? ` (${b.tools.join(', ')})` : '';
+      const cycle = b.cycle_len > 1 ? `a cycle of ${b.cycle_len} steps` : 'the same step';
+      const floor = b.capped ? 'at least ' : '';
+      const what =
+        b.streak >= 2
+          ? `The agent ran ${cycle}${tools} ${floor}${b.streak} times in a row with the same results`
+          : `The agent made the same calls${tools} ${floor}${b.call_streak} times in a row, with results that changed`;
+      const did: Record<string, string> = {
+        nudged: 'The gateway added a note to the last tool result asking the model to change approach.',
+        stopped: 'The gateway refused tool calls for this reply and asked the model to answer in text.',
+        stop_skipped:
+          'The stop was due, but the client required a tool call, so the gateway added a note to the last tool result instead.',
+      };
+      const would: Record<string, string> = {
+        nudged: 'A note asking the model to change approach would have been added.',
+        stopped: 'Tool calls would have been refused for this reply.',
+        stop_skipped: 'A note would have been added (the client required a tool call, so no stop).',
+      };
+      const tail =
+        b.action === 'detected'
+          ? b.would
+            ? `Recorded only — ${would[b.would] ?? ''}`
+            : 'Recorded only.'
+          : (did[b.action] ?? '');
+      return `${what}. ${tail}`;
+    },
+    classes: 'bg-(--tag-amber-bg) text-(--tag-amber-text) border border-(--warning)/30',
+    iconName: 'refresh',
   },
   guardrail_error: {
     label: 'Guardrail Error',

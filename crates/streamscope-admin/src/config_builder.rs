@@ -393,6 +393,11 @@ pub async fn build_tenant_body(
     let member_limit_defaults = crate::limits::load_defaults(&mut *conn).await?;
     let member_limit_exceptions = crate::limits::load_exceptions(&mut *conn).await?;
 
+    // The agent loop guard: the tenant default, and each workspace whose
+    // guard differs from it (an own setting, or the Agent workspace, off).
+    let loop_guard = crate::limits::load_tenant_loop_guard(&mut *conn).await?;
+    let workspace_loop_guard = crate::limits::load_workspace_loop_guards(&mut *conn, loop_guard).await?;
+
     // Replica endpoints: each enabled server's enabled endpoints once, and a
     // member list only for a model not every one of them serves.
     let upstream_endpoints = crate::routes::upstream_endpoints::load_endpoint_table(&mut *conn).await?;
@@ -1049,6 +1054,8 @@ pub async fn build_tenant_body(
         workspace_profiles,
         default_profiles,
         profile_modes,
+        loop_guard,
+        workspace_loop_guard,
     };
     body.canonicalize();
     Ok(body)

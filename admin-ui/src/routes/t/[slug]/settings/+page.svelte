@@ -12,6 +12,7 @@
   import EgressSettingsSection from '#lib/components/settings/EgressSettingsSection.svelte';
   import DefaultsSettingsSection from '#lib/components/settings/DefaultsSettingsSection.svelte';
   import BudgetSettingsSection from '#lib/components/settings/BudgetSettingsSection.svelte';
+  import LoopGuardSettingsSection from '#lib/components/settings/LoopGuardSettingsSection.svelte';
   import AccountingSettingsSection from '#lib/components/settings/AccountingSettingsSection.svelte';
   import { adminApi } from '#lib/api-client.js';
   import { extractInheritedDefaults } from '#lib/api-helpers.js';
@@ -92,7 +93,10 @@
     {:else if active === 'defaults'}
       <DefaultsSettingsSection {isSystemTenant} />
     {:else if active === 'budget'}
-      <BudgetSettingsSection />
+      <div class="space-y-8">
+        <BudgetSettingsSection />
+        <LoopGuardSettingsSection />
+      </div>
     {:else if active === 'accounting'}
       <AccountingSettingsSection />
     {:else if active === 'proxy'}

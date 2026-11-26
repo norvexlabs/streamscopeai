@@ -959,6 +959,11 @@ An extension is connected in the console, not at install:
    Web, the classifier under Settings → Guardrail. Each organisation sets its own; there is no
    platform-wide default. The built-in web tool is granted to a workspace in the console too.
 
+Web search needs no extension when an organisation uses **Staan**, a European web search API, as its
+backend: it sets its own Staan API key in the console, and the gateway and the admin API (which runs
+the console's test search) then need outbound HTTPS to `api.staan.ai` (a public address — nothing to list on an egress list; open it on your firewall if
+outbound traffic is filtered).
+
 The endpoint must be one the gateway can reach. An extension installed on Docker in loopback mode
 prints `http://127.0.0.1:<port>`, which is the host's loopback, not the gateway container's: install
 it with a domain (its front then serves it over TLS, to the addresses its allow input holds), or give

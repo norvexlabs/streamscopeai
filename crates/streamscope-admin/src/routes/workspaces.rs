@@ -23,6 +23,7 @@ use uuid::Uuid;
 use super::{ActionResponse, ApiError, ApiErrorCode, ApiErrorResponse, OffsetPage, PageQuery};
 use crate::db::tenant::{Scoped, TenantConn};
 use crate::middleware::AuditDiffSink;
+use streamscope_core::config::loop_guard::LoopGuardSettings;
 use crate::AdminState;
 
 /// The exception columns every read and `RETURNING` of an exception names, in
@@ -504,6 +505,36 @@ pub struct WorkspaceLimitsOverview {
     pub member_defaults_allowed: bool,
     pub member_count: i64,
     pub exception_count: i64,
+    /// The workspace's own agent loop guard; `null` = it runs the tenant
+    /// default.
+    pub loop_guard: Option<LoopGuardSettings>,
+    /// The tenant default agent loop guard an inheriting workspace runs.
+    pub tenant_default_loop_guard: LoopGuardSettings,
+    /// False on the Agent workspace, which is never guarded.
+    pub loop_guard_allowed: bool,
+}
+
+/// A workspace's agent loop guard: its own setting, and the tenant default it
+/// runs while it has none.
+#[derive(Serialize, ToSchema, PartialEq)]
+pub struct WorkspaceLoopGuard {
+    /// The workspace's own guard; `null` = it runs the tenant default.
+    pub loop_guard: Option<LoopGuardSettings>,
+    /// The tenant default an inheriting workspace runs.
+    pub tenant_default: LoopGuardSettings,
+    /// False on the Agent workspace, which is never guarded and takes no own
+    /// setting.
+    pub allowed: bool,
+}
+
+/// The change to a workspace's agent loop guard.
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateWorkspaceLoopGuard {
+    /// The workspace's own guard. Absent leaves it unchanged, `null` makes the
+    /// workspace run the tenant default again, a value is its own (validated:
+    /// `nudge_at` ≥ 2, `stop_at` ≥ `nudge_at` + 2, `stop_at` ≤ 50).
+    #[serde(default, deserialize_with = "crate::routes::double_option::deserialize")]
+    pub loop_guard: Option<Option<LoopGuardSettings>>,
 }
 
 /// Refuse a limit value no bucket can mean: a negative rate or budget, or a
@@ -2673,6 +2704,7 @@ pub(crate) async fn limits_overview(
         ApiError::internal("failed to load limits")
     };
     let default = crate::limits::load_tenant_budget_default(db.conn()).await.map_err(internal)?;
+    let loop_guard = fetch_loop_guard(db, id, role).await?;
     let (member_count, exception_count): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM workspace_members WHERE workspace_id = $1), \
                 (SELECT COUNT(*) FROM workspace_user_rate_limit_overrides o \
@@ -2691,7 +2723,143 @@ pub(crate) async fn limits_overview(
         member_defaults_allowed: !matches!(role, WorkspaceRole::Agent | WorkspaceRole::Inline),
         member_count,
         exception_count,
+        loop_guard: loop_guard.loop_guard,
+        tenant_default_loop_guard: loop_guard.tenant_default,
+        loop_guard_allowed: loop_guard.allowed,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Agent loop guard
+// ---------------------------------------------------------------------------
+
+/// A workspace's agent loop guard as stored, beside the tenant default.
+async fn fetch_loop_guard(db: &mut TenantConn, id: Uuid, role: WorkspaceRole) -> Result<WorkspaceLoopGuard, ApiError> {
+    let internal = |e: sqlx::Error| {
+        tracing::error!("fetch loop guard: {e}");
+        ApiError::internal("failed to load the agent loop guard")
+    };
+    let row: Option<(Option<String>, Option<i32>, Option<i32>)> = sqlx::query_as(
+        "SELECT loop_guard_mode, loop_guard_nudge_at, loop_guard_stop_at \
+           FROM workspace_rate_limits WHERE workspace_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(db.conn())
+    .await
+    .map_err(internal)?;
+    let tenant_default = crate::limits::load_tenant_loop_guard(db.conn()).await.map_err(internal)?;
+    Ok(WorkspaceLoopGuard {
+        loop_guard: row.and_then(|(mode, nudge, stop)| crate::limits::own_loop_guard(mode.as_deref(), nudge, stop)),
+        tenant_default,
+        allowed: !matches!(role, WorkspaceRole::Agent),
+    })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/admin/workspaces/{id}/loop-guard",
+    tag = "Workspaces",
+    params(("id" = Uuid, Path, description = "Workspace id")),
+    responses(
+        (status = 200, description = "The workspace's own agent loop guard (null = the tenant default) and the tenant default", body = WorkspaceLoopGuard),
+        (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_loop_guard(
+    mut db: TenantConn,
+    Path(id): Path<Uuid>,
+) -> Result<Json<WorkspaceLoopGuard>, ApiError> {
+    let role = workspace_role(&mut db, id).await?;
+    Ok(Json(fetch_loop_guard(&mut db, id, role).await?))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/admin/workspaces/{id}/loop-guard",
+    tag = "Workspaces",
+    params(("id" = Uuid, Path, description = "Workspace id")),
+    request_body = UpdateWorkspaceLoopGuard,
+    responses(
+        (status = 200, description = "Agent loop guard updated", body = WorkspaceLoopGuard),
+        (status = 400, description = "A threshold out of bounds, or an own guard on the Agent workspace", body = ApiErrorResponse),
+        (status = 404, description = "Not found", body = ApiErrorResponse),
+        (status = 500, description = "Internal server error", body = ApiErrorResponse),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_loop_guard(
+    mut db: TenantConn,
+    Path(id): Path<Uuid>,
+    axum::Extension(audit_sink): axum::Extension<AuditDiffSink>,
+    Json(req): Json<UpdateWorkspaceLoopGuard>,
+) -> Result<Json<WorkspaceLoopGuard>, ApiError> {
+    let role = workspace_role(&mut db, id).await?;
+    // Read for the answer's tenant default and an absent field's reply; the
+    // audit's before is re-read under the write's lock.
+    let before = fetch_loop_guard(&mut db, id, role).await?;
+    let Some(own) = req.loop_guard else {
+        return Ok(Json(before));
+    };
+    if let Some(g) = &own {
+        if matches!(role, WorkspaceRole::Agent) {
+            return Err(ApiError::bad_request(
+                "The Agent workspace is never guarded — its analysis traffic is the gateway's own.",
+            )
+            .code(ApiErrorCode::LoopGuardNotAllowed));
+        }
+        g.validate().map_err(|e| {
+            ApiError::bad_request(format!("agent loop guard: {e}")).code(ApiErrorCode::InvalidLoopGuard)
+        })?;
+    }
+    let tenant_id = db.tenant_uuid();
+    let internal = |e: sqlx::Error| {
+        tracing::error!("update loop guard: {e}");
+        ApiError::internal("failed to update the agent loop guard")
+    };
+    // The before the audit records is read under the row's lock, in the
+    // write's own transaction: a concurrent save waits, and is never
+    // recorded as this one's.
+    let mut tx = db.conn().begin().await.map_err(internal)?;
+    let locked: Option<(Option<String>, Option<i32>, Option<i32>)> = sqlx::query_as(
+        "SELECT loop_guard_mode, loop_guard_nudge_at, loop_guard_stop_at \
+           FROM workspace_rate_limits WHERE workspace_id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(internal)?;
+    let before_own =
+        locked.and_then(|(mode, nudge, stop)| crate::limits::own_loop_guard(mode.as_deref(), nudge, stop));
+    // The three columns are one value: written together, NULL together.
+    let (mode, nudge_at, stop_at) = match own {
+        Some(g) => (Some(g.mode.as_str()), Some(g.nudge_at as i32), Some(g.stop_at as i32)),
+        None => (None, None, None),
+    };
+    sqlx::query(
+        "INSERT INTO workspace_rate_limits (workspace_id, tenant_id, loop_guard_mode, loop_guard_nudge_at, loop_guard_stop_at) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (tenant_id, workspace_id) DO UPDATE SET \
+            loop_guard_mode = EXCLUDED.loop_guard_mode, \
+            loop_guard_nudge_at = EXCLUDED.loop_guard_nudge_at, \
+            loop_guard_stop_at = EXCLUDED.loop_guard_stop_at, \
+            updated_at = now()",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(mode)
+    .bind(nudge_at)
+    .bind(stop_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    audit_sink.record(
+        Some(&serde_json::json!({ "loop_guard": before_own })),
+        Some(&serde_json::json!({ "loop_guard": own })),
+    );
+    Ok(Json(WorkspaceLoopGuard { loop_guard: own, ..before }))
 }
 
 #[utoipa::path(
@@ -2746,6 +2914,10 @@ pub fn workspaces_router() -> axum::Router<Arc<AdminState>> {
         .route("/{id}/rate-limits", get(get_rate_limits).put(put_rate_limits))
         .route("/{id}/member-defaults", get(get_member_defaults).put(put_member_defaults))
         .route("/{id}/limits", get(get_limits_overview))
+        // A sub-resource, as `/member-defaults` is: `/rate-limits` is a full
+        // replace whose absent field means "no limit", so a field there would
+        // be cleared by every rate-limit save.
+        .route("/{id}/loop-guard", get(get_loop_guard).patch(update_loop_guard))
         .route("/{id}/members/{user_id}/effective-limits", get(get_member_effective_limits))
         .route("/{id}/rate-limit-overrides", get(list_rate_limit_overrides))
         .route(

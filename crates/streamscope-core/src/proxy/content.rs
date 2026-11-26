@@ -599,7 +599,7 @@ pub fn stored_message_key(message: &serde_json::Value) -> (String, usize) {
 
 /// Remove every `cache_control` from a message's blocks, at any depth — but
 /// never inside a tool call's arguments, which are the model's own data.
-fn strip_breakpoints(value: &mut serde_json::Value) {
+pub(crate) fn strip_breakpoints(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Array(items) => items.iter_mut().for_each(strip_breakpoints),
         serde_json::Value::Object(object) => {
@@ -1128,7 +1128,7 @@ pub fn own_prose(text: &str) -> Option<String> {
 /// than `text` (e.g. `role`, or a non-`text` `type`). The single-field
 /// `{text:"..."}` check intentionally does NOT match `ThoughtText`
 /// (`{thought, text, thoughtSignature?}`) which has additional keys.
-fn is_volatile_text_part(part: &serde_json::Value) -> bool {
+pub(crate) fn is_volatile_text_part(part: &serde_json::Value) -> bool {
     let Some(obj) = part.as_object() else { return false };
     let is_tagged_text = obj.get("type").and_then(|t| t.as_str()) == Some("text");
     let is_bare_text = obj.len() == 1 && obj.contains_key("text");
@@ -1161,7 +1161,7 @@ fn is_volatile_text_part(part: &serde_json::Value) -> bool {
 ///
 /// Returns whether it dropped text — a volatile part or span — so a caller
 /// can tell a hash of the canonical form from one of the exact text.
-fn canonicalize_content_value(v: &mut serde_json::Value) -> bool {
+pub(crate) fn canonicalize_content_value(v: &mut serde_json::Value) -> bool {
     match v {
         serde_json::Value::String(s) => {
             let stripped = strip_volatile_inline(s);

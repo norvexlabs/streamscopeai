@@ -1,6 +1,6 @@
 <script lang="ts">
   import { adminApi } from '#lib/api-client.js';
-  import { extractError, fetchAllPages, keysRevoked } from '#lib/api-helpers.js';
+  import { extractError, extractErrorCode, fetchAllPages, keysRevoked } from '#lib/api-helpers.js';
   import { goto } from '$app/navigation';
   import { thref } from '#lib/tenant.js';
   import { profileLists } from '#lib/scope.svelte.js';
@@ -39,6 +39,8 @@
   import LimitMeter from '#lib/components/limits/LimitMeter.svelte';
   import EffectiveLimitStack from '#lib/components/limits/EffectiveLimitStack.svelte';
   import MemberExceptionModal from '#lib/components/limits/MemberExceptionModal.svelte';
+  import LoopGuardFields from '#lib/components/limits/LoopGuardFields.svelte';
+  import { LOOP_GUARD_DEFAULT, LOOP_GUARD_HELP, describeLoopGuard, loopGuardProblem, type LoopGuardSettings } from '#lib/loop-guard.js';
   import { compareToDefault, decodeLimit, effectiveCap, encodeLimit, isValidLimit, type LimitState } from '#lib/limits.js';
   import { formatTokens } from '#lib/formatters.js';
   import { useDirtyForm } from '#lib/hooks.svelte.js';
@@ -544,6 +546,10 @@
   let defMode = $state<'enforce' | 'alert_only'>('enforce');
   let savingPool = $state(false);
   let savingDefaults = $state(false);
+  // The agent loop guard: inherit the organisation default, or an own value.
+  let loopGuardInherit = $state(true);
+  let loopGuard = $state<LoopGuardSettings>({ ...LOOP_GUARD_DEFAULT });
+  let savingLoopGuard = $state(false);
 
   function seedLimitFields(l: LimitsOverview) {
     poolRpm = decodeLimit(l.pool.requests_per_minute, 'pool_rate');
@@ -560,6 +566,8 @@
     defDaily = decodeLimit(l.member_defaults.daily_budget, 'member_default');
     defMonthly = decodeLimit(l.member_defaults.monthly_budget, 'member_default');
     defMode = l.member_defaults.budget_mode === 'alert_only' ? 'alert_only' : 'enforce';
+    loopGuardInherit = l.loop_guard == null;
+    loopGuard = { ...(l.loop_guard ?? l.tenant_default_loop_guard) };
   }
 
   const money = (n: number) => formatAmount(n);
@@ -624,6 +632,30 @@
       refreshTestStack();
     }
     savingDefaults = false;
+  }
+
+  async function saveLoopGuard() {
+    if (!loopGuardInherit && loopGuardProblem(loopGuard)) return;
+    savingLoopGuard = true;
+    const { data, error } = await adminApi.PATCH('/api/v1/admin/workspaces/{id}/loop-guard', {
+      params: { path: { id } },
+      body: { loop_guard: loopGuardInherit ? null : loopGuard },
+    });
+    if (error) {
+      const code = extractErrorCode(error);
+      toast.error(
+        code === 'loop_guard_not_allowed' ? 'The Agent workspace is never guarded' : 'Failed to save the agent loop guard',
+        { body: extractError(error), code: code ?? undefined },
+      );
+    } else {
+      toast.success('Agent loop guard saved');
+      if (data) {
+        loopGuardInherit = data.loop_guard == null;
+        loopGuard = { ...(data.loop_guard ?? data.tenant_default) };
+      }
+      await loadLimits();
+    }
+    savingLoopGuard = false;
   }
 
   // Member exceptions.
@@ -1067,6 +1099,29 @@
               </FormField>
               <p class="text-xs text-(--text-secondary)">{l.member_count} member{l.member_count === 1 ? '' : 's'} · {l.exception_count} with an exception. A value above the pool changes nothing — the pool still applies.</p>
               <button onclick={saveMemberDefaults} disabled={savingDefaults || ![defRpm, defRpmMcp, defRpmA2a, defTpm, defDaily, defMonthly].every(isValidLimit)} class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingDefaults ? 'Saving…' : 'Save member default'}</button>
+            {/if}
+          </section>
+
+          <!-- Agent loop guard: inherit the organisation default, or own -->
+          <section class="rounded-xl border border-(--border) bg-(--bg-card) p-4 space-y-4" data-testid="limits-loop-guard">
+            <div class="flex items-baseline justify-between">
+              <h3 class="text-sm font-semibold text-(--text-primary)">Agent loop guard</h3>
+              <span class="text-xs text-(--text-secondary)">repeated tool calls</span>
+            </div>
+            <p class="text-xs text-(--text-secondary)">{LOOP_GUARD_HELP}</p>
+            {#if !l.loop_guard_allowed}
+              <Callout severity="info" title="Never guarded here">
+                This workspace carries the gateway's own analysis traffic, which the loop guard never acts on.
+              </Callout>
+            {:else}
+              <ToggleSetting
+                label={`Inherit organisation default (${describeLoopGuard(l.tenant_default_loop_guard)})`}
+                bind:value={loopGuardInherit}
+              />
+              {#if !loopGuardInherit}
+                <LoopGuardFields bind:value={loopGuard} idPrefix="ws-loop-guard" />
+              {/if}
+              <button onclick={saveLoopGuard} disabled={savingLoopGuard || (!loopGuardInherit && loopGuardProblem(loopGuard) !== null)} data-testid="ws-loop-guard-save" class="px-4 py-1.5 text-sm rounded-lg bg-(--accent) text-(--accent-fg) hover:bg-(--accent-hover) disabled:opacity-50">{savingLoopGuard ? 'Saving…' : 'Save loop guard'}</button>
             {/if}
           </section>
 

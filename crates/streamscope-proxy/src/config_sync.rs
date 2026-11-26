@@ -526,6 +526,8 @@ fn build_tenant_config(resp: &ConfigResponse) -> streamscope_core::config::Tenan
         admin_public_url: resp.admin_public_url.clone(),
         api_public_url: resp.api_public_url.clone(),
         default_workspace_id: resp.default_workspace_id,
+        loop_guard: resp.loop_guard,
+        workspace_loop_guard: resp.workspace_loop_guard.clone(),
         keys: tenant_keys(resp),
         credentials: {
             let stored = snapshot_credentials(resp);
@@ -1168,6 +1170,8 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            loop_guard: Default::default(),
+            workspace_loop_guard: Default::default(),
         }
     }
 
@@ -1212,6 +1216,24 @@ pub(crate) mod tests {
             cache_share_scope: None,
             rates: streamscope_core::pricing::Rates::unknown(),
         }
+    }
+
+    /// The tenant's loop guard and each workspace's own reach the edge's
+    /// config.
+    #[test]
+    fn the_loop_guard_crosses_the_wire() {
+        use streamscope_core::config::loop_guard::{LoopGuardMode, LoopGuardSettings};
+        let ws = uuid::Uuid::new_v4();
+        let tenant = LoopGuardSettings { mode: LoopGuardMode::Nudge, nudge_at: 4, stop_at: 9 };
+        let resp = ConfigResponse {
+            loop_guard: tenant,
+            workspace_loop_guard: [(ws, LoopGuardSettings::OFF)].into_iter().collect(),
+            ..make_response(vec![])
+        };
+        let cfg = build_tenant_config(&resp);
+        assert_eq!(cfg.loop_guard_for(None), tenant);
+        assert_eq!(cfg.loop_guard_for(Some(ws)), LoopGuardSettings::OFF);
+        assert_eq!(cfg.loop_guard_for(Some(uuid::Uuid::new_v4())), tenant);
     }
 
     // --- Provider::from_str_relaxed tests ---
@@ -1370,6 +1392,8 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            loop_guard: Default::default(),
+            workspace_loop_guard: Default::default(),
         };
         let mut updates = HashMap::new();
         updates.insert(tenant.to_string(), resp_with);
@@ -1639,6 +1663,8 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            loop_guard: Default::default(),
+            workspace_loop_guard: Default::default(),
         };
         apply_multi_tenant_snapshot(&registry, &wrap_system(resp_with));
         assert!(load_system_config(&registry).debug_mode);
@@ -1723,6 +1749,8 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            loop_guard: Default::default(),
+            workspace_loop_guard: Default::default(),
         };
 
         apply_multi_tenant_snapshot(&registry, &wrap_system(resp));
@@ -1780,6 +1808,8 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            loop_guard: Default::default(),
+            workspace_loop_guard: Default::default(),
         };
 
         apply_multi_tenant_snapshot(&registry, &wrap_system(resp));

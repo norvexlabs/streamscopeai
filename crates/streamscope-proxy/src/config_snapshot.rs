@@ -230,6 +230,8 @@ mod tests {
                 workspace_profiles: Vec::new(),
                 default_profiles: Vec::new(),
                 profile_modes: Vec::new(),
+                loop_guard: Default::default(),
+                workspace_loop_guard: Default::default(),
             },
         );
 

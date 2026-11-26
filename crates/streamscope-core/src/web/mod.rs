@@ -5,8 +5,7 @@
 //! Module layout:
 //! - [`types`] — wire-format-agnostic request/response shapes
 //! - [`backend`] — `Backend` enum that dispatches to a provider
-//! - [`providers`] — one module per provider (Brave, Tavily, Google CSE,
-//!   Serper, SearXNG)
+//! - [`providers`] — one module per provider (SearXNG, Staan)
 //! - [`url_filter`] — pluggable hook chain run against every URL the system
 //!   considers (search hits, fetch targets)
 //! - [`filters`] — built-in filter implementations
@@ -49,7 +48,7 @@ pub use service::{dispatch_intercept, DispatchOutcome, WebContext, WebSurface};
 pub use settings::{FetchProvider, WebDestinationLists, WebDestinations, WebSettings};
 pub use types::{
     DeclaredArgs, FetchRequest, FetchResult, ModelErrorCode, Paging, SearchHit, SearchRequest, SearchResult,
-    WebError, WebProvider,
+    StaanMarket, WebError, WebProvider,
 };
 pub use url_filter::{FilterChain, FilterContext, FilterVerdict, UrlFilter};
 

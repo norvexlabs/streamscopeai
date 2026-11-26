@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { dedupeBadgesByCode, turnScopedBadges, type AuditBadge } from '#lib/badges.js';
+import { dedupeBadgesByCode, needsAttention, turnScopedBadges, type AuditBadge } from '#lib/badges.js';
 
 /**
  * The two badge collapsers decide what an operator sees on an audit row.
@@ -84,4 +84,30 @@ describe('turnScopedBadges', () => {
 		expect(turnScopedBadges(null)).toEqual([]);
 		expect(turnScopedBadges(undefined)).toEqual([]);
 	});
+});
+
+describe('needsAttention', () => {
+  const loop = (action: 'detected' | 'nudged' | 'stopped', streak: number): AuditBadge => ({
+    code: 'tool_loop',
+    streak,
+    call_streak: 4,
+    cycle_len: 1,
+    tools: ['bash'],
+    action,
+  });
+
+  it('flags a loop that repeated with the same results, or that the gateway acted on', () => {
+    expect(needsAttention(loop('detected', 2))).toBe(true);
+    expect(needsAttention(loop('nudged', 3))).toBe(true);
+    expect(needsAttention(loop('stopped', 8))).toBe(true);
+  });
+
+  it('does not flag the same calls with results that changed', () => {
+    expect(needsAttention(loop('detected', 1))).toBe(false);
+  });
+
+  it('flags other attention codes and nothing else', () => {
+    expect(needsAttention({ code: 'unpriced' })).toBe(true);
+    expect(needsAttention({ code: 'spilled' })).toBe(false);
+  });
 });

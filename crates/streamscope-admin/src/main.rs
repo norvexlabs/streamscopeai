@@ -523,6 +523,8 @@ async fn advance_cors_origins(
         routes::workspaces::get_member_defaults,
         routes::workspaces::put_member_defaults,
         routes::workspaces::get_limits_overview,
+        routes::workspaces::get_loop_guard,
+        routes::workspaces::update_loop_guard,
         routes::workspaces::get_member_effective_limits,
         // Profiles (generic per-kind bundles) + per-profile guardrail policy
         routes::qos_classes::list_qos_classes,
@@ -1003,6 +1005,10 @@ async fn advance_cors_origins(
         routes::workspaces::PutRateLimitOverrideRequest,
         routes::workspaces::MemberLimitDefaults,
         routes::workspaces::WorkspaceLimitsOverview,
+        routes::workspaces::WorkspaceLoopGuard,
+        routes::workspaces::UpdateWorkspaceLoopGuard,
+        streamscope_core::config::loop_guard::LoopGuardSettings,
+        streamscope_core::config::loop_guard::LoopGuardMode,
         limits::EffectiveLimitStack,
         limits::LimitLayer,
         limits::LimitMeter,
@@ -1581,6 +1587,7 @@ async fn advance_cors_origins(
         streamscope_core::web::WebSettings,
         streamscope_core::web::FetchProvider,
         streamscope_core::web::WebProvider,
+        streamscope_core::web::StaanMarket,
         // Guardrail admin surface — tenant-wide backend + per-profile policy
         routes::guardrail::GuardrailBackendResponse,
         routes::guardrail::UpdateGuardrailBackendRequest,

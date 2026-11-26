@@ -1226,8 +1226,7 @@ impl ResponsePipeline {
         let ws_search_clients = self.state.web_search_clients.clone();
         let ws_upstream_id = crate::web::builtin_upstream_id(self.meta.tenant_id);
         // Decrypted backend credential for the synthetic builtin-web row.
-        // Paid backends (Brave, Tavily, Google CSE, Serper) read this through
-        // `WebContext.credential`; SearXNG ignores it.
+        // Staan reads it through `WebContext.credential`; SearXNG ignores it.
         let ws_credential_owned: Option<String> = self
             .tenant_config
             .mcp

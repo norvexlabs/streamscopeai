@@ -11,6 +11,7 @@
 
 pub mod capabilities;
 pub mod healing;
+pub mod loop_guard;
 pub mod mixed_pending_splice;
 pub mod request;
 pub mod response;
@@ -82,8 +83,12 @@ pub async fn run_request_phase(
     rhai_fail_mode: crate::scripting::ScriptFailMode,
     request_content: Option<&crate::proxy::content::RequestContent>,
     conversation: Option<uuid::Uuid>,
+    loop_guard: &crate::config::loop_guard::LoopGuardSettings,
 ) -> Result<RequestPhaseOutcome, AppError> {
-    let transform = request::transform_request(
+    // The loop guard reads the history as the client sent it, before any
+    // transform edits it.
+    let tool_loop = loop_guard::evaluate(request, loop_guard);
+    let mut transform = request::transform_request(
         request,
         user,
         script_engine,
@@ -118,8 +123,54 @@ pub async fn run_request_phase(
     });
     let guardrail = request::scan_inbound_request(request, guardrail, user.tenant_id, conversation, screen_keys.as_deref()).await?;
 
+    // Its note is written last, after the guardrail screened the client's
+    // content: the gateway's own text is never screened as the user's. Where
+    // the guardrail withheld content, the note (which speaks of results the
+    // model can no longer read) is not written: recorded as due.
+    if let Some(verdict) = tool_loop {
+        record_tool_loop(request, verdict, &mut transform, guardrail.messages_modified);
+    }
+
     Ok(RequestPhaseOutcome {
         transform,
         guardrail,
     })
+}
+
+
+/// Apply the loop guard's verdict ([`loop_guard::settle`]) and record what
+/// happened: the badge, and for a rewrite, its injection blocks and the
+/// `Modified` chip.
+fn record_tool_loop(
+    request: &mut ApiRequest,
+    verdict: loop_guard::LoopVerdict,
+    transform: &mut TransformResult,
+    content_withheld: bool,
+) {
+    let (verdict, changes) = if content_withheld && verdict.action != loop_guard::ToolLoopAction::Detected {
+        let due = Some(verdict.action);
+        (loop_guard::LoopVerdict { action: loop_guard::ToolLoopAction::Detected, would: due, ..verdict }, Vec::new())
+    } else {
+        loop_guard::settle(request, &verdict)
+    };
+    for (field, action, content, scope) in changes {
+        transform.injection_blocks.push(crate::proxy::content::InjectionBlock {
+            transform: "loop_guard".to_string(),
+            scope: scope.to_string(),
+            field,
+            action: action.to_string(),
+            content,
+        });
+        transform.badges.add_modified();
+    }
+    let finding = verdict.finding;
+    transform.badges.add(crate::audit::AuditBadge::ToolLoop {
+        streak: finding.streak,
+        call_streak: finding.call_streak,
+        cycle_len: finding.cycle_len,
+        tools: finding.tools,
+        action: verdict.action,
+        would: verdict.would,
+        capped: finding.capped,
+    });
 }

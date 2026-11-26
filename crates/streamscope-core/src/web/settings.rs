@@ -9,18 +9,16 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::types::WebProvider;
+use super::types::{StaanMarket, WebProvider};
 
 /// Where the `web_fetch` tool extracts content from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FetchProvider {
     /// Built-in fetch: tenant's own `reqwest` client → SSRF guard →
-    /// HTML→markdown extraction. No external dependency. Default.
+    /// HTML→text extraction. No external dependency. Default.
     #[default]
     Builtin,
-    /// Tavily `extract` API. Requires the Tavily backend or its key.
-    Tavily,
 }
 
 /// The destination lists attached to the Web tool, as the config body carries
@@ -78,16 +76,17 @@ pub struct WebSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<WebProvider>,
 
-    /// Custom upstream endpoint URL. Required for SearXNG (operator-supplied
-    /// instance), optional for paid providers (override their well-known URL
-    /// — useful for regional endpoints or pen-tests against a sandbox).
+    /// The SearXNG instance's URL, required for SearXNG. Staan does not read
+    /// it: its origin is the platform's `WEB_SEARCH_STAAN_URL`, so a tenant
+    /// cannot send its key anywhere else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
 
-    /// Google CSE engine ID (`cx`). Required when backend is
-    /// [`WebProvider::GoogleCse`].
+    /// Staan's search market. `None` sends none (Staan's own default); a
+    /// caller's language hint then picks one where it names exactly one
+    /// ([`StaanMarket::for_language`]). Not read by SearXNG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub engine_id: Option<String>,
+    pub market: Option<StaanMarket>,
 
     /// Which extractor `web_fetch` uses.
     #[serde(default)]
@@ -133,9 +132,9 @@ pub struct WebSettings {
     /// dispatches in parallel within a single round. Caps the
     /// `futures::stream::buffer_unordered` concurrency. Without this bound,
     /// a model emitting 20+ tool_uses in one round would spawn 20+
-    /// concurrent SearXNG / paid-backend HTTP calls. Default `8` — tuned
-    /// for the SearXNG dev container's modest concurrency budget; raise
-    /// for paid backends with higher rate limits.
+    /// concurrent search-backend HTTP calls. Default `8` — tuned for a
+    /// SearXNG instance's modest concurrency budget; Staan accepts 20
+    /// requests a second.
     #[serde(default = "default_substitution_max_parallel")]
     pub substitution_max_parallel: u32,
 
@@ -228,7 +227,7 @@ impl Default for WebSettings {
         Self {
             backend: None,
             endpoint: None,
-            engine_id: None,
+            market: None,
             fetch_provider: FetchProvider::default(),
             max_results: default_max_results(),
             destinations: WebDestinations::default(),

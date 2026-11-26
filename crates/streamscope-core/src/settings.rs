@@ -154,6 +154,10 @@ pub struct CoreSettings {
     /// Total HTTP timeout for the built-in web-fetch tool (arbitrary end-user /
     /// agent supplied URLs). Env: `WEB_FETCH_TIMEOUT_SECS`.
     pub web_fetch_timeout: Duration,
+    /// Origin of the Staan search API the Web tool's Staan backend calls (and
+    /// sends the tenant's key to). Not per tenant: a tenant cannot redirect
+    /// its key. Env: `WEB_SEARCH_STAAN_URL`.
+    pub web_search_staan_url: String,
 
     // -- Client-IP attribution --
     /// Number of trusted reverse proxies between a client and this process, used
@@ -197,6 +201,7 @@ impl Default for CoreSettings {
             audit_batch_deadline_ms: 100,
             edge_blob_max_mb: 32,
             web_fetch_timeout: Duration::from_secs(30),
+            web_search_staan_url: crate::web::providers::staan::DEFAULT_BASE.to_string(),
             trusted_proxy_hops: 1,
             loaded_overrides: HashMap::new(),
         }
@@ -290,6 +295,36 @@ impl CoreSettings {
         parse_setting!("AUDIT_BATCH_DEADLINE_MS", cfg.audit_batch_deadline_ms);
         parse_setting!("EDGE_BLOB_MAX_MB", cfg.edge_blob_max_mb);
         parse_setting!("WEB_FETCH_TIMEOUT_SECS", cfg.web_fetch_timeout, secs);
+        // An absolute http(s) URL. Anything else is kept as given, so every
+        // Staan search fails as a configuration error rather than sending the
+        // keys to the public default the operator meant to route around — said
+        // on stderr too, since settings may load before logging is set up.
+        if let Some(raw) = resolve_setting(&overrides, "WEB_SEARCH_STAAN_URL")
+            && !raw.trim().is_empty()
+        {
+            match url::Url::parse(raw.trim()) {
+                Ok(u) if matches!(u.scheme(), "http" | "https")
+                    && u.has_host()
+                    && u.username().is_empty()
+                    && u.password().is_none() =>
+                {
+                    if u.scheme() == "http" {
+                        eprintln!("WEB_SEARCH_STAAN_URL={raw:?} is plain http: every tenant's Staan key travels unencrypted");
+                        tracing::warn!(value = %raw, "WEB_SEARCH_STAAN_URL is plain http — every tenant's Staan key travels unencrypted");
+                    }
+                    cfg.web_search_staan_url = raw.trim().to_string();
+                }
+                _ => {
+                    // Not echoed: a value carrying credentials must not reach a log.
+                    eprintln!("WEB_SEARCH_STAAN_URL is not an http(s) URL without credentials: every Staan search fails until it is");
+                    tracing::error!("WEB_SEARCH_STAAN_URL is not an http(s) URL without credentials — every Staan search fails until it is");
+                    cfg.web_search_staan_url = raw.trim().to_string();
+                }
+            }
+            if overrides.contains_key("WEB_SEARCH_STAAN_URL") {
+                loaded.insert("WEB_SEARCH_STAAN_URL".to_string(), raw.trim().to_string());
+            }
+        }
         parse_setting!("TRUSTED_PROXY_HOPS", cfg.trusted_proxy_hops);
         cfg.loaded_overrides = loaded;
         cfg
@@ -347,6 +382,7 @@ impl CoreSettings {
                 "WEB_FETCH_TIMEOUT_SECS".to_string(),
                 self.web_fetch_timeout.as_secs().to_string(),
             ),
+            ("WEB_SEARCH_STAAN_URL".to_string(), self.web_search_staan_url.clone()),
             ("TRUSTED_PROXY_HOPS".to_string(), self.trusted_proxy_hops.to_string()),
         ])
     }

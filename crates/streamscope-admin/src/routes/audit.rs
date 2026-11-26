@@ -654,7 +654,7 @@ pub struct WebAuditLogEntry {
     pub upstream_server_name: Option<String>,
     /// `"search"` or `"fetch"`.
     pub operation: String,
-    /// Configured backend code (`"searxng"` | `"brave"` | …).
+    /// Configured backend code (`"searxng"` | `"staan"`; a fetch: `"builtin"`).
     pub backend: String,
     /// search → query string; fetch → URL.
     pub query: Option<String>,
