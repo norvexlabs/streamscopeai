@@ -370,7 +370,10 @@ metadata documents** empty unless you mean any user, or any caller at all, to re
   keys entered here; the matching private keys stay with the operator, never on the appliance, so a
   backup is unreadable without them. An operator can lock the backup settings against the console
   (Operator Guide, *Backup & restore*): the tab then says so, still shows, tests and runs the saved
-  settings, but no longer saves or tests a change. Provisioning, restores, secrets, a database reset, removing the backup
+  settings, but no longer saves or tests a change. When the operator keeps the backups on the
+  appliance itself rather than in a destination (Operator Guide, *Backups kept on the appliance*),
+  the tab says so and how many it keeps, and still runs one now; it edits and tests nothing, as
+  there is no destination. Provisioning, restores, secrets, a database reset, removing the backup
   settings and an upgrade without its backup are the operator's, over SSH, and never offered here.
   On Kubernetes this page is not shown (the platform is managed with standard cluster tooling).
 

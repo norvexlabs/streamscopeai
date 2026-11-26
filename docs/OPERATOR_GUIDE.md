@@ -165,7 +165,8 @@ history, the gateway's buffers and the bundled container images). The appliance 
 systems** (active and passive, for atomic A/B rollback) and a recovery system; `vm create` adds the
 space they take to the disk it makes and prints both (`a 43 GiB disk (the OS 23 GiB, the app 20
 GiB)`). Size up from the minimum with your retention window and request
-volume; the appliance tightens retention on its own as the disk fills (see *Disk pressure* in § D).
+volume, and add the backups it keeps if you keep them on the VM (*Backups kept on the appliance*
+in § D); the appliance tightens retention on its own as the disk fills (see *Disk pressure* in § D).
 
 ### Prerequisites (operator workstation)
 
@@ -256,7 +257,7 @@ ssh -t <user>@<vm> sudo ssai-stow install             # asks for what is still d
 | `--cert FILE` `--key FILE` `--ca FILE` | The `byo` certificate, its key and its issuing CA, sent over SSH to the first install. Give `--ca` for a private CA: without it the chain is checked against your workstation's trusted CAs. |
 | `--http-port N` `--https-port N` | Move the front's ports. |
 | `--set KEY=VALUE`, `--answers FILE` | The install answers and the advanced settings of § E. `--answers` is a YAML map, `KEY: value`, and may carry the front's TLS settings in a `tls` section (`mode`, `cert`, `key`, `ca`, paths relative to the file); a flag wins over the file. |
-| `--secrets FILE` | A decrypted secrets export: rebuild a VM with the secrets of one that was lost (see *Recovery playbook*). The secrets go only to the VM `vm create` made: until its install, the VM serves a one-time SSH host key its seed carries, and `vm create` prints that key's fingerprint for you to check before you send the secrets. |
+| `--secrets FILE` | A decrypted secrets export: rebuild a VM with the secrets of one that was lost (see *Recovery playbook*; an export taken before 2026.11.89 needs the line `export: true` added, scenario 6). The secrets go only to the VM `vm create` made: until its install, the VM serves a one-time SSH host key its seed carries, and `vm create` prints that key's fingerprint for you to check before you send the secrets. |
 | `--registry PREFIX` `--registry-ca FILE` | Install from a mirror (§ A). |
 | `--registry-login-file FILE` | The VM's own login to the registry it pulls from (§ A), sent over SSH to the first install. |
 | `--tune-profile default\|network` | The VM's network tuning (default `network`, for the gateway's many connections). On an installed VM, `sudo ssai-stow install --tune-profile P` changes it, and `--tune-profile release` returns to the release's own. |
@@ -288,7 +289,7 @@ logging in.
 | # | Check | Pass criteria |
 |---|---|---|
 | 1 | `ssh <user>@<vm> ssai-stow status` | The OS and the installed release on the same version, its channel, every service `running`, no `not finished` line |
-| 2 | `ssh <user>@<vm> ssai-stow health` | `ready` |
+| 2 | `ssh <user>@<vm> ssai-stow health` | `ready` — until the boot is over and the health gate has judged it, it says so instead (`the boot is still bringing the install up`, then `the health gate has not judged this boot yet`): run it again |
 | 3 | `ssh <user>@<vm> ssai-stow ps` | Every service up and healthy |
 | 4 | `curl -I https://<console-host>/` | a redirect to the portal, valid certificate (or the local CA with `internal`) |
 | 5 | Browser → `https://<console-host>/admin` → sign in | Lands on the dashboard |
@@ -367,6 +368,19 @@ secret stops MCP OAuth tokens signed by it only once every gateway has picked up
 configuration — normally a second or two. Watch the sync indicator in the console if you need to be
 sure. Browser, portal and CLI sessions are checked by the admin API itself and stop the moment it
 restarts.
+
+#### Replacing `INTERNAL_SERVICE_SECRET`
+
+`INTERNAL_SERVICE_SECRET` is shared by the admin API, the console and the install's disk-pressure
+watch (which reads it on each call), and nothing stored is derived from it, so it is replaced in one pass rather than rotated in three:
+
+```bash
+ssai-stow secrets rotate INTERNAL_SERVICE_SECRET        # a new value; the admin API and the console restart with it
+```
+
+It asks first, as the old value is not kept (`--yes` confirms without asking). On Docker add
+`--dir <dir>`. Sign-ins that complete while the two services restart fail and are simply tried
+again, as is a disk-pressure request; sessions already open are unaffected. On Kubernetes the installer does not replace it.
 
 #### TLS modes
 
@@ -621,7 +635,9 @@ tenant (read-only or admin) when the automation only manages one tenant.
 
 Postgres is the only state that cannot rebuild itself — certificates, the gateway's buffers,
 container images and seeded configuration all do. A backup is a `pg_dump` encrypted with age as it
-streams and uploaded with rclone to a destination off the VM; nothing is written to the VM's disk.
+streams and uploaded with rclone to a destination off the VM; nothing is written to the VM's disk —
+unless you choose to keep the backups on the VM and pull them over SSH instead (*Backups kept on
+the appliance*, below).
 
 **The appliance is a single node: its database has no standby and no failover.** Its answer to a
 lost database or a lost VM is this backup and the *Recovery playbook* below (scenario 6), so what
@@ -690,10 +706,11 @@ tries settings without saving them. Each backup is named
 **Restore** replaces the database with a `full` backup:
 
 ```bash
-ssh -t <user>@<vm> ssai-stow restore <object> --identity - < backup.key
+ssh <user>@<vm> ssai-stow restore <object> --identity - --yes < backup.key
 ```
 
-It asks to confirm, stops every service but the database, loads the backup into a database of its
+With the key on standard input there is no terminal to confirm on, so `--yes` confirms it. It
+stops every service but the database, loads the backup into a database of its
 own beside the current one, and swaps the two only once the load succeeded — a restore that fails
 leaves the database as it was. Then the stack comes back and provisioning runs on the restored data.
 A backup restores onto **the release it was taken from**: restore before upgrading, or roll back
@@ -706,10 +723,38 @@ A backup the install holds no record of — one taken by another VM (the one a r
 a restore drill's source) — is refused naming `--unrecorded`, which loads it unchecked: give it
 only for a backup you know you made, as a dump's statements run with the database owner's rights.
 
+#### Backups kept on the appliance
+
+A site whose backup store cannot be reached from the appliance — or that keeps no storage
+credential on it — keeps the backups on the VM and **pulls** them over SSH into its own store:
+
+```bash
+ssh <user>@<vm> ssai-stow backup config --keep-local 7 --recipient age1…   # no destination: the latest 7 stay on the VM
+ssh <user>@<vm> ssai-stow backup list                                       # the ones kept, marked local
+ssh <user>@<vm> ssai-stow backup export <object> -o - > backup.tar          # stream one out
+ssh <user>@<vm> ssai-stow backup run --output - --recipient age1… > now.tar  # or take one now and stream it out, no settings needed
+ssh <user>@<vm> ssai-stow restore <object> --identity - --yes < backup.key   # restore one the VM keeps, in place
+scp backup.tar <user>@<vm>: && ssh <user>@<vm> ssai-stow restore --input backup.tar --identity - --yes < backup.key && ssh <user>@<vm> rm backup.tar   # or give one back from your store
+```
+
+The scheduled backups, and the one an upgrade takes first, are kept on the VM's disk (encrypted, as
+always, to the public keys given), the profile's latest N of them (`--keep-local`, 1 to 100); a
+destination given later replaces this mode, and the backups already kept stay on the disk, still
+listed as local: `ssai-stow` does not remove them, so pull what you need before leaving this mode,
+and size the disk for them. Each streamed-out archive holds one backup (a tar of its
+encrypted objects); `--json` names it on standard error with its SHA-256, so a script can check what
+it stored. `restore --input` refuses an archive cut short or not of the release installed, and
+refuses one another install streamed out unless given `--unrecorded`; it needs room on the VM for
+the archive you copied and the copy it loads, so remove the archive after it. **Size the disk for
+the kept backups**: they share the data partition, and when it fills, *Disk pressure* shortens the
+audit and session history of every organisation — which frees nothing the backups take. **Test** in
+the console has no destination to try in this mode.
+
 **Restore drill** (monthly — an untested backup is a broken backup): build a scratch VM from the
 secrets export (*Recovery playbook*, scenario 6), restore the latest backup onto it (`--unrecorded`:
-the scratch VM did not take it) and sanity-check
-it. Record the wall-clock (your RTO) and the schedule cadence (your RPO).
+the scratch VM did not take it), remove its backup settings straight away (`ssai-stow backup
+config --remove`: from the restore on, its schedule would back its copy up into the production
+destination), then sanity-check it and delete it. Record the wall-clock (your RTO) and the schedule cadence (your RPO).
 
 ### Disk pressure
 
@@ -733,8 +778,9 @@ Scenarios from least to most severe:
    why in `status`. Recovery is then yours, from the backup taken before the upgrade.
 2. **Migration failed at boot** — admin-api does not exit on a migration error; it reports
    **not ready** and answers HTTP 503 `{"code":"MIGRATION_FAILED",...}` on every request that
-   needs the database, so read the reason with `ssai-stow health` and `ssai-stow logs
-   admin-api` (the public URLs stay down meanwhile). The database is left at the previous version as
+   needs the database, so read the reason with `ssai-stow logs admin-api` (the public URLs stay
+   down meanwhile; `ssai-stow health` says only that the boot or the health gate is not over, and
+   the verbs below are refused until the gate has judged the boot). The database is left at the previous version as
    if the migration never ran. **Default: `ssai-stow rollback`** (safe — the old release knows
    the old schema). Or fix forward with a corrected release, or (last resort, with a verified off-VM
    backup) `reset-db` and restore.
@@ -758,15 +804,31 @@ Scenarios from least to most severe:
 
    ```bash
    age --decrypt -i secrets.key streamscope-secrets.age > secrets.yaml
+   # with 2026.11.89 or later and an export taken before it: add the line `export: true` (see below)
    sh streamscopeai.sh vm create --secrets secrets.yaml …     # same release as the backup; not --tls byo
    ssh <user>@<vm> sudo ssai-stow install --given - < byo.yaml   # if it served byo: project, tls of cert and key as PEM (§ D)
    ssh <user>@<vm> ssai-stow backup config --destination … --rclone-config - --recipient age1… < rclone.conf
    ssh <user>@<vm> ssai-stow backup list
-   ssh -t <user>@<vm> ssai-stow restore <object> --unrecorded --identity - < backup.key   # the lost VM's backup
+   ssh <user>@<vm> ssai-stow restore <object> --unrecorded --identity - --yes < backup.key   # the lost VM's backup
    ```
 
-   The new VM starts unprovisioned and says so in `status` (`not provisioned: a backup … is
-   awaited`) until the restore loads the data, so nothing is created on the empty database. Restore
+   From 2026.11.89 on an export carries the top-level line `export: true` (beside `project:`), and
+   only a file with it makes the new VM wait for its data. **Rebuilding with 2026.11.89 or later from
+   an export taken with an earlier release**, add that line to the decrypted `secrets.yaml` first.
+   Without it the file is taken as a new install's secrets: the installer refuses it when it holds
+   values only an export carries (the provisioned accounts, the `internal` front's local CA), and
+   otherwise makes a plain install that provisions an empty database and backs it up at once. Never
+   take the refusal's other way on, removing those values: that makes the same plain install. A release before 2026.11.89 refuses the line and needs none:
+   rebuild with it from the export as it is. Once you run 2026.11.89 or later, export the secrets
+   again: the new file carries the line.
+
+   The new VM starts unprovisioned and says so in `status` (`awaiting its data`) until the restore
+   loads the data, so nothing is created on the empty database, and it takes **no backup** meanwhile
+   — neither the schedule's nor an upgrade's — so the empty machine never lands beside the lost one's
+   backups. A lost VM that kept its backups on itself is restored from your own copy instead:
+   `scp backup.tar <user>@<vm>:`, then `ssh <user>@<vm> ssai-stow restore --input backup.tar
+   --unrecorded --identity - --yes < backup.key` (the private key never lands on the VM), and
+   remove `backup.tar` after it. Restore
    before flipping DNS, verify, then flip. Without backups **and** the secrets export, you
    re-provision from scratch and audit history is lost — which is why exporting the secrets and
    running off-VM backups is non-negotiable.
@@ -780,20 +842,22 @@ On the VM (over SSH):
 | `ssai-stow --version` | The release this installer carries, and the Stowage release that built it |
 | `ssai-stow describe [--json]` | What that release offers, read with no install: its default registry and its routes |
 | `ssai-stow status [--json]` | The release and channel, the install's state, each route's URL, the advanced settings in effect, the system booted (active / passive / recovery), the last failed boot, the disk and its pressure, the services; `--json` also lists every setting the install records |
-| `ssai-stow health [--json]` | Ready, or why not — the health gate's check, from inside the VM, even when the public URLs are down |
+| `ssai-stow health [--json]` | Ready, or why not — the health gate's check, from inside the VM, even when the public URLs are down; until the boot is over and the health gate has judged it, not ready with that reason and no check |
 | `ssai-stow ps [--json]` | The services, their state and health; a service that is down is named with its exit code, the signal, whether its memory limit killed it, and that limit (`status` says the same) |
 | `ssai-stow logs <service> [--tail N]` | A service's last lines (default 200, at most 5000) |
 | `ssai-stow restart \| stop \| start <service>` | One service |
 | `ssai-stow events [--after N] [--follow]` | The appliance's journal: jobs, reboots, boots, the health gate's verdicts, the backup settings the console changed |
 | `ssai-stow updates [--channel C] [--version V]` | A newer release, with its changelog |
-| `ssai-stow upgrade [--yes] [--channel C] [--version V] [--no-reboot] [--skip-backup]` | Back up, write the passive slot, reboot into it after 30 s |
+| `ssai-stow upgrade [--yes] [--channel C] [--version V] [--no-reboot] [--skip-backup] [--set KEY=VALUE]…` | Back up, write the passive slot, reboot into it after 30 s; `--set` (or `--answers`) gives an input the new release adds, which its changelog names |
 | `ssai-stow rollback [--yes]` | Reboot into the passive system: back to the release the last upgrade replaced |
 | `ssai-stow reboot \| shutdown [--drain-secs N]` | Drain (default 30 s, at most 600), then reboot / power off |
-| `ssai-stow backup config \| run \| status \| list \| verify` | Backups (see *Backup & restore*); `backup config --lock` / `--unlock` keeps the settings from the console or gives them back |
-| `ssai-stow restore <object> [--identity FILE\|-] [--unrecorded]` | Load a backup into the database; `--unrecorded` loads one this install did not take (see *Backup & restore*) |
+| `ssai-stow backup config \| run \| status \| list \| verify \| export` | Backups (see *Backup & restore*); `backup config --lock` / `--unlock` keeps the settings from the console or gives them back; `--keep-local N`, `backup run --output` and `backup export` keep and stream them (see *Backups kept on the appliance*) |
+| `ssai-stow restore <object> [--identity FILE\|-] [--yes] [--unrecorded]` | Load a backup into the database; `--unrecorded` loads one this install did not take (see *Backup & restore*) |
+| `ssai-stow restore --input FILE --identity FILE\|- [--yes] [--unrecorded]` | The same, from an archive `backup export` or `backup run --output` streamed out (`--input -` reads it from standard input, with `--identity FILE` and `--yes`); `--yes` whenever standard input is not a terminal |
 | `sudo ssai-stow registry-login FILE\|- \| --remove` | Record or remove the VM's own registry login (§ A) |
 | `ssai-stow secrets export --recipient age1… [-o FILE\|-]` | The install's secrets, encrypted, for disaster recovery |
 | `ssai-stow secrets rotate AUTH_SECRET [--stage \| --finish]` | Rotate the signing secret (see *Rotating `AUTH_SECRET`*) |
+| `ssai-stow secrets rotate INTERNAL_SERVICE_SECRET [--yes]` | Replace the internal service secret in one pass (see *Replacing `INTERNAL_SERVICE_SECRET`*) |
 | `ssai-stow network [set \| confirm \| revert \| reset]` | The network settings (see below) |
 | `ssai-stow provision [--set KEY=VALUE]…` | Run provisioning again (idempotent); `--set` corrects a value it recorded (§ E) |
 | `sudo ssai-stow install [--set KEY=VALUE]… [--tls …] [--domains …] [--cert … --key …]` | Change the install's settings (see below); on a VM without an install, make it |
@@ -902,7 +966,7 @@ install directory, the Kubernetes release's Secret), never typed by you:
 |---|---|
 | `ENCRYPTION_KEY` | Encrypts upstream API keys at rest. Permanent: rotating it would leave stored credentials unreadable |
 | `AUTH_SECRET` | Signs sessions and tokens. Rotated with `secrets rotate` (see *Rotating `AUTH_SECRET`*), which holds the incoming or outgoing secret in a verify-only second slot while a rotation is under way |
-| `INTERNAL_SERVICE_SECRET` | Authenticates the platform's own services to the admin API |
+| `INTERNAL_SERVICE_SECRET` | Authenticates the platform's own services to the admin API. Replaced in one pass with `secrets rotate INTERNAL_SERVICE_SECRET` on Docker and the VM (see *Replacing `INTERNAL_SERVICE_SECRET`*) |
 | `EDGE_TOKEN` | Authenticates the gateways to the admin API |
 | `POSTGRES_PASSWORD` / `POSTGRES_APP_PASSWORD` | The database's migration and runtime roles (bundled database) |
 
@@ -1528,7 +1592,9 @@ It carries the generated secrets, the secret inputs and the provisioned administ
 credentials, never the registry login. A first install on a new cluster — or on any shape — takes
 the decrypted file back with `--secrets FILE` (`-` for standard input): `k8s install --secrets` is
 refused where the release's Secret already exists, and leaves provisioning to an explicit `k8s
-provision`, run once the old install's database is restored.
+provision`, run once the old install's database is restored. Installing with 2026.11.89 or later
+from an export taken before it, add the top-level line `export: true` to the decrypted file first
+(see *Recovery playbook (appliance)*, scenario 6).
 
 ### Step 4 — Verify the install
 
@@ -2016,7 +2082,9 @@ it deletes the database and the gateway's buffers (the certificates are kept), s
 provisions anew, with new passwords. Nothing is dumped first.
 
 Rotate the signing secret with `streamscopeai/ssai-stow secrets rotate AUTH_SECRET --dir ./streamscopeai`
-and its `--stage` / `--finish` passes (see *Rotating `AUTH_SECRET`*, § B).
+and its `--stage` / `--finish` passes (see *Rotating `AUTH_SECRET`*, § B); replace the internal
+service secret in one pass with `streamscopeai/ssai-stow secrets rotate INTERNAL_SERVICE_SECRET --dir
+./streamscopeai` (see *Replacing `INTERNAL_SERVICE_SECRET`*, § B).
 
 ### Hardening
 
@@ -2052,11 +2120,19 @@ you) as it streams to the rclone destination. The schedule is a systemd timer of
 set up when the installer runs as root on a host with systemd; elsewhere a backup runs when you run
 `backup run`. A restore loads the backup into a database of its own and swaps it in only once the
 load succeeded, then brings the stack up and runs provisioning. Every upgrade also dumps the
-database to `streamscopeai/snapshots/` first.
+database to `streamscopeai/snapshots/` first. Backups can also stay on the host and be pulled over
+SSH (`sudo streamscopeai/ssai-stow backup config --dir ./streamscopeai --keep-local N --recipient
+age1…`, then `backup export`, `backup run --output` and `restore --input`, each with `--dir`), as
+on the VM (§ D, *Backups kept on the appliance*) — except that an upgrade here dumps to
+`snapshots/` rather than adding a kept backup, and the disk-pressure watch reads the filesystem
+holding Docker's data, which may not be the one holding the install directory.
 
 Keep the secrets export beside the backups: to rebuild on a new host, install with the decrypted
-export (`sh streamscopeai.sh --secrets secrets.yaml`, the same release) — it starts without
-provisioning, waiting for your data — then `restore --unrecorded` the backup into it (the new install
+export (`sh streamscopeai.sh --secrets secrets.yaml`, the same release; with 2026.11.89 or later
+and an export taken before it, add the top-level line `export: true` first, see § D, *Recovery
+playbook (appliance)*, scenario 6) — it starts without
+provisioning and takes no backup, waiting for your data (`status` says so) — then `restore
+--unrecorded` the backup into it (the new install
 took none of the lost one's backups, so it holds no record to check them against; see § D, *Backup &
 restore*). With `--tls internal`, the new
 install keeps the lost one's root, so the clients that trusted it still do. If the database must

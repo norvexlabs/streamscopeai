@@ -148,7 +148,10 @@ data:
 secrets:
   - { key: ENCRYPTION_KEY,          gen: hex32 }
   - { key: AUTH_SECRET,             gen: hex32, rotation: true }
-  - { key: INTERNAL_SERVICE_SECRET, gen: hex32 }
+  # Shared by admin-api, the console and the disk-pressure hook (read per call);
+  # nothing stored derives from it: `secrets rotate INTERNAL_SERVICE_SECRET`
+  # replaces it in one pass (Docker and the VM).
+  - { key: INTERNAL_SERVICE_SECRET, gen: hex32, replace: true }
   - { key: EDGE_TOKEN,              gen: hex32 }
   - { key: POSTGRES_PASSWORD,       gen: pass18 }
   - { key: POSTGRES_APP_PASSWORD,   gen: pass18 }

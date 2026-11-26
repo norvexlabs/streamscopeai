@@ -822,6 +822,11 @@ pub struct BackupConfig {
     /// The profiles the release declares.
     #[serde(default)]
     pub profiles: Vec<String>,
+    /// The backups are kept on the host, the profile's latest this many, with
+    /// no destination: the operator pulls them over SSH (`backup export`).
+    /// Absent when they go to a destination.
+    #[serde(default)]
+    pub keep_local: Option<u32>,
     /// The operator locked the settings over SSH: a save, or a test of settings
     /// other than the saved ones, is refused (403 `appliance_operator_only`);
     /// they are still read, tested as saved and run. A daemon that does not
@@ -953,21 +958,25 @@ pub(crate) async fn get_backup_status() -> Result<Json<BackupStatus>, ApiError> 
     Ok(Json(BackupStatus { next: s.next.filter(|n| !n.is_empty()), running: s.running, last: s.last }))
 }
 
-/// One backup in the destination.
+/// One backup in the destination, or kept on the host.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BackupObject {
     pub name: String,
     pub size: i64,
     pub time: DateTime<Utc>,
+    /// Kept on the host (`keep_local`, or kept from before a destination
+    /// was set), not in the destination: the operator pulls it over SSH.
+    #[serde(default)]
+    pub local: bool,
 }
 
 #[utoipa::path(
     get, path = "/api/v1/admin/global/appliance/backup/list", tag = "Appliance",
     params(PageQuery),
     responses(
-        (status = 200, description = "The destination's backups, newest first", body = OffsetPage<BackupObject>),
+        (status = 200, description = "The destination's backups and those kept on the host, newest first", body = OffsetPage<BackupObject>),
         (status = 404, description = "Not an appliance deployment", body = ApiErrorResponse),
-        (status = 409, description = "No backup is configured", body = ApiErrorResponse),
+        (status = 409, description = "Refused by the host, with the reason", body = ApiErrorResponse),
         (status = 502, description = "Host daemon error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = [])),
@@ -997,7 +1006,7 @@ pub struct BackupRunRequest {
         (status = 415, description = "A body without a JSON Content-Type", body = ApiErrorResponse),
         (status = 422, description = "A body that is not the request (an unknown field included)", body = ApiErrorResponse),
         (status = 404, description = "Not an appliance deployment", body = ApiErrorResponse),
-        (status = 409, description = "No backup is configured, or a job runs", body = ApiErrorResponse),
+        (status = 409, description = "No backup is configured, a job runs, or the install awaits its data (rebuilt from a secrets export, not yet restored)", body = ApiErrorResponse),
         (status = 502, description = "Host daemon error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = [])),
@@ -1018,7 +1027,7 @@ pub(crate) async fn action_backup_run(OptionalJson(body): OptionalJson<BackupRun
         (status = 415, description = "A body without a JSON Content-Type", body = ApiErrorResponse),
         (status = 422, description = "A body that is not the settings (an unknown field, `rclone_config` included)", body = ApiErrorResponse),
         (status = 404, description = "Not an appliance deployment", body = ApiErrorResponse),
-        (status = 409, description = "A job runs or a reboot is scheduled", body = ApiErrorResponse),
+        (status = 409, description = "A job runs or a reboot is scheduled, or the backups are kept on the host (no destination to test)", body = ApiErrorResponse),
         (status = 502, description = "Host daemon error", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = [])),
@@ -1924,6 +1933,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backups_kept_on_the_host_are_shown_as_kept_there() {
+        let mut local = settings_reply();
+        local["keep_local"] = serde_json::json!(7);
+        local["rclone_config_set"] = serde_json::json!(false);
+        local.as_object_mut().expect("object").remove("destination");
+        let f = fake(vec![("GET", "/v1/backup/config", 200, local)]).await;
+        let c = f.host.backup_config().await.expect("config");
+        assert_eq!((c.keep_local, c.destination.as_deref(), c.rclone_config_set), (Some(7), None, false));
+        let f = fake(vec![("GET", "/v1/backup/config", 200, settings_reply())]).await;
+        let c = f.host.backup_config().await.expect("config");
+        assert_eq!((c.keep_local, c.destination.as_deref()), (None, Some("b:bucket/x")));
+    }
+
+    #[tokio::test]
     async fn settings_the_operator_locked_are_shown_locked_and_a_save_is_refused_with_the_reason() {
         let mut locked = settings_reply();
         locked["locked"] = serde_json::json!(true);
@@ -2030,7 +2053,8 @@ mod tests {
             ("GET", "/v1/backup/status", 200, serde_json::json!({"settings": settings_reply(), "next": "Wed 2026-10-15 03:00:00 UTC",
                 "running": false, "last": {"object": "streamscope-full-x.age", "profile": "full", "release": {"version": "1.0", "revision": 1},
                 "started": "2026-10-14T03:00:00Z", "finished": "2026-10-14T03:01:00Z", "bytes": 1234, "prune_error": "denied", "error": "  "}})),
-            ("GET", "/v1/backup/list", 200, serde_json::json!([{"name": "a.age", "size": 5, "time": "2026-10-13T03:00:00Z"}])),
+            ("GET", "/v1/backup/list", 200, serde_json::json!([{"name": "a.age", "size": 5, "time": "2026-10-13T03:00:00Z"},
+                {"name": "b.age", "size": 6, "time": "2026-10-12T03:00:00Z", "local": true}])),
             ("POST", "/v1/backup", 202, serde_json::json!({"job": "backup", "target": "streamscope-config-y.age"})),
         ])
         .await;
@@ -2038,7 +2062,9 @@ mod tests {
         let last = st.last.expect("last");
         // A blank error is absent: the daemon's text goes through daemon_text.
         assert_eq!((last.bytes, last.error, last.prune_error.as_deref()), (1234, None, Some("denied")));
-        assert_eq!(f.host.backup_list().await.expect("list")[0].size, 5);
+        let list = f.host.backup_list().await.expect("list");
+        // A backup kept on the host says so; one in the destination omits it.
+        assert_eq!(list.iter().map(|b| (b.size, b.local)).collect::<Vec<_>>(), [(5, false), (6, true)]);
         let a = f.host.backup(&BackupRunRequest { profile: Some("config".into()) }).await.expect("run");
         assert_eq!(a.target.as_deref(), Some("streamscope-config-y.age"));
         f.host.backup(&BackupRunRequest { profile: None }).await.expect("run default");

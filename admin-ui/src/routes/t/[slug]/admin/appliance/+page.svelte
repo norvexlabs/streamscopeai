@@ -954,11 +954,17 @@
         <h2 class="text-sm font-semibold text-(--text-primary)">Backup</h2>
         {#if backupCfg?.locked}
           <Callout severity="info" title="Locked by the operator">
-            The operator keeps these settings over SSH (<span class="font-mono">ssai-stow backup config --unlock</span> gives them back): nothing is saved here, and Test tries the saved settings.{#if backupCfg.configured} You can still run a backup.{/if}
+            The operator keeps these settings over SSH (<span class="font-mono">ssai-stow backup config --unlock</span> gives them back): nothing is saved here{#if backupCfg.keep_local}.{:else}, and Test tries the saved settings.{/if}{#if backupCfg.configured} You can still run a backup.{/if}
           </Callout>
         {/if}
         {#if !editingBackup}
-          {#if backupCfg && !backupCfg.rclone_config_set && !backupCfg.locked}
+          {#if backupCfg?.keep_local}
+            <Callout severity="info" title="Backups are kept on the appliance">
+              The operator keeps the latest {backupCfg.keep_local} backups of the profile on the appliance itself, with no
+              destination, and pulls them over SSH (<span class="font-mono">ssai-stow backup export</span>). A destination
+              is set over SSH (<span class="font-mono">ssai-stow backup config --destination … --rclone-config …</span>).
+            </Callout>
+          {:else if backupCfg && !backupCfg.rclone_config_set && !backupCfg.locked}
             <Callout severity="warning" title="No destination is set up">
               The operator sets the first destination and its credentials over SSH
               (<span class="font-mono">ssai-stow backup config --destination … --rclone-config … --recipient …</span>);
@@ -973,10 +979,10 @@
             </Callout>
           {/if}
           <div class="text-sm space-y-1">
-            <div class="flex justify-between"><span class="text-(--text-secondary)">Destination</span><span class="font-mono">{backupCfg?.configured ? backupCfg.destination : 'not set'}</span></div>
+            <div class="flex justify-between"><span class="text-(--text-secondary)">Destination</span><span class="font-mono">{backupCfg?.keep_local ? 'the appliance' : backupCfg?.configured ? backupCfg.destination : 'not set'}</span></div>
             <div class="flex justify-between"><span class="text-(--text-secondary)">Schedule</span><span class="font-mono">{backupCfg?.schedule ?? '—'}</span></div>
-            <div class="flex justify-between"><span class="text-(--text-secondary)">Profile / retention</span><span class="font-mono">{backupCfg?.profile ?? '—'} / {backupCfg?.retention_days ? `${backupCfg.retention_days}d` : 'keep all'}</span></div>
-            <div class="flex justify-between"><span class="text-(--text-secondary)">Credentials</span><span>{backupCfg?.rclone_config_set ? (backupCfg.rclone_config_from === 'unknown' ? 'not known to be the operator’s — not run' : 'configured') : 'not set'}</span></div>
+            <div class="flex justify-between"><span class="text-(--text-secondary)">Profile / retention</span><span class="font-mono">{backupCfg?.profile ?? '—'} / {backupCfg?.keep_local ? `latest ${backupCfg.keep_local}` : backupCfg?.retention_days ? `${backupCfg.retention_days}d` : 'keep all'}</span></div>
+            <div class="flex justify-between"><span class="text-(--text-secondary)">Credentials</span><span>{backupCfg?.keep_local ? 'none needed' : backupCfg?.rclone_config_set ? (backupCfg.rclone_config_from === 'unknown' ? 'not known to be the operator’s — not run' : 'configured') : 'not set'}</span></div>
             <div class="flex justify-between"><span class="text-(--text-secondary)">Encrypted to</span><span class="font-mono">{backupCfg?.recipients?.length ? `${backupCfg.recipients.length} key${backupCfg.recipients.length > 1 ? 's' : ''}` : 'no key'}</span></div>
             {#if backupStatus}
               <div class="flex justify-between"><span class="text-(--text-secondary)">Next run</span><span>{backupStatus.running ? 'running now' : backupCfg?.rclone_config_from === 'unknown' ? 'none: the config is not run' : (backupStatus.next ?? '—')}</span></div>

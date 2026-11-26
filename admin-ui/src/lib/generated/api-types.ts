@@ -8233,6 +8233,13 @@ export interface components {
             /** @description Where backups go: an rclone remote and a path in it. */
             destination?: string | null;
             /**
+             * Format: int32
+             * @description The backups are kept on the host, the profile's latest this many, with
+             *     no destination: the operator pulls them over SSH (`backup export`).
+             *     Absent when they go to a destination.
+             */
+            keep_local?: number | null;
+            /**
              * @description The operator locked the settings over SSH: a save, or a test of settings
              *     other than the saved ones, is refused (403 `appliance_operator_only`);
              *     they are still read, tested as saved and run. A daemon that does not
@@ -8274,8 +8281,13 @@ export interface components {
             retention_days: number;
             schedule: string;
         };
-        /** @description One backup in the destination. */
+        /** @description One backup in the destination, or kept on the host. */
         BackupObject: {
+            /**
+             * @description Kept on the host (`keep_local`, or kept from before a destination
+             *     was set), not in the destination: the operator pulls it over SSH.
+             */
+            local?: boolean;
             name: string;
             /** Format: int64 */
             size: number;
@@ -15050,6 +15062,11 @@ export interface components {
         OffsetPage_BackupObject: {
             has_more: boolean;
             items: {
+                /**
+                 * @description Kept on the host (`keep_local`, or kept from before a destination
+                 *     was set), not in the destination: the operator pulls it over SSH.
+                 */
+                local?: boolean;
                 name: string;
                 /** Format: int64 */
                 size: number;
@@ -30644,7 +30661,7 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
-            /** @description No backup is configured, or a job runs */
+            /** @description No backup is configured, a job runs, or the install awaits its data (rebuilt from a secrets export, not yet restored) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -30732,7 +30749,7 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
-            /** @description A job runs or a reboot is scheduled */
+            /** @description A job runs or a reboot is scheduled, or the backups are kept on the host (no destination to test) */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -31160,7 +31177,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The destination's backups, newest first */
+            /** @description The destination's backups and those kept on the host, newest first */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -31178,7 +31195,7 @@ export interface operations {
                     "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
-            /** @description No backup is configured */
+            /** @description Refused by the host, with the reason */
             409: {
                 headers: {
                     [name: string]: unknown;

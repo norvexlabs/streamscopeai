@@ -5,6 +5,52 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.89]
+
+### Changed
+
+- **BREAKING** for disaster recovery: a secrets export now carries the top-level line `export: true`, and
+  only a file with it makes a rebuilt install wait for its data (provisioning held back; on the VM
+  appliance and Docker, no backup until a restore). An export taken with an earlier release lacks it: to
+  rebuild from one with this release or a later one, add the line to the decrypted file — without it the
+  installer refuses a file holding values only an export carries (the provisioned accounts, the local CA) and
+  makes any other a plain install. Export the secrets again once you run this release, so the file you keep
+  carries the line. An earlier release refuses the line and needs none.
+- **BREAKING** for monitoring scripts: on the VM appliance, `ssai-stow health` answers not ready until the
+  boot is over and the health gate has judged it, saying so instead of running its check, so a script
+  that waits for ready can then upgrade, back up or restore without being refused.
+
+### Fixed
+
+- On the VM appliance, a boot or health-gate step that was skipped or stopped no longer leaves upgrades,
+  rollbacks and service operations refused for good, and `status` keeps an install failure recorded
+  before such a boot.
+
+## [2026.11.88]
+
+### Added
+
+- **Backups kept on the host and pulled over SSH** (VM appliance and Docker). Instead of a destination,
+  `ssai-stow backup config --keep-local N` keeps the latest N backups on the host itself, encrypted as
+  always to your public keys, for a tool reaching it over SSH to pull into its own store: `backup export`
+  streams one out as a single archive, `backup run --output` takes one now and streams it out (no
+  settings needed), and `restore --input` gives one back. No storage credential then lives on the host.
+  The console's **Appliance → Backup** tab shows that the backups are kept on the appliance and how many.
+- **`ssai-stow secrets rotate INTERNAL_SERVICE_SECRET`** replaces the secret the console and the admin
+  API share in one pass (VM appliance and Docker), restarting the two services with the new value.
+- **A VM upgrade takes the settings a new release adds**: `ssai-stow upgrade --set KEY=VALUE` (or
+  `--answers`), as the Docker install already did — from this release on, so a VM upgrades to this
+  release before one that adds a required setting.
+
+### Changed
+
+- **BREAKING** for scripts: an install rebuilt from a secrets export (`--secrets`) takes **no backup** — neither the schedule's nor
+  an upgrade's — until a restore loads its data or it is provisioned afresh, so an empty machine never
+  lands beside the lost one's backups; `status` says it awaits its data, and `backup run` is refused
+  meanwhile.
+- The installer, the VM's host daemon and the signature verifier no longer carry an unmaintained OpenPGP
+  library.
+
 ## [2026.11.87]
 
 ### Added

@@ -109,8 +109,8 @@
   artifact: os
   package: golang.org/x/net
   path: /usr/bin/runc
-  reason: "golang.org/x/net v0.55.0 in runc v1.5.3, the runc of Docker's latest containerd.io (2.4.2-4) for Ubuntu 26.04 and runc's latest release; no build with x/net 0.57.0 yet (checked 2026-11-25). The VM's engine runs only the stack's own images"
-  expires: 2026-11-27
+  reason: "golang.org/x/net v0.55.0 in runc v1.5.3, the runc of Docker's latest containerd.io (2.4.2-4) for Ubuntu 26.04 and runc's latest release; no build with x/net 0.57.0 yet (checked 2026-11-26). The VM's engine runs only the stack's own images"
+  expires: 2027-01-01
 - id: GO-2026-5026
   artifact: postgres
   package: stdlib
