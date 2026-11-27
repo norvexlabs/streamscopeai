@@ -113,7 +113,7 @@ pub(crate) async fn session_turns(
     let rows = sqlx::query(
         "SELECT t.request_id, t.timestamp, t.turn_number, t.parent_request_id, \
          t.is_baseline, t.message_count, t.response_content, t.response_tool_calls, \
-         t.system_prompt_hash, t.transform_diff, t.request_size_bytes, t.response_size_bytes, \
+         t.system_prompt_hash, t.transform_diff - 'effective_messages' AS transform_diff, t.request_size_bytes, t.response_size_bytes, \
          a.prompt_tokens, a.completion_tokens, \
          a.cache_creation_tokens, a.cache_read_tokens, a.reasoning_tokens, \
          a.cost, a.cost_currency, a.finish_reason, \
@@ -275,7 +275,10 @@ impl RawJson {
 /// The columns of a [`TimelineTurn`], read from `conversation_turns_resolved
 /// t` and its `g` / `a` / `us` / `ws` / `u` / `ak` joins, with `$2` (every
 /// prompt) and a `v` row (`opens_view`, `reads_whole`) in scope.
-const TURN_COLUMNS: &str = "t.request_id, t.timestamp, t.turn_number, t.is_baseline, t.response_content, t.response_tool_calls, t.response_citations, CASE WHEN $2 OR v.opens_view THEN t.system_prompt_hash END AS system_prompt_hash, t.transform_diff, v.reads_whole, CASE WHEN v.reads_whole THEN t.message_hashes ELSE t.added_hashes END AS message_hashes, t.message_count, t.parent_request_id, t.added_from, t.tools_available_hash, t.tools_effective_hash, t.request_params, t.event_type, t.api_version, a.prompt_tokens, a.completion_tokens, a.cache_creation_tokens, a.cache_read_tokens, a.reasoning_tokens, a.cost, a.cost_currency, a.finish_reason, a.latency_ttft_ms, g.latency_total_ms, a.model_used, a.model_requested, a.badges, g.error_category, g.status_code, g.error_detail, a.provider, a.media_call, a.chat_media_summary, us.name as upstream_server_name, ws.name as workspace_name, u.email as user_email, ak.name as key_name, ak.key_prefix, g.client_ip, g.end_user, g.end_user_groups, g.session_id AS gateway_session_id";
+// A stored turn's `transform_diff` may hold an `effective_messages` key (a
+// whole history) that no reader uses: every read of the column strips it in
+// SQL, so a session is never loaded turns × history.
+const TURN_COLUMNS: &str = "t.request_id, t.timestamp, t.turn_number, t.is_baseline, t.response_content, t.response_tool_calls, t.response_citations, CASE WHEN $2 OR v.opens_view THEN t.system_prompt_hash END AS system_prompt_hash, t.transform_diff - 'effective_messages' AS transform_diff, v.reads_whole, CASE WHEN v.reads_whole THEN t.message_hashes ELSE t.added_hashes END AS message_hashes, t.message_count, t.parent_request_id, t.added_from, t.tools_available_hash, t.tools_effective_hash, t.request_params, t.event_type, t.api_version, a.prompt_tokens, a.completion_tokens, a.cache_creation_tokens, a.cache_read_tokens, a.reasoning_tokens, a.cost, a.cost_currency, a.finish_reason, a.latency_ttft_ms, g.latency_total_ms, a.model_used, a.model_requested, a.badges, g.error_category, g.status_code, g.error_detail, a.provider, a.media_call, a.chat_media_summary, us.name as upstream_server_name, ws.name as workspace_name, u.email as user_email, ak.name as key_name, ak.key_prefix, g.client_ip, g.end_user, g.end_user_groups, g.session_id AS gateway_session_id";
 
 /// Every turn of a session with its audit row, ordered by turn number.
 ///

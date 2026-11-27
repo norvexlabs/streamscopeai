@@ -52,7 +52,7 @@ pub(crate) async fn turn(
         "SELECT request_id, timestamp, session_id, turn_number, parent_request_id, \
          is_baseline, message_hashes, message_count, \
          tools_available_hash, tools_effective_hash, \
-         request_params, system_prompt_hash, transform_diff, response_content, \
+         request_params, system_prompt_hash, transform_diff - 'effective_messages' AS transform_diff, response_content, \
          response_tool_calls, response_citations, request_size_bytes, response_size_bytes, event_type, \
          api_version \
          FROM conversation_turns_resolved WHERE request_id = $1 LIMIT 1",

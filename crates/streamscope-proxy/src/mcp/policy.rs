@@ -57,6 +57,32 @@ pub enum PolicyDecision {
     },
 }
 
+impl PolicyDecision {
+    /// The decision as the workspace's tool policy carries it out: observing,
+    /// a block or a rewrite becomes an allow whose result is marked not
+    /// applied, so the request reaches the upstream as the client sent it and
+    /// the row records what enforcing would have done — by the decision, not
+    /// the rule: a rewrite that cannot be written is a refusal, recorded as a
+    /// block.
+    pub fn under(self, mode: streamscope_core::config::tool_enforcement::ToolEnforcement) -> Self {
+        if !mode.observes() {
+            return self;
+        }
+        match self {
+            Self::Block { result, .. } => {
+                Self::Allow(Some(RiskResult { not_applied: true, action: "block".to_string(), ..result }))
+            }
+            Self::Replace { result, mutated_params } => Self::Allow(Some(RiskResult {
+                not_applied: true,
+                action: "replace".to_string(),
+                would_rewrite: Some(mutated_params),
+                ..result
+            })),
+            allow => allow,
+        }
+    }
+}
+
 /// Per-call inputs the dispatcher already has on hand. Bundled for the policy
 /// evaluator so the call site stays one line.
 pub struct PolicyContext<'a> {
@@ -533,6 +559,8 @@ fn rule_to_result(rule: &Rule, tool_id: Option<String>, profile_id: Option<Strin
         pattern: None,
         profile_id,
         tool_id,
+        not_applied: false,
+        would_rewrite: None,
     }
 }
 
@@ -546,6 +574,8 @@ fn synthetic_unknown(tool_id: Option<String>, profile_id: Option<String>) -> Ris
         pattern: None,
         profile_id,
         tool_id,
+        not_applied: false,
+        would_rewrite: None,
     }
 }
 
@@ -999,6 +1029,49 @@ mod tests {
                 assert_eq!(result.tool_id.as_deref(), Some("coding_rules"));
             }
             other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    /// Observing, a block or a rewrite reaches the upstream as an allow whose
+    /// result says what the rule would have done; enforcing, it stays a block.
+    #[test]
+    fn an_observing_policy_allows_what_a_rule_blocks_and_marks_it_not_applied() {
+        use streamscope_core::config::tool_enforcement::ToolEnforcement;
+        let rules = vec![rule_block_resource("ASI-FILE-1", "file://etc/*")];
+        let req = make_request("resources/read", json!({"uri": "file://etc/passwd"}));
+        let ctx = PolicyContext { field_profiles: None, rules: &rules, mcp_server: "filesystem", app_id: None };
+        match evaluate_request(&ctx, &req, &[]).under(ToolEnforcement::Observe) {
+            PolicyDecision::Allow(Some(result)) => {
+                assert!(result.not_applied);
+                assert_eq!((result.id.as_deref(), result.action.as_str()), (Some("ASI-FILE-1"), "block"));
+            }
+            other => panic!("expected an observed Allow, got {other:?}"),
+        }
+        match evaluate_request(&ctx, &req, &[]).under(ToolEnforcement::Enforce) {
+            PolicyDecision::Block { result, .. } => assert!(!result.not_applied),
+            other => panic!("expected Block, got {other:?}"),
+        }
+        // An observed rewrite carries what it would have sent.
+        let rewrite = PolicyDecision::Replace {
+            result: rule_to_result(&rules[0], None, None),
+            mutated_params: json!({"uri": "file://tmp/x"}),
+        };
+        match rewrite.under(ToolEnforcement::Observe) {
+            PolicyDecision::Allow(Some(result)) => {
+                assert!(result.not_applied);
+                assert_eq!(result.action, "replace");
+                assert_eq!(result.would_rewrite, Some(json!({"uri": "file://tmp/x"})));
+            }
+            other => panic!("expected an observed Allow, got {other:?}"),
+        }
+        // A classification is the same in both modes.
+        let mut classify = rule_block_resource("ASI-FILE-2", "file://etc/*");
+        classify.action = RuleAction::Classify;
+        let rules = vec![classify];
+        let ctx = PolicyContext { field_profiles: None, rules: &rules, mcp_server: "filesystem", app_id: None };
+        match evaluate_request(&ctx, &req, &[]).under(ToolEnforcement::Observe) {
+            PolicyDecision::Allow(Some(result)) => assert!(!result.not_applied),
+            other => panic!("expected Allow, got {other:?}"),
         }
     }
 

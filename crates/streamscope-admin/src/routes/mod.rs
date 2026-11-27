@@ -917,6 +917,15 @@ pub enum ApiErrorCode {
     /// An own agent loop guard on the Agent workspace, whose analysis traffic
     /// is never guarded. Append-only.
     LoopGuardNotAllowed,
+    /// The requested audit order needs a figure the listed kind does not
+    /// record (cost and tokens are an LLM request's), or the listing
+    /// interleaves kinds (`kind=all`), which is ordered by time only; pick a
+    /// kind. Append-only.
+    SortUnsupportedForKind,
+    /// An order by figure needs a window — a `start`, and at most
+    /// `FIGURE_SORT_MAX_DAYS` to its end: the order sorts every row of the
+    /// window before the first page is known. Append-only.
+    SortNeedsWindow,
 }
 
 /// Structured error response body matching the proxy's `ErrorResponse` format.
@@ -1696,6 +1705,11 @@ pub struct ActionImpact {
     /// QoS class delete: route targets moved to the replacement class.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_targets_moved: Option<i64>,
+    /// Set a tool profile as default: the mode the promoted profile now runs
+    /// in — the old Default's — when it is not the one its workspaces ran in
+    /// before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_enforcement: Option<streamscope_core::config::tool_enforcement::ToolEnforcement>,
 }
 
 impl From<ResetImpact> for ActionImpact {
@@ -1874,6 +1888,29 @@ pub fn check_bounds(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) ->
     }
 }
 
+/// The longest window an order by figure may sort: the console's longest
+/// period preset (30 days) and a day of slack for an absolute range.
+pub const FIGURE_SORT_MAX_DAYS: i64 = 31;
+
+/// Refuses an order by figure without a bounded window (400 `SortNeedsWindow`):
+/// it sorts every row of the window before the first page is known, so the
+/// window — a `start`, and at most [`FIGURE_SORT_MAX_DAYS`] to its `end` (now
+/// when absent) — is what bounds its cost.
+pub fn check_figure_window(start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>) -> Result<(), ApiError> {
+    let refused = || {
+        ApiError::bad_request(format!(
+            "an order by figure needs a `start` within {FIGURE_SORT_MAX_DAYS} days of its `end`"
+        ))
+        .code(ApiErrorCode::SortNeedsWindow)
+    };
+    let start = start.ok_or_else(refused)?;
+    let end = end.unwrap_or_else(Utc::now);
+    if end - start > chrono::Duration::days(FIGURE_SORT_MAX_DAYS) {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 /// Refuses a traffic-log `search` term shorter than
 /// [`crate::sql_pattern::MIN_SEARCH_CHARS`] characters once trimmed (400
 /// `SearchTermTooShort`). An absent or blank term is no search and passes.
@@ -1908,6 +1945,53 @@ pub struct AnalyticsScope {
     /// workspaces except the Agent one, so agent traffic is just another
     /// (deselected-by-default) workspace, not a special case.
     pub workspace_ids: Option<Vec<Uuid>>,
+}
+
+/// The `badges` query parameter: comma-separated badge codes, a row matching
+/// when it carries ANY of them. A token that is not a badge code refuses the
+/// request — dropping it would widen the filter, to every row when no token is
+/// left. Empty tokens are no filter of their own; an empty value is none. The
+/// alert codes are refused too: no stored badge can match them (a row's
+/// session alert is added when it is read, a session's alert is its
+/// `alert_level`, masked per profile) — the alert filter is `alert_level`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BadgeCodes(pub Vec<streamscope_core::audit::AuditBadgeCode>);
+
+impl BadgeCodes {
+    /// The codes, or `None` when the value named none.
+    pub fn codes(raw: &Option<Self>) -> Option<&[streamscope_core::audit::AuditBadgeCode]> {
+        raw.as_ref().map(|b| b.0.as_slice()).filter(|c| !c.is_empty())
+    }
+}
+
+impl std::str::FromStr for BadgeCodes {
+    type Err = String;
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let mut codes: Vec<streamscope_core::audit::AuditBadgeCode> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                let code: streamscope_core::audit::AuditBadgeCode = t.parse().map_err(|e| format!("`badges`: {e}"))?;
+                match code {
+                    streamscope_core::audit::AuditBadgeCode::SessionAlert
+                    | streamscope_core::audit::AuditBadgeCode::AgentAlert => {
+                        Err(format!("`badges`: `{t}` is an alert; filter by `alert_level` instead"))
+                    }
+                    _ => Ok(code),
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        codes.sort_by_key(|c| c.as_str());
+        codes.dedup();
+        Ok(BadgeCodes(codes))
+    }
+}
+
+impl<'de> Deserialize<'de> for BadgeCodes {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// The `workspace_ids` query param as the typed scope set; an empty list is
@@ -1971,6 +2055,38 @@ mod workspace_ids_tests {
         };
         assert!(parse(&format!("workspace_ids={A}")).is_ok());
         assert!(parse("workspace_ids=nope").is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod badge_codes_tests {
+    use super::*;
+    use streamscope_core::audit::AuditBadgeCode;
+
+    #[test]
+    fn a_list_of_codes_parses_once_each_and_empty_tokens_add_nothing() {
+        let codes: BadgeCodes = " tool_blocked,,guardrail,tool_blocked, ".parse().unwrap();
+        assert_eq!(codes.0, vec![AuditBadgeCode::Guardrail, AuditBadgeCode::ToolBlocked]);
+        assert_eq!(BadgeCodes::codes(&Some("".parse().unwrap())), None, "an empty value is no filter");
+        assert_eq!(BadgeCodes::codes(&None), None);
+    }
+
+    #[test]
+    fn one_token_that_is_not_a_code_refuses_the_whole_value() {
+        assert!("tool_blocked,not_a_badge".parse::<BadgeCodes>().is_err(), "never widened to the other codes");
+        assert!("not_a_badge".parse::<BadgeCodes>().is_err(), "never widened to every row");
+        assert!("Tool_Blocked".parse::<BadgeCodes>().is_err(), "a code is matched as spelled");
+    }
+
+    #[test]
+    fn an_alert_code_is_refused_for_the_alert_filter() {
+        for alert in ["session_alert", "agent_alert", "tool_blocked,session_alert"] {
+            let err = alert.parse::<BadgeCodes>().unwrap_err();
+            assert!(err.contains("alert_level"), "{alert}: {err}");
+        }
+        // Positive control: the code beside it alone is accepted.
+        assert!("tool_blocked".parse::<BadgeCodes>().is_ok());
     }
 }
 

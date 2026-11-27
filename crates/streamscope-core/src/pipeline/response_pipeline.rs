@@ -1314,7 +1314,8 @@ impl ResponsePipeline {
                 upstream_api_version,
             )
             .withheld_tools(self.meta.withheld_tools.clone())
-            .mcp_tool_names(self.tenant_config.mcp.tool_names.clone());
+            .mcp_tool_names(self.tenant_config.mcp.tool_names.clone())
+            .tool_enforcement(tc.effective_tool_enforcement(self.meta.workspace_id));
             Some(accumulator)
         } else {
             None
@@ -3149,6 +3150,7 @@ impl ResponsePipeline {
                 // its healed arguments before anything runs it, with the same
                 // rules and model this path's own response policy pass reads.
                 let sub_tool_rules = self.tenant_config.effective_tool_rules(self.meta.workspace_id);
+                let sub_observe = self.tenant_config.effective_tool_enforcement(self.meta.workspace_id).observes();
                 let sub_model = self.api_request.as_ref().map(|r| r.model().to_string());
                 for p in &mut pending {
                     if self.healing_active() {
@@ -3158,7 +3160,8 @@ impl ResponsePipeline {
                             sub_badges.add_json_healed();
                         }
                     }
-                    p.police(
+                    p.police_as(
+                        sub_observe,
                         &sub_tool_rules,
                         &self.tenant_config.tool_field_profiles,
                         &self.tenant_config.mcp.tool_names,
@@ -3181,8 +3184,9 @@ impl ResponsePipeline {
                 // every one, the round is continued like a pure one, without
                 // them — as a stream's accumulator leaves them out — and the
                 // removal is recorded once the next round's answer replaces
-                // this one.
-                let mut real_removed = if real_tool_use_present && !pending.is_empty() {
+                // this one. An observing policy removes none: the round stays
+                // mixed and its calls reach the client.
+                let mut real_removed = if real_tool_use_present && !pending.is_empty() && !sub_observe {
                     response_blocks::real_calls_the_policy_removes(
                         &response_json,
                         self.upstream_api_version,
@@ -4263,7 +4267,38 @@ impl ResponsePipeline {
 
             let mut response_path_buffered = false;
 
-            if response_policy_acts {
+            let observe = self
+                .tenant_config
+                .effective_tool_enforcement(self.meta.workspace_id)
+                .observes();
+            if response_policy_acts && observe {
+                // Observing: the answer is delivered as the model wrote it;
+                // the pass runs on a copy and what it would remove or rewrite
+                // is recorded as not applied.
+                let mut policed = response_json.clone();
+                let (names, infos, mods) = response_blocks::apply_response_policy_json(
+                    &mut policed,
+                    self.upstream_api_version,
+                    &effective_tool_rules,
+                    &self.tenant_config.tool_field_profiles,
+                    &self.tenant_config.mcp.tool_names,
+                    model.as_deref(),
+                    app_id_for_policy,
+                    &self.meta.withheld_tools,
+                );
+                if !mods.is_empty() {
+                    transform_state.badges.add(crate::audit::AuditBadge::ModifiedNotApplied);
+                    transform_state.tool_arg_modifications.extend(
+                        mods.into_iter().map(|m| crate::proxy::content::ToolArgModification { not_applied: true, ..m }),
+                    );
+                }
+                for name in names {
+                    transform_state.badges.add_tool_block_not_applied(crate::audit::Phase::Response, name);
+                }
+                transform_state.response_blocked_tools.extend(
+                    infos.into_iter().map(|info| crate::proxy::content::BlockedToolInfo { not_applied: true, ..info }),
+                );
+            } else if response_policy_acts {
                 let (rsp_blocked_names, rsp_blocked_infos, rsp_arg_mods) =
                     response_blocks::apply_response_policy_json(
                         &mut response_json,
@@ -5804,7 +5839,8 @@ fn police_replayed_answer(
     }
     ts.response_blocked_tools
         .extend(blocked_infos.into_iter().map(|info| crate::proxy::content::BlockedToolInfo { not_applied: true, ..info }));
-    ts.tool_arg_modifications.extend(arg_mods);
+    ts.tool_arg_modifications
+        .extend(arg_mods.into_iter().map(|m| crate::proxy::content::ToolArgModification { not_applied: true, ..m }));
 }
 
 /// The HTTP status of an answer carrying an error: the one the error names

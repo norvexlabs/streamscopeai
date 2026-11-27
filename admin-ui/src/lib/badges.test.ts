@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { dedupeBadgesByCode, needsAttention, turnScopedBadges, type AuditBadge } from '#lib/badges.js';
+import fc from 'fast-check';
+import {
+	BADGE_REGISTRY,
+	badgeFilterGroups,
+	dedupeBadgesByCode,
+	needsAttention,
+	offeredBadgeFilter,
+	parseBadgeFilter,
+	turnScopedBadges,
+	type AuditBadge,
+	type BadgeCode,
+} from '#lib/badges.js';
 
 /**
  * The two badge collapsers decide what an operator sees on an audit row.
@@ -110,4 +121,62 @@ describe('needsAttention', () => {
     expect(needsAttention({ code: 'unpriced' })).toBe(true);
     expect(needsAttention({ code: 'spilled' })).toBe(false);
   });
+});
+
+const CODES = Object.keys(BADGE_REGISTRY) as BadgeCode[];
+const FILTERABLE = CODES.filter((c) => BADGE_REGISTRY[c].family !== 'alert');
+
+describe('parseBadgeFilter', () => {
+	it('reads the known codes it names, in order, once each', () => {
+		expect(parseBadgeFilter(' guardrail,,tool_blocked,guardrail ')).toEqual(['guardrail', 'tool_blocked']);
+		expect(parseBadgeFilter('')).toEqual([]);
+		expect(parseBadgeFilter(undefined)).toEqual([]);
+	});
+
+	it('drops what the filter never sends: an unknown code, an alert, a prototype key', () => {
+		expect(parseBadgeFilter('nope,session_alert,agent_alert,constructor,toString,__proto__,tool_loop')).toEqual(['tool_loop']);
+	});
+
+	// The value comes from the URL: whatever it holds, the parse yields only
+	// filterable codes, never one twice, and every filterable code it names
+	// survives (positive control: the parse is not simply empty).
+	it('yields exactly the filterable codes a value names', () => {
+		fc.assert(
+			fc.property(fc.array(fc.oneof(fc.constantFrom(...CODES), fc.string())), (tokens) => {
+				const out = parseBadgeFilter(tokens.join(','));
+				expect(new Set(out).size).toBe(out.length);
+				for (const c of out) expect(FILTERABLE).toContain(c);
+				for (const t of tokens.map((x) => x.trim())) {
+					if ((FILTERABLE as string[]).includes(t)) expect(out).toContain(t);
+				}
+			}),
+		);
+	});
+});
+
+describe('badgeFilterGroups', () => {
+	it('offers every filterable code once across all kinds, and no alert', () => {
+		const offered = badgeFilterGroups(['llm', 'mcp', 'web', 'a2a']).flatMap((g) => g.codes);
+		expect(new Set(offered).size).toBe(offered.length);
+		expect([...offered].sort()).toEqual([...FILTERABLE].sort());
+	});
+
+	it('narrows to the codes a kind can carry', () => {
+		const mcp = badgeFilterGroups(['mcp']).flatMap((g) => g.codes);
+		expect(mcp).toContain('mcp_rpc_error');
+		expect(mcp).toContain('tool_blocked');
+		expect(mcp).not.toContain('cache_hit');
+		const llm = badgeFilterGroups(['llm']).flatMap((g) => g.codes);
+		expect(llm).toContain('cache_hit');
+		expect(llm).not.toContain('mcp_rpc_error');
+	});
+});
+
+describe('offeredBadgeFilter', () => {
+	it('keeps only the codes the listed kinds can carry', () => {
+		expect(offeredBadgeFilter('cache_hit,mcp_rpc_error', ['mcp'])).toEqual(['mcp_rpc_error']);
+		expect(offeredBadgeFilter('cache_hit,mcp_rpc_error', ['llm'])).toEqual(['cache_hit']);
+		expect(offeredBadgeFilter('cache_hit,mcp_rpc_error', ['llm', 'mcp'])).toEqual(['cache_hit', 'mcp_rpc_error']);
+		expect(offeredBadgeFilter('session_alert,nope', ['llm', 'mcp', 'web', 'a2a'])).toEqual([]);
+	});
 });

@@ -263,7 +263,7 @@ gateway within a couple of seconds.
 
 **You're set up when** a client request appears on the dashboard and replays under Sessions. From
 here, layer on governance as you need it — **tool policy** to block or rewrite risky agent tool
-calls (step 7), **transforms** to redact or inject content, and the **experts** that watch your
+calls (step 7; it starts in Observe, recording what it would do, until you switch it to Enforce), **transforms** to redact or inject content, and the **experts** that watch your
 traffic and propose rules automatically (step 8). The **MCP gateway** (step 5) and **web
 search/fetch** (step 6) extend the same auth, audit, and policy to Model-Context-Protocol traffic
 when you want them.
@@ -2396,13 +2396,26 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
   "block" a reply, because by then the remote agent has already done the work; rewriting (or
   dropping) the content is how you withhold it. A refused call gets a clear "blocked by policy"
   error naming the rule, and is recorded with everything else.
-- **Default posture** — out of the box the highest-confidence rules ship in **block**
-  mode: reads or writes of credential files (`/etc/passwd`, `/etc/shadow`, SSH / cloud /
-  cluster keys), destructive commands (`rm -rf /`, `mkfs`, `DROP TABLE`), reverse shells,
-  and cloud-metadata / paste-site exfiltration. Everything operationally legitimate but
-  risky — package installs, ordinary file/DB writes, `sudo`, `ssh`, deployments, broad
-  `/etc` reads — ships in **classify** (observe) so it's flagged but allowed; tighten any
-  of these to **block** when you're ready.
+- **Default posture** — the highest-confidence rules ship as **block** rules: reads or
+  writes of credential files (`/etc/passwd`, `/etc/shadow`, SSH / cloud / cluster keys),
+  destructive commands (`rm -rf /`, `mkfs`, `DROP TABLE`), reverse shells, and
+  cloud-metadata / paste-site exfiltration. Everything operationally legitimate but risky —
+  package installs, ordinary file/DB writes, `sudo`, `ssh`, deployments, broad `/etc`
+  reads — ships as **classify** so it's flagged but allowed; tighten any of these to
+  **block** when you're ready.
+- **Observe, then Enforce** — every tool-policy profile runs in one of two **modes**, chosen at
+  the top of its page. In **Observe**, a block or rewrite rule that matches is recorded and
+  nothing else: the call goes through as sent, and its audit entry carries **Would block** (or
+  **Not applied** for a rewrite) naming the rule, and for a rewrite what it would have sent
+  instead — on model tool calls, MCP requests and agent calls alike. In **Enforce**, the same
+  rules refuse and rewrite. Classify rules and web substitution act the same in both modes.
+  **Every organisation's tool policy observes until an administrator switches it to Enforce**
+  (an existing organisation as much as a new one): let it run for a while, review what it caught
+  (the banner on the profile links to the Requests list filtered to the entries recorded as not
+  applied across the organisation), adjust the rules, then switch the profile to **Enforce** —
+  the console asks you to confirm, naming how many rules will start blocking and rewriting. A
+  Layered profile follows the Default's mode unless you set one on it; a new Standalone profile
+  starts in Observe.
 - **Profiles** (the first tab) — a card list of tool-policy profiles. The **Default**
   profile is the shared base every other profile builds on; create a named profile to give a
   workspace different rules. When you create one you choose how it relates to the Default:
@@ -2410,8 +2423,12 @@ A unified risk-rule engine gates LLM tool calls, MCP `tools/call` / `resources/r
   from a Default rule by *forking* it; delete the fork to revert) or **Standalone**
   (independent — start from the built-in defaults or blank). **Open a card to edit its rules**
   (a full-page editor); the Default (and any Standalone) has a **Reset to seed** button to
-  restore the built-in defaults. A workspace selects a profile in step 3.7 (unset = the
-  Default).
+  restore the built-in defaults (its mode is kept). Each card shows **Observe** when the
+  profile observes (**Observe (Default)** when it follows an observing Default). **Set as
+  default** keeps the mode the Default ran in, so no workspace following it changes
+  behaviour; the promoted profile's own workspaces move to that mode, and the console asks
+  first when that changes how they run. A workspace selects a profile in step 3.7 (unset = the Default); the picker
+  marks an observing profile.
 - **Detectors** — a rule condition normally matches a pattern you write (a glob, a regex, a list
   of keywords). For shapes no single readable pattern captures, pick **detector** as the
   condition's comparison and choose one of the built-in detectors instead. Each reads the
@@ -2735,8 +2752,17 @@ admin-console only (read-only accounts see them too).
   split to show: a second of audio is an input for transcription and an output for
   speech-to-text, so it belongs to whichever one the request used, not to a fixed column.
 - **Audit** (`/audit`) — every request, 100% coverage including auth failures, rate-limit rejections,
-  and upstream errors. Filter by user, app/client, status, period, workspace, and **kind**
-  (`llm` / `mcp` / `web` / `a2a`); open a row for the full trace. Content (request/response bodies)
+  and upstream errors. Filter by user, app/client, status, period, workspace, API key, and **kind**
+  (`llm` / `mcp` / `web` / `a2a`); open a row for the full trace. **Badges** lists the requests
+  carrying any of the badges you pick — grouped by family (policy and tools, guardrail, translation
+  and routing, cache, capacity and cost, web, MCP, record), each with a line saying what it means
+  and what to do about it, and narrowed to the badges the chosen kind can carry; a picked badge is
+  then shown on every row it matched, beside the attention badges. **Sort** orders a
+  single kind by a figure, largest first and newest first among equals: **Slowest** on any one kind,
+  **Most expensive** and **Most tokens** on LLM requests (cost is compared as recorded, whatever
+  its currency), over a period of 31 days at most. With **All** kinds, a longer period, or while a
+  search term is set, the list stays newest first.
+  Content (request/response bodies)
   appears only when **Content Logging** is enabled. A row badged **Record Stripped** was too large
   for its gateway to deliver whole: who, when, status, tokens and cost are recorded; its structured
   payloads (parameters, results, diffs) are not, and long text may show only its size. A row badged
@@ -2745,7 +2771,15 @@ admin-console only (read-only accounts see them too).
   console could not store it. The request is recorded in full otherwise, and its trace and
   conversation show everything else; the missing content is simply absent.
 - **Sessions** (`/sessions`) — agentic conversations grouped into sessions and **replayed**
-  turn-by-turn: messages, tool calls, thinking/reasoning blocks, and media, rendered the same way the
+  turn-by-turn. A session row shows the attention badges its model turns carried (a guardrail
+  finding, a blocked tool, a tool loop, an unpriced model…), up to three and a count of the rest;
+  click one to list the sessions carrying it, or pick several in **Badges** (any of them matches, and
+  each picked badge shows on the rows it matched;
+  a session shows the badges of the turns recorded since the console keeps them, its older turns'
+  not). The alert badges are not in the picker: **Alert** filters by them. **Sort** lists the
+  newest, the oldest, the most severe alerts, the most turns, the most expensive (as recorded,
+  whatever its currency) or the most tokens first — the last three over 31 days at most; under a
+  search term only newest and oldest apply. Each session shows messages, tool calls, thinking/reasoning blocks, and media, rendered the same way the
   gateway saw them. A message that cites sources (an Anthropic answer's web-search or document
   citations, an OpenAI answer's web-page and file annotations, or such an answer sent back in a
   conversation's history) carries a collapsed **Sources** list: each source's title or link, the file it

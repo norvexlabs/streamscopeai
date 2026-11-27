@@ -115,6 +115,11 @@ pub struct ConfigResponse {
     /// a Layered profile as `Default ⊕ own` vs a Standalone as `own`. The Default
     /// profile itself is `standalone = true` (it is the base).
     pub profile_modes: Vec<(uuid::Uuid, streamscope_core::config::ProfileKind, bool)>,
+    /// `(profile_id, mode)` — each tool profile's own Observe / Enforce value
+    /// (`profiles.tool_enforcement`); a profile absent here has none (a Layered
+    /// profile then follows the Default). Resolved by the proxy with
+    /// [`Self::profile_modes`] and [`Self::default_profiles`].
+    pub tool_profile_enforcement: Vec<(uuid::Uuid, streamscope_core::config::tool_enforcement::ToolEnforcement)>,
     /// The tenant's default agent loop guard (its `system_settings` keys,
     /// resolved; an unset key takes the built-in default).
     pub loop_guard: streamscope_core::config::loop_guard::LoopGuardSettings,
@@ -465,6 +470,7 @@ impl ConfigResponse {
         self.workspace_profiles.sort();
         self.default_profiles.sort();
         self.profile_modes.sort();
+        self.tool_profile_enforcement.sort();
         for classes in self.qos.route_classes.values_mut() {
             classes.sort();
         }
@@ -548,6 +554,7 @@ mod tests {
             "workspace_profiles": [[uuid(2), "tools", null], [uuid(1), "tools", uuid(5)], [uuid(1), "guardrail", null]],
             "default_profiles": [["tools", uuid(7)], ["guardrail", uuid(6)]],
             "profile_modes": [[uuid(5), "tools", true], [uuid(4), "tools", false]],
+            "tool_profile_enforcement": [[uuid(7), "observe"], [uuid(5), "enforce"]],
             "loop_guard": { "mode": "observe", "nudge_at": 3, "stop_at": 8 },
             "workspace_loop_guard": { uuid(2).to_string(): { "mode": "off", "nudge_at": 3, "stop_at": 8 } },
             "qos": { "route_classes": { uuid(1).to_string(): [uuid(3), uuid(1), uuid(2)] } },
@@ -581,6 +588,7 @@ mod tests {
             shuffle(&mut shuffled.workspace_profiles, seed ^ 5);
             shuffle(&mut shuffled.default_profiles, seed ^ 6);
             shuffle(&mut shuffled.profile_modes, seed ^ 7);
+            shuffle(&mut shuffled.tool_profile_enforcement, seed ^ 10);
             for classes in shuffled.qos.route_classes.values_mut() {
                 shuffle(classes, seed ^ 8);
             }

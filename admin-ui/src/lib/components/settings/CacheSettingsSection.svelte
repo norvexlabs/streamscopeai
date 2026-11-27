@@ -398,7 +398,7 @@
           <TextInput
             id="cache-embedding-alias"
             bind:value={embeddingAlias}
-            list="cache-embedding-alias-options"
+            suggestions={aliasOptions.map((o) => ({ value: o.alias, label: o.verified ? 'known embedding model' : undefined }))}
             placeholder="e.g. text-embedding-3-small"
           />
           <button
@@ -409,11 +409,6 @@
             {probing ? 'Checking…' : 'Check'}
           </button>
         </div>
-        <datalist id="cache-embedding-alias-options">
-          {#each aliasOptions as opt (opt.alias)}
-            <option value={opt.alias} label={opt.verified ? 'known embedding model' : ''}></option>
-          {/each}
-        </datalist>
       </FormField>
       {#if probeResult}
         <Callout

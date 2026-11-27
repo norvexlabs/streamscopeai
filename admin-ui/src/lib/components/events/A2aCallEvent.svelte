@@ -44,7 +44,7 @@
     error_code?: number | null;
     error_message?: string | null;
     latency_ms?: number | null;
-    blocked?: { rule_id?: string | null; rule_title?: string | null; reason: string; phase: string } | null;
+    blocked?: { rule_id?: string | null; rule_title?: string | null; reason: string; phase: string; not_applied?: boolean } | null;
     guardrails?: GuardrailInfo[];
     turn?: number;
   };
@@ -187,11 +187,11 @@
       </div>
     </button>
 
-    <!-- The call was refused: it is still shown (the caller really did attempt
-         it), with the rule that stopped it. -->
+    <!-- The call was refused — or, under an observing policy, would have been —
+         with the rule that matched it. -->
     {#if event.blocked}
       <div class="px-4 py-2 text-xs border-t border-(--warning-border) bg-(--warning-bg)">
-        <span class="font-semibold text-(--warning)">{m.event_a2a_blocked()}</span>
+        <span class="font-semibold text-(--warning)">{event.blocked.not_applied ? m.event_a2a_would_block() : m.event_a2a_blocked()}</span>
         <span class="text-(--text-secondary)">{event.blocked.rule_title ?? event.blocked.reason}</span>
       </div>
     {/if}

@@ -33,6 +33,9 @@
   import SelectInput from '#lib/components/forms/SelectInput.svelte';
   import Icon from '#lib/components/Icon.svelte';
   import ScopeFilters from '#lib/components/browse/ScopeFilters.svelte';
+  import BadgePicker from '#lib/components/filter/BadgePicker.svelte';
+  import { offeredBadgeFilter } from '#lib/badges.js';
+  import { FIGURE_SORT_MAX_DAYS, figureSortFits } from '#lib/browse/sort.js';
   import { m } from '#lib/paraglide/messages.js';
 
   interface Props {
@@ -61,6 +64,31 @@
   const period = useAuditPeriod(filters, applyFilters, { persist: p.persistPeriod });
   const pager = usePagination({ limit: 50 });
   const shortSearch = $derived(searchTooShort(filters.values.search));
+  const searching = $derived(!shortSearch && !!filters.values.search?.trim());
+
+  // A search pages its matches by time: under a term only `newest` and
+  // `oldest` are sent (the server refuses a rank with one).
+  const SORTS = ['oldest', 'alerts', 'turns', 'cost', 'tokens'] as const;
+  type Sort = (typeof SORTS)[number];
+  const sortLabel: Record<Sort, () => string> = {
+    oldest: m.browse_sort_oldest,
+    alerts: m.browse_sort_alerts,
+    turns: m.browse_sort_turns,
+    cost: m.browse_sort_cost,
+    tokens: m.browse_sort_tokens,
+  };
+  // A figure sorts every session of the window: offered only over a window
+  // the server serves it on.
+  const FIGURES: readonly Sort[] = ['turns', 'cost', 'tokens'];
+  const sortWindow = $derived(figureSortFits(period.value));
+  const unservable = (sort: Sort) => (searching && sort !== 'oldest') || (!sortWindow && FIGURES.includes(sort));
+  const sortSent = $derived.by(() => {
+    const v = oneOf(SORTS, filters.values.sort);
+    return v && !unservable(v) ? v : undefined;
+  });
+  /** The badge codes the list sends: those the picker shows ticked (a
+   *  session's codes are its LLM turns'). */
+  const badgesSent = $derived(offeredBadgeFilter(filters.values.badges, ['llm']).join(','));
 
   // Each row opens in the workspace being viewed (portal).
   setPortalWorkspace(() => filters.values.workspace_id || undefined);
@@ -94,6 +122,8 @@
       start,
       end,
       alert_level: alertLevel,
+      badges: badgesSent || undefined,
+      sort: sortSent,
       linked: listLinkage(oneOf(LINKAGE_CHOICES, v.linked), shortSearch ? undefined : v.search?.trim() || undefined, alertLevel),
       limit: pager.limit,
       offset: pager.offset,
@@ -128,6 +158,12 @@
     } finally {
       if (gen === loadGen) loading = false;
     }
+  }
+
+  /** A session row's badge chip: list the sessions carrying that badge. */
+  function filterByBadge(code: string) {
+    filters.values.badges = code;
+    void applyFilters();
   }
 
   function handleFilterKeydown(e: KeyboardEvent) {
@@ -255,6 +291,19 @@
         <option value="unlinked">{m.browse_linked_unlinked()}</option>
       </SelectInput>
     </FilterField>
+    <!-- The badges a session's LLM turns carried, any of them. -->
+    <BadgePicker bind:value={filters.values.badges} surfaces={['llm']} onchange={applyFilters} />
+    <FilterField label={m.browse_sort()} class="min-w-32.5">
+      <SelectInput
+        bind:value={filters.values.sort}
+        onchange={applyFilters}
+        title={searching ? m.browse_sort_with_search() : !sortWindow ? m.browse_sort_needs_window({ days: FIGURE_SORT_MAX_DAYS }) : undefined}>
+        <option value="">{m.browse_sort_newest()}</option>
+        {#each SORTS as sort (sort)}
+          <option value={sort} disabled={unservable(sort)}>{sortLabel[sort]()}</option>
+        {/each}
+      </SelectInput>
+    </FilterField>
     <button
       onclick={clearFilters}
       class="px-3 py-1.5 border border-(--border) rounded-lg text-(--text-secondary) text-sm hover:text-(--text-primary) transition-colors"
@@ -299,6 +348,8 @@
     expand={canExpand(nested, depth, session.links?.sub_agents)
       ? { open: session.session_id in expanded, toggle: () => void toggle(session) }
       : undefined}
+    onbadge={filterByBadge}
+    filtered={badgesSent ? badgesSent.split(',') : []}
   />
   <!-- Only a row that offers the toggle shows its sub-agents: below the depth
        cap a session open elsewhere (a link cycle) renders nothing more. -->

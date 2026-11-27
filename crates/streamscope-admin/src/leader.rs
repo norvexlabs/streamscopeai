@@ -95,21 +95,23 @@ pub async fn release_leader(mut conn: MaintenanceConn, lock_id: i64) {
     }
 }
 
-/// Insert a manual agent trigger request.
-pub async fn insert_agent_trigger(pool: &Db, tenant_id: Option<uuid::Uuid>) {
-    let _ = sqlx::query(
+/// Insert a manual agent trigger request for one tenant.
+pub async fn insert_agent_trigger(pool: &Db, tenant_id: uuid::Uuid) -> sqlx::Result<()> {
+    sqlx::query(
         "INSERT INTO agent_trigger_requests (tenant_id) VALUES ($1)",
     )
     .bind(tenant_id)
     .execute(pool.global(Global::Infra))
-    .await;
+    .await
+    .map(|_| ())
 }
 
-/// Check if there are pending agent trigger requests and drain them.
-/// Returns tenant IDs (None = all tenants).
-pub async fn drain_agent_triggers(pool: &Db) -> Vec<Option<uuid::Uuid>> {
-    sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-        "DELETE FROM agent_trigger_requests RETURNING tenant_id",
+/// Drain the pending agent trigger requests: the tenants they name. A request
+/// naming no tenant is drained and runs nothing.
+pub async fn drain_agent_triggers(pool: &Db) -> Vec<uuid::Uuid> {
+    sqlx::query_scalar::<_, uuid::Uuid>(
+        "WITH drained AS (DELETE FROM agent_trigger_requests RETURNING tenant_id) \
+         SELECT tenant_id FROM drained WHERE tenant_id IS NOT NULL",
     )
     .fetch_all(pool.global(Global::Infra))
     .await

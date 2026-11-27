@@ -387,9 +387,9 @@ export function errorCategoryColor(category: string): string {
 
 /** Convert period days to ISO date range. Output uses the canonical
  * `start`/`end` field names that every analytics-shaped endpoint accepts. */
-export function daysToDateRange(days: number): { start: string; end: string } {
-  const end = new Date();
-  const start = new Date();
+export function daysToDateRange(days: number, now: Date = new Date()): { start: string; end: string } {
+  const end = new Date(now);
+  const start = new Date(now);
   start.setDate(start.getDate() - days);
   return { start: start.toISOString(), end: end.toISOString() };
 }

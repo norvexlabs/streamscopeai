@@ -5447,6 +5447,7 @@ mod tests {
             interval_secs: 60,
             session_cooldown_mins: 0,
             run_window: None,
+            last_cycle_at: None,
         }
     }
 

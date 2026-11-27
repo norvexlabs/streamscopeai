@@ -74,6 +74,30 @@ pub struct AgentConfig {
     /// with a log line. Lets operators reserve agent load for off-hours on
     /// shared on-premise LLMs.
     pub run_window: Option<RunWindow>,
+    /// When this tenant's last cycle ended (`agent_last_cycle_at`), on any
+    /// admin-api replica.
+    pub last_cycle_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl AgentConfig {
+    /// Seconds until an untriggered cycle is due — 0 once `interval_secs`
+    /// have passed since the tenant's last cycle ended, wherever it ran. Every
+    /// replica's loop wakes on its own, and one that takes the leader lock
+    /// after another's cycle would otherwise run the tenant again at once. A
+    /// stamp more than one interval ahead of this clock was written by a clock
+    /// that ran ahead: it is due rather than holding analysis back until real
+    /// time catches up. Replicas whose clocks differ by more than the interval
+    /// therefore each find the other's stamp due and run the tenant in turn:
+    /// the gate assumes clocks kept within an interval of each other (NTP).
+    pub fn secs_until_due(&self, now: chrono::DateTime<chrono::Utc>) -> u64 {
+        let Some(last) = self.last_cycle_at else { return 0 };
+        let interval = i64::try_from(self.interval_secs).unwrap_or(i64::MAX);
+        let elapsed = now.signed_duration_since(last).num_seconds();
+        if elapsed < -interval {
+            return 0;
+        }
+        u64::try_from(interval.saturating_sub(elapsed.max(0))).unwrap_or(0)
+    }
 }
 
 /// A UTC-hour window during which the agent is allowed to run.
@@ -188,6 +212,9 @@ impl AgentConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_AGENT_SESSION_COOLDOWN_MINS),
             run_window,
+            last_cycle_at: get("agent_last_cycle_at")
+                .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+                .map(|t| t.with_timezone(&chrono::Utc)),
         })
     }
 }
@@ -490,10 +517,11 @@ pub fn spawn_agent_task(
 
             let any_enabled = Arc::new(AtomicBool::new(false));
             // Sleep the SHORTEST configured interval across enabled tenants, so a
-            // tenant asking for a fast cadence is honored (extra wakeups for
-            // slower tenants are cheap no-ops — their own watermark/cooldown gate
-            // work). Seeded with the sentinel so "no enabled tenant" falls back
-            // to the default below.
+            // tenant asking for a fast cadence is honored (a wakeup before a
+            // slower tenant's interval has passed skips it, and the wait is
+            // then until it is due: `secs_until_due`).
+            // Seeded with the sentinel so "no enabled tenant" falls back to the
+            // default below.
             let min_interval = Arc::new(AtomicU64::new(u64::MAX));
 
             // Try to acquire leader lock. Non-leaders sleep and retry.
@@ -507,16 +535,11 @@ pub fn spawn_agent_task(
                     continue;
                 };
 
-                // Check for manual triggers (drain them). Trigger entries are
-                // either `Some(tenant_id)` for tenant-targeted runs or `None`
-                // for "all tenants" — collect both into the set so the
-                // per-tenant closure can bypass the run-window restriction
-                // for explicitly triggered tenants.
+                // Drain the manual triggers: each names one tenant, which then
+                // runs whatever its interval and run window.
                 let triggers = crate::leader::drain_agent_triggers(&state.db).await;
-                let triggered_all = triggers.iter().any(|t| t.is_none());
                 let triggered_tenants: std::collections::HashSet<uuid::Uuid> =
-                    triggers.into_iter().flatten().collect();
-                let triggered_all = std::sync::Arc::new(triggered_all);
+                    triggers.into_iter().collect();
                 let triggered_tenants = std::sync::Arc::new(triggered_tenants);
 
                 // Run per-tenant analysis cycle
@@ -525,7 +548,6 @@ pub fn spawn_agent_task(
                     let client = client.clone();
                     let any_enabled = any_enabled.clone();
                     let min_interval = min_interval.clone();
-                    let triggered_all = triggered_all.clone();
                     let triggered_tenants = triggered_tenants.clone();
                     async move {
                         let tenant_id = db.tenant_uuid();
@@ -550,8 +572,17 @@ pub fn spawn_agent_task(
                         // Manual "Run Now" triggers bypass the run window —
                         // operators clicking the button explicitly want a cycle
                         // regardless of off-hours scheduling.
-                        let manually_triggered =
-                            *triggered_all || triggered_tenants.contains(&tenant_id);
+                        let manually_triggered = triggered_tenants.contains(&tenant_id);
+
+                        if !manually_triggered {
+                            let wait = config.secs_until_due(chrono::Utc::now());
+                            if wait > 0 {
+                                // Wake when it is due, not a whole interval later.
+                                min_interval.fetch_min(wait, Ordering::Relaxed);
+                                tracing::debug!(%tenant_id, wait, "agent skipping tenant — its interval has not passed since its last cycle");
+                                return Ok(());
+                            }
+                        }
 
                         if let Some(window) = config.run_window
                             && !manually_triggered
@@ -694,5 +725,33 @@ mod run_window_tests {
         assert_eq!(resolve_interval_secs(5), AGENT_MIN_INTERVAL_SECS);
         // A normal value passes through.
         assert_eq!(resolve_interval_secs(600), 600);
+    }
+
+    #[test]
+    fn a_cycle_is_due_once_its_interval_has_passed_since_the_last_one() {
+        let last = chrono::DateTime::parse_from_rfc3339("2026-11-26T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let config = |last_cycle_at| super::AgentConfig {
+            proxy_url: String::new(),
+            api_key: String::new(),
+            app_id: String::new(),
+            interval_secs: 3600,
+            session_cooldown_mins: 0,
+            run_window: None,
+            last_cycle_at,
+        };
+        let at = |secs| last + chrono::TimeDelta::seconds(secs);
+        // Never run: due.
+        assert_eq!(config(None).secs_until_due(at(0)), 0);
+        // Both sides of the interval.
+        assert_eq!(config(Some(last)).secs_until_due(at(3599)), 1);
+        assert_eq!(config(Some(last)).secs_until_due(at(3600)), 0);
+        assert_eq!(config(Some(last)).secs_until_due(at(9000)), 0);
+        // Right after a cycle another replica ran: due a whole interval later.
+        assert_eq!(config(Some(last)).secs_until_due(at(1)), 3599);
+        // A stamp a little ahead of this clock (replica skew): a whole interval.
+        assert_eq!(config(Some(last)).secs_until_due(at(-5)), 3600);
+        // Both sides of a stamp one interval ahead: beyond it, a clock that ran ahead.
+        assert_eq!(config(Some(last)).secs_until_due(at(-3600)), 3600);
+        assert_eq!(config(Some(last)).secs_until_due(at(-3601)), 0);
     }
 }

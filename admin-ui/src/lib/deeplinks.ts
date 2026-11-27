@@ -21,7 +21,9 @@
 export const AUDIT_FILTER_KEYS = [
   // Cross-kind (applied on every arm; `has_guardrail` ignored on MCP).
   'user_email', 'user_id', 'workspace_ids', 'app_id', 'error_category',
-  'search', 'kind', 'jti', 'has_guardrail',
+  'search', 'kind', 'jti', 'has_guardrail', 'badges', 'key_id',
+  // The page's order (`latency` under one kind; `cost` / `tokens` under `llm`).
+  'sort',
   // LLM-only.
   'model', 'finish_reason', 'upstream_server', 'api_version', 'media_type', 'has_blocked',
   // Web-only.
@@ -60,6 +62,7 @@ export function auditHref(params: Partial<Record<AuditLinkKey, string | null>>):
  *  come from `PERIOD_FILTER_KEYS`. */
 export const SESSIONS_FILTER_KEYS = [
   'user_email', 'user_id', 'workspace_ids', 'app_id', 'model', 'search', 'alert_level', 'linked',
+  'badges', 'sort',
 ] as const;
 
 export type SessionsFilterKey = (typeof SESSIONS_FILTER_KEYS)[number];

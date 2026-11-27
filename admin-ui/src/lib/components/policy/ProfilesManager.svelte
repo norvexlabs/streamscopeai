@@ -2,7 +2,7 @@
   import { untrack } from 'svelte';
   import { adminApi } from '#lib/api-client.js';
   import { extractError, extractErrorCode } from '#lib/api-helpers.js';
-  import { profileLists, type ProfileListKind } from '#lib/scope.svelte.js';
+  import { profileLists, profileLite, type ProfileListKind } from '#lib/scope.svelte.js';
   import type { components } from '#lib/generated/api-types.js';
   import { toast } from '#lib/toast.svelte.js';
   import Modal from '#lib/components/Modal.svelte';
@@ -16,6 +16,7 @@
   import { fetchAllPages } from '#lib/api-helpers.js';
   import { profileUsage, usedByLabel } from '#lib/profileUsage.js';
   import { PROFILE_KINDS, profileCount } from '#lib/profileKinds.js';
+  import type { ToolEnforcementChoice } from '#lib/toolEnforcement.js';
 
   type Profile = components['schemas']['Profile'];
 
@@ -76,7 +77,7 @@
     } else {
       profiles = data?.items ?? [];
       // Keep the shared profile list (drives the workspace pickers) in sync.
-      profileLists.land(read, profiles.map((p) => ({ id: p.id, name: p.name, is_default: p.is_default })));
+      profileLists.land(read, profiles.map(profileLite));
       if (isClientAccess) void loadUsage(profiles);
     }
     loading = false;
@@ -98,6 +99,24 @@
    *  for standalone (a layered profile already has the Default beneath it). */
   let startSource = $state('blank');
   let creating = $state(false);
+  /** Tool policy only: the new profile's mode. A Layered one follows the
+   *  Default unless the admin picks one; a Standalone one starts observing. */
+  let newEnforcement = $state<ToolEnforcementChoice>('follow');
+  const isTools = $derived(kind === 'tools');
+
+  // A Standalone profile cannot follow: 'follow' becomes Observe while it is
+  // Standalone, and comes back if the admin returns to Layered without
+  // choosing a mode of their own meanwhile.
+  let enforcementForced = $state(false);
+  $effect(() => {
+    if (newMode === 'standalone' && newEnforcement === 'follow') {
+      newEnforcement = 'observe';
+      enforcementForced = true;
+    } else if (newMode === 'layered' && enforcementForced) {
+      newEnforcement = 'follow';
+      enforcementForced = false;
+    }
+  });
 
   // A layered profile can't start from the seed (it would duplicate the Default).
   $effect(() => {
@@ -113,6 +132,8 @@
     } else {
       newMode = 'layered'; startSource = 'blank';
     }
+    newEnforcement = 'follow';
+    enforcementForced = false;
     showCreate = true;
   }
 
@@ -135,6 +156,7 @@
         name: newName.trim(),
         description: newDescription.trim() || null,
         start_from,
+        tool_enforcement: isTools && newEnforcement !== 'follow' ? newEnforcement : undefined,
       },
     });
     creating = false;
@@ -179,8 +201,18 @@
   // Portal & clients asks first: the switch reaches every developer of the
   // workspaces on the Default at their next provision, sync or run.
   let confirmDefault = $state<Profile | null>(null);
+  /** Tool policy: the mode the promoted profile's own workspaces move to —
+   *  the new Default runs in the old Default's mode — when it differs from the
+   *  one they run in now. */
+  function modeChangeOnPromotion(p: Profile): string | null {
+    if (!isTools) return null;
+    const base = profiles.find((d) => d.is_default)?.effective_tool_enforcement;
+    if (!base || base === p.effective_tool_enforcement) return null;
+    return base;
+  }
+  const promotionMode = $derived(confirmDefault ? modeChangeOnPromotion(confirmDefault) : null);
   function askDefault(p: Profile) {
-    if (isClientAccess) confirmDefault = p;
+    if (isClientAccess || modeChangeOnPromotion(p)) confirmDefault = p;
     else void setDefault(p);
   }
   async function setDefault(p: Profile) {
@@ -264,6 +296,10 @@
               {:else}
                 <span class="px-2 py-0.5 text-[10px] rounded-full bg-(--bg-secondary) text-(--text-secondary)">Layered</span>
               {/if}
+              {#if p.effective_tool_enforcement === 'observe'}
+                <span class="px-2 py-0.5 text-[10px] rounded-full bg-(--tag-blue-bg) text-(--tag-blue-text)" data-testid="profile-observe"
+                  title="Block and rewrite rules are recorded, not applied">{!p.tool_enforcement && !p.is_default && !p.standalone ? 'Observe (Default)' : 'Observe'}</span>
+              {/if}
             </div>
             {#if p.description}<p class="text-xs text-(--text-secondary) truncate">{p.description}</p>{/if}
             {#if isClientAccess && usage}
@@ -322,6 +358,17 @@
         {/each}
       </SelectInput>
     </FormField>
+    {#if isTools}
+    <FormField label="Mode" help="Observe records what block and rewrite rules would do, without applying them.">
+      <SelectInput bind:value={newEnforcement} onchange={() => (enforcementForced = false)}>
+        {#if newMode === 'layered'}
+          <option value="follow">Follow the Default</option>
+        {/if}
+        <option value="observe">Observe — record only, change nothing</option>
+        <option value="enforce">Enforce — block and rewrite</option>
+      </SelectInput>
+    </FormField>
+    {/if}
     {/if}
     <div class="flex justify-end gap-2">
       <button onclick={() => (showCreate = false)} class="px-4 py-1.5 text-sm rounded-lg text-(--text-secondary) hover:text-(--text-primary)">Cancel</button>
@@ -355,7 +402,9 @@
 <ConfirmDialog
   open={!!confirmDefault}
   title="Set as default"
-  message={`Make ${confirmDefault?.name ?? 'this profile'} the Default? Every workspace with no profile of its own, and the Agent and Inline AI workspaces, follow its clients and sandbox rules at their developers' next provision, sync or run; the portal Quickstart follows on its next load.`}
+  message={isClientAccess
+    ? `Make ${confirmDefault?.name ?? 'this profile'} the Default? Every workspace with no profile of its own, and the Agent and Inline AI workspaces, follow its clients and sandbox rules at their developers' next provision, sync or run; the portal Quickstart follows on its next load.`
+    : `Make ${confirmDefault?.name ?? 'this profile'} the Default? The Default keeps its mode, so ${confirmDefault?.name ?? 'this profile'} will run in ${promotionMode === 'observe' ? 'Observe — its block and rewrite rules recorded, not applied' : 'Enforce — its block and rewrite rules applied'} in the workspaces that use it.`}
   confirmLabel="Set as default"
   onconfirm={() => confirmDefault && setDefault(confirmDefault)}
   oncancel={() => (confirmDefault = null)}

@@ -28,11 +28,7 @@
     placeholder?: string;
   } = $props();
 
-  // Per-instance, because several of these render side by side (the conversion
-  // table) and a shared `<datalist>` id would leave every input pointing at the
-  // first one's element.
-  const uid = $props.id();
-  const listId = `iso4217-${uid}`;
+  const suggestions = COMMON_CURRENCIES.map((code) => ({ value: code }));
 
   // Canonicalise on commit rather than per keystroke: rewriting the value on
   // every `input` event fights the same element's `bind:value` and moves the
@@ -50,14 +46,9 @@
   {placeholder}
   bind:value
   mono
-  list={listId}
+  {suggestions}
   maxlength={3}
   autocapitalize="characters"
   spellcheck={false}
   onchange={normalize}
 />
-<datalist id={listId}>
-  {#each COMMON_CURRENCIES as code (code)}
-    <option value={code}></option>
-  {/each}
-</datalist>

@@ -71,10 +71,10 @@
       disabled={saving}
       onchange={(e) => assign((e.currentTarget as HTMLSelectElement).value)}
     >
-      <option value="inherit">Default (tenant default)</option>
+      <option value="inherit">Default (tenant default){profiles.find((p) => p.is_default)?.observing ? ' — Observe' : ''}</option>
       {#if allowOff}<option value="off">Off (no policy)</option>{/if}
       {#each profiles as p (p.id)}
-        {#if !p.is_default}<option value={p.id}>{p.name}</option>{/if}
+        {#if !p.is_default}<option value={p.id}>{p.name}{p.observing ? ' — Observe' : ''}</option>{/if}
       {/each}
     </SelectInput>
   </FormField>

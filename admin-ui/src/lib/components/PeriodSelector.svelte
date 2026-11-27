@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { PeriodValue } from '#lib/scope.svelte.js';
   import Icon from '#lib/components/Icon.svelte';
+  import DateInput from '#lib/components/forms/DateInput.svelte';
   import { m } from '#lib/paraglide/messages.js';
 
   const PRESET_DAYS = [1, 7, 30] as const;
@@ -41,8 +42,11 @@
     pickerOpen = true;
   }
 
+  // What a typed date must look like before it is applied.
+  const DAY = /^\d{4}-\d{2}-\d{2}$/;
+
   function applyAbsolute() {
-    if (!pickerStart || !pickerEnd) return;
+    if (applyDisabled) return;
     const startTs = new Date(`${pickerStart}T00:00:00Z`).toISOString();
     const endTs = new Date(`${pickerEnd}T23:59:59.999Z`).toISOString();
     pickerOpen = false;
@@ -50,7 +54,7 @@
   }
 
   const applyDisabled = $derived.by(() => {
-    if (!pickerStart || !pickerEnd) return true;
+    if (!DAY.test(pickerStart) || !DAY.test(pickerEnd)) return true;
     if (pickerEnd < pickerStart) return true;
     const todayIso = new Date().toISOString().slice(0, 10);
     if (pickerEnd > todayIso) return true;
@@ -117,21 +121,11 @@
       <div class="flex flex-col gap-2.5">
         <label class="flex flex-col gap-1 text-xs text-(--text-secondary)">
           {m.period_start()}
-          <input
-            type="date"
-            bind:value={pickerStart}
-            max={new Date().toISOString().slice(0, 10)}
-            class="px-2 py-1.5 rounded-sm border border-(--border) bg-(--bg-secondary) text-sm text-(--text-primary)"
-          />
+          <DateInput bind:value={pickerStart} max={new Date().toISOString().slice(0, 10)} />
         </label>
         <label class="flex flex-col gap-1 text-xs text-(--text-secondary)">
           {m.period_end()}
-          <input
-            type="date"
-            bind:value={pickerEnd}
-            max={new Date().toISOString().slice(0, 10)}
-            class="px-2 py-1.5 rounded-sm border border-(--border) bg-(--bg-secondary) text-sm text-(--text-primary)"
-          />
+          <DateInput bind:value={pickerEnd} max={new Date().toISOString().slice(0, 10)} />
         </label>
 
         <div class="flex items-center justify-between gap-2 pt-1.5 mt-1 border-t border-(--border)">

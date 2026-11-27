@@ -506,68 +506,169 @@ pub enum ToolLoopAction {
     StopSkipped,
 }
 
+/// Declares [`AuditBadgeCode`]: one variant per [`AuditBadge`] variant, its
+/// wire code, and the list of every code — one table, so the list and the
+/// spelling cannot disagree.
+macro_rules! badge_codes {
+    ($($variant:ident => $code:literal),+ $(,)?) => {
+        /// The `code` of an [`AuditBadge`] alone — what a badge filter names.
+        /// Append-only, like the badge codes it spells. Spelled by
+        /// `rename_all`, as [`AuditBadge`]'s tags are, so the published schema
+        /// names the same codes (a per-variant rename from a macro argument is
+        /// not seen by the schema derive); the table's `$code` must equal it
+        /// (locked by `a_badge_code_spells_the_stored_tag_of_every_variant`).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+        #[serde(rename_all = "snake_case")]
+        pub enum AuditBadgeCode {
+            $($variant),+
+        }
+
+        impl AuditBadgeCode {
+            /// Every code, in declaration order.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            /// The wire code, as the badge's `code` tag spells it.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $code),+
+                }
+            }
+        }
+    };
+}
+
+badge_codes! {
+    Modified => "modified",
+    ModifiedNotApplied => "modified_not_applied",
+    Compressed => "compressed",
+    JsonHealed => "json_healed",
+    Refusal => "refusal",
+    ToolBlocked => "tool_blocked",
+    ToolBlockedOverflow => "tool_blocked_overflow",
+    ToolBlockNotApplied => "tool_block_not_applied",
+    BlockOverflow => "block_overflow",
+    ScriptError => "script_error",
+    ProtocolTranslated => "protocol_translated",
+    CapabilityRerouted => "capability_rerouted",
+    Catchall => "catchall",
+    SanitizedToolNames => "sanitized_tool_names",
+    ResponseSanitizedToolNames => "response_sanitized_tool_names",
+    AgentAlert => "agent_alert",
+    SessionAlert => "session_alert",
+    McpRpcError => "mcp_rpc_error",
+    McpLegacySse => "mcp_legacy_sse",
+    McpSamplingIntercepted => "mcp_sampling_intercepted",
+    LlmSyntheticSampling => "llm_synthetic_sampling",
+    CacheHit => "cache_hit",
+    CacheObserveHit => "cache_observe_hit",
+    CacheStoreSkipped => "cache_store_skipped",
+    CacheSemanticSkipped => "cache_semantic_skipped",
+    Queued => "queued",
+    Spilled => "spilled",
+    Unpriced => "unpriced",
+    ToolLoop => "tool_loop",
+    UpstreamAdapted => "upstream_adapted",
+    WebBlocked => "web_blocked",
+    WebUrlFiltered => "web_url_filtered",
+    WebAllResultsFiltered => "web_all_results_filtered",
+    WebRateLimited => "web_rate_limited",
+    WebContentStripped => "web_content_stripped",
+    RecordStripped => "record_stripped",
+    ContentUnavailable => "content_unavailable",
+    WebSsrfRefused => "web_ssrf_refused",
+    WebSchemeRefused => "web_scheme_refused",
+    WebSubstitutedServer => "web_substituted_server",
+    WebSubstitutedClient => "web_substituted_client",
+    WebSubstitutionMaxIter => "web_substitution_max_iter",
+    WebSubstitutionToolError => "web_substitution_tool_error",
+    WebSubstitutionTruncatedStream => "web_substitution_truncated_stream",
+    WebSubstitutionMixedPending => "web_substitution_mixed_pending",
+    WebSubstitutionForwardFailed => "web_substitution_forward_failed",
+    WebSubstitutionSerializeFailed => "web_substitution_serialize_failed",
+    WebSubstitutionNonStreaming => "web_substitution_non_streaming",
+    WebSubstitutionHistoryCap => "web_substitution_history_cap",
+    WebSubstitutionCancelled => "web_substitution_cancelled",
+    WebSubstitutionMixedPendingSpliced => "web_substitution_mixed_pending_spliced",
+    WebSubstitutionMixedPendingSpliceFailed => "web_substitution_mixed_pending_splice_failed",
+    Guardrail => "guardrail",
+    GuardrailError => "guardrail_error",
+}
+
+impl std::str::FromStr for AuditBadgeCode {
+    type Err = String;
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|c| c.as_str() == raw)
+            .ok_or_else(|| format!("`{raw}` is not a badge code"))
+    }
+}
+
 impl AuditBadge {
     /// Stable wire `code` string for filtering/queries.
     pub fn code(&self) -> &'static str {
+        self.badge_code().as_str()
+    }
+
+    /// The code alone — what a filter names. An exhaustive match: a new
+    /// variant does not compile until it names its code.
+    pub fn badge_code(&self) -> AuditBadgeCode {
         match self {
-            Self::Modified => "modified",
-            Self::ModifiedNotApplied => "modified_not_applied",
-            Self::Compressed => "compressed",
-            Self::JsonHealed => "json_healed",
-            Self::Refusal => "refusal",
-            Self::ToolBlocked { .. } => "tool_blocked",
-            Self::ToolBlockedOverflow { .. } => "tool_blocked_overflow",
-            Self::ToolBlockNotApplied { .. } => "tool_block_not_applied",
-            Self::BlockOverflow { .. } => "block_overflow",
-            Self::ScriptError { .. } => "script_error",
-            Self::ProtocolTranslated { .. } => "protocol_translated",
-            Self::CapabilityRerouted { .. } => "capability_rerouted",
-            Self::Catchall => "catchall",
-            Self::SanitizedToolNames { .. } => "sanitized_tool_names",
-            Self::ResponseSanitizedToolNames { .. } => "response_sanitized_tool_names",
-            Self::AgentAlert { .. } => "agent_alert",
-            Self::SessionAlert { .. } => "session_alert",
-            Self::McpRpcError { .. } => "mcp_rpc_error",
-            Self::McpLegacySse => "mcp_legacy_sse",
-            Self::McpSamplingIntercepted => "mcp_sampling_intercepted",
-            Self::LlmSyntheticSampling => "llm_synthetic_sampling",
-            Self::CacheHit { .. } => "cache_hit",
-            Self::CacheObserveHit { .. } => "cache_observe_hit",
-            Self::CacheStoreSkipped { .. } => "cache_store_skipped",
-            Self::CacheSemanticSkipped { .. } => "cache_semantic_skipped",
-            Self::Queued { .. } => "queued",
-            Self::Spilled => "spilled",
-            Self::Unpriced => "unpriced",
-            Self::ToolLoop { .. } => "tool_loop",
-            Self::UpstreamAdapted { .. } => "upstream_adapted",
-            Self::WebBlocked => "web_blocked",
-            Self::WebUrlFiltered { .. } => "web_url_filtered",
-            Self::WebAllResultsFiltered => "web_all_results_filtered",
-            Self::WebRateLimited => "web_rate_limited",
-            Self::WebContentStripped { .. } => "web_content_stripped",
-            Self::RecordStripped { .. } => "record_stripped",
-            Self::ContentUnavailable => "content_unavailable",
-            Self::WebSsrfRefused => "web_ssrf_refused",
-            Self::WebSchemeRefused => "web_scheme_refused",
-            Self::WebSubstitutedServer { .. } => "web_substituted_server",
-            Self::WebSubstitutedClient { .. } => "web_substituted_client",
-            Self::WebSubstitutionMaxIter => "web_substitution_max_iter",
-            Self::WebSubstitutionToolError => "web_substitution_tool_error",
-            Self::WebSubstitutionTruncatedStream => "web_substitution_truncated_stream",
-            Self::WebSubstitutionMixedPending => "web_substitution_mixed_pending",
-            Self::WebSubstitutionForwardFailed => "web_substitution_forward_failed",
-            Self::WebSubstitutionSerializeFailed => "web_substitution_serialize_failed",
-            Self::WebSubstitutionNonStreaming => "web_substitution_non_streaming",
-            Self::WebSubstitutionHistoryCap => "web_substitution_history_cap",
-            Self::WebSubstitutionCancelled => "web_substitution_cancelled",
-            Self::WebSubstitutionMixedPendingSpliced { .. } => {
-                "web_substitution_mixed_pending_spliced"
-            }
-            Self::WebSubstitutionMixedPendingSpliceFailed { .. } => {
-                "web_substitution_mixed_pending_splice_failed"
-            }
-            Self::Guardrail { .. } => "guardrail",
-            Self::GuardrailError { .. } => "guardrail_error",
+            Self::Modified => AuditBadgeCode::Modified,
+            Self::ModifiedNotApplied => AuditBadgeCode::ModifiedNotApplied,
+            Self::Compressed => AuditBadgeCode::Compressed,
+            Self::JsonHealed => AuditBadgeCode::JsonHealed,
+            Self::Refusal => AuditBadgeCode::Refusal,
+            Self::ToolBlocked { .. } => AuditBadgeCode::ToolBlocked,
+            Self::ToolBlockedOverflow { .. } => AuditBadgeCode::ToolBlockedOverflow,
+            Self::ToolBlockNotApplied { .. } => AuditBadgeCode::ToolBlockNotApplied,
+            Self::BlockOverflow { .. } => AuditBadgeCode::BlockOverflow,
+            Self::ScriptError { .. } => AuditBadgeCode::ScriptError,
+            Self::ProtocolTranslated { .. } => AuditBadgeCode::ProtocolTranslated,
+            Self::CapabilityRerouted { .. } => AuditBadgeCode::CapabilityRerouted,
+            Self::Catchall => AuditBadgeCode::Catchall,
+            Self::SanitizedToolNames { .. } => AuditBadgeCode::SanitizedToolNames,
+            Self::ResponseSanitizedToolNames { .. } => AuditBadgeCode::ResponseSanitizedToolNames,
+            Self::AgentAlert { .. } => AuditBadgeCode::AgentAlert,
+            Self::SessionAlert { .. } => AuditBadgeCode::SessionAlert,
+            Self::McpRpcError { .. } => AuditBadgeCode::McpRpcError,
+            Self::McpLegacySse => AuditBadgeCode::McpLegacySse,
+            Self::McpSamplingIntercepted => AuditBadgeCode::McpSamplingIntercepted,
+            Self::LlmSyntheticSampling => AuditBadgeCode::LlmSyntheticSampling,
+            Self::CacheHit { .. } => AuditBadgeCode::CacheHit,
+            Self::CacheObserveHit { .. } => AuditBadgeCode::CacheObserveHit,
+            Self::CacheStoreSkipped { .. } => AuditBadgeCode::CacheStoreSkipped,
+            Self::CacheSemanticSkipped { .. } => AuditBadgeCode::CacheSemanticSkipped,
+            Self::Queued { .. } => AuditBadgeCode::Queued,
+            Self::Spilled => AuditBadgeCode::Spilled,
+            Self::Unpriced => AuditBadgeCode::Unpriced,
+            Self::ToolLoop { .. } => AuditBadgeCode::ToolLoop,
+            Self::UpstreamAdapted { .. } => AuditBadgeCode::UpstreamAdapted,
+            Self::WebBlocked => AuditBadgeCode::WebBlocked,
+            Self::WebUrlFiltered { .. } => AuditBadgeCode::WebUrlFiltered,
+            Self::WebAllResultsFiltered => AuditBadgeCode::WebAllResultsFiltered,
+            Self::WebRateLimited => AuditBadgeCode::WebRateLimited,
+            Self::WebContentStripped { .. } => AuditBadgeCode::WebContentStripped,
+            Self::RecordStripped { .. } => AuditBadgeCode::RecordStripped,
+            Self::ContentUnavailable => AuditBadgeCode::ContentUnavailable,
+            Self::WebSsrfRefused => AuditBadgeCode::WebSsrfRefused,
+            Self::WebSchemeRefused => AuditBadgeCode::WebSchemeRefused,
+            Self::WebSubstitutedServer { .. } => AuditBadgeCode::WebSubstitutedServer,
+            Self::WebSubstitutedClient { .. } => AuditBadgeCode::WebSubstitutedClient,
+            Self::WebSubstitutionMaxIter => AuditBadgeCode::WebSubstitutionMaxIter,
+            Self::WebSubstitutionToolError => AuditBadgeCode::WebSubstitutionToolError,
+            Self::WebSubstitutionTruncatedStream => AuditBadgeCode::WebSubstitutionTruncatedStream,
+            Self::WebSubstitutionMixedPending => AuditBadgeCode::WebSubstitutionMixedPending,
+            Self::WebSubstitutionForwardFailed => AuditBadgeCode::WebSubstitutionForwardFailed,
+            Self::WebSubstitutionSerializeFailed => AuditBadgeCode::WebSubstitutionSerializeFailed,
+            Self::WebSubstitutionNonStreaming => AuditBadgeCode::WebSubstitutionNonStreaming,
+            Self::WebSubstitutionHistoryCap => AuditBadgeCode::WebSubstitutionHistoryCap,
+            Self::WebSubstitutionCancelled => AuditBadgeCode::WebSubstitutionCancelled,
+            Self::WebSubstitutionMixedPendingSpliced { .. } => AuditBadgeCode::WebSubstitutionMixedPendingSpliced,
+            Self::WebSubstitutionMixedPendingSpliceFailed { .. } => AuditBadgeCode::WebSubstitutionMixedPendingSpliceFailed,
+            Self::Guardrail { .. } => AuditBadgeCode::Guardrail,
+            Self::GuardrailError { .. } => AuditBadgeCode::GuardrailError,
         }
     }
 }
@@ -2137,6 +2238,26 @@ mod tests {
             "duplicate AuditBadge `code()` strings found — codes must be \
              append-only and unique. Got: {codes:?}"
         );
+    }
+
+
+    /// A badge filter names a code, and the store matches it against the
+    /// stored `code` tag: the two spellings must be one. Every variant's tag is
+    /// its `AuditBadgeCode`, which reads back from its own spelling, and the
+    /// code list names every variant once.
+    #[test]
+    fn a_badge_code_spells_the_stored_tag_of_every_variant() {
+        let every = one_of_every_audit_badge_variant();
+        for badge in &every {
+            let tag = serde_json::to_value(badge).expect("a badge serializes")["code"].clone();
+            let code = badge.badge_code();
+            assert_eq!(tag, serde_json::Value::from(code.as_str()), "{badge:?}");
+            assert_eq!(serde_json::to_value(code).expect("a code serializes"), tag);
+            assert_eq!(code.as_str().parse::<AuditBadgeCode>(), Ok(code));
+        }
+        let covered: std::collections::HashSet<AuditBadgeCode> = every.iter().map(AuditBadge::badge_code).collect();
+        assert_eq!(covered.len(), AuditBadgeCode::ALL.len(), "the code list and the variants disagree");
+        assert!("no_such_badge".parse::<AuditBadgeCode>().is_err(), "an unknown code is refused, never read as no filter");
     }
 
     /// Lock the intentionally-dropped contract: these specific variants

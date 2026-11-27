@@ -31,9 +31,12 @@
      *  render read-only. The Default and Standalone profiles own all their rules. */
     layered?: boolean;
     activate?: boolean;
+    /** The profile observes: its block and rewrite rules are recorded, not
+     *  applied, and their chips say so. */
+    observing?: boolean;
   }
 
-  let { inventoryToolNames = [], profileId, baselineProfileId, layered = false, activate = true }: Props = $props();
+  let { inventoryToolNames = [], profileId, baselineProfileId, layered = false, activate = true, observing = false }: Props = $props();
 
   let slug = $derived(page.params.slug ?? '');
 
@@ -415,8 +418,12 @@
                 <span class="text-[10px] font-mono px-1.5 py-0.5 rounded-sm bg-(--bg-primary) text-(--text-secondary) border border-(--border)">{rule.id}</span>
                 <span class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase border"
                   style="color: {riskColor(rule.risk)}; border-color: color-mix(in srgb, {riskColor(rule.risk)} 19%, transparent); background: {riskBg(rule.risk)}">{rule.risk}</span>
-                {#if rule.action?.kind === 'block'}
+                {#if rule.action?.kind === 'block' && observing}
+                  <span class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-semibold uppercase text-(--error) border border-(--error)/30" title="Observing: recorded as Would block, not applied">block · observed</span>
+                {:else if rule.action?.kind === 'block'}
                   <span class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-semibold uppercase text-(--error) bg-(--error-bg) border border-(--error)/30">block</span>
+                {:else if rule.action?.kind === 'replace' && observing}
+                  <span class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-semibold uppercase text-(--tag-violet-text) border border-(--tag-violet-mark)/30" title="Observing: recorded as Not applied, the call keeps its arguments">replace · observed</span>
                 {:else if rule.action?.kind === 'replace'}
                   <span class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-semibold uppercase text-(--tag-violet-text) bg-(--tag-violet-bg)">replace</span>
                 {:else if rule.action?.kind === 'substitute'}

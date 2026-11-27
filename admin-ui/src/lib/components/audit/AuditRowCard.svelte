@@ -37,9 +37,12 @@
      * redundant) and `true` for the interleaved `kind=all` view.
      */
     showKindChip?: boolean;
+    /** The badge codes the list is filtered on: shown on the collapsed row
+     *  too, attention codes or not, so the row says why it matched. */
+    filtered?: readonly string[];
   }
 
-  let { row, expanded, onToggle, onFilterUser, showKindChip = true }: Props = $props();
+  let { row, expanded, onToggle, onFilterUser, showKindChip = true, filtered = [] }: Props = $props();
 
   const kind = $derived(row.kind as AuditKind);
   const latencyMs = $derived(row.latency_total_ms ?? null);
@@ -47,7 +50,7 @@
   // …) on the collapsed row so a flagged record is visible without expanding.
   // The full badge set still renders in the kind-specific detail below.
   const attentionBadges = $derived(
-    dedupeBadgesByCode((row.badges ?? []).filter(needsAttention))
+    dedupeBadgesByCode((row.badges ?? []).filter((b) => needsAttention(b) || filtered.includes(b.code)))
   );
 </script>
 

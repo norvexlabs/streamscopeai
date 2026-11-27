@@ -6,6 +6,7 @@
   // inline workspace filter instead. Self-hides when the tenant has a single
   // workspace (nothing to choose). Mirrors the `<PeriodSelector>` chrome.
   import { consoleScope } from '#lib/scope.svelte.js';
+  import SelectInput from '#lib/components/forms/SelectInput.svelte';
 
   // Default workspace first, Agent and Inline AI workspaces last, others by
   // name in between.
@@ -28,15 +29,15 @@
 {#if consoleScope.workspaceCount > 1}
   <div class="flex items-center gap-2">
     <span class="text-xs text-(--text-secondary) uppercase tracking-wider">Workspace</span>
-    <select
+    <SelectInput
       bind:value={consoleScope.workspace}
       aria-label="Workspace scope"
-      class="px-2.5 py-1.5 bg-(--bg-primary) border border-(--border) rounded-lg text-(--text-primary) text-sm font-medium focus:outline-hidden focus:border-(--accent) transition-colors"
+      fluid={false}
     >
       <option value="all">All except agent</option>
       {#each sorted as w (w.id)}
         <option value={w.id}>{w.name}{w.role === 'agent' ? ' (Agent)' : w.role === 'inline' ? ' (Inline AI)' : w.role === 'default' && w.name.toLowerCase() !== 'default' ? ' (Default)' : ''}</option>
       {/each}
-    </select>
+    </SelectInput>
   </div>
 {/if}

@@ -615,14 +615,23 @@ impl Screening {
                 .policy
                 .iter()
                 .map(|(phase, r)| {
-                    serde_json::json!({
+                    let mut finding = serde_json::json!({
                         "phase": phase,
                         "rule_id": r.id,
                         "risk": r.risk,
                         "title": r.title,
                         "description": r.description,
                         "action": r.action,
-                    })
+                    });
+                    if r.not_applied {
+                        finding["not_applied"] = Value::Bool(true);
+                    }
+                    crate::mcp::handler::put_would_rewrite(
+                        &mut finding,
+                        r.would_rewrite.as_ref(),
+                        crate::settings::proxy_settings().a2a_audit_stream_max_bytes,
+                    );
+                    finding
                 })
                 .collect();
             diff.insert("policy_findings".to_string(), Value::Array(findings));
@@ -642,14 +651,24 @@ impl Screening {
 fn effective_policy(
     identity: &A2aIdentity,
 ) -> (
-    Vec<streamscope_core::config::tool_rules::Rule>,
+    ToolPolicy,
     streamscope_core::guardrail::GuardrailSettings,
 ) {
     let ws = identity.user.workspace_id;
     (
-        identity.config.effective_tool_rules(ws).into_owned(),
+        ToolPolicy {
+            rules: identity.config.effective_tool_rules(ws).into_owned(),
+            observe: identity.config.effective_tool_enforcement(ws).observes(),
+        },
         identity.config.effective_guardrail(ws).clone(),
     )
+}
+
+/// The workspace's tool rules, and whether its policy observes: a block or a
+/// rewrite is then recorded on the row and the call or reply goes on as sent.
+struct ToolPolicy {
+    rules: Vec<streamscope_core::config::tool_rules::Rule>,
+    observe: bool,
 }
 
 /// Screen the caller's message: policy first (a refusal costs no classifier
@@ -672,7 +691,7 @@ async fn screen_request(
     }
 
     let ctx = policy::PolicyContext {
-        rules: &rules,
+        rules: &rules.rules,
         agent_slug: &identity.agent.slug,
         app_id: identity.app_id.as_deref(),
     };
@@ -683,6 +702,27 @@ async fn screen_request(
         &slots,
         &texts,
     ) {
+        // Observing: recorded by what enforcing would have done, the call sent as it came.
+        policy::PolicyDecision::Block { result, .. } if rules.observe => {
+            let mut bb = streamscope_core::audit::BadgeBuilder::new();
+            bb.add_tool_block_not_applied(streamscope_core::audit::Phase::Request, identity.agent.slug.clone());
+            screening.badges.extend(bb.finish());
+            screening.add_policy(
+                PHASE_REQUEST,
+                streamscope_core::config::tool_rules::RiskResult { not_applied: true, action: "block".to_string(), ..result },
+            );
+        }
+        policy::PolicyDecision::Replace { result, slots: new_slots, texts: new_texts } if rules.observe => {
+            screening.badges.push(streamscope_core::audit::AuditBadge::ModifiedNotApplied);
+            screening.add_policy(
+                PHASE_REQUEST,
+                streamscope_core::config::tool_rules::RiskResult {
+                    not_applied: true,
+                    would_rewrite: Some(domain::rewrite_preview(&new_slots, &texts, &new_texts)),
+                    ..result
+                },
+            );
+        }
         policy::PolicyDecision::Block { result, message } => {
             let mut bb = streamscope_core::audit::BadgeBuilder::new();
             bb.add_tool_blocked(
@@ -737,7 +777,7 @@ async fn screen_request(
 /// those bytes are already on the wire, so a finding can only be recorded.
 #[allow(clippy::too_many_arguments)]
 async fn screen_reply_slots(
-    rules: &[streamscope_core::config::tool_rules::Rule],
+    tool_policy: &ToolPolicy,
     guardrail: &streamscope_core::guardrail::GuardrailSettings,
     agent_slug: &str,
     app_id: Option<&str>,
@@ -748,7 +788,7 @@ async fn screen_reply_slots(
     screening: &mut Screening,
 ) -> Option<ScreenedReply> {
     let ctx = policy::PolicyContext {
-        rules,
+        rules: &tool_policy.rules,
         agent_slug,
         app_id,
     };
@@ -781,12 +821,26 @@ async fn screen_reply_slots(
             slots: new_slots,
             texts: new_texts,
         } => {
-            if enforce {
+            if enforce && !tool_policy.observe {
                 slots = new_slots;
                 texts = new_texts;
                 rewritten = true;
+                screening.add_policy(PHASE_RESPONSE, risk);
+            } else {
+                // Recorded, not applied: the policy observes, or the reply
+                // already went out as a stream.
+                if !screening.badges.contains(&streamscope_core::audit::AuditBadge::ModifiedNotApplied) {
+                    screening.badges.push(streamscope_core::audit::AuditBadge::ModifiedNotApplied);
+                }
+                screening.add_policy(
+                    PHASE_RESPONSE,
+                    streamscope_core::config::tool_rules::RiskResult {
+                        not_applied: true,
+                        would_rewrite: Some(streamscope_core::a2a::domain::rewrite_preview(&new_slots, &texts, &new_texts)),
+                        ..risk
+                    },
+                );
             }
-            screening.add_policy(PHASE_RESPONSE, risk);
         }
         policy::PolicyDecision::Allow(Some(risk)) => screening.add_policy(PHASE_RESPONSE, risk),
         policy::PolicyDecision::Allow(None) => {}

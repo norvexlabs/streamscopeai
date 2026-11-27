@@ -137,6 +137,11 @@ pub struct RedactedToolResultInfo {
     /// Stable identifier (e.g. `ASI02-02`) of the rule that redacted the
     /// result.
     pub rule_id: String,
+    /// The rewrite was recorded, not applied: the workspace's tool policy
+    /// observes, so the model read `original_content`. Never counted as a
+    /// redaction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applied: bool,
 }
 
 /// Per-argument modification a response-phase `replace` rule applied to a tool
@@ -154,6 +159,10 @@ pub struct ToolArgModification {
     pub effective: serde_json::Value,
     /// Id of the rule that made the change.
     pub rule_id: String,
+    /// The rewrite was recorded, not applied: the workspace's tool policy
+    /// observes, so the call kept `original`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applied: bool,
 }
 
 /// Per-program outcome of a transform step. Replaces the prior
@@ -389,14 +398,11 @@ pub struct TransformDiff {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redacted_tool_results: Option<Vec<RedactedToolResultInfo>>,
 
-    // --- request-side effective snapshots ---
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// The request's messages after transforms, when a transform changed them; `null` otherwise.
-    #[schema(value_type = Object)]
-    pub effective_messages: Option<serde_json::Value>,
-    // NB: `effective_tools` (post-policy tools blob) was retired here in favour
-    // of the row-level `tools_effective_hash` column on `conversation_turns`,
-    // which references the deduplicated `tool_definitions` side table.
+    // No copy of the request's messages or tools after transforms rides here:
+    // one per changed turn would grow a session's rows and its view with
+    // turns × history. What changed is in `step_diffs` / `injection_blocks`;
+    // the effective tool set is the `tools_effective_hash` column on
+    // `conversation_turns`, its blob in the deduplicated `tool_definitions`.
 
     // --- response-side transform data ---
     /// Programs that ran in the response phase and their outcome.
@@ -2016,17 +2022,6 @@ pub fn build_transform_diff(
 
     let messages_original_count = original_content.messages_json.len();
 
-    // Capture effective messages when content was modified by transforms.
-    let messages_modified = messages_original_count != messages_after_count
-        || step_diffs
-            .as_ref()
-            .is_some_and(|diffs| !diffs.is_empty());
-    let effective_messages = if messages_modified {
-        Some(extract_messages_json(post_transform_request))
-    } else {
-        None
-    };
-
     // Capture effective tools when tools were blocked or modified.
     let effective_tools = if tools_modified {
         extract_tools_json(post_transform_request)
@@ -2043,7 +2038,6 @@ pub fn build_transform_diff(
         step_diffs,
         blocked_tools: blocked_tools.filter(|v| !v.is_empty()),
         redacted_tool_results: redacted_tool_results.filter(|v| !v.is_empty()),
-        effective_messages,
         injection_blocks,
         response_transform_programs: None,
         response_step_diffs: None,
@@ -2058,24 +2052,6 @@ pub fn build_transform_diff(
         telemetry_dropped,
     };
     (diff, effective_tools)
-}
-
-/// Serialize the post-transform messages array from an `ApiRequest`.
-fn extract_messages_json(request: &ApiRequest) -> serde_json::Value {
-    match request {
-        ApiRequest::ChatCompletions(req) => serde_json::to_value(&req.messages)
-            .unwrap_or(serde_json::Value::Array(vec![])),
-        ApiRequest::Responses(req) => match &req.input {
-            ResponseInput::Text(t) => serde_json::json!([{"role": "user", "content": t}]),
-            ResponseInput::Messages(msgs) => serde_json::to_value(msgs)
-                .unwrap_or(serde_json::Value::Array(vec![])),
-            ResponseInput::Raw(items) => serde_json::Value::Array(items.clone()),
-        },
-        ApiRequest::AnthropicMessages(req) => serde_json::to_value(&req.messages)
-            .unwrap_or(serde_json::Value::Array(vec![])),
-        ApiRequest::GoogleGemini(req) => serde_json::to_value(&req.contents)
-            .unwrap_or(serde_json::Value::Array(vec![])),
-    }
 }
 
 /// Serialize the post-transform tools array from an `ApiRequest` (None if no tools).

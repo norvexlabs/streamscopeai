@@ -793,7 +793,7 @@ async fn accessible_providers(
 
 use super::audit::{
     get_session_conversation_impl, get_trace_impl, AuditKind, AuditLogRow,
-    AuditQuery, LinkedSessionsQuery, SessionLinkage, SessionSort, ConversationResponse, LinkedSessions, ResponseFormat,
+    AuditQuery, AuditSort, LinkedSessionsQuery, SessionLinkage, SessionSort, ConversationResponse, LinkedSessions, ResponseFormat,
     SessionListQuery, SessionNotFound, SessionSummary, ToolDefinitionBlobResponse, ToolDefinitionQuery, TraceResponse,
     tool_definition_response,
 };
@@ -805,7 +805,7 @@ use crate::audit_store::ownership::{
     assert_media_owned, assert_request_owned, assert_session_owned, assert_tool_definition_owned,
 };
 use crate::audit_store::sessions::{linked_sessions_in_portal_scope, list_sessions_impl};
-use super::OffsetPage;
+use super::{BadgeCodes, OffsetPage};
 use streamscope_core::audit::BlobType;
 
 const PORTAL_AUDIT_DEFAULT_LIMIT: i64 = 100;
@@ -951,6 +951,10 @@ pub struct PortalSessionQuery {
     pub linked: Option<SessionLinkage>,
     /// A teammate's email (substring), in a shared-workspace view only.
     pub user_email: Option<String>,
+    /// Sessions whose LLM turns carried ANY of these badge codes
+    /// (comma-separated). An unknown code is a 400.
+    #[param(value_type = Option<String>)]
+    pub badges: Option<BadgeCodes>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -998,6 +1002,12 @@ pub struct PortalAuditQuery {
     pub task_state: Option<String>,
     /// Comma-separated MCP or A2A methods.
     pub methods: Option<String>,
+    /// Rows carrying ANY of these badge codes (comma-separated). An unknown
+    /// code is a 400.
+    #[param(value_type = Option<String>)]
+    pub badges: Option<BadgeCodes>,
+    /// Order of the page. Default `newest`; see the console's `sort`.
+    pub sort: Option<AuditSort>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }
@@ -1016,7 +1026,7 @@ fn teammate_filter(scope: &PortalDataScope, user_email: Option<String>) -> Optio
     params(PortalSessionQuery),
     responses(
         (status = 200, description = "The session summaries the caller may read", body = OffsetPage<SessionSummary>),
-        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term", body = ApiErrorResponse),
+        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or `sort=alerts`, a sort by figure or `linked=top_level` with a search term, a sort by figure without a `start` within 31 days of its `end`, or an unknown or alert badge code", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 403, description = "The Sessions page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -1031,6 +1041,7 @@ pub async fn my_sessions(
     super::check_bounds(q.start, q.end)?;
     super::check_search(q.search.as_deref())?;
     SessionSort::check_with_search(q.sort, q.search.as_deref())?;
+    SessionSort::check_window(q.sort, q.start, q.end)?;
     SessionLinkage::check_with_search(q.linked, q.search.as_deref())?;
     let limit = q
         .limit
@@ -1053,6 +1064,7 @@ pub async fn my_sessions(
     // Both read the alert as the store masks it for this scope, so neither
     // reveals one a session's workspace hides.
     query.alert_level = q.alert_level;
+    query.badges = q.badges;
     query.sort = q.sort;
     // Overfetch +1 for cheap has_more (impl trusts the passed limit).
     query.limit = Some(limit + 1);
@@ -1131,7 +1143,7 @@ pub async fn my_session_linked(
     params(PortalAuditQuery),
     responses(
         (status = 200, description = "The audit rows the caller may read, kind-discriminated", body = OffsetPage<AuditLogRow>),
-        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or a `kind=all` page is too deep", body = ApiErrorResponse),
+        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, a `kind=all` page is too deep, an unknown or alert badge code, or a `sort` the kind, a search term or the window cannot serve", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 403, description = "The Requests page is hidden for the caller's workspaces (`portal_page_hidden`)", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
@@ -1194,6 +1206,10 @@ pub async fn my_audit(
     query.agent_slug = q.agent_slug;
     query.task_state = q.task_state;
     query.methods = q.methods;
+    // A badge says THAT something happened, never what: the codes are
+    // metadata, applied whether or not content is withheld.
+    query.badges = q.badges;
+    query.sort = q.sort;
 
     let mut page = list_audit_rows(db.conn(), &query, &scope, limit, offset).await?;
     page.items = page.items.for_member();

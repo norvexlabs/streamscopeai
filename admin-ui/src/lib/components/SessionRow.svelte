@@ -5,6 +5,7 @@
   import { linkChipLabel } from '#lib/colormaps/linkage.js';
   import Icon from '#lib/components/Icon.svelte';
   import type { SessionSummary } from '#lib/api-types.js';
+  import { BADGE_REGISTRY, isAttentionCode, type BadgeCode } from '#lib/badges.js';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
 
@@ -22,6 +23,12 @@
     /** The sub-agents badge as a toggle that shows them under the row (a tree
      *  only). */
     expand?: { open: boolean; toggle: () => void };
+    /** A badge chip was clicked: filter the list by it. Without it the chips
+     *  only show. */
+    onbadge?: (code: BadgeCode) => void;
+    /** The badge codes the list is filtered on: shown as chips too,
+     *  attention codes or not, so the row says why it matched. */
+    filtered?: readonly string[];
   }
 
   let {
@@ -30,7 +37,24 @@
     selfScoped = false,
     nested = false,
     expand,
+    onbadge,
+    filtered = [],
   }: Props = $props();
+
+  // The session's attention badges (the rest stay filterable, not shown): a
+  // few chips, then a count whose tooltip names the others.
+  const CHIPS = 3;
+  const attention = $derived(
+    (session.badge_codes ?? []).filter((c) => isAttentionCode(c) || filtered.includes(c)),
+  );
+  const chips = $derived(attention.slice(0, CHIPS));
+  const moreChips = $derived(attention.slice(CHIPS));
+
+  function filterBy(e: Event, code: BadgeCode) {
+    e.preventDefault();
+    e.stopPropagation();
+    onbadge?.(code);
+  }
 
   // The plane comes from the pathname; on the portal the workspace whose
   // activity is being viewed rides along (`setPortalWorkspace` on the page): a
@@ -155,6 +179,27 @@
         <span class="text-[10px] px-1.5 py-0.5 rounded-sm {subAgentAlert === 'major' ? 'bg-(--error-bg) text-(--error)/80' : subAgentAlert === 'minor' ? 'bg-(--warning-bg) text-(--warning)/80' : 'bg-(--tag-neutral-bg) text-(--tag-neutral-text)'}">
           {m.browse_subagent_alert({ level: subAgentAlert === 'major' ? m.browse_alert_major() : subAgentAlert === 'minor' ? m.browse_alert_minor() : m.browse_alert_info() })}
         </span>
+      {/if}
+      {#each chips as code (code)}
+        {@const entry = BADGE_REGISTRY[code]}
+        {#if onbadge}
+          <span
+            role="button"
+            tabindex="0"
+            title={entry.help()}
+            onclick={(e) => filterBy(e, code)}
+            onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') filterBy(e, code); }}
+            class="text-[10px] px-1.5 py-0.5 rounded-sm cursor-pointer {entry.classes}"
+          >{entry.label}</span>
+        {:else}
+          <span title={entry.help()} class="text-[10px] px-1.5 py-0.5 rounded-sm {entry.classes}">{entry.label}</span>
+        {/if}
+      {/each}
+      {#if moreChips.length > 0}
+        <span
+          title={moreChips.map((c) => BADGE_REGISTRY[c].label).join(', ')}
+          class="text-[10px] px-1.5 py-0.5 rounded-sm bg-(--tag-neutral-bg) text-(--tag-neutral-text)"
+        >+{moreChips.length}</span>
       {/if}
       {#if session.links?.continued_in}
         {@const next = session.links.continued_in}

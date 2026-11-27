@@ -1032,7 +1032,8 @@ pub struct ToolInvocation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_total_ms: Option<i64>,
     /// Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-    /// `not_applied_response`, `redacted`, `args_modified`.
+    /// `not_applied_response`, `redacted`, `redaction_not_applied` (an
+    /// observing policy's rewrite of the result, not applied), `args_modified`.
     pub outcomes: Vec<String>,
     /// Canonical `ConversationEvent::ToolCall` event — rendered by the UI with
     /// the same component the session view uses.
@@ -1729,8 +1730,11 @@ async fn collect_tool_invocations(
                     Some(ConversationEvent::ToolResult { redacted, .. }) => redacted.clone(),
                     _ => None,
                 };
-                if redaction.is_some() {
-                    outcomes.push("redacted".to_string());
+                // An observing policy's rewrite left the result as sent.
+                match &redaction {
+                    Some(r) if r.not_applied => outcomes.push("redaction_not_applied".to_string()),
+                    Some(_) => outcomes.push("redacted".to_string()),
+                    None => {}
                 }
                 if outcomes.is_empty() {
                     outcomes.push("ok".to_string());
@@ -1741,7 +1745,9 @@ async fn collect_tool_invocations(
                     let matches = match of {
                         ToolCallOutcome::Ok => outcomes.iter().any(|o| o == "ok"),
                         ToolCallOutcome::Blocked => outcomes.iter().any(|o| o.starts_with("blocked_")),
-                        ToolCallOutcome::NotApplied => outcomes.iter().any(|o| o == "not_applied_response"),
+                        ToolCallOutcome::NotApplied => {
+                            outcomes.iter().any(|o| o == "not_applied_response" || o == "redaction_not_applied")
+                        }
                         ToolCallOutcome::Redacted => outcomes.iter().any(|o| o == "redacted"),
                         ToolCallOutcome::ArgsModified => outcomes.iter().any(|o| o == "args_modified"),
                     };

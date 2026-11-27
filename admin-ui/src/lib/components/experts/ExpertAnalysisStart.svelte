@@ -6,9 +6,10 @@
    */
   import { adminApi } from '#lib/api-client.js';
   import { extractError } from '#lib/api-helpers.js';
-  import { analyzesAgain, leavesBehind, localDay, localInstant } from '#lib/analysisStart.js';
+  import { analyzesAgain, leavesBehind, localDay, localInstant, parseTimeOfDay } from '#lib/analysisStart.js';
   import ConfirmDialog from '#lib/components/ConfirmDialog.svelte';
   import TextInput from '#lib/components/forms/TextInput.svelte';
+  import DateInput from '#lib/components/forms/DateInput.svelte';
   import { formatDateTime } from '#lib/formatters.js';
   import { toast } from '#lib/toast.svelte.js';
   import type { components } from '#lib/generated/api-types.js';
@@ -31,8 +32,14 @@
   let today = $state(opened);
   let day = $state(opened);
   let time = $state('');
-  // A time input reads '' until it is complete, which would mean no time at all.
-  let timeIncomplete = $state(false);
+  // The minute the restart uses, as it is read — never the text as typed.
+  const shownTime = $derived.by(() => {
+    const t = parseTimeOfDay(time);
+    return t ? `${String(t.hours).padStart(2, '0')}:${String(t.minutes).padStart(2, '0')}` : '';
+  });
+  // A time typed but not yet a time of day (`parseTimeOfDay`) is no time
+  // at all: the restart waits for it.
+  const timeIncomplete = $derived(time.trim() !== '' && !parseTimeOfDay(time));
   let current = $state<AnalysisStart | null>(null);
   let loadError = $state('');
   let confirming = $state(false);
@@ -40,11 +47,11 @@
 
   // Today with no time means from now, so what is queued today is dropped; an
   // earlier day with no time starts at its first instant.
-  const isToday = $derived(day === today && !time);
+  const isToday = $derived(day === today && !time.trim());
   const from = $derived(localInstant(day, time));
   // A time is the admin's own; a notification dates a session in UTC.
   const named = $derived(
-    time && from ? `${day} ${time} your time (${from.toISOString().slice(0, 16).replace('T', ' ')} UTC)` : day,
+    time.trim() && from ? `${day} ${shownTime} your time (${from.toISOString().slice(0, 16).replace('T', ' ')} UTC)` : day,
   );
   const again = $derived(!isToday && !!from && analyzesAgain(from, current?.furthest_through));
   // Today already says everything so far is dropped; only an earlier date can
@@ -67,7 +74,7 @@
   function refreshToday() {
     const now = localDay(new Date());
     if (now === today) return;
-    if (day === today && !time) day = now;
+    if (day === today && !time.trim()) day = now;
     today = now;
   }
 
@@ -138,9 +145,11 @@
         <p class="text-xs text-(--error-text) mt-1.5">{loadError}</p>
       {/if}
       {#if timeIncomplete}
-        <p class="text-xs text-(--warning) mt-1.5">Finish the time, or clear it.</p>
+        <p class="text-xs text-(--warning) mt-1.5">Enter a 24-hour time (HH:MM), or clear it.</p>
       {:else if day && time && !from}
         <p class="text-xs text-(--warning) mt-1.5">That minute does not exist on this day: the clocks change. Pick another.</p>
+      {:else if !day}
+        <p class="text-xs text-(--warning) mt-1.5">Pick a day up to today (YYYY-MM-DD).</p>
       {/if}
       {#if current}
         <p class="text-xs text-(--text-secondary) mt-1.5">
@@ -159,17 +168,22 @@
     <div class="flex items-end gap-2 flex-wrap">
       <div class="flex-1 min-w-40">
         <label for="analysis-start-date" class="block text-sm text-(--text-secondary) mb-1">Analyze from</label>
-        <TextInput id="analysis-start-date" type="date" max={today} bind:value={day} disabled={saving} onfocus={refreshToday} />
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <!-- A click on the calendar button focuses nothing in Safari: the press
+             refreshes too, before the calendar opens on it. -->
+        <div onfocusin={refreshToday} onpointerdowncapture={refreshToday}>
+          <DateInput id="analysis-start-date" max={today} bind:value={day} disabled={saving} />
+        </div>
       </div>
       <div class="w-44">
         <label for="analysis-start-time" class="block text-sm text-(--text-secondary) mb-1">Time, yours (optional)</label>
         <TextInput
           id="analysis-start-time"
-          type="time"
           bind:value={time}
+          placeholder="HH:MM"
+          inputmode="numeric"
+          maxlength={8}
           disabled={saving}
-          oninput={(e) => (timeIncomplete = e.currentTarget.validity.badInput)}
-          onblur={(e) => (timeIncomplete = e.currentTarget.validity.badInput)}
         />
       </div>
       <button

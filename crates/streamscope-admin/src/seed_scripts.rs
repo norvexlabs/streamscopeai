@@ -564,10 +564,12 @@ pub(crate) async fn ensure_default_profile(
     description: &str,
 ) -> Result<uuid::Uuid, sqlx::Error> {
     // The Default profile is the base — it inherits nothing, so it is itself
-    // standalone (its bucket is its own content).
+    // standalone (its bucket is its own content). A tool policy starts in
+    // Observe, written here and only here: the insert is a no-op on an existing
+    // tenant, so a restart never resets a mode an administrator chose.
     sqlx::query(
-        "INSERT INTO profiles (tenant_id, kind, name, description, is_default, standalone) \
-         VALUES ($1, $2, $3, $4, true, true) \
+        "INSERT INTO profiles (tenant_id, kind, name, description, is_default, standalone, tool_enforcement) \
+         VALUES ($1, $2, $3, $4, true, true, CASE WHEN $2 = 'tools' THEN 'observe' END) \
          ON CONFLICT (tenant_id, kind, name) DO NOTHING",
     )
     .bind(tenant_id)

@@ -537,7 +537,7 @@ beyond `ssai provision` and `ssai run`.
 | Aider | Its YAML configuration keeps your settings but not your comments. Under the Windows sandbox it needs a git identity, global or the project's own (or `--no-git`). In the container sandbox it must already be in the image. No MCP servers. |
 | Goose | Home-directory configuration only; its YAML keeps your settings but not your comments. In the container sandbox it must already be in the image. |
 | Mistral Vibe | Home-directory configuration only. It stops at its first session under the Windows sandbox, and must already be in the image for the container sandbox. |
-| Open Code Review | Home-directory configuration only. On Windows, keep the project outside your profile for its `review`. `ssai run` turns its update check off. |
+| Open Code Review | Home-directory configuration only. `ssai run` turns its update check off. |
 | Zed | Export `STREAMSCOPE_API_KEY` in your shell (or set it in the Agent Panel): Zed does not read the key from its `settings.json`. No MCP servers. |
 | Cursor | Configured through its own settings: `provision` prints the steps instead of writing a file. |
 | Cline | Its VS Code `settings.json` is edited in place, your comments kept. |
@@ -604,8 +604,7 @@ Check these before your first `ssai run`; each links to its detail.
 - **Where the project lives:** not a drive's root, a network share, your profile folder or a folder
   above it; on a drive that keeps access lists (not FAT or exFAT); and, outside your profile, in a
   folder private to you — `run` offers to make the folder under the drive's root private, once for
-  every project in it (`--private-root`). A Go tool resolving a project inside your profile (Open Code
-  Review's `review`) needs the project outside your profile.
+  every project in it (`--private-root`).
 - **When the agent cannot open a file:** `ssai sandbox doctor` says why, and `--fix` repairs it
   ([below](#when-the-agent-cannot-open-a-file)).
 - **What does not run:** OpenCode's desktop app (the command-line agents do), Mistral Vibe (it stops at
@@ -884,8 +883,8 @@ folder's entries back too; the inner project's next run grants them again). An i
 the grant does not reach — one that inherits nothing, or one whose access was set before the grant —
 is named on the first run (see [When the agent cannot open a file](#when-the-agent-cannot-open-a-file)).
 Granting a project takes a moment the first time, as every file in it is given the account's access
-(a line counts the files as it goes); the folders above a grant are opened for the account alone, so
-your profile's other files are never touched. `run` refuses a drive's root, a network share (the
+(a line counts the files as it goes); the folders above a grant are opened for the account alone (and
+listed, down to the project), so your profile's other files are never touched. `run` refuses a drive's root, a network share (the
 sandbox's account cannot reach one), your profile folder and any folder above it.
 
 A project outside your profile must sit in a folder that is private to you, as your profile is: a
@@ -941,15 +940,18 @@ computer — not the sandbox account's. Only those two values are carried, resol
 `git config --global` cannot change that configuration. Aider writes an identity into the
 project when git has none, which the sandbox refuses: set one, globally or in the project (or run
 Aider with `--no-git`). Mistral Vibe changes the access settings of the folders it creates, which the
-sandbox never allows, so it stops at its first session. A Go tool resolving a project inside your
-profile (Open Code Review's `review`) needs to list your profile folder, which the sandbox account
-cannot: keep such a project outside your profile. Aider and Open Code Review's `USERPROFILE` reaches every program the agent starts: one
+sandbox never allows, so it stops at its first session. Aider and Open Code Review's `USERPROFILE` reaches every program the agent starts: one
 reading its home (`gh`, git's global settings) looks in your profile, which it may not read, rather
 than in the sandbox account's.
 
 What it does not hold, as on the other systems: name lookups (DNS) still resolve, a channel an
 agent could use to leak data in small amounts; the agent can write where every account on the
 computer may (`C:\Users\Public`, `C:\ProgramData`, `C:\Windows\Temp`, a new folder at a drive's root);
+it can list what is in your profile folder, in a private root and in each folder between them and a
+project granted to it — names, sizes and dates, never what a file holds — and, by watching one of those
+folders for changes, learn the name of each file changed anywhere below it while it runs (a grant stays
+between runs: revoking a project keeps what another granted project shares with it, and `ssai sandbox
+revoke --all` takes every grant back);
 a connection to one of this computer's own network addresses counts as local and is not blocked; a
 window the agent opens shares your desktop (its keyboard, clipboard and screen); Windows Credential
 Manager is per account, so a tool that keeps its login there does not find it (a provisioned tool
@@ -1620,7 +1622,7 @@ message says is described in the Admin Guide's
 ## 10. Review your activity
 
 **Sessions** (`/portal/sessions`) and **Requests** (`/portal/audit`) show the console's Sessions and
-Audit pages, with the same filters and details, over your own traffic — or, with **Team** on a
+Audit pages, with the same filters (the console's API-key filter aside) and details, over your own traffic — or, with **Team** on a
 workspace that shares, that workspace's, where a teammate filter also appears. The default period is
 the last 7 days. An administrator can hide conversations — the Sessions page and every request's
 content — or the Requests page for a team; with conversations hidden, Requests lists each request's
@@ -1628,7 +1630,13 @@ model, tokens, cost and status, and a request does not open.
 
 - **Requests** lists every kind of request: model calls, MCP tool calls, agent (A2A) calls and
   web searches and fetches, each expandable to its full captured content. The MCP server,
-  upstream and agent filters offer only what the member's workspaces are granted.
+  upstream and agent filters offer only what the member's workspaces are granted. **Badges**
+  lists the requests carrying any of the badges picked, each explained in the picker; **Sort**
+  orders one kind by latency, and model calls by cost or tokens, largest first, over a period of
+  31 days at most. The badge filter
+  applies with conversations hidden too: a badge says that something happened, never what.
+- **Sessions** shows each session's attention badges (click one to filter by it), and filters and
+  sorts as the console does: by badge, and by the most turns, cost or tokens.
 - **A session** opens in the same conversation viewer as the console, with its linked parent
   and child sessions, the web calls a turn made, and the before/after view of a transformed
   message.

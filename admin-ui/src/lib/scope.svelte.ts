@@ -453,7 +453,20 @@ export function resolvePortalWorkspace(list: PortalWorkspaceMembership[], rememb
 }
 
 /** Lightweight profile identity for the per-kind workspace profile pickers. */
-export type ProfileLite = { id: string; name: string; is_default: boolean };
+/** `observing`: a tool-policy profile that records its blocks and rewrites
+ *  rather than applying them. */
+export type ProfileLite = { id: string; name: string; is_default: boolean; observing?: boolean };
+
+/** A profile as the shared lists hold it — the one mapping every writer of
+ *  `profileLists` uses. */
+export function profileLite(p: {
+    id: string;
+    name: string;
+    is_default: boolean;
+    effective_tool_enforcement?: string | null;
+}): ProfileLite {
+    return { id: p.id, name: p.name, is_default: p.is_default, observing: p.effective_tool_enforcement === 'observe' };
+}
 
 export type ProfileListKind = 'tools' | 'guardrail' | 'transform' | 'expert' | 'client_access';
 
@@ -509,7 +522,7 @@ class ProfileLists {
         const { data } = await adminApi
             .GET('/api/v1/admin/profiles', { params: { query: { kind, limit: 200 } } })
             .catch(() => ({ data: undefined }));
-        if (data) this.land(read, data.items.map((p) => ({ id: p.id, name: p.name, is_default: p.is_default })));
+        if (data) this.land(read, data.items.map(profileLite));
     }
 }
 

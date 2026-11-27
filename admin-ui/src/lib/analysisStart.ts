@@ -21,17 +21,28 @@ export function startOfLocalDay(day: string): Date | null {
   return at.getFullYear() === year && at.getMonth() === month - 1 && at.getDate() === date ? at : null;
 }
 
+/** A typed `H:MM`, `HH:MM` or `HHMM` time of day (surrounding spaces ignored; a
+ *  phone's numeric keypad has no `:`, so four digits are a time too — three
+ *  are not, being as likely a time half typed), or null when it
+ *  is not one — the one reading `localInstant` and the page's "finish the
+ *  time" check share. */
+export function parseTimeOfDay(time: string): { hours: number; minutes: number } | null {
+  const m = /^(?:(\d{1,2}):|(\d{2}))(\d{2})$/.exec(time.trim());
+  if (!m) return null;
+  const [hours, minutes] = [Number(m[1] ?? m[2]), Number(m[3])];
+  return hours > 23 || minutes > 59 ? null : { hours, minutes };
+}
+
 /**
  * The instant the Analysis start control names, or `null` for one that is not:
  * the start of `day` with no `time`, else that minute of it.
  */
 export function localInstant(day: string, time: string): Date | null {
   const start = startOfLocalDay(day);
-  if (!start || !time) return start;
-  const m = /^(\d{2}):(\d{2})$/.exec(time);
-  if (!m) return null;
-  const [hours, minutes] = [Number(m[1]), Number(m[2])];
-  if (hours > 23 || minutes > 59) return null;
+  if (!start || !time.trim()) return start;
+  const parsed = parseTimeOfDay(time);
+  if (!parsed) return null;
+  const { hours, minutes } = parsed;
   start.setHours(hours, minutes);
   // A minute a clock change skips rolls over: not the minute asked for.
   return start.getHours() === hours && start.getMinutes() === minutes ? start : null;

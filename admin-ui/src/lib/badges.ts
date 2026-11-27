@@ -5,6 +5,7 @@
 import { formatCost } from './formatters';
 import type { components } from './generated/api-types';
 import type { IconName } from './icons';
+import { m } from './paraglide/messages.js';
 
 export type AuditBadge = components['schemas']['AuditBadge'];
 
@@ -31,9 +32,33 @@ export function needsAttention(b: AuditBadge): boolean {
   return true;
 }
 
+/** The audit row kinds a badge can be recorded on — what the badge filter
+ *  offers per kind. Inclusive: a kind listed that never carries the badge
+ *  only yields an empty filter, while a kind left out would hide a badge
+ *  that exists. */
+export type BadgeSurface = 'llm' | 'mcp' | 'web' | 'a2a';
+
+/** The picker's group a badge is listed under. `alert` is never offered: a
+ *  session's alert is filtered by its alert level. */
+export type BadgeFamily =
+  | 'policy'
+  | 'guardrail'
+  | 'translation'
+  | 'cache'
+  | 'capacity'
+  | 'web'
+  | 'mcp'
+  | 'record'
+  | 'alert';
+
 type BadgeRegistryEntry = {
   /** Short user-facing label rendered in the chip. */
   label: string;
+  /** What the badge means and what to do about it, in the viewer's language.
+   *  Required: a badge the server adds does not compile until it has one. */
+  help: () => string;
+  family: BadgeFamily;
+  surfaces: readonly BadgeSurface[];
   /** Single-line tooltip. Receives the badge + optional context so variants
    *  can interpolate concrete detail (program names, etc.). */
   tooltip: (badge: AuditBadge, context?: BadgeContext) => string;
@@ -161,6 +186,63 @@ const AGENT_ALERT_LEVEL_RANK: Record<components['schemas']['AlertLevel'], number
   info: 1,
 };
 
+export type BadgeCode = AuditBadge['code'];
+
+/** Whether a code is an attention code: what a collapsed row (and a session
+ *  row's chips) surface, the rest staying in the detail. */
+export function isAttentionCode(code: BadgeCode): boolean {
+  return ATTENTION_BADGE_CODES.has(code);
+}
+
+/** The families the badge filter lists, in display order. */
+const BADGE_FILTER_FAMILIES: readonly Exclude<BadgeFamily, 'alert'>[] = [
+  'policy',
+  'guardrail',
+  'translation',
+  'cache',
+  'capacity',
+  'web',
+  'mcp',
+  'record',
+];
+
+/** The badge filter's choices for rows of `surfaces`: every code one of them
+ *  can carry, grouped by family in display order, each group by label; the
+ *  alert family never (alerts are filtered by level). */
+export function badgeFilterGroups(
+  surfaces: readonly BadgeSurface[],
+): { family: Exclude<BadgeFamily, 'alert'>; codes: BadgeCode[] }[] {
+  const codes = (Object.keys(BADGE_REGISTRY) as BadgeCode[]).filter((c) =>
+    BADGE_REGISTRY[c].surfaces.some((sf) => surfaces.includes(sf)),
+  );
+  return BADGE_FILTER_FAMILIES.map((family) => ({
+    family,
+    codes: codes
+      .filter((c) => BADGE_REGISTRY[c].family === family)
+      .sort((a, b) => BADGE_REGISTRY[a].label.localeCompare(BADGE_REGISTRY[b].label)),
+  })).filter((g) => g.codes.length > 0);
+}
+
+/** The codes of a `badges` filter value that the badge filter offers for rows
+ *  of `surfaces`: what the picker shows ticked and what a list sends — a code
+ *  the kind cannot carry, an alert or an unknown code is neither. */
+export function offeredBadgeFilter(value: string | undefined, surfaces: readonly BadgeSurface[]): BadgeCode[] {
+  const offered = new Set(badgeFilterGroups(surfaces).flatMap((g) => g.codes));
+  return parseBadgeFilter(value).filter((c) => offered.has(c));
+}
+
+/** A `badges` filter value (comma-separated codes) as the known codes it
+ *  names, in order, once each — a stale or hand-typed unknown code is
+ *  dropped here rather than refused by the server. */
+export function parseBadgeFilter(value: string | undefined): BadgeCode[] {
+  const seen = new Set<BadgeCode>();
+  for (const raw of (value ?? '').split(',')) {
+    const c = raw.trim();
+    if (Object.hasOwn(BADGE_REGISTRY, c) && BADGE_REGISTRY[c as BadgeCode].family !== 'alert') seen.add(c as BadgeCode);
+  }
+  return [...seen];
+}
+
 /** Collapse badges to one per code, preserving first-seen order. Several audit
  *  badges legitimately repeat on a single row — e.g. one `tool_blocked` per
  *  blocked call — but the chips are at-a-glance indicators and the
@@ -209,6 +291,9 @@ export function turnScopedBadges(badges: readonly AuditBadge[] | null | undefine
 export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   modified: {
     label: 'Modified',
+    help: () => m.badge_help_modified(),
+    family: 'policy',
+    surfaces: ['llm', 'mcp', 'a2a'],
     tooltip: (_b, ctx) => {
       const names = ctx?.modifyingTransforms ?? [];
       if (names.length === 0) {
@@ -221,13 +306,19 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   modified_not_applied: {
     label: 'Not applied',
+    help: () => m.badge_help_modified_not_applied(),
+    family: 'policy',
+    surfaces: ['llm', 'mcp', 'a2a'],
     tooltip: () =>
-      'Policy produced a rewrite or a refusal that did not reach the wire — the submitting enforcement point is verdict-only, the analyzed answer had already reached the client, the block was a signed thinking block the provider requires back unchanged, a request script made an edit the request has no place for, or a script reshaping the conversation rebuilt a turn without content it could not see (an image, thinking, a signature)',
+      'Policy produced a rewrite or a refusal that did not reach the wire — the tool policy observes, the submitting enforcement point is verdict-only, the analyzed answer had already reached the client, the block was a signed thinking block the provider requires back unchanged, a request script made an edit the request has no place for, or a script reshaping the conversation rebuilt a turn without content it could not see (an image, thinking, a signature)',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
     iconName: 'pencil',
   },
   compressed: {
     label: 'Compressed',
+    help: () => m.badge_help_compressed(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (_b, ctx) => {
       const mc = ctx?.messageCount;
       if (mc && mc.before !== mc.after) {
@@ -240,18 +331,27 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   refusal: {
     label: 'Refusal',
+    help: () => m.badge_help_refusal(),
+    family: 'policy',
+    surfaces: ['llm'],
     tooltip: () => 'The model refused: the answer is its refusal, not a reply',
     classes: 'bg-(--warning)/10 text-(--warning) border border-(--warning)',
     iconName: 'shield',
   },
   json_healed: {
     label: 'JSON Healed',
+    help: () => m.badge_help_json_healed(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: () => 'Upstream returned malformed JSON; the gateway repaired it before forwarding',
     classes: 'bg-(--success)/10 text-(--success) border border-(--success)',
     iconName: 'checkCircle',
   },
   tool_blocked: {
     label: 'Tool Blocked',
+    help: () => m.badge_help_tool_blocked(),
+    family: 'policy',
+    surfaces: ['llm', 'mcp', 'a2a'],
     tooltip: (b) => {
       if (b.code !== 'tool_blocked') return '';
       const phase = b.phase === 'request' ? 'Request' : 'Response';
@@ -263,17 +363,23 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   tool_block_not_applied: {
     label: 'Would block',
+    help: () => m.badge_help_tool_block_not_applied(),
+    family: 'policy',
+    surfaces: ['llm', 'mcp', 'a2a'],
     tooltip: (b) => {
       if (b.code !== 'tool_block_not_applied') return '';
       const phase = b.phase === 'request' ? 'Request' : 'Response';
       const list = b.names.length > 0 ? `: ${b.names.join(', ')}` : '';
-      return `${phase}-phase tool policy would have blocked ${b.count} tool call(s)${list}, and they were not stopped: the submitting enforcement point is verdict-only, or the analyzed answer had already reached the client`;
+      return `${phase}-phase tool policy would have blocked ${b.count} tool call(s)${list}, and they were not stopped: the tool policy observes, the submitting enforcement point is verdict-only, or the analyzed answer had already reached the client`;
     },
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
     iconName: 'shield',
   },
   tool_blocked_overflow: {
     label: 'Tool Block Overflow',
+    help: () => m.badge_help_tool_blocked_overflow(),
+    family: 'policy',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'tool_blocked_overflow') return '';
       const list = b.names.length > 0 ? `: ${b.names.join(', ')}` : '';
@@ -284,6 +390,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   block_overflow: {
     label: 'Block Overflow',
+    help: () => m.badge_help_block_overflow(),
+    family: 'policy',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'block_overflow') return '';
       return `${b.kind === 'text' ? 'Text' : 'Thinking'} block exceeded the buffered-event cap — ${b.count} block(s) dropped (fail-closed)`;
@@ -293,6 +402,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   script_error: {
     label: 'Script Error',
+    help: () => m.badge_help_script_error(),
+    family: 'policy',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'script_error') return '';
       const phase = b.phase === 'request' ? 'request' : 'response';
@@ -304,6 +416,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   protocol_translated: {
     label: 'Protocol Translated',
+    help: () => m.badge_help_protocol_translated(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'protocol_translated') return '';
       const base = `Cross-protocol translation: ${prettyProtocol(b.from)} → ${prettyProtocol(b.to)}`;
@@ -315,6 +430,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   upstream_adapted: {
     label: 'Adapted to upstream',
+    help: () => m.badge_help_upstream_adapted(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'upstream_adapted') return '';
       const api =
@@ -331,6 +449,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   capability_rerouted: {
     label: 'Rerouted',
+    help: () => m.badge_help_capability_rerouted(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'capability_rerouted') return '';
       return `${b.from} cannot serve this request — ${b.reason} The gateway forwarded it to the next model on this alias that can.`;
@@ -340,6 +461,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   catchall: {
     label: 'Catchall',
+    help: () => m.badge_help_catchall(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (_b, ctx) => {
       const c = ctx?.catchall;
       if (c && (c.method || c.path)) {
@@ -354,6 +478,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   sanitized_tool_names: {
     label: 'Tool Names Sanitized',
+    help: () => m.badge_help_sanitized_tool_names(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'sanitized_tool_names') return '';
       return `${b.count} tool name(s) rewritten before forwarding upstream`;
@@ -363,6 +490,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   response_sanitized_tool_names: {
     label: 'Response Tool Names Sanitized',
+    help: () => m.badge_help_response_sanitized_tool_names(),
+    family: 'translation',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'response_sanitized_tool_names') return '';
       return `${b.count} tool name(s) emitted by the model rewritten before delivery to the client (see transform_diff.injection_blocks for the original→sanitized mapping)`;
@@ -372,6 +502,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   agent_alert: {
     label: 'Agent Alert',
+    help: () => m.badge_help_agent_alert(),
+    family: 'alert',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'agent_alert') return '';
       return `Agent expert "${b.axis}" raised a ${b.level} alert`;
@@ -381,6 +514,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   session_alert: {
     label: 'Session Alert',
+    help: () => m.badge_help_session_alert(),
+    family: 'alert',
+    surfaces: ['llm', 'mcp', 'web', 'a2a'],
     tooltip: (b) => {
       if (b.code !== 'session_alert') return '';
       // The session's most severe level and every expert that raised an alert
@@ -394,6 +530,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   // they show up alongside `tool_blocked` etc. with the same visual weight.
   mcp_rpc_error: {
     label: 'RPC Error',
+    help: () => m.badge_help_mcp_rpc_error(),
+    family: 'mcp',
+    surfaces: ['mcp'],
     tooltip: (b) => {
       if (b.code !== 'mcp_rpc_error') return '';
       // Authoritative list lives in `crates/streamscope-proxy/src/mcp/jsonrpc.rs`
@@ -433,6 +572,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   mcp_legacy_sse: {
     label: 'Legacy SSE',
+    help: () => m.badge_help_mcp_legacy_sse(),
+    family: 'mcp',
+    surfaces: ['mcp'],
     tooltip: () =>
       'Upstream is using the legacy text/event-stream GET transport — has not migrated to Streamable HTTP (MCP spec 2025-03-26+)',
     classes: 'bg-zinc-800 text-zinc-300 border border-zinc-700',
@@ -440,6 +582,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   mcp_sampling_intercepted: {
     label: 'Sampling Intercepted',
+    help: () => m.badge_help_mcp_sampling_intercepted(),
+    family: 'mcp',
+    surfaces: ['mcp'],
     tooltip: () =>
       'Upstream sampling/createMessage was answered by the gateway via the LLM pipeline (auth, budgets, audit, transforms) instead of being forwarded to the agent',
     classes: 'bg-(--accent)/15 text-(--accent) border border-(--accent)',
@@ -447,6 +592,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   llm_synthetic_sampling: {
     label: 'Synthetic Sampling',
+    help: () => m.badge_help_llm_synthetic_sampling(),
+    family: 'mcp',
+    surfaces: ['llm'],
     tooltip: () =>
       'LLM call synthesized by the gateway in response to an MCP sampling/createMessage interception (not initiated by an upstream client)',
     classes: 'bg-(--accent)/15 text-(--accent) border border-(--accent)',
@@ -456,6 +604,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   // and (when enabled) the cross-protocol substitution loop.
   web_blocked: {
     label: 'Web Blocked',
+    help: () => m.badge_help_web_blocked(),
+    family: 'web',
+    surfaces: ['mcp', 'web'],
     tooltip: () =>
       'Web-search request was blocked by tool policy before reaching the upstream search engine',
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
@@ -463,6 +614,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_url_filtered: {
     label: 'URL Filtered',
+    help: () => m.badge_help_web_url_filtered(),
+    family: 'web',
+    surfaces: ['web'],
     tooltip: (b) => {
       if (b.code !== 'web_url_filtered') return '';
       return `${b.count} fetched URL(s) dropped by the per-tenant URL filter chain (denylist / scheme / host)`;
@@ -472,6 +626,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_all_results_filtered: {
     label: 'All Results Filtered',
+    help: () => m.badge_help_web_all_results_filtered(),
+    family: 'web',
+    surfaces: ['web'],
     tooltip: () =>
       'Every result returned by the upstream search engine was filtered out by tenant policy — empty result list returned to the model',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -479,12 +636,18 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_rate_limited: {
     label: 'Rate Limited',
+    help: () => m.badge_help_web_rate_limited(),
+    family: 'web',
+    surfaces: ['web'],
     tooltip: () => 'Web-search call rejected: per-tenant rate limit exceeded',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
     iconName: 'alert',
   },
   web_content_stripped: {
     label: 'Content Stripped',
+    help: () => m.badge_help_web_content_stripped(),
+    family: 'web',
+    surfaces: ['web'],
     tooltip: (b) => {
       if (b.code !== 'web_content_stripped') return '';
       return `Web-fetch content stripped before reaching the model: ${b.reason}`;
@@ -494,6 +657,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   record_stripped: {
     label: 'Record Stripped',
+    help: () => m.badge_help_record_stripped(),
+    family: 'record',
+    surfaces: ['llm', 'mcp', 'web', 'a2a'],
     tooltip: (b) => {
       if (b.code !== 'record_stripped') return '';
       const why = b.reason === 'too_deep' ? 'nested too deep' : 'too large';
@@ -504,6 +670,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   content_unavailable: {
     label: 'Content Unavailable',
+    help: () => m.badge_help_content_unavailable(),
+    family: 'record',
+    surfaces: ['llm'],
     tooltip: () =>
       'Some content this request named — a conversation message, its tool definitions, its system prompt or a media file — never reached the console: the gateway could not deliver it, or the console could not store it. The request is recorded and its conversation renders without that content',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -511,6 +680,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_ssrf_refused: {
     label: 'SSRF Refused',
+    help: () => m.badge_help_web_ssrf_refused(),
+    family: 'web',
+    surfaces: ['web'],
     tooltip: () =>
       'Web-fetch URL pointed at a private / link-local / loopback address — refused by the SSRF guard before any network call',
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
@@ -518,6 +690,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_scheme_refused: {
     label: 'Scheme Refused',
+    help: () => m.badge_help_web_scheme_refused(),
+    family: 'web',
+    surfaces: ['web'],
     tooltip: () =>
       'Web-fetch URL used a non-http(s) scheme (file:, gopher:, javascript:, …) — refused by the scheme allowlist',
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
@@ -525,6 +700,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substituted_server: {
     label: 'Server Tool Substituted',
+    help: () => m.badge_help_web_substituted_server(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'web_substituted_server') return '';
       const base = `Native server-tool ${b.server_type} replaced with the gateway's filtered web executor`;
@@ -539,6 +717,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substituted_client: {
     label: 'Client Tool Substituted',
+    help: () => m.badge_help_web_substituted_client(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'web_substituted_client') return '';
       return `Client tool ${b.client_label} routed through the gateway's filtered web executor`;
@@ -548,6 +729,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_max_iter: {
     label: 'Substitution Max Iter',
+    help: () => m.badge_help_web_substitution_max_iter(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Substitution loop hit the per-request iteration cap and stopped — final upstream output was forwarded as-is',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -555,6 +739,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_tool_error: {
     label: 'Substitution Error',
+    help: () => m.badge_help_web_substitution_tool_error(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Substituted web call returned an executor error — the model received the error and continued',
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
@@ -562,6 +749,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_truncated_stream: {
     label: 'Substitution Truncated',
+    help: () => m.badge_help_web_substitution_truncated_stream(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Upstream stream ended without a Done event while pending intercepts were queued — the loop forwarded the last bytes as-is and dropped the pending intercepts',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -569,6 +759,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_mixed_pending: {
     label: 'Substitution Mixed-Pending',
+    help: () => m.badge_help_web_substitution_mixed_pending(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'One upstream turn emitted both intercepted and real tool_use blocks. The agent loop dispatched the intercepted call for audit and parked the result; the next request in the same session splices it back into history.',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -576,6 +769,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_mixed_pending_spliced: {
     label: 'Substitution Mixed-Pending Spliced',
+    help: () => m.badge_help_web_substitution_mixed_pending_spliced(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'web_substitution_mixed_pending_spliced') return '';
       return `${b.count} parked mixed-pending result${b.count === 1 ? '' : 's'} from a prior request in this session were folded into the conversation as synthesised assistant tool_use → user tool_result pairs before forwarding upstream`;
@@ -585,6 +781,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_mixed_pending_splice_failed: {
     label: 'Substitution Mixed-Pending Splice Failed',
+    help: () => m.badge_help_web_substitution_mixed_pending_splice_failed(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'web_substitution_mixed_pending_splice_failed') return '';
       return `${b.count} parked mixed-pending result${b.count === 1 ? '' : 's'} were drained from the cross-request cache but could not be folded into the upstream request (translation or re-parse failed) and were dropped — see injection_blocks for the underlying error`;
@@ -594,6 +793,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_forward_failed: {
     label: 'Substitution Forward Failed',
+    help: () => m.badge_help_web_substitution_forward_failed(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Re-issuing the upstream call after a substitution round failed (transport / HTTP error / closure missing); the agent loop stopped and yielded a synthetic error marker to the client',
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
@@ -601,6 +803,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_serialize_failed: {
     label: 'Substitution Serialize Failed',
+    help: () => m.badge_help_web_substitution_serialize_failed(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Re-serializing the cumulative DomainRequest for the next substitution round failed; the agent loop stopped and yielded a synthetic error marker',
     classes: 'bg-red-900/20 text-red-300 border border-red-500/30',
@@ -608,6 +813,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_non_streaming: {
     label: 'Substitution Non-Streaming',
+    help: () => m.badge_help_web_substitution_non_streaming(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'A non-streaming request matched a substitution rule, but the agent loop is streaming-only — the upstream tool_use was forwarded to the client unchanged',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -615,6 +823,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_history_cap: {
     label: 'Substitution History Cap',
+    help: () => m.badge_help_web_substitution_history_cap(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Cumulative DomainRequest body for the next substitution round exceeded web.substitution_history_max_bytes — the loop dropped its oldest tool_use/tool_result splices to bring the body under cap',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -622,6 +833,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   web_substitution_cancelled: {
     label: 'Substitution Cancelled',
+    help: () => m.badge_help_web_substitution_cancelled(),
+    family: 'web',
+    surfaces: ['llm'],
     tooltip: () =>
       'Substitution agent loop was cancelled mid-flight (client SSE disconnect or upstream timeout) — pending intercepted calls were dropped without dispatching, no further upstream egress was incurred',
     classes: 'bg-amber-900/20 text-amber-300 border border-amber-500/30',
@@ -631,6 +845,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   // before it is folded back into the model.
   guardrail: {
     label: 'Guardrail',
+    help: () => m.badge_help_guardrail(),
+    family: 'guardrail',
+    surfaces: ['llm', 'web', 'a2a'],
     tooltip: (b) => {
       if (b.code !== 'guardrail') return '';
       const cats = b.categories
@@ -647,6 +864,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   cache_hit: {
     label: 'Cached',
+    help: () => m.badge_help_cache_hit(),
+    family: 'cache',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'cache_hit') return '';
       const saved = b.avoided_cost > 0
@@ -662,6 +882,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   cache_observe_hit: {
     label: 'Cache Observed',
+    help: () => m.badge_help_cache_observe_hit(),
+    family: 'cache',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'cache_observe_hit') return '';
       const sim = b.similarity != null
@@ -674,6 +897,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   cache_store_skipped: {
     label: 'Not Cached',
+    help: () => m.badge_help_cache_store_skipped(),
+    family: 'cache',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'cache_store_skipped') return '';
       const why: Record<string, string> = {
@@ -700,6 +926,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   cache_semantic_skipped: {
     label: 'No Similarity Match',
+    help: () => m.badge_help_cache_semantic_skipped(),
+    family: 'cache',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'cache_semantic_skipped') return '';
       const why: Record<string, string> = {
@@ -717,6 +946,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   queued: {
     label: 'Queued',
+    help: () => m.badge_help_queued(),
+    family: 'capacity',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'queued') return '';
       const seconds = b.wait_ms / 1000;
@@ -728,6 +960,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   spilled: {
     label: 'Moved replica',
+    help: () => m.badge_help_spilled(),
+    family: 'capacity',
+    surfaces: ['llm'],
     tooltip: () =>
       'The replica this request was routed to had no room — under gateway-managed QoS, not even after the few seconds a request waits for its own replica — so the gateway sent it to another replica of the same model instead. The answer is the same — this is not a failover to a different provider — but a session pinned to a replica for its prompt cache loses that cache for this turn, and a fleet doing this constantly is a fleet that needs more capacity.',
     classes: 'bg-(--tag-blue-bg) text-(--tag-blue-text) border border-(--accent)/30',
@@ -735,6 +970,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   unpriced: {
     label: 'Unpriced',
+    help: () => m.badge_help_unpriced(),
+    family: 'capacity',
+    surfaces: ['llm'],
     tooltip: () =>
       'Something this request consumed had no rate, or its cost could not be stated in the accounting currency — so the recorded cost is a floor of zero, which is not the same as free. A zero-cost request never accrues against a budget, so any budget covering it will not enforce. Set a price list on the model under its provider (or link it to a catalog entry), and add a conversion rate under Settings → Accounting for any currency it is priced in.',
     classes: 'bg-(--tag-amber-bg) text-(--tag-amber-text) border border-(--warning)/30',
@@ -742,6 +980,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   tool_loop: {
     label: 'Tool loop',
+    help: () => m.badge_help_tool_loop(),
+    family: 'policy',
+    surfaces: ['llm'],
     tooltip: (b) => {
       if (b.code !== 'tool_loop') return '';
       const tools = b.tools.length ? ` (${b.tools.join(', ')})` : '';
@@ -775,6 +1016,9 @@ export const BADGE_REGISTRY: Record<AuditBadge['code'], BadgeRegistryEntry> = {
   },
   guardrail_error: {
     label: 'Guardrail Error',
+    help: () => m.badge_help_guardrail_error(),
+    family: 'guardrail',
+    surfaces: ['llm', 'web', 'a2a'],
     tooltip: (b) => {
       if (b.code !== 'guardrail_error') return '';
       // An incomplete scan is not a detector failure: the detector answered, but

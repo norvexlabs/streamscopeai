@@ -151,6 +151,9 @@ maintainers write the changelog entry and set the version when they release.
   — a setting of the platform administrator, never an environment variable or a tenant's.
 - Every external call has a timeout, and every response body is read through the capped reader.
 - Upstream and database errors are never returned to a client.
+- Code that applies a tool-policy block or rewrite reads the workspace's tool-policy mode beside its
+  rules: in Observe it runs the same decision, sends the original on, and records the outcome as not
+  applied.
 
 **Rust**
 - Edition 2024. No `unwrap()`/`expect()` unless provably infallible; typed errors.

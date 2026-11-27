@@ -375,13 +375,17 @@ pub(crate) async fn tool_inventory_impl(
     });
 
     // Aggregate `redacted_count` from `transform_diff.redacted_tool_results[]`
-    // over the same window/scope. Counts the number of redaction entries (one
-    // per rewritten tool_result block), matching what the Log tab surfaces.
+    // over the same window/scope. Counts the redaction entries (one per
+    // rewritten tool_result block), matching what the Log tab surfaces — an
+    // entry an observing policy recorded (`not_applied`) rewrote nothing and
+    // is not one.
     let redacted_sql = format!(
-        r#"SELECT COALESCE(SUM(jsonb_array_length(ct.transform_diff->'redacted_tool_results')), 0)::bigint
+        r#"SELECT count(*)::bigint
             FROM conversation_turns ct
             JOIN sessions s ON s.session_id = ct.session_id
+            CROSS JOIN LATERAL jsonb_array_elements(ct.transform_diff->'redacted_tool_results') AS rd_elem
             WHERE ct.tenant_id = $1
+              AND NOT COALESCE((rd_elem->>'not_applied')::boolean, false)
               AND ct.transform_diff->'redacted_tool_results' IS NOT NULL
               AND jsonb_array_length(ct.transform_diff->'redacted_tool_results') > 0
               {where_extra}"#
@@ -611,7 +615,7 @@ impl ToolCallTurns {
             ct.request_params,
             ct.response_content,
             ct.response_tool_calls,
-            ct.transform_diff,
+            ct.transform_diff - 'effective_messages' AS transform_diff,
             nxt.request_id         AS next_request_id,
             nxt.api_version        AS next_api_version,
             nxt.request_params     AS next_request_params,
@@ -639,7 +643,7 @@ impl ToolCallTurns {
             -- the history of) every turn of the window to join them.
             SELECT r.request_id, r.timestamp, r.turn_number, r.api_version,
                    r.request_params,
-                   r.transform_diff, ans.answer_sliced AS sliced,
+                   r.transform_diff - 'effective_messages' AS transform_diff, ans.answer_sliced AS sliced,
                    CASE WHEN ans.answer_sliced THEN r.added_hashes ELSE r.message_hashes END AS hashes
             FROM conversation_turns_resolved r
             WHERE r.tenant_id = ct.tenant_id

@@ -360,6 +360,13 @@ pub struct RiskResult {
     /// Resolved canonical `tool_id` for this call (e.g. `shell_exec`).
     /// `None` when no profile registered for `(tool_name, app_id, mcp_server)`.
     pub tool_id: Option<String>,
+    /// The `block` or `replace` was recorded, not applied: the workspace's
+    /// tool policy observes, so the call went on as sent.
+    pub not_applied: bool,
+    /// An observed `replace`: what the rewrite would have sent instead — the
+    /// call's params (MCP), or each rewritten part and string (A2A). `None`
+    /// for anything applied.
+    pub would_rewrite: Option<serde_json::Value>,
 }
 
 // ─── Public API ─────────────────────────────────────────────────────
@@ -1199,6 +1206,8 @@ pub fn classify_tool_call(
         pattern: None,
         profile_id,
         tool_id,
+        not_applied: false,
+        would_rewrite: None,
     }
 }
 
@@ -1212,6 +1221,8 @@ fn rule_to_result(rule: &Rule, tool_id: Option<String>, profile_id: Option<Strin
         pattern: pattern_summary(rule),
         profile_id,
         tool_id,
+        not_applied: false,
+        would_rewrite: None,
     }
 }
 

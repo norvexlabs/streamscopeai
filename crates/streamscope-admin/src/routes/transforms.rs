@@ -2324,7 +2324,9 @@ pub async fn agent_status(
     }))
 }
 
-/// Trigger an immediate agent analysis cycle.
+/// Trigger an immediate agent analysis cycle for the caller's tenant — only
+/// it: a trigger runs its tenant whatever its interval and run window, so one
+/// tenant's request never spends another's judge model.
 #[utoipa::path(
     post,
     path = "/api/v1/admin/experts/actions/agent-run",
@@ -2332,14 +2334,21 @@ pub async fn agent_status(
     responses(
         (status = 200, description = "Agent cycle triggered", body = ActionResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 500, description = "The trigger could not be queued", body = ApiErrorResponse),
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn trigger_agent_run(
     State(state): State<Arc<AdminState>>,
-) -> Json<ActionResponse> {
-    crate::leader::insert_agent_trigger(&state.db, None).await;
-    Json(ActionResponse::ok().with_message("Agent cycle triggered."))
+    db: TenantConn,
+) -> Result<Json<ActionResponse>, ApiError> {
+    let tenant = db.tenant_uuid();
+    drop(db); // one connection at a time: the insert runs on the global pool
+    crate::leader::insert_agent_trigger(&state.db, tenant).await.map_err(|e| {
+        tracing::error!(%tenant, "agent trigger insert failed: {e}");
+        ApiError::internal("agent trigger could not be queued")
+    })?;
+    Ok(Json(ActionResponse::ok().with_message("Agent cycle triggered.")))
 }
 
 // ─── Expert Memory ───

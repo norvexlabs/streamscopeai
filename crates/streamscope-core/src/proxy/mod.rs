@@ -1448,6 +1448,7 @@ async fn proxy_handler_inner(
         needs_translation,
         capture_diffs,
         &effective_tool_rules,
+        ctx.config.effective_tool_enforcement(ctx.user.workspace_id),
         Some(&ctx.config.tool_field_profiles),
         Some(&ctx.config.mcp),
         ctx.config.sanitize_tool_names,

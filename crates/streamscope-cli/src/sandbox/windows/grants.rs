@@ -45,7 +45,16 @@ pub enum Kind {
     /// (Bun's and libuv's `realpath`), and without it the path does not
     /// resolve, so a client that vouches for every folder above a write
     /// (Claude Code) refuses each file below as one it cannot vouch for.
-    ReadAttributes,
+    OpenFolder,
+    /// [`Kind::OpenFolder`], and list the folder: only a folder on the way
+    /// down to the project. Go's `filepath.EvalSymlinks` spells each part of
+    /// a path as the disk does by looking it up in its parent's listing, so
+    /// a folder above the project it may only open makes the project's path
+    /// unresolvable (Open Code Review). Listing a folder also gives the
+    /// attributes of each item in it, and lets a change watch on it report
+    /// the names changed anywhere below (every account bypasses traverse
+    /// checks): never written on a folder the project's path does not cross.
+    ListFolder,
     /// Deny: create, change or remove anything in a held tree, or the tree.
     DenyTree,
     /// Deny: change, replace or remove a held file.
@@ -56,6 +65,8 @@ pub enum Kind {
 
 // File access rights (winnt.h).
 const FILE_READ_DATA: u32 = 0x1;
+// The same bit on a folder.
+const FILE_LIST_DIRECTORY: u32 = FILE_READ_DATA;
 const FILE_WRITE_DATA: u32 = 0x2;
 const FILE_APPEND_DATA: u32 = 0x4;
 const FILE_READ_EA: u32 = 0x8;
@@ -80,7 +91,8 @@ impl Kind {
                 read | FILE_EXECUTE | FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE
             }
             Kind::ReadExecute | Kind::ReadFile => read | FILE_EXECUTE,
-            Kind::ReadAttributes => FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            Kind::OpenFolder => FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            Kind::ListFolder => FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             Kind::DenyTree => {
                 FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | DELETE | FILE_DELETE_CHILD
             }
@@ -98,7 +110,7 @@ impl Kind {
     pub fn inheritance(self) -> u32 {
         match self {
             Kind::Modify | Kind::ReadExecute | Kind::DenyTree => OBJECT_INHERIT | CONTAINER_INHERIT,
-            Kind::ReadFile | Kind::ReadAttributes | Kind::DenyFile | Kind::DenyNode => 0,
+            Kind::ReadFile | Kind::OpenFolder | Kind::ListFolder | Kind::DenyFile | Kind::DenyNode => 0,
         }
     }
 }
@@ -183,10 +195,9 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     }
     for file in &dirs.files {
         push(file, Trustee::Account, Kind::ReadFile);
-        // Its folder too, opened and its attributes read, like every folder
-        // above a grant.
+        // Its folder too, opened, like every folder above a grant.
         if let Some(parent) = file.parent().filter(|p| anchors.iter().any(|a| below(p, a).is_some())) {
-            push(parent, Trustee::Account, Kind::ReadAttributes);
+            push(parent, Trustee::Account, Kind::OpenFolder);
             reached.push(parent);
         }
     }
@@ -194,21 +205,23 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
     // above): there the entry would need an administrator or reach too far.
     let grantable = |d: &PathBuf| refused_root(&d.to_string_lossy(), &profile.to_string_lossy()).is_none();
     for dir in project.stat_only.iter().filter(|d| grantable(d)) {
-        push(dir, Trustee::Account, Kind::ReadAttributes);
+        push(dir, Trustee::Account, Kind::OpenFolder);
         reached.push(dir);
     }
     // Each folder between a private one (the profile, a private root) and a
-    // granted one, the private one included, opened and its attributes read.
+    // granted one, the private one included, opened — and listed on the way
+    // down to the project itself.
     // A granted folder that IS a private root needs none of its own.
     for dir in reached {
+        let kind = if dir == root { Kind::ListFolder } else { Kind::OpenFolder };
         for anchor in &anchors {
             let Some(rest) = below(dir, anchor).filter(|r| !r.as_os_str().is_empty()) else { continue };
             let mut at = anchor.to_path_buf();
-            push(&at, Trustee::Account, Kind::ReadAttributes);
+            push(&at, Trustee::Account, kind);
             let parts: Vec<_> = rest.components().collect();
             for part in parts.iter().take(parts.len().saturating_sub(1)) {
                 at.push(part);
-                push(&at, Trustee::Account, Kind::ReadAttributes);
+                push(&at, Trustee::Account, kind);
             }
         }
     }
@@ -220,6 +233,11 @@ pub fn plan(root: &Path, project: &ProjectGrants, dirs: &RunDirs, profile: &Path
         };
         push(&held.path, Trustee::Account, kind);
     }
+    // A folder listed needs no entry to open it as well, however the two
+    // chains spell it.
+    let listed: Vec<String> =
+        out.iter().filter(|a| a.kind == Kind::ListFolder).map(|a| a.path.to_string_lossy().to_lowercase()).collect();
+    out.retain(|a| a.kind != Kind::OpenFolder || !listed.contains(&a.path.to_string_lossy().to_lowercase()));
     out
 }
 
@@ -335,10 +353,17 @@ mod tests {
             assert_eq!(deny.mask() & (SYNCHRONIZE | FILE_READ_DATA | FILE_READ_ATTRIBUTES), 0, "{deny:?}");
         }
         assert!(!Kind::Modify.is_deny());
-        // A folder above a grant opens (its path resolves) and is neither
-        // listed nor read.
-        assert_eq!(Kind::ReadAttributes.mask(), FILE_READ_ATTRIBUTES | SYNCHRONIZE, "icacls' (S,RA)");
-        assert_eq!(Kind::ReadAttributes.mask() & (FILE_READ_DATA | FILE_READ_EA | READ_CONTROL), 0);
+        // A folder above a client's grant opens (its path resolves) and is
+        // neither listed nor read.
+        assert_eq!(Kind::OpenFolder.mask(), FILE_READ_ATTRIBUTES | SYNCHRONIZE, "icacls' (S,RA)");
+        assert_eq!(Kind::OpenFolder.mask() & (FILE_LIST_DIRECTORY | FILE_READ_EA | READ_CONTROL), 0);
+        assert_eq!(Kind::OpenFolder.inheritance(), 0);
+        // A folder above the project is listed as well (each name in it is
+        // spelled as the disk does), for itself alone: nothing it holds is read.
+        assert_eq!(Kind::ListFolder.mask(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE, "icacls' (S,RD,RA)");
+        assert_eq!(Kind::ListFolder.mask(), 0x10_0081);
+        assert_eq!(Kind::ListFolder.mask() & (FILE_READ_EA | FILE_EXECUTE | READ_CONTROL), 0);
+        assert_eq!(Kind::ListFolder.inheritance(), 0, "never reaches what the folder holds");
     }
 
     #[test]
@@ -380,14 +405,26 @@ mod tests {
         assert!(!outside.iter().any(|a| a.trustee == Trustee::OwnerRights), "{outside:?}");
         assert!(has("/Users/dev/AppData/Roaming/npm", Trustee::Account, Kind::ReadExecute));
         assert!(has("/Users/dev/AppData/Local/streamscopeai/ca/bundle.pem", Trustee::Account, Kind::ReadFile));
-        for folder in ["/Users/dev/AppData/Local", "/Users/dev/AppData/Local/streamscopeai", "/Users/dev/AppData/Local/streamscopeai/ca"] {
-            assert!(has(folder, Trustee::Account, Kind::ReadAttributes), "{folder}");
+        // The folders above a client's own folders and files are opened,
+        // never listed: only the project's own path is.
+        for folder in [
+            "/Users/dev/AppData",
+            "/Users/dev/AppData/Roaming",
+            "/Users/dev/AppData/Local",
+            "/Users/dev/AppData/Local/streamscopeai",
+            "/Users/dev/AppData/Local/streamscopeai/ca",
+        ] {
+            assert!(has(folder, Trustee::Account, Kind::OpenFolder), "{folder}");
+            assert!(!has(folder, Trustee::Account, Kind::ListFolder), "{folder}");
             assert!(!has(folder, Trustee::Account, Kind::ReadExecute), "{folder}");
         }
-        for ancestor in ["/Users/dev", "/Users/dev/src", "/Users/dev/AppData", "/Users/dev/AppData/Roaming"] {
-            assert!(has(ancestor, Trustee::Account, Kind::ReadAttributes), "{ancestor}");
+        // The profile is on both paths: listed, with no second entry.
+        for ancestor in ["/Users/dev", "/Users/dev/src"] {
+            assert!(has(ancestor, Trustee::Account, Kind::ListFolder), "{ancestor}");
+            assert!(!has(ancestor, Trustee::Account, Kind::OpenFolder), "{ancestor}");
         }
-        assert!(!has("/Users/dev/src/app", Trustee::Account, Kind::ReadAttributes));
+        assert!(!has("/Users/dev/src/app", Trustee::Account, Kind::ListFolder));
+        assert!(!has("/Users/dev/.claude", Trustee::Account, Kind::ListFolder));
         assert!(has("/Users/dev/src/app/.git", Trustee::Account, Kind::DenyNode));
         assert!(has("/Users/dev/src/app/.git/hooks", Trustee::Account, Kind::DenyTree));
         // A project inside the profile, with no worktree and no file outside:
@@ -405,15 +442,18 @@ mod tests {
         // The developer holds full control under it: `OWNER RIGHTS` is written.
         assert!(has("/work/team/app", Trustee::OwnerRights, Kind::Modify));
         // Every folder from the root down to the project's parent is opened.
-        assert!(has("/work", Trustee::Account, Kind::ReadAttributes));
-        assert!(has("/work/team", Trustee::Account, Kind::ReadAttributes));
-        assert!(!has("/work/team/app", Trustee::Account, Kind::ReadAttributes));
+        assert!(has("/work", Trustee::Account, Kind::ListFolder));
+        assert!(has("/work/team", Trustee::Account, Kind::ListFolder));
+        assert!(!has("/work/team/app", Trustee::Account, Kind::ListFolder));
         // Positive control: the same project with no private root gets neither.
         let open = plan(Path::new("/work/team/app"), &ProjectGrants::default(), &RunDirs::default(), profile, &[]);
-        assert!(!open.iter().any(|a| a.trustee == Trustee::OwnerRights || a.kind == Kind::ReadAttributes), "{open:?}");
+        assert!(
+            !open.iter().any(|a| a.trustee == Trustee::OwnerRights || matches!(a.kind, Kind::ListFolder | Kind::OpenFolder)),
+            "{open:?}"
+        );
         // A project that is its own private root opens nothing above itself.
         let alone = plan(Path::new("/app"), &ProjectGrants::default(), &RunDirs::default(), profile, &[PathBuf::from("/app")]);
-        assert!(!alone.iter().any(|a| a.kind == Kind::ReadAttributes), "{alone:?}");
+        assert!(!alone.iter().any(|a| matches!(a.kind, Kind::ListFolder | Kind::OpenFolder)), "{alone:?}");
         assert!(alone.iter().any(|a| a.trustee == Trustee::OwnerRights));
     }
 
@@ -449,7 +489,8 @@ mod tests {
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
         assert!(has("/Users/dev/main/.git", Trustee::Account, Kind::Modify));
         assert!(has("/Users/dev/main/.git", Trustee::OwnerRights, Kind::Modify));
-        assert!(has("/Users/dev/main", Trustee::Account, Kind::ReadAttributes));
+        assert!(has("/Users/dev/main", Trustee::Account, Kind::OpenFolder));
+        assert!(!has("/Users/dev/main", Trustee::Account, Kind::ListFolder));
         assert!(!has("/Users/dev/main", Trustee::Account, Kind::Modify));
         // A main checkout whose git folder lies elsewhere: the folders above
         // it are opened too, or its path does not resolve.
@@ -460,14 +501,14 @@ mod tests {
         };
         let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile, &[]);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
-        assert!(has("/Users/dev/code", Trustee::Account, Kind::ReadAttributes));
+        assert!(has("/Users/dev/code", Trustee::Account, Kind::OpenFolder));
         // One outside the profile is opened too;
         // a drive root never gets an entry.
         let project =
             ProjectGrants { stat_only: vec![PathBuf::from("/srv/main"), PathBuf::from(r"D:\")], ..Default::default() };
         let aces = plan(Path::new("/Users/dev/wt"), &project, &RunDirs::default(), profile, &[]);
         let has = |p: &str, t, k| aces.contains(&Ace { path: PathBuf::from(p), trustee: t, kind: k });
-        assert!(has("/srv/main", Trustee::Account, Kind::ReadAttributes));
+        assert!(has("/srv/main", Trustee::Account, Kind::OpenFolder));
         assert!(!aces.iter().any(|a| a.path == Path::new(r"D:\")), "{aces:?}");
     }
 

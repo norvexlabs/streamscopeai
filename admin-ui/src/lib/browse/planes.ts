@@ -50,6 +50,8 @@ export interface AuditOptions {
   a2aAgents: { id: string; name: string }[];
   /** QoS class id → name. */
   qosClassNames: Map<string, string>;
+  /** The API keys the key filter offers (console only; empty on the portal). */
+  keys: { id: string; name: string }[];
 }
 
 export interface BrowsePlane {
@@ -89,12 +91,12 @@ const ws = (workspaceId: string | undefined) => (workspaceId ? { workspace_id: w
  *  it on the caller's own rows, and a stale one must not ride along). */
 const teammate = (scope: Record<string, string>) => (scope.workspace_id ? blank(scope.user_email) : undefined);
 
-/** Console scope keys: a user, a workspace set, an MCP token. */
-const CONSOLE_SCOPE_KEYS = ['user_email', 'user_id', 'workspace_ids', 'jti'] as const;
+/** Console scope keys: a user, a workspace set, an MCP token, an API key. */
+const CONSOLE_SCOPE_KEYS = ['user_email', 'user_id', 'workspace_ids', 'jti', 'key_id'] as const;
 /** Portal scope keys: the workspace being viewed, and a teammate in it. */
 const PORTAL_SCOPE_KEYS = ['workspace_id', 'user_email'] as const;
 
-const CONSOLE_ONLY = new Set<string>(['user_id', 'workspace_ids', 'jti']);
+const CONSOLE_ONLY = new Set<string>(['user_id', 'workspace_ids', 'jti', 'key_id']);
 
 export const consolePlane: BrowsePlane = {
   portal: false,
@@ -112,6 +114,7 @@ export const consolePlane: BrowsePlane = {
           user_id: blank(scope.user_id),
           ...workspaceIdsQuery(scope.workspace_ids ?? '', consoleScope.workspaces), // workspace-reload-ok: called only from the browse components' usePeriodicLoad loaders
           jti: blank(scope.jti),
+          key_id: blank(scope.key_id),
         },
       },
     }),
@@ -127,12 +130,13 @@ export const consolePlane: BrowsePlane = {
       },
     }),
   async auditOptions() {
-    const [apps, vs, up, agents, qos] = await Promise.all([
+    const [apps, vs, up, agents, qos, keys] = await Promise.all([
       this.apps(),
       adminApi.GET('/api/v1/admin/mcp/virtual-servers', { params: { query: { limit: 200 } } }),
       adminApi.GET('/api/v1/admin/mcp/upstream-servers', { params: { query: { limit: 200 } } }),
       adminApi.GET('/api/v1/admin/a2a/agents', { params: { query: { limit: 200 } } }),
       adminApi.GET('/api/v1/admin/qos-classes', {}),
+      adminApi.GET('/api/v1/admin/keys', { params: { query: { plane: 'gateway', limit: 200 } } }),
     ]);
     return {
       apps,
@@ -140,6 +144,7 @@ export const consolePlane: BrowsePlane = {
       upstreamServers: (up.data?.items ?? []).map((u) => ({ id: u.id, name: u.name })),
       a2aAgents: (agents.data?.items ?? []).map((a) => ({ id: a.slug, name: a.slug })),
       qosClassNames: new Map((qos.data?.items ?? []).map((c) => [c.id, c.name])),
+      keys: (keys.data?.items ?? []).map((k) => ({ id: k.id, name: `${k.name || k.owner_email} (${k.key_prefix}…)` })),
     };
   },
   conversation: (id) =>
@@ -187,6 +192,7 @@ export const portalPlane: BrowsePlane = {
       upstreamServers: data?.mcp_upstream_servers ?? [],
       a2aAgents: data?.a2a_agents ?? [],
       qosClassNames: new Map((data?.qos_classes ?? []).map((c) => [c.id, c.name])),
+      keys: [],
     };
   },
   async apps() {

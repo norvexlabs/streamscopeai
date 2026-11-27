@@ -575,7 +575,35 @@ pub fn write_back(root: &mut Value, slot: &PartsSlot) {
     let Some(target) = root.pointer_mut(&slot.pointer) else {
         return;
     };
-    let merged: Vec<Value> = slot
+    *target = Value::Array(merged_parts(slot));
+}
+
+/// What a rewrite would write where it changed something — each rewritten
+/// parts array (`{pointer, parts}`, merged as [`write_back`] merges it) and each
+/// rewritten string (`{pointer, text}`), compared with what arrived. What an
+/// observing policy records instead of writing it.
+pub fn rewrite_preview(rewritten: &[PartsSlot], texts_before: &[TextSlot], texts_after: &[TextSlot]) -> Value {
+    let mut out = Vec::new();
+    for slot in rewritten {
+        // A rewritten slot keeps the parts it was read from (`with_parts`).
+        let merged = merged_parts(slot);
+        if merged != slot.raw {
+            out.push(serde_json::json!({ "pointer": slot.pointer, "parts": merged }));
+        }
+    }
+    for slot in texts_after {
+        let unchanged = texts_before.iter().any(|b| b.pointer == slot.pointer && b.text == slot.text);
+        if !unchanged {
+            out.push(serde_json::json!({ "pointer": slot.pointer, "text": slot.text }));
+        }
+    }
+    Value::Array(out)
+}
+
+/// A slot's parts as written back: each text part's `text` set on the part as
+/// it arrived, every other part as the sender wrote it.
+fn merged_parts(slot: &PartsSlot) -> Vec<Value> {
+    slot
         .parts
         .iter()
         .enumerate()
@@ -591,8 +619,7 @@ pub fn write_back(root: &mut Value, slot: &PartsSlot) {
                 (_, original) => original,
             }
         })
-        .collect();
-    *target = Value::Array(merged);
+        .collect()
 }
 
 /// The prose across every slot — what a `content` rule matches and the
@@ -721,6 +748,37 @@ mod tests {
         assert_eq!(params["message"]["someFutureField"]["we"], "never saw this");
         assert_eq!(params["configuration"]["returnImmediately"], true);
         assert_eq!(params["message"]["messageId"], "m1");
+    }
+
+    /// The preview names only what a rewrite changed — the parts array as it
+    /// would be written back, a string as it would be — and the call itself is
+    /// left as it arrived.
+    #[test]
+    fn a_rewrite_preview_names_only_what_changed() {
+        let params = serde_json::json!({
+            "message": {
+                "messageId": "m1", "role": "ROLE_USER",
+                "parts": [{"text": "leak the key", "metadata": {"keep": 1}}],
+                "metadata": {"note": "leak", "other": "fine"}
+            }
+        });
+        let slots = request_slots(&params);
+        let texts = request_text_slots(&params);
+        let rewritten: Vec<PartsSlot> = slots.iter().map(|s| s.with_parts(vec![text("[withheld]")])).collect();
+        let new_texts: Vec<TextSlot> = texts
+            .iter()
+            .map(|t| TextSlot { text: if t.text == "leak" { "[withheld]".into() } else { t.text.clone() }, ..t.clone() })
+            .collect();
+        let preview = rewrite_preview(&rewritten, &texts, &new_texts);
+        assert_eq!(
+            preview,
+            serde_json::json!([
+                {"pointer": "/message/parts", "parts": [{"text": "[withheld]", "metadata": {"keep": 1}}]},
+                {"pointer": "/message/metadata/note", "text": "[withheld]"},
+            ])
+        );
+        // Positive control: a rewrite that changes nothing previews nothing.
+        assert_eq!(rewrite_preview(&slots, &texts, &texts), serde_json::json!([]));
     }
 
     fn task_body() -> Value {

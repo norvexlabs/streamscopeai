@@ -260,6 +260,7 @@ struct SessionSummaryRow {
     total_cost: f64,
     cost_currency: Option<String>,
     cost_currency_count: i16,
+    badge_codes: Vec<String>,
 }
 
 /// A session's spend from its row's running total and classification
@@ -293,9 +294,17 @@ impl SessionSummaryRow {
             spend: session_spend(self.cost_currency_count, self.cost_currency, self.total_cost, fallback),
             link: self.links.link(),
             links: self.links.links(),
+            badge_codes: stored_badge_codes(self.badge_codes),
             ..self.summary
         }
     }
+}
+
+/// A session's stored badge codes, typed. A code this release does not know
+/// (written by a newer one, read after a rollback) is not shown: the row says
+/// what this release can name.
+fn stored_badge_codes(stored: Vec<String>) -> Vec<streamscope_core::audit::AuditBadgeCode> {
+    stored.iter().filter_map(|c| c.parse().ok()).collect()
 }
 
 /// The summaries of `rows`. The tenant's accounting currency is read once, and
@@ -321,7 +330,7 @@ fn summary_columns() -> &'static str {
             "s.session_id, s.turn_count::bigint AS turn_count, \
              (s.total_prompt_tokens + s.total_completion_tokens)::bigint AS total_tokens, \
              s.total_cache_creation_tokens, s.total_cache_read_tokens, s.total_reasoning_tokens, \
-             s.total_cost, s.cost_currency, s.cost_currency_count, s.created_at AS first_timestamp, s.updated_at AS last_timestamp, \
+             s.total_cost, s.cost_currency, s.cost_currency_count, s.badge_codes, s.created_at AS first_timestamp, s.updated_at AS last_timestamp, \
              s.last_latency_ms, s.model_used, s.user_id, s.user_email, s.key_id, s.app_id, \
              {ALERT_COLUMNS}, s.first_user_prompt, \
              {LINKAGE_COLUMNS}"
@@ -764,14 +773,19 @@ pub(crate) async fn list_sessions_impl(
         // so the per-session joins run for the page's rows alone, never for
         // the rows an offset skips or a filter drops.
         let linked = LinkedView::at(1, 2, scope);
-        // The alert as the reader is shown it, so a confined view ranks no
-        // hidden one; 0 for every row under the other orders.
+        // The page's rank, ascending, then the newest first among equals: the
+        // alert as the reader is shown it, so a confined view ranks no hidden
+        // one; a figure negated, so the largest comes first; 0 under the
+        // orders by time.
         let rank = match sort {
             SessionSort::Alerts => format!(
                 "CASE WHEN s.alert_level IS NULL OR NOT ({shown}) THEN 2 WHEN s.alert_level = 'major' THEN 0 \
                  WHEN s.alert_level = 'minor' THEN 1 ELSE 2 END",
                 shown = linked.alerts_shown(),
             ),
+            SessionSort::Turns => "-s.turn_count::float8".to_string(),
+            SessionSort::Cost => "-s.total_cost".to_string(),
+            SessionSort::Tokens => "-(s.total_prompt_tokens + s.total_completion_tokens)::float8".to_string(),
             SessionSort::Oldest | SessionSort::Newest => "0".to_string(),
         };
         let mut sql = format!(
@@ -779,7 +793,7 @@ pub(crate) async fn list_sessions_impl(
         );
         let (bind_idx, _) = push_session_filters(&mut sql, &query, scope, linked, 3);
         let (inner_order, outer_order) = match sort {
-            SessionSort::Alerts => (
+            SessionSort::Alerts | SessionSort::Turns | SessionSort::Cost | SessionSort::Tokens => (
                 "ORDER BY rank, s.updated_at DESC, s.session_id DESC".to_string(),
                 "ORDER BY p.rank, p.updated_at DESC, p.session_id DESC",
             ),
@@ -885,6 +899,12 @@ pub(crate) async fn list_sessions_impl(
     Ok(SearchRows { rows, scan_cut: walk.cut() })
 }
 
+/// The `badges` filter's codes as the stored set spells them, or `None` when
+/// it names none.
+fn badge_codes(query: &SessionListQuery) -> Option<Vec<&'static str>> {
+    crate::routes::BadgeCodes::codes(&query.badges).map(|c| c.iter().map(|c| c.as_str()).collect())
+}
+
 /// Append the session list's filters to `sql`, numbering binds from
 /// `bind_idx`; [`bind_session_filters`] binds them in the same order. Returns
 /// the next bind index, and whether a filter the search lookup does not apply
@@ -947,6 +967,13 @@ fn push_session_filters(
     }
     if query.app_id.is_some() {
         both(sql, &|a| format!("{a}.app_id = ${bind_idx}"));
+        bind_idx += 1;
+        post_filtered = true;
+    }
+    if badge_codes(query).is_some() {
+        // Any of the codes: `&&` over the session's own set, a filter on the
+        // window's rows (no index: see the column's migration).
+        both(sql, &|a| format!("{a}.badge_codes && ${bind_idx}::text[]"));
         bind_idx += 1;
         post_filtered = true;
     }
@@ -1083,6 +1110,9 @@ fn bind_session_filters<'q, O>(
     }
     if let Some(app_id) = &query.app_id {
         q = q.bind(app_id.clone());
+    }
+    if let Some(codes) = badge_codes(query) {
+        q = q.bind(codes);
     }
     if let Some(exclude_user) = &query.exclude_user {
         q = q.bind(exclude_user.clone());

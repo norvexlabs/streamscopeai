@@ -444,3 +444,33 @@
   package: libxml2
   reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r3 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-22). The database is reached only by the stack's own services, never published"
   expires: 2027-01-21
+- id: CVE-2026-11979
+  artifact: postgres
+  package: libxml2
+  reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r5 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-27). The database is reached only by the stack's own services, never published"
+  expires: 2027-01-21
+- id: CVE-2026-86138
+  artifact: postgres
+  package: libxml2
+  reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r4 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-27). The database is reached only by the stack's own services, never published"
+  expires: 2027-01-21
+- id: CVE-2026-86139
+  artifact: postgres
+  package: libxml2
+  reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r4 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-27). The database is reached only by the stack's own services, never published"
+  expires: 2027-01-21
+- id: CVE-2026-86140
+  artifact: postgres
+  package: libxml2
+  reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r4 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-27). The database is reached only by the stack's own services, never published"
+  expires: 2027-01-21
+- id: CVE-2026-86142
+  artifact: postgres
+  package: libxml2
+  reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r4 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-27). The database is reached only by the stack's own services, never published"
+  expires: 2027-01-21
+- id: CVE-2026-86143
+  artifact: postgres
+  package: libxml2
+  reason: "libxml2 2.13.9-r2 in the official postgres image; 2.13.9-r4 is out, not yet in the image (the pinned b6972e11 and the newest 18.7-alpine3.24 digest, 0115267a, both carry r2; re-checked 2026-11-27). The database is reached only by the stack's own services, never published"
+  expires: 2027-01-21

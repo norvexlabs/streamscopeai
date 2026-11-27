@@ -693,7 +693,7 @@
                 mono
                 class="w-48 text-xs" />
               <SelectInput value={cond.op} onchange={(e) => setOp(i, (e.currentTarget as HTMLSelectElement).value as ConditionOp)}
-                class="w-auto text-xs">
+                fluid={false} class="text-xs">
                 {#each opsForTarget(cond.target) as op (op)}
                   <option value={op}>{op}</option>
                 {/each}

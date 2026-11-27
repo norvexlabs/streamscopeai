@@ -244,6 +244,8 @@ fn rule_to_result(rule: &Rule) -> RiskResult {
         // field profile to resolve one against.
         profile_id: None,
         tool_id: None,
+        not_applied: false,
+        would_rewrite: None,
     }
 }
 

@@ -98,6 +98,7 @@ pub async fn transform_request(
     needs_translation: bool,
     capture_diffs: bool,
     tool_rules: &[Rule],
+    tool_enforcement: crate::config::tool_enforcement::ToolEnforcement,
     field_profiles: Option<&tool_rules::FieldProfileSet>,
     mcp_config: Option<&crate::config::mcp::McpConfig>,
     sanitize_tool_names: bool,
@@ -156,6 +157,10 @@ pub async fn transform_request(
         .copied()
         .filter(|r| matches!(r.action.kind(), ActionKind::Block))
         .collect();
+    // Observing: the tools a block would have removed. They stay declared, and
+    // nothing else takes them over — a substitution would hand the gateway a
+    // call that enforcing never lets the model make.
+    let mut observed_blocked: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !blocking_def_rules.is_empty() {
         // Resolve tool_id once per name from the per-tenant field-profile
         // registry so the rule evaluator can match `target: "tool_id"`. Tools
@@ -187,13 +192,20 @@ pub async fn transform_request(
         // Each name's matching rule, recorded as the removal decides it, so the
         // notice and the audit below name the rule that removed it.
         let mut matched: std::collections::HashMap<String, &Rule> = std::collections::HashMap::new();
-        let removed = request.remove_tools(|name| match find_block_rule(name) {
+        let would_block = |name: &str| match find_block_rule(name) {
             Some(rule) => {
                 matched.insert(name.to_string(), rule);
                 true
             }
             None => false,
-        });
+        };
+        // Observing: the declarations stay; the names a block would remove are
+        // only recorded.
+        let removed = if tool_enforcement.observes() {
+            request.tools_remove_would_take(would_block)
+        } else {
+            request.remove_tools(would_block)
+        };
         // A tool the client lists as deferred is not declared yet, so the
         // removal above cannot reach it: the notice names it too. Never in a
         // request that declares no tools, which offers the model nothing to
@@ -212,7 +224,26 @@ pub async fn transform_request(
                 .collect(),
             _ => Vec::new(),
         };
-        if !removed.is_empty() || !deferred.is_empty() {
+        if tool_enforcement.observes() {
+            for name in removed.iter().chain(&deferred) {
+                let Some(rule) = matched.get(name).copied() else {
+                    tracing::error!(tool = %name, "a tool observed by policy has no matching block rule");
+                    continue;
+                };
+                badges.add_tool_block_not_applied(Phase::Request, name.clone());
+                observed_blocked.insert(name.clone());
+                blocked_tools.push(crate::proxy::content::BlockedToolInfo {
+                    not_applied: true,
+                    name: name.clone(),
+                    title: rule.title.as_deref().unwrap_or("Blocked by policy").to_string(),
+                    description: rule.description.as_deref().unwrap_or("Blocked by policy").to_string(),
+                    rule_id: rule.id.clone(),
+                    tool_use_id: None,
+                    call_index: None,
+                    arguments: None,
+                });
+            }
+        } else if !removed.is_empty() || !deferred.is_empty() {
             let mut notice =
                 "\n\n[Tool Policy] The following tools have been blocked by your administrator:"
                     .to_string();
@@ -352,6 +383,9 @@ pub async fn transform_request(
         let mut name_to_server_type: std::collections::HashMap<String, Option<String>> =
             std::collections::HashMap::new();
         for (name, server_type) in &tool_defs {
+            if observed_blocked.contains(name) {
+                continue;
+            }
             if let Some(rule) = find_rewrite_rule(name, server_type.as_deref()) {
                 name_to_rule.insert(name.clone(), (rule, &rule.action));
                 name_to_server_type.insert(name.clone(), server_type.clone());
@@ -543,7 +577,11 @@ pub async fn transform_request(
         .collect();
     if !replace_result_rules.is_empty() {
         let rules_for_walk = replace_result_rules.clone();
-        let redactions = request.redact_tool_results(|name_hint, _id, content, args| {
+        // Observing: every result is left as sent, and what a rewrite would
+        // have made of it is recorded, marked not applied.
+        let observe = tool_enforcement.observes();
+        let mut observed: Vec<crate::proxy::content::RedactedToolResultInfo> = Vec::new();
+        let find_redaction = |name_hint: &str, content: &str, args: Option<&serde_json::Value>| {
             // Try each rule in order — stop at the first hit that produces
             // an actual rewrite (regex non-match returns None and lets a
             // later rule have a shot).
@@ -587,7 +625,29 @@ pub async fn transform_request(
                 return Some((new_content, title, description, rule.id.clone()));
             }
             None
+        };
+        let redactions = request.redact_tool_results(|name_hint, id, content, args| {
+            let hit = find_redaction(name_hint, content, args)?;
+            if !observe {
+                return Some(hit);
+            }
+            let (redacted_content, rule_name, reason, rule_id) = hit;
+            observed.push(crate::proxy::content::RedactedToolResultInfo {
+                tool_use_id: id.to_string(),
+                tool_name: (!name_hint.is_empty()).then(|| name_hint.to_string()),
+                original_content: content.to_string(),
+                redacted_content,
+                rule_name,
+                reason,
+                rule_id,
+                not_applied: true,
+            });
+            None
         });
+        if !observed.is_empty() {
+            badges.add(crate::audit::AuditBadge::ModifiedNotApplied);
+            redacted_tool_results.extend(observed);
+        }
         if !redactions.is_empty() {
             // Redaction is a "content rewritten by a transform" event — use
             // the umbrella `Modified` badge. Per-rule detail lives in
@@ -912,8 +972,9 @@ pub async fn transform_request(
 
     let declared: Vec<String> =
         request.tool_definitions_with_server_type().into_iter().map(|(name, _)| name).collect();
+    // A tool an observing policy would have removed is still offered: never withheld.
     let withheld_tools =
-        blocked_tools.iter().filter(|b| !declared.contains(&b.name)).cloned().collect();
+        blocked_tools.iter().filter(|b| !b.not_applied && !declared.contains(&b.name)).cloned().collect();
 
     Ok(TransformResult {
         badges,
@@ -1442,7 +1503,7 @@ mod tests {
         let (engine, programs) = empty_engine_and_programs();
         for (version, body) in cases {
             let mut request = ApiRequest::parse(version, &Bytes::from(body)).unwrap();
-            let result = transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+            let result = transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
             let wire = match &request {
@@ -1479,7 +1540,7 @@ mod tests {
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
         ] {
             let mut request = ApiRequest::parse(crate::api::sse::ApiVersion::ChatCompletions, &Bytes::from(body)).unwrap();
-            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
             identities.push(crate::proxy::response_cache::tests::content_hash(&request));
@@ -1495,7 +1556,7 @@ mod tests {
         let (engine, programs) = empty_engine_and_programs();
 
         let _result =
-            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
         // stream_options injection is internal — verified via the request body, not a badge.
@@ -1525,7 +1586,7 @@ mod tests {
             if let ApiRequest::ChatCompletions(chat) = &mut request {
                 chat.stream_options = Some(sent.clone());
             }
-            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
             let ApiRequest::ChatCompletions(chat) = &request else { panic!("chat request") };
@@ -1540,7 +1601,7 @@ mod tests {
         let (engine, programs) = empty_engine_and_programs();
 
         let _result =
-            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
         if let ApiRequest::ChatCompletions(chat) = &request {
@@ -1576,7 +1637,7 @@ mod tests {
         }];
 
         let result =
-            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open)
+            transform_request(&mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open)
                 .await
                 .unwrap();
         // Ensure script ran successfully (Modified outcome present).
@@ -1665,7 +1726,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, true, &block_rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            None, None, None, false, true, &block_rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -1731,7 +1792,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, false, &rules, None, None, true, ScriptFailMode::Open,
+            None, None, None, false, false, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -1754,7 +1815,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, false, &[], None, None, true, ScriptFailMode::Open,
+            None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -1824,7 +1885,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, true, &rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            None, None, None, false, true, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -1891,7 +1952,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, false, &rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            None, None, None, false, false, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -1976,7 +2037,7 @@ mod tests {
         let result = transform_request(
             &mut request, &user, &engine, &programs,
             Some("claude-code"), // <-- app_id propagated from the X-App-Id header
-            None, None, false, true, &rules, Some(&profiles), None, true,
+            None, None, false, true, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true,
             ScriptFailMode::Open,
         )
         .await
@@ -2095,7 +2156,7 @@ mod tests {
         let result = transform_request(
             &mut request, &user, &engine, &programs,
             Some("claude-code"),
-            None, None, false, true, &rules, Some(&profiles), None, true,
+            None, None, false, true, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true,
             ScriptFailMode::Open,
         )
         .await
@@ -2197,7 +2258,7 @@ mod tests {
             let sent: serde_json::Value = serde_json::from_slice(&parse().serialize().unwrap()).unwrap();
             let mut request = parse();
             let result = transform_request(
-                &mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, false,
+                &mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, false,
                 ScriptFailMode::Open,
             )
             .await
@@ -2226,7 +2287,7 @@ mod tests {
         let mut request =
             ApiRequest::parse(crate::api::sse::ApiVersion::ChatCompletions, &Bytes::from(body)).unwrap();
         transform_request(
-            &mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, false,
+            &mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, false,
             ScriptFailMode::Open,
         )
         .await
@@ -2250,7 +2311,7 @@ mod tests {
         let mut request =
             ApiRequest::parse(crate::api::sse::ApiVersion::GoogleGemini, &Bytes::from(body)).unwrap();
         let result = transform_request(
-            &mut request, &user, &engine, &programs, None, None, None, false, false, &[], None, None, false,
+            &mut request, &user, &engine, &programs, None, None, None, false, false, &[], crate::config::tool_enforcement::ToolEnforcement::Enforce, None, None, false,
             ScriptFailMode::Open,
         )
         .await
@@ -2560,7 +2621,7 @@ mod tests {
         let result = transform_request(
             &mut request, &user, &engine, &programs,
             Some("claude-code"),
-            None, None, false, true, &rules, Some(&profiles), None, true,
+            None, None, false, true, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true,
             ScriptFailMode::Open,
         )
         .await
@@ -2693,7 +2754,7 @@ mod tests {
         let result = transform_request(
             &mut request, &user, &engine, &programs,
             Some("claude-code"),
-            None, None, false, true, &rules, Some(&profiles), None, true,
+            None, None, false, true, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true,
             ScriptFailMode::Open,
         )
         .await
@@ -2758,7 +2819,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, false, &rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            None, None, None, false, false, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -2862,7 +2923,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, false, &rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            None, None, None, false, false, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -2906,7 +2967,7 @@ mod tests {
 
         let result = transform_request(
             &mut request, &user, &engine, &programs,
-            None, None, None, false, false, &rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            None, None, None, false, false, &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -3037,7 +3098,7 @@ mod tests {
         let profiles = web_fetch_profiles();
         transform_request(
             request, &user, &engine, programs, Some("claude-code"), None, None, false, true,
-            rules, Some(&profiles), None, true, ScriptFailMode::Open,
+            rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), None, true, ScriptFailMode::Open,
         )
         .await
         .unwrap()
@@ -3101,7 +3162,7 @@ mod tests {
         let engine = ScriptEngine::new();
         let result = transform_request(
             &mut request, &user, &engine, &[], Some("claude-code"), None, None, false, true,
-            &[web_fetch_rule(substitute_web_fetch())], Some(&profiles), Some(&mcp), true, ScriptFailMode::Open,
+            &[web_fetch_rule(substitute_web_fetch())], crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), Some(&mcp), true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -3184,7 +3245,7 @@ mod tests {
         let engine = ScriptEngine::new();
         let result = transform_request(
             &mut request, &user, &engine, &[], None, None, None, false, true,
-            &rules, Some(&profiles), Some(&mcp), true, ScriptFailMode::Open,
+            &rules, crate::config::tool_enforcement::ToolEnforcement::Enforce, Some(&profiles), Some(&mcp), true, ScriptFailMode::Open,
         )
         .await
         .unwrap();
@@ -3460,5 +3521,96 @@ mod tests {
         });
         let result = transform_claude_code(&mut declared_and_listed, &[block()], &[]).await;
         assert_eq!(blocked(&result), ["WebFetch"]);
+    }
+
+    /// An observing tool policy offers every tool and leaves every result as
+    /// sent: what a block would remove and a rewrite would make is recorded,
+    /// marked not applied, and nothing is withheld from the answer.
+    #[tokio::test]
+    async fn an_observing_policy_changes_nothing_and_records_what_it_would_have_done() {
+        use crate::config::tool_enforcement::ToolEnforcement;
+        let json = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "Read", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "secret=hunter2"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "web_search", "parameters": {}}},
+                {"type": "function", "function": {"name": "Read", "parameters": {}}}
+            ]
+        });
+        let rules = [
+            rule_from_json(serde_json::json!({
+                "id": "R-BLOCK", "phase": "request", "scope": "tool_definitions", "risk": "danger",
+                "match": [{"target": "tool_id", "op": "equals", "value": "web_search"}],
+                "action": {"kind": "block"}, "title": "Web search", "description": "no web",
+            })),
+            rule_from_json(serde_json::json!({
+                "id": "R-REDACT", "phase": "request", "scope": "tool_results", "risk": "caution",
+                "match": [], "action": {"kind": "replace", "with": "[redacted]"},
+            })),
+        ];
+        let profiles = tool_rules::FieldProfileSet::new(vec![tool_rules::FieldProfile {
+            id: Some("test-web_search".into()),
+            description: None,
+            source: None,
+            tool_id: "web_search".into(),
+            tool_pattern: "web_search".into(),
+            app_filter: None,
+            mcp_server: None,
+            server_type: None,
+            field: "query".into(),
+            wire_field: None,
+            normalizer: crate::config::tool_rules_normalize::Normalizer::Raw,
+            priority: 100,
+            is_builtin: false,
+        }]);
+        let user = make_user_context_with_map(ModelMap::default());
+        let (engine, programs) = empty_engine_and_programs();
+        let run = async |mode: ToolEnforcement| {
+            let mut request =
+                ApiRequest::parse(crate::api::sse::ApiVersion::ChatCompletions, &Bytes::from(json.to_string())).unwrap();
+            let result = transform_request(
+                &mut request, &user, &engine, &programs, None, None, None, false, true,
+                &rules, mode, Some(&profiles), None, true, ScriptFailMode::Open,
+            )
+            .await
+            .unwrap();
+            let wire = serde_json::to_value(match &request {
+                ApiRequest::ChatCompletions(r) => r,
+                _ => unreachable!(),
+            })
+            .unwrap();
+            (result, wire)
+        };
+
+        let (observed, wire) = run(ToolEnforcement::Observe).await;
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 2, "every tool is offered: {wire}");
+        assert!(!wire.to_string().contains("[Tool Policy]"), "no notice: {wire}");
+        assert!(wire.to_string().contains("secret=hunter2"), "the result is as sent: {wire}");
+        assert!(observed.withheld_tools.is_empty());
+        assert_eq!(observed.blocked_tools.len(), 1);
+        assert!(observed.blocked_tools[0].not_applied);
+        assert_eq!((observed.blocked_tools[0].name.as_str(), observed.blocked_tools[0].rule_id.as_str()), ("web_search", "R-BLOCK"));
+        assert_eq!(observed.redacted_tool_results.len(), 1);
+        let redaction = &observed.redacted_tool_results[0];
+        assert!(redaction.not_applied);
+        assert_eq!((redaction.original_content.as_str(), redaction.redacted_content.as_str()), ("secret=hunter2", "[redacted]"));
+        let badges = observed.badges.clone().finish();
+        assert!(badges.iter().any(|b| matches!(b,
+            crate::audit::AuditBadge::ToolBlockNotApplied { phase: crate::audit::Phase::Request, names, .. } if names == &["web_search"])), "{badges:?}");
+        assert!(badges.contains(&crate::audit::AuditBadge::ModifiedNotApplied), "{badges:?}");
+        assert!(!badges.iter().any(|b| matches!(b, crate::audit::AuditBadge::ToolBlocked { .. } | crate::audit::AuditBadge::Modified)), "{badges:?}");
+
+        // Positive control: the same rules enforcing remove the tool and rewrite the result.
+        let (enforced, wire) = run(ToolEnforcement::Enforce).await;
+        assert_eq!(wire["tools"].as_array().unwrap().len(), 1, "{wire}");
+        assert!(!wire.to_string().contains("secret=hunter2"), "{wire}");
+        assert!(enforced.blocked_tools.iter().all(|b| !b.not_applied) && enforced.blocked_tools.len() == 1);
+        assert!(enforced.redacted_tool_results.iter().all(|r| !r.not_applied) && enforced.redacted_tool_results.len() == 1);
     }
 }

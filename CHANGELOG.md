@@ -5,6 +5,70 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Calendar Versioning](https://calver.org/) (`YYYY.M.MICRO`).
 
+## [2026.11.92]
+
+### Added
+
+- **BREAKING** for tool-policy enforcement: a tool-policy profile now runs in **Observe** or
+  **Enforce**. In Observe, a block or rewrite rule that matches is recorded — the audit entry says
+  **Would block** or **Not applied** and names the rule — and the call goes through as sent, on
+  model tool calls, MCP requests and agent calls alike; in Enforce the same rules refuse and
+  rewrite. Classify rules and web substitution act the same in both. **Every organisation's tool
+  policy is in Observe after this update, and a new one starts there**: nothing is blocked or
+  rewritten until an administrator switches its profile to Enforce, at the top of the profile's
+  page (the console confirms how many rules will start acting). A Layered profile follows the
+  Default's mode unless it sets one; profile cards and the workspace picker mark an observing
+  profile, and the banner on an observing profile links to the requests recorded as not applied.
+- The Audit and Sessions lists filter by badge, in the console and the portal: **Badges** lists
+  the requests (or the sessions) carrying any of the badges picked. The picker groups the badges
+  by family, offers only those the listed kind can carry, and says under each what it means and
+  what to do about it.
+- A session row shows the attention badges its model turns carried — a guardrail finding, a
+  blocked tool, a tool loop, an unpriced model… — up to three and a count of the rest; clicking
+  one lists the sessions carrying it; a badge picked in the filter shows on every row it matched.
+- **Sort** orders the lists by a figure, largest first: the Sessions list by turns, cost or tokens
+  (beside newest, oldest and alerts, now offered in the page too), the Audit list by latency on
+  any one kind and by cost or tokens on LLM requests. Cost is compared as recorded, whatever its
+  currency. A search keeps its newest-first order.
+- The console's Audit list filters by API key.
+
+### Changed
+
+- Every dropdown in the console and the portal — the filter bars, forms and header pickers — now
+  opens a list drawn in the console's theme instead of the browser's own, and works the same by
+  mouse and keyboard. Suggestion lists (currency codes, embedding aliases, tool ids) and the date
+  fields (a custom period, a key's custom expiry, an expert's restart date) follow it, with a
+  themed calendar. Known limit: while a list is open, a screen reader does not yet announce
+  the option the arrow keys move to; the choice is announced once made.
+
+## [2026.11.91]
+
+### Fixed
+
+- Under the Windows sandbox, Open Code Review (and any tool written in Go that resolves its working
+  folder) no longer fails with "Access is denied" in a project under your profile or a private root:
+  the sandbox account may now list the folders on the way down to the project (your profile or the
+  private root included) — names, sizes and dates, never what a file holds. Watching one of them, an
+  agent can learn the names of files changed below it while it runs; the Portal Guide says so.
+
+## [2026.11.90]
+
+### Changed
+
+- **BREAKING** for API scripts: an audit record's `transform_diff` no longer carries `effective_messages`, the
+  request's whole message list after a transform changed it. What a transform changed stays in its
+  steps and injection blocks.
+
+### Fixed
+
+- A session whose turns a transform, a tool rule or a sanitising step changed no longer stores each such
+  turn's whole history again, so its view in the console and the portal grows with the conversation,
+  not with turns × history.
+- With more than one admin-api replica, the agent no longer analyzes a tenant again unasked right after
+  another replica's cycle: a tenant runs at most once per its interval unless a run is triggered.
+- **Experts → Run now** runs the analysis of your own organisation only; it no longer started every
+  organisation's on the platform, whatever their interval and run window.
+
 ## [2026.11.89]
 
 ### Changed

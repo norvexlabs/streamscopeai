@@ -47,6 +47,8 @@
         return { label: 'would block', bg: 'var(--warning-bg)', fg: 'var(--warning)', border: 'var(--warning-border)' };
       case 'redacted':
         return { label: 'redacted', bg: 'var(--warning-bg)', fg: 'var(--warning)', border: 'var(--warning-border)' };
+      case 'redaction_not_applied':
+        return { label: 'would redact', bg: 'var(--warning-bg)', fg: 'var(--warning)', border: 'var(--warning-border)' };
       case 'args_modified':
         return { label: 'args modified', bg: 'var(--tag-teal-bg)', fg: 'var(--tag-teal-text)', border: 'var(--tag-teal-bg)' };
       default:

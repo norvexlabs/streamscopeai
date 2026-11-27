@@ -195,7 +195,8 @@
     <div class="pt-2 border-t border-(--border) text-xs space-y-1">
       {#each policyFindings as p, i (i)}
         <div class="flex items-center gap-2">
-          <StatusPill tone={p.action === 'block' ? 'error' : 'warning'}>{p.action}</StatusPill>
+          <StatusPill tone={p.action === 'block' && !p.not_applied ? 'error' : 'warning'}>{p.action}</StatusPill>
+          {#if p.not_applied}<span class="text-[9px] uppercase font-semibold text-(--warning)">{m.conv_not_applied()}</span>{/if}
           <span class="text-[10px] uppercase tracking-wider text-(--text-tertiary)">{p.phase}</span>
           {#if p.rule_id && selfScoped}
             <span class="font-mono text-[11px] text-(--text-primary)">{p.rule_id}</span>
@@ -208,6 +209,19 @@
           {/if}
           <span class="text-(--text-secondary)">{p.title ?? p.description ?? ''}</span>
         </div>
+        {#if p.would_rewrite && p.would_rewrite.length > 0}
+          <div class="pl-2 space-y-1">
+            <div class="text-[10px] font-semibold uppercase tracking-wider text-(--warning)">{m.browse_detail_would_rewrite()}</div>
+            {#each p.would_rewrite as w, j (j)}
+              <div class="font-mono text-[11px]">
+                <span class="text-(--text-tertiary)">{w.pointer}</span>
+                <pre class="text-(--text-secondary) whitespace-pre-wrap break-all max-h-32 overflow-y-auto">{w.text ?? JSON.stringify(w.parts, null, 2)}</pre>
+              </div>
+            {/each}
+          </div>
+        {:else if p.would_rewrite_omitted_bytes}
+          <div class="pl-2 text-[10px] text-(--warning)">{m.browse_detail_would_rewrite_omitted({ size: p.would_rewrite_omitted_bytes })}</div>
+        {/if}
       {/each}
     </div>
   {/if}

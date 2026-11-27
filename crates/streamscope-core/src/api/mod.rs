@@ -1149,7 +1149,20 @@ impl ApiRequest {
     }
 
     /// Remove tools whose names match the predicate. Returns names of removed tools.
-    pub fn remove_tools(&mut self, mut should_remove: impl FnMut(&str) -> bool) -> Vec<String> {
+    pub fn remove_tools(&mut self, should_remove: impl FnMut(&str) -> bool) -> Vec<String> {
+        self.walk_tool_removal(should_remove, true)
+    }
+
+    /// The names [`Self::remove_tools`] would remove with this predicate, read
+    /// by the same walk and left in place — what an observing tool policy
+    /// records, named exactly as enforcing it removes.
+    pub fn tools_remove_would_take(&mut self, should_remove: impl FnMut(&str) -> bool) -> Vec<String> {
+        self.walk_tool_removal(should_remove, false)
+    }
+
+    /// One walk over the declarations for both: `apply` removes what the
+    /// predicate names, otherwise it only lists it.
+    fn walk_tool_removal(&mut self, mut should_remove: impl FnMut(&str) -> bool, apply: bool) -> Vec<String> {
         let mut removed = Vec::new();
         match self {
             Self::ChatCompletions(req) => {
@@ -1159,12 +1172,16 @@ impl ApiRequest {
                         let name = tools[i].function_name().unwrap_or("");
                         if should_remove(name) {
                             removed.push(name.to_string());
-                            tools.remove(i);
+                            if apply {
+                                tools.remove(i);
+                            } else {
+                                i += 1;
+                            }
                         } else {
                             i += 1;
                         }
                     }
-                    if tools.is_empty() {
+                    if apply && tools.is_empty() {
                         req.tools = None;
                     }
                 }
@@ -1176,12 +1193,16 @@ impl ApiRequest {
                         let name = tools[i].function_name().unwrap_or("");
                         if should_remove(name) {
                             removed.push(name.to_string());
-                            tools.remove(i);
+                            if apply {
+                                tools.remove(i);
+                            } else {
+                                i += 1;
+                            }
                         } else {
                             i += 1;
                         }
                     }
-                    if tools.is_empty() {
+                    if apply && tools.is_empty() {
                         req.tools = None;
                     }
                 }
@@ -1193,12 +1214,16 @@ impl ApiRequest {
                         let name = tools[i].name.as_str();
                         if should_remove(name) {
                             removed.push(name.to_string());
-                            tools.remove(i);
+                            if apply {
+                                tools.remove(i);
+                            } else {
+                                i += 1;
+                            }
                         } else {
                             i += 1;
                         }
                     }
-                    if tools.is_empty() {
+                    if apply && tools.is_empty() {
                         req.tools = None;
                     }
                 }
@@ -1212,7 +1237,11 @@ impl ApiRequest {
                                 let name = decls[i].name.as_str();
                                 if should_remove(name) {
                                     removed.push(name.to_string());
-                                    decls.remove(i);
+                                    if apply {
+                                        decls.remove(i);
+                                    } else {
+                                        i += 1;
+                                    }
                                 } else {
                                     i += 1;
                                 }
@@ -1222,14 +1251,16 @@ impl ApiRequest {
                     // Drop an entry whose declarations were all removed; a
                     // built-in tool entry (`google_search`, …) declares no
                     // functions and is not this pass's to remove.
-                    tools.retain(|t| t.function_declarations.as_ref().is_none_or(|d| !d.is_empty()));
-                    if tools.is_empty() {
+                    if apply {
+                        tools.retain(|t| t.function_declarations.as_ref().is_none_or(|d| !d.is_empty()));
+                    }
+                    if apply && tools.is_empty() {
                         req.tools = None;
                     }
                 }
             }
         }
-        if !removed.is_empty() {
+        if apply && !removed.is_empty() {
             self.retire_tool_choice(&removed);
         }
         removed
@@ -1573,6 +1604,7 @@ impl ApiRequest {
                                         rule_name,
                                         reason,
                                         rule_id,
+                                        not_applied: false,
                                     });
                                     // Preserve non-text blocks (image/document)
                                     // when content is Blocks — only rewrite the
@@ -1710,6 +1742,7 @@ impl ApiRequest {
                                 rule_name,
                                 reason,
                                 rule_id,
+                                not_applied: false,
                             });
                             set_output_text(item, new);
                         }
@@ -1804,6 +1837,7 @@ impl ApiRequest {
                             rule_name,
                             reason,
                             rule_id,
+                            not_applied: false,
                         });
                     }
                 }
@@ -1869,6 +1903,7 @@ impl ApiRequest {
                                     rule_name,
                                     reason,
                                     rule_id,
+                                    not_applied: false,
                                 });
                                 function_response.response = serde_json::Value::String(new);
                             }
@@ -2274,6 +2309,36 @@ fn responses_wire(req: &responses::ResponsesRequest) -> Result<Value, serde_json
 
 #[cfg(test)]
 mod tests {
+    /// The listing walk names exactly what the removal removes, on every
+    /// protocol — a hosted tool with no function name included — and changes
+    /// nothing in the request.
+    #[test]
+    fn listing_what_a_removal_would_take_names_what_it_removes_and_removes_nothing() {
+        let bodies = [
+            (crate::api::sse::ApiVersion::ChatCompletions, serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"type": "function", "function": {"name": "a", "parameters": {}}}, {"type": "function", "function": {"name": "b", "parameters": {}}}],
+                "tool_choice": {"type": "function", "function": {"name": "a"}}})),
+            (crate::api::sse::ApiVersion::Responses, serde_json::json!({"model": "m", "input": "hi",
+                "tools": [{"type": "function", "name": "a", "parameters": {}}, {"type": "web_search"}]})),
+            (crate::api::sse::ApiVersion::AnthropicMessages, serde_json::json!({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "a", "input_schema": {"type": "object"}}, {"name": "b", "input_schema": {"type": "object"}}]})),
+            (crate::api::sse::ApiVersion::GoogleGemini, serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "tools": [{"functionDeclarations": [{"name": "a"}, {"name": "b"}]}, {"googleSearch": {}}]})),
+        ];
+        // Every name, the empty one a hosted tool reads as included.
+        for take in [|n: &str| n == "a", |n: &str| n.is_empty(), |_: &str| true] {
+            for (version, body) in &bodies {
+                let parse = || ApiRequest::parse(*version, &bytes::Bytes::from(body.to_string())).unwrap();
+                let mut listed = parse();
+                let before = listed.serialize().unwrap();
+                let names = listed.tools_remove_would_take(take);
+                assert_eq!(listed.serialize().unwrap(), before, "{version:?}: the listing changed the request");
+                let mut removed = parse();
+                assert_eq!(removed.remove_tools(take), names, "{version:?}");
+            }
+        }
+    }
+
     use super::*;
     use bytes::Bytes;
     use sse::ApiVersion;

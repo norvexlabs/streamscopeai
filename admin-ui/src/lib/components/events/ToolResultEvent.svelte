@@ -10,6 +10,7 @@
     tool_name?: string | null;
     original_content: string;
     redacted_content: string;
+    not_applied?: boolean;
     rule_name: string;
     reason: string;
     rule_id: string;
@@ -73,7 +74,7 @@
           <span
             class="inline-flex items-center px-1.5 py-0.5 rounded-full text-[9px] font-semibold uppercase"
             style="color: var(--warning); background: var(--warning-bg)"
-          >{m.event_redacted()}</span>
+          >{event.redacted?.not_applied ? m.conv_not_applied() : m.event_redacted()}</span>
         {/if}
         {#each guardrails as guardrail}
           <GuardrailPill {guardrail} />
@@ -89,7 +90,10 @@
       {#if expanded}
         <div class="px-4 pb-3 max-h-64 overflow-y-auto">
           {#if isRedacted && showOriginal && event.redacted}
-            <pre class="text-xs font-mono text-(--error)/80 whitespace-pre-wrap">{event.redacted.original_content}</pre>
+            <!-- The other side of the rewrite: what the model was sent before it, or
+                 — an observing policy's rewrite, which left the result as sent —
+                 what it would have been sent. -->
+            <pre class="text-xs font-mono text-(--error)/80 whitespace-pre-wrap">{event.redacted.not_applied ? event.redacted.redacted_content : event.redacted.original_content}</pre>
           {:else if resultObj}
             <table class="w-full">
               <tbody>
@@ -111,7 +115,7 @@
           <span class="inline-flex items-center px-1.5 py-0.5 rounded-sm text-[10px] font-mono font-semibold text-(--warning) bg-(--warning-bg) border border-(--warning-border)">{event.redacted.rule_id}</span>
           <div class="flex-1 text-[11px] leading-snug">
             <span class="font-semibold text-(--warning)">{event.redacted.rule_name || m.event_redacted_by_policy()}</span>
-            <span class="text-(--warning)/80"> {m.event_result_rewritten()}</span>
+            <span class="text-(--warning)/80"> {event.redacted.not_applied ? m.event_result_rewrite_not_applied() : m.event_result_rewritten()}</span>
             {#if event.redacted.reason}
               <div class="text-[10px] text-(--warning)/80 mt-0.5 wrap-break-word">{event.redacted.reason}</div>
             {/if}
@@ -121,7 +125,7 @@
             onclick={(e) => { e.stopPropagation(); showOriginal = !showOriginal; expanded = true; }}
             class="text-[9px] uppercase tracking-wider text-(--warning)/80 hover:text-(--warning) font-semibold border border-(--warning-border) px-1.5 py-0.5 rounded-sm"
             title={m.event_toggle_redacted_original()}
-          >{showOriginal ? m.event_show_redacted() : m.event_show_original()}</button>
+          >{showOriginal === !event.redacted.not_applied ? m.event_show_redacted() : m.event_show_original()}</button>
         </div>
       {/if}
       {#each guardrails as guardrail}

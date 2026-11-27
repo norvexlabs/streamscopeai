@@ -624,6 +624,7 @@ async fn analyze_request(
         false,
         capture_diffs,
         &effective_tool_rules,
+        ctx.config.effective_tool_enforcement(ctx.user.workspace_id),
         Some(&ctx.config.tool_field_profiles),
         Some(&ctx.config.mcp),
         ctx.config.sanitize_tool_names,
@@ -732,13 +733,14 @@ async fn analyze_request(
             transform_result
                 .blocked_tools
                 .into_iter()
-                .map(|info| content::BlockedToolInfo { not_applied: !tool_blocks_stand, ..info })
+                // An observing policy's entry was never applied, whatever the caller forwards.
+                .map(|info| content::BlockedToolInfo { not_applied: info.not_applied || !tool_blocks_stand, ..info })
                 .collect()
         });
         let rtr = (!transform_result.redacted_tool_results.is_empty())
             .then_some(transform_result.redacted_tool_results);
-        // The effective request — the system prompt, messages and tools the
-        // turn records as sent — is what the caller forwards: the transformed
+        // The effective request — the system prompt and tools the turn
+        // records as sent — is what the caller forwards: the transformed
         // body only when it forwards it, else the client's own request — a
         // refused request records no change either. What policy would have
         // changed stays on the steps, the blocked entries and the badges.
@@ -757,7 +759,6 @@ async fn analyze_request(
             Vec::new(), // telemetry_dropped — inline AI never translates protocols
         );
         if !sends_transformed {
-            transform_diff.effective_messages = None;
             transform_diff.messages_after_count = transform_diff.messages_original_count;
         }
         Some(ContentMeta {

@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 
 use streamscope_core::config::ProfileKind;
+use streamscope_core::config::tool_enforcement::ToolEnforcement;
 use streamscope_core::config::model_map::{ModelMap, UpstreamModel};
 
 use crate::db::tenant::Scoped;
@@ -441,6 +442,19 @@ pub async fn build_tenant_body(
     .await?
     .into_iter()
     .filter_map(|(id, kind, standalone)| Some((id, stored_kind(&kind)?, standalone)))
+    .collect();
+
+    // Each tool profile's own Observe / Enforce value; the proxy resolves a
+    // Layered profile with none to the Default's.
+    let tool_profile_enforcement: Vec<(uuid::Uuid, ToolEnforcement)> = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, tool_enforcement FROM profiles \
+         WHERE tenant_id = $1 AND kind = 'tools' AND tool_enforcement IS NOT NULL",
+    )
+    .bind(tenant_id)
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .filter_map(|(id, mode)| Some((id, ToolEnforcement::parse(&mode)?)))
     .collect();
 
     // The tenant's Default workspace, surfaced as `default_workspace_id` on the
@@ -1054,6 +1068,7 @@ pub async fn build_tenant_body(
         workspace_profiles,
         default_profiles,
         profile_modes,
+        tool_profile_enforcement,
         loop_guard,
         workspace_loop_guard,
     };

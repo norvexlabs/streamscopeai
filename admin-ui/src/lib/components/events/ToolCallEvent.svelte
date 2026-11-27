@@ -24,6 +24,7 @@
     original: unknown;
     effective: unknown;
     rule_id: string;
+    not_applied?: boolean;
   };
 
   type InterceptionInfo = {
@@ -135,7 +136,14 @@
                 <tr>
                   <td class="pr-3 py-0.5 text-[11px] font-mono text-(--text-secondary) whitespace-nowrap align-top">{key}</td>
                   <td class="py-0.5 text-[11px] font-mono text-(--text-primary) break-all">
-                    {#if mod}
+                    {#if mod?.not_applied}
+                      <!-- An observing policy's rewrite: the call kept its value. -->
+                      <span>{formatArgValue(mod.original)}</span>
+                      <span class="mx-1 text-(--text-secondary)">⇢</span>
+                      <span class="text-(--text-secondary)">{formatArgValue(mod.effective)}</span>
+                      <span class="ml-1 inline-flex items-center px-1 py-0 rounded-sm text-[9px] font-mono text-(--warning) bg-(--warning-bg) border border-(--warning-border)">{mod.rule_id}</span>
+                      <span class="ml-1 text-[9px] uppercase font-semibold text-(--warning)">{msg.conv_not_applied()}</span>
+                    {:else if mod}
                       <span class="line-through text-(--text-secondary)">{formatArgValue(mod.original)}</span>
                       <span class="mx-1 text-(--text-secondary)">→</span>
                       <span>{formatArgValue(mod.effective)}</span>

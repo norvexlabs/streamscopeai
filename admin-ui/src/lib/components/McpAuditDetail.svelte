@@ -207,9 +207,13 @@
           <span class="px-2 py-0.5 rounded-sm text-[10px] font-medium border {riskClasses(diff.policy_classification.risk)}">
             {diff.policy_classification.risk}
           </span>
-          <span class="px-2 py-0.5 rounded-sm text-[10px] font-medium border {actionClasses(diff.policy_classification.action)}">
+          <!-- An observing policy's block was not applied: never the red of a refusal. -->
+          <span class="px-2 py-0.5 rounded-sm text-[10px] font-medium border {actionClasses(diff.policy_classification.not_applied ? 'replace' : diff.policy_classification.action)}">
             {diff.policy_classification.action}
           </span>
+          {#if diff.policy_classification.not_applied}
+            <span class="text-[9px] uppercase font-semibold text-(--warning)">{m.conv_not_applied()}</span>
+          {/if}
           {#if diff.policy_classification.tool_id}
             <code class="px-1.5 py-0.5 rounded-sm text-[10px] font-mono bg-(--bg-secondary) text-(--text-primary)">
               {diff.policy_classification.tool_id}
@@ -231,6 +235,12 @@
         {/if}
         {#if diff.policy_classification.description}
           <div class="text-xs text-(--text-secondary)">{diff.policy_classification.description}</div>
+        {/if}
+        {#if diff.policy_classification.would_rewrite}
+          <div class="text-[10px] font-semibold uppercase tracking-wider text-(--warning)">{m.browse_detail_would_rewrite()}</div>
+          <pre class="text-[11px] font-mono text-(--text-secondary) whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{JSON.stringify(diff.policy_classification.would_rewrite, null, 2)}</pre>
+        {:else if diff.policy_classification.would_rewrite_omitted_bytes}
+          <div class="text-[10px] text-(--warning)">{m.browse_detail_would_rewrite_omitted({ size: diff.policy_classification.would_rewrite_omitted_bytes })}</div>
         {/if}
       </div>
     {/if}

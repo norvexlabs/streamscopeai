@@ -2,6 +2,7 @@
   import { getLocale, setLocale, assertIsLocale, locales } from '#lib/paraglide/runtime.js';
   import { m } from '#lib/paraglide/messages.js';
   import Icon from '#lib/components/Icon.svelte';
+  import SelectInput from '#lib/components/forms/SelectInput.svelte';
 
   // Autonyms — each language shown in its own name, independent of the active
   // UI locale. Add a line here when a locale is added to project.inlang.
@@ -29,16 +30,15 @@
   title={m.locale_selector_label()}
 >
   <Icon name="globe" size="sm" tone="neutral" />
-  <select
+  <SelectInput
     value={current}
     onchange={onChange}
     aria-label={m.locale_selector_label()}
-    class="bg-transparent text-sm text-(--text-primary) focus:outline-hidden cursor-pointer"
+    variant="bare"
+    fluid={false}
   >
     {#each locales as loc (loc)}
-      <option value={loc} class="bg-(--bg-primary) text-(--text-primary)">
-        {LOCALE_LABELS[loc] ?? loc}
-      </option>
+      <option value={loc}>{LOCALE_LABELS[loc] ?? loc}</option>
     {/each}
-  </select>
+  </SelectInput>
 </label>

@@ -20,7 +20,7 @@ const AUDIT_DEFAULT_LIMIT: i64 = 100;
 
 use super::{
     ApiError, ApiErrorCode, ApiErrorResponse, OffsetPage, PageQuery, SpendTotal,
-    WorkspaceIds, spend_total,
+    BadgeCodes, WorkspaceIds, spend_total,
 };
 use crate::AdminState;
 use crate::audit_store::AuditScope;
@@ -180,6 +180,68 @@ pub struct AuditQuery {
     /// A2A-side: filter to one `TASK_STATE_*`. Whitelisted at the handler, so an
     /// unknown value can't reach the inline SQL literal.
     pub task_state: Option<String>,
+    /// Rows carrying ANY of these badge codes (comma-separated). An unknown
+    /// code is a 400, never read as no filter. Applies to every `kind`.
+    #[param(value_type = Option<String>)]
+    pub badges: Option<BadgeCodes>,
+    /// The API key the request authenticated with. Applies to every `kind`.
+    pub key_id: Option<Uuid>,
+    /// Order of the page. Default `newest`. `latency` needs one `kind` (not
+    /// `all`), `cost` and `tokens` the `llm` kind (`sort_unsupported_for_kind`);
+    /// none but `newest` takes a search term (`sort_unsupported_with_search`),
+    /// and each needs a `start` within 31 days of its `end` (`sort_needs_window`).
+    pub sort: Option<AuditSort>,
+}
+
+/// The order of an audit page: newest first, or the largest figure first
+/// (newest first among equals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditSort {
+    /// Most recent first.
+    #[default]
+    Newest,
+    /// Most expensive first (an LLM request's cost, in its booked currency —
+    /// the figure as stored, whatever the currency).
+    Cost,
+    /// Most tokens first (an LLM request's prompt plus completion tokens).
+    Tokens,
+    /// Slowest first (the request's total latency at the gateway).
+    Latency,
+}
+
+impl AuditSort {
+    /// Refuse an order the page cannot serve: a figure under a text search
+    /// (the search walks its matches newest first), under `kind=all` (the
+    /// kinds are interleaved by time), that the kind does not record, or over
+    /// a window [`super::check_figure_window`] does not bound.
+    pub fn check(
+        sort: Option<Self>,
+        kind: Option<AuditKind>,
+        search: Option<&str>,
+        window: (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>),
+    ) -> Result<(), ApiError> {
+        let sort = sort.unwrap_or_default();
+        if sort == Self::Newest {
+            return Ok(());
+        }
+        if search_text(search).is_some() {
+            return Err(ApiError::bad_request("a sort by figure cannot be combined with a search term")
+                .code(super::ApiErrorCode::SortUnsupportedWithSearch));
+        }
+        let kind = kind.unwrap_or_default();
+        let served = match sort {
+            Self::Newest => true,
+            Self::Latency => kind != AuditKind::All,
+            Self::Cost | Self::Tokens => kind == AuditKind::Llm,
+        };
+        if served {
+            super::check_figure_window(window.0, window.1)
+        } else {
+            Err(ApiError::bad_request("this sort needs a kind that records its figure: latency any one kind, cost and tokens `llm`")
+                .code(super::ApiErrorCode::SortUnsupportedForKind))
+        }
+    }
 }
 
 impl AuditQuery {
@@ -479,6 +541,35 @@ pub struct McpPolicyClassification {
     pub tool_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    /// The `block` or `replace` was recorded, not applied: the workspace's
+    /// tool policy observes, so the call went on as sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applied: bool,
+    /// An observed `replace`: the JSON-RPC `params` the rewrite would have sent
+    /// upstream in place of the client's (the method's own params shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub would_rewrite: Option<serde_json::Value>,
+    /// The observed rewrite's size when it was past the audit payload limit
+    /// and `would_rewrite` was left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would_rewrite_omitted_bytes: Option<u64>,
+}
+
+/// One place an observed agent-call rewrite would have changed: a message's
+/// parts array, or one string (a metadata leaf).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct A2aRewritePreview {
+    /// RFC 6901 pointer into the call's params (request) or the reply.
+    pub pointer: String,
+    /// The parts the array would have held — each A2A part as sent, its
+    /// `text` rewritten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<Object>>)]
+    pub parts: Option<Vec<serde_json::Value>>,
+    /// The string the leaf would have held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// One policy rule that fired on an agent call, and where.
@@ -495,6 +586,17 @@ pub struct A2aPolicyFinding {
     pub description: Option<String>,
     /// `classify` | `block` | `replace`.
     pub action: String,
+    /// The `block` or `replace` was recorded, not applied: the workspace's
+    /// tool policy observes, so the call or reply went on as sent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_applied: bool,
+    /// An observed `replace`: what it would have changed, place by place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would_rewrite: Option<Vec<A2aRewritePreview>>,
+    /// The observed rewrite's size when it was past the audit payload limit
+    /// and `would_rewrite` was left out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub would_rewrite_omitted_bytes: Option<u64>,
 }
 
 /// `a2a_audit.transform_diff` — what the gateway did to an agent call.
@@ -832,7 +934,7 @@ pub struct A2aAuditLogEntry {
     params(AuditQuery),
     responses(
         (status = 200, description = "Paginated audit log entries (kind-discriminated)", body = OffsetPage<AuditLogRow>),
-        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or a `kind=all` page is too deep", body = ApiErrorResponse),
+        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, a `kind=all` page is too deep, an unknown or alert badge code, or a `sort` the kind, a search term or the window cannot serve", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -1767,19 +1869,41 @@ pub enum SessionSort {
     Oldest,
     /// Major alerts, then minor, then the rest; most recent first within each.
     Alerts,
+    /// Most turns first; most recent first among equals.
+    Turns,
+    /// Most expensive first — the session's total as stored, in its own
+    /// currency, whatever the currency; most recent first among equals.
+    Cost,
+    /// Most tokens first (prompt plus completion); most recent first among
+    /// equals.
+    Tokens,
 }
 
 impl SessionSort {
-    /// Refuse an order a search cannot serve: `alerts` would need every match
-    /// read before the first row is known.
+    /// Refuse an order a search cannot serve: a rank (alerts, a figure) would
+    /// need every match read before the first row is known.
     pub fn check_with_search(sort: Option<Self>, search: Option<&str>) -> Result<(), ApiError> {
-        if sort == Some(Self::Alerts) && search_text(search).is_some() {
+        let ranked = !matches!(sort.unwrap_or_default(), Self::Newest | Self::Oldest);
+        if ranked && search_text(search).is_some() {
             return Err(ApiError::bad_request(
-                "sort=alerts cannot be combined with a search term; filter by alert level instead",
+                "only sort=newest or sort=oldest can be combined with a search term; filter instead",
             )
             .code(super::ApiErrorCode::SortUnsupportedWithSearch));
         }
         Ok(())
+    }
+
+    /// Refuse an order by figure over a window [`super::check_figure_window`]
+    /// does not bound: it sorts every session of the window.
+    pub fn check_window(
+        sort: Option<Self>,
+        start: Option<chrono::DateTime<chrono::Utc>>,
+        end: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<(), ApiError> {
+        match sort.unwrap_or_default() {
+            Self::Turns | Self::Cost | Self::Tokens => super::check_figure_window(start, end),
+            Self::Newest | Self::Oldest | Self::Alerts => Ok(()),
+        }
     }
 }
 
@@ -1798,9 +1922,15 @@ pub struct SessionListQuery {
     pub end: Option<chrono::DateTime<chrono::Utc>>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
-    /// Default `newest`. `alerts` is refused with a `search` term
-    /// (`sort_unsupported_with_search`): filter on `alert_level` instead.
+    /// Default `newest`. Every order but `newest` and `oldest` is refused with
+    /// a `search` term (`sort_unsupported_with_search`): filter instead.
+    /// `turns`, `cost` and `tokens` need a `start` within 31 days of its `end`
+    /// (`sort_needs_window`).
     pub sort: Option<SessionSort>,
+    /// Sessions whose LLM turns carried ANY of these badge codes
+    /// (comma-separated). An unknown code is a 400.
+    #[param(value_type = Option<String>)]
+    pub badges: Option<BadgeCodes>,
     /// Sessions whose alert is exactly this level.
     pub alert_level: Option<streamscope_core::audit::AlertLevel>,
     /// Filter sessions updated after this timestamp (RFC3339).
@@ -1937,6 +2067,11 @@ pub struct SessionSummary {
     pub alert_note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_user_prompt: Option<String>,
+    /// The distinct badge codes the session's LLM turns carried (the alert
+    /// badges excepted: the session's alert is `alert_level`), sorted. Empty on
+    /// a session no turn has landed on since the codes were recorded.
+    #[sqlx(skip)]
+    pub badge_codes: Vec<streamscope_core::audit::AuditBadgeCode>,
     /// The session this one is linked to, and how; absent when it is linked to
     /// none the caller may see.
     #[sqlx(skip)]
@@ -1965,7 +2100,7 @@ pub struct SessionSummary {
     params(SessionListQuery),
     responses(
         (status = 200, description = "Paginated session summaries", body = OffsetPage<SessionSummary>),
-        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term", body = ApiErrorResponse),
+        (status = 400, description = "`start` is not before `end`, a search term under 3 characters, `sort=alerts`, a sort by figure or `linked=top_level` with a search term, a sort by figure without a `start` within 31 days of its `end`, or an unknown or alert badge code", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -1978,6 +2113,9 @@ pub async fn list_sessions(
     super::check_bounds(query.start, query.end)?;
     super::check_search(query.search.as_deref())?;
     SessionSort::check_with_search(query.sort, query.search.as_deref())?;
+    // Either pair of bounds is the session window (`updated_since` /
+    // `updated_before` are the console's older names for it).
+    SessionSort::check_window(query.sort, query.start.or(query.updated_since), query.end.or(query.updated_before))?;
     SessionLinkage::check_with_search(query.linked, query.search.as_deref())?;
     let limit = query.limit.unwrap_or(SESSIONS_DEFAULT_LIMIT).clamp(1, crate::settings::admin_settings().sessions_max_limit().max(1));
     let offset = crate::routes::resolve_offset(query.offset);
@@ -3618,7 +3756,8 @@ fn a2a_call_event(row: A2aCallRowForSession, turn: i32) -> ConversationEvent {
                             .or_else(|| p.title.clone())
                             .unwrap_or_else(|| "blocked by tool policy".to_string()),
                         phase: p.phase.clone(),
-                        not_applied: false,
+                        // An observing policy's block: the call went through.
+                        not_applied: p.not_applied,
                         record: None,
                     })
                 });
@@ -3978,11 +4117,68 @@ mod tests {
     }
 
     #[test]
-    fn only_alerts_with_a_term_is_refused() {
-        assert!(SessionSort::check_with_search(Some(SessionSort::Alerts), Some("x")).is_err());
-        assert!(SessionSort::check_with_search(Some(SessionSort::Alerts), Some("  ")).is_ok());
-        assert!(SessionSort::check_with_search(Some(SessionSort::Alerts), None).is_ok());
+    fn an_audit_sort_by_figure_needs_its_kind_no_term_and_a_bounded_window() {
+        use AuditKind::*;
+        let now = chrono::Utc::now();
+        let week = (Some(now - chrono::Duration::days(7)), None);
+        let ok = |sort, kind, search| AuditSort::check(Some(sort), kind, search, week).is_ok();
+        // Newest is every listing's order, with or without a window.
+        for kind in [None, Some(Llm), Some(Mcp), Some(Web), Some(A2a), Some(All)] {
+            assert!(ok(AuditSort::Newest, kind, Some("term")));
+            assert!(AuditSort::check(Some(AuditSort::Newest), kind, None, (None, None)).is_ok());
+        }
+        // Latency: any one kind, never the interleaved `all`.
+        for kind in [None, Some(Llm), Some(Mcp), Some(Web), Some(A2a)] {
+            assert!(ok(AuditSort::Latency, kind, None));
+        }
+        assert!(!ok(AuditSort::Latency, Some(All), None));
+        // Cost and tokens: the LLM kind (the default) only.
+        for sort in [AuditSort::Cost, AuditSort::Tokens] {
+            assert!(ok(sort, None, None));
+            assert!(ok(sort, Some(Llm), Some("  ")), "a blank term is no search");
+            for kind in [Mcp, Web, A2a, All] {
+                let err = AuditSort::check(Some(sort), Some(kind), None, week).unwrap_err();
+                assert_eq!(err.code, ApiErrorCode::SortUnsupportedForKind);
+            }
+            let err = AuditSort::check(Some(sort), Some(Llm), Some("term"), week).unwrap_err();
+            assert_eq!(err.code, ApiErrorCode::SortUnsupportedWithSearch);
+        }
+        // The window: a start is owed, and its span is capped on both sides of the bound.
+        let days = |d| Some(now - chrono::Duration::days(d));
+        let window = |w| AuditSort::check(Some(AuditSort::Latency), Some(Llm), None, w);
+        assert_eq!(window((None, None)).unwrap_err().code, ApiErrorCode::SortNeedsWindow);
+        assert_eq!(window((None, Some(now))).unwrap_err().code, ApiErrorCode::SortNeedsWindow);
+        assert!(window((days(crate::routes::FIGURE_SORT_MAX_DAYS), Some(now))).is_ok());
+        assert_eq!(
+            window((days(crate::routes::FIGURE_SORT_MAX_DAYS + 1), Some(now))).unwrap_err().code,
+            ApiErrorCode::SortNeedsWindow
+        );
+        // An absent end is now.
+        assert!(window((days(crate::routes::FIGURE_SORT_MAX_DAYS - 1), None)).is_ok());
+    }
+
+    #[test]
+    fn a_session_sort_by_figure_needs_a_bounded_window_and_the_others_do_not() {
+        let now = chrono::Utc::now();
+        for figure in [SessionSort::Turns, SessionSort::Cost, SessionSort::Tokens] {
+            assert_eq!(SessionSort::check_window(Some(figure), None, None).unwrap_err().code, ApiErrorCode::SortNeedsWindow);
+            assert!(SessionSort::check_window(Some(figure), Some(now - chrono::Duration::days(30)), None).is_ok());
+            assert!(SessionSort::check_window(Some(figure), Some(now - chrono::Duration::days(40)), Some(now)).is_err());
+        }
+        for by_time in [None, Some(SessionSort::Newest), Some(SessionSort::Oldest), Some(SessionSort::Alerts)] {
+            assert!(SessionSort::check_window(by_time, None, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn only_a_rank_with_a_term_is_refused() {
+        for ranked in [SessionSort::Alerts, SessionSort::Turns, SessionSort::Cost, SessionSort::Tokens] {
+            assert!(SessionSort::check_with_search(Some(ranked), Some("x")).is_err());
+            assert!(SessionSort::check_with_search(Some(ranked), Some("  ")).is_ok());
+            assert!(SessionSort::check_with_search(Some(ranked), None).is_ok());
+        }
         assert!(SessionSort::check_with_search(Some(SessionSort::Oldest), Some("x")).is_ok());
+        assert!(SessionSort::check_with_search(None, Some("x")).is_ok());
         // `top_level` alone, or with a blank term, is a tree; with a term, refused.
         assert!(SessionLinkage::check_with_search(Some(SessionLinkage::TopLevel), Some("x")).is_err());
         assert!(SessionLinkage::check_with_search(Some(SessionLinkage::TopLevel), Some("  ")).is_ok());

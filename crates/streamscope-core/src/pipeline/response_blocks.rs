@@ -150,6 +150,36 @@ fn withheld_tool<'a>(
 }
 
 impl PendingInterceptedCall {
+    /// [`Self::police`] as the workspace's tool policy carries it out: enforcing,
+    /// exactly that; observing, the call keeps the arguments the model sent and
+    /// is never blocked, and the record says what enforcing would have done,
+    /// marked not applied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn police_as(
+        &mut self,
+        observe: bool,
+        tool_rules: &[crate::config::tool_rules::Rule],
+        field_profiles: &crate::config::tool_rules::FieldProfileSet,
+        mcp_names: &crate::config::tool_names::McpToolNames,
+        model: Option<&str>,
+        app_id: Option<&str>,
+        withheld_tools: &[crate::proxy::content::BlockedToolInfo],
+    ) -> InterceptPolicyRecord {
+        if !observe {
+            return self.police(tool_rules, field_profiles, mcp_names, model, app_id, withheld_tools);
+        }
+        // Observing: the call runs as the model sent it; what the rules would
+        // have done is decided on a copy and recorded as not applied.
+        let mut record = self.clone().police(tool_rules, field_profiles, mcp_names, model, app_id, withheld_tools);
+        if let Some(blocked) = &mut record.blocked {
+            blocked.not_applied = true;
+        }
+        for m in &mut record.modifications {
+            m.not_applied = true;
+        }
+        record
+    }
+
     /// Decide this call by the response-phase tool-call rules before the
     /// gateway runs it, as every call the client receives is decided: under
     /// the name the model called, the substitute's (`binding.replaced_name`)
@@ -279,7 +309,11 @@ impl InterceptPolicyRecord {
         blocked_tools: &mut Vec<crate::proxy::content::BlockedToolInfo>,
         arg_modifications: &mut Vec<crate::proxy::content::ToolArgModification>,
     ) {
-        if !self.modifications.is_empty() {
+        // An observing policy's record: nothing was rewritten or removed.
+        if self.modifications.iter().any(|m| m.not_applied) {
+            badges.add(crate::audit::AuditBadge::ModifiedNotApplied);
+            arg_modifications.extend(self.modifications);
+        } else if !self.modifications.is_empty() {
             badges.add_modified();
             injection_blocks.push(crate::proxy::content::InjectionBlock {
                 transform: "tool_policy".to_string(),
@@ -290,7 +324,10 @@ impl InterceptPolicyRecord {
             });
             arg_modifications.extend(self.modifications);
         }
-        if let Some(info) = self.blocked {
+        if let Some(info) = self.blocked.as_ref().filter(|b| b.not_applied) {
+            badges.add_tool_block_not_applied(crate::audit::Phase::Response, self.name.clone());
+            blocked_tools.push(info.clone());
+        } else if let Some(info) = self.blocked {
             badges.add_tool_blocked(crate::audit::Phase::Response, self.name.clone());
             injection_blocks.push(crate::proxy::content::InjectionBlock {
                 transform: "tool_policy".to_string(),
@@ -918,6 +955,10 @@ pub struct BlockAccumulator {
     /// script failure — is reflected without each having to remember to
     /// decrement. Read by `settle_finish_reason`.
     tool_calls_delivered: u32,
+    /// The workspace's tool policy observes ([`Self::tool_enforcement`]): a
+    /// call a block or rewrite rule matches is delivered as the model sent it,
+    /// and the decision is recorded as not applied.
+    observe: bool,
 }
 
 impl BlockAccumulator {
@@ -967,7 +1008,15 @@ impl BlockAccumulator {
             heal_structured_text,
             heal_tool_args,
             tool_calls_delivered: 0,
+            observe: false,
         }
+    }
+
+    /// Whether the answer's tool policy applies its blocks and rewrites or
+    /// only records them (`TenantConfig::effective_tool_enforcement`).
+    pub fn tool_enforcement(mut self, mode: crate::config::tool_enforcement::ToolEnforcement) -> Self {
+        self.observe = mode.observes();
+        self
     }
 
     /// The tenant's virtual servers (`McpConfig::tool_names`), so a called
@@ -1717,8 +1766,16 @@ impl BlockAccumulator {
     fn police_intercepted(&mut self, call: &mut PendingInterceptedCall) {
         let model = self.request_meta.as_ref().map(|m| m.model.as_str());
         let app_id = self.request_meta.as_ref().and_then(|m| m.app_id.as_deref());
-        let record = call.police(&self.tool_rules, &self.tool_field_profiles, &self.mcp_tool_names, model, app_id, &self.withheld_tools);
-        if record.blocked.is_some() {
+        let record = call.police_as(
+            self.observe,
+            &self.tool_rules,
+            &self.tool_field_profiles,
+            &self.mcp_tool_names,
+            model,
+            app_id,
+            &self.withheld_tools,
+        );
+        if record.blocked.as_ref().is_some_and(|b| !b.not_applied) {
             self.stats.tool_blocks_blocked += 1;
         }
         record.record_into(
@@ -1801,6 +1858,10 @@ impl BlockAccumulator {
                     }
                     decision => decision,
                 };
+                if self.observe {
+                    self.record_observed(&block, decision);
+                    return self.run_response_scripts(block);
+                }
                 match decision {
                     PolicyDecision::Allow => self.run_response_scripts(block),
                     PolicyDecision::Replace {
@@ -2216,6 +2277,36 @@ impl BlockAccumulator {
         }
     }
 
+    /// Record what an observing tool policy would have done to a call, which
+    /// is delivered as the model sent it.
+    fn record_observed(&mut self, block: &PendingBlock, decision: PolicyDecision) {
+        match decision {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Replace { modifications, .. } => {
+                self.badges.add(crate::audit::AuditBadge::ModifiedNotApplied);
+                self.tool_arg_modifications
+                    .extend(modifications.into_iter().map(|m| crate::proxy::content::ToolArgModification { not_applied: true, ..m }));
+            }
+            PolicyDecision::Block { tool_name, reason, rule_id, rule_title } => {
+                self.badges.add_tool_block_not_applied(crate::audit::Phase::Response, tool_name.clone());
+                let arguments = (!block.tool_arguments.is_empty()).then(|| {
+                    serde_json::from_str::<serde_json::Value>(&block.tool_arguments)
+                        .unwrap_or_else(|_| serde_json::Value::String(block.tool_arguments.clone()))
+                });
+                self.blocked_tool_infos.push(crate::proxy::content::BlockedToolInfo {
+                    not_applied: true,
+                    title: rule_title.unwrap_or_else(|| format!("Response tool blocked: {tool_name}")),
+                    description: reason.unwrap_or_else(|| "Blocked by policy".to_string()),
+                    name: tool_name,
+                    rule_id,
+                    tool_use_id: block.tool_call_id.clone(),
+                    call_index: None,
+                    arguments,
+                });
+            }
+        }
+    }
+
     /// Walk response/tool_calls rules in priority order; return the first
     /// matching rule whose action is `block` or whose `replace` regex
     /// actually rewrites the args — unless the call, a shell call that only
@@ -2396,6 +2487,7 @@ fn diff_tool_args(
                     original: bv,
                     effective: av,
                     rule_id: rule_id.to_string(),
+                    not_applied: false,
                 });
             }
         }
@@ -2408,6 +2500,7 @@ fn diff_tool_args(
         original: before,
         effective: after,
         rule_id: rule_id.to_string(),
+        not_applied: false,
     }]
 }
 
@@ -5554,6 +5647,106 @@ mod tests {
             crate::audit::AuditBadge::ToolBlocked { phase, names, .. }
                 if *phase == crate::audit::Phase::Response && names.iter().any(|n| n == "Read")
         )));
+    }
+
+    /// A streamed call an observing policy would block or rewrite reaches the
+    /// client as the model sent it, and the decision is recorded as not
+    /// applied — never as a block or a rewrite. The same rules enforcing stop
+    /// and rewrite it (positive control).
+    #[test]
+    fn an_observing_policy_streams_the_call_as_sent_and_records_what_it_would_do() {
+        use crate::config::tool_enforcement::ToolEnforcement;
+        let rule = |id: &str, path: &str, action: serde_json::Value| {
+            json!({
+                "id": id, "phase": "response", "scope": "tool_calls", "risk": "danger",
+                "match": [
+                    { "target": "tool_id", "op": "equals", "value": "read_file" },
+                    { "target": "arg.file_path", "op": "glob", "value": path }
+                ],
+                "action": action, "description": "sensitive file",
+            })
+        };
+        let rules = rules_from_json(vec![
+            rule("R-BLOCK", "/etc/*", json!({ "kind": "block" })),
+            rule("R-REWRITE", "/home/*", json!({ "kind": "replace", "regex": "/home/[a-z]+", "with": "/home/x" })),
+        ]);
+        let stream = |mode: ToolEnforcement| {
+            let mut acc = make_tool_accumulator(rules.clone()).tool_enforcement(mode);
+            let mut out = Vec::new();
+            for (index, path) in [(0, "/etc/shadow"), (1, "/home/alice/.ssh/id_rsa")] {
+                out.extend(acc.process(
+                    DomainEvent::ToolCallDelta {
+                        index,
+                        id: Some(format!("call_{index}")),
+                        function_name: Some("Read".into()),
+                        arguments_delta: json!({ "file_path": path }).to_string(),
+                        form: crate::api::domain::CallArguments::Json,
+                    },
+                    None,
+                ));
+            }
+            out.extend(acc.process(DomainEvent::Done { finish_reason: None, native_finish_reason: None }, None));
+            let args: Vec<String> = out
+                .iter()
+                .filter_map(|e| match &e.domain_event {
+                    Some(DomainEvent::ToolCallDelta { arguments_delta, .. }) => Some(arguments_delta.clone()),
+                    _ => None,
+                })
+                .collect();
+            (acc, args)
+        };
+
+        let (observed, args) = stream(ToolEnforcement::Observe);
+        assert_eq!(args.len(), 2, "both calls are delivered: {args:?}");
+        assert!(args[0].contains("/etc/shadow") && args[1].contains("/home/alice"), "as sent: {args:?}");
+        assert_eq!(observed.stats.tool_blocks_blocked, 0);
+        assert_eq!(observed.blocked_tool_infos.len(), 1);
+        let info = &observed.blocked_tool_infos[0];
+        assert!(info.not_applied);
+        assert_eq!((info.rule_id.as_str(), info.tool_use_id.as_deref()), ("R-BLOCK", Some("call_0")));
+        assert!(!observed.tool_arg_modifications.is_empty());
+        assert!(observed.tool_arg_modifications.iter().all(|m| m.not_applied && m.rule_id == "R-REWRITE"));
+        assert!(observed.injection_blocks.is_empty(), "nothing was changed: {:?}", observed.injection_blocks);
+        let badges = observed.badges.clone().finish();
+        assert!(badges.iter().any(|b| matches!(b,
+            crate::audit::AuditBadge::ToolBlockNotApplied { phase: crate::audit::Phase::Response, names, .. } if names == &["Read"])), "{badges:?}");
+        assert!(badges.contains(&crate::audit::AuditBadge::ModifiedNotApplied), "{badges:?}");
+        assert!(!badges.iter().any(|b| matches!(b, crate::audit::AuditBadge::ToolBlocked { .. } | crate::audit::AuditBadge::Modified)), "{badges:?}");
+
+        let (enforced, args) = stream(ToolEnforcement::Enforce);
+        assert_eq!(args.len(), 1, "the blocked call is removed: {args:?}");
+        assert!(args[0].contains("/home/x"), "the rewrite is applied: {args:?}");
+        assert_eq!(enforced.stats.tool_blocks_blocked, 1);
+        assert!(enforced.blocked_tool_infos.iter().all(|b| !b.not_applied));
+        assert!(enforced.tool_arg_modifications.iter().all(|m| !m.not_applied));
+    }
+
+    /// A call the gateway would run for a substitution is run as the model
+    /// sent it when the policy observes; the block is recorded, not applied.
+    #[test]
+    fn an_observing_policy_runs_an_intercepted_call_and_records_the_block() {
+        let rules = [fetch_rule(serde_json::json!({"kind": "block"}))];
+        let profiles = fetch_profile_for("WebFetch");
+        let mut call = fetch_call("https://pastebin.com/raw/x");
+        let record = call.police_as(true, &rules, &profiles, &Default::default(), None, None, &[]);
+        assert!(call.blocked.is_none(), "the call still runs");
+        assert_eq!(call.arguments_json, serde_json::json!({ "url": "https://pastebin.com/raw/x" }).to_string());
+        let info = record.blocked.clone().expect("the block is recorded");
+        assert!(info.not_applied);
+        let (mut badges, mut injections, mut blocked, mut mods) =
+            (crate::audit::BadgeBuilder::new(), Vec::new(), Vec::new(), Vec::new());
+        record.record_into(&mut badges, &mut injections, &mut blocked, &mut mods);
+        let badges = badges.finish();
+        assert!(badges.iter().any(|b| matches!(b, crate::audit::AuditBadge::ToolBlockNotApplied { .. })), "{badges:?}");
+        assert!(!badges.iter().any(|b| matches!(b, crate::audit::AuditBadge::ToolBlocked { .. })), "{badges:?}");
+        assert!(injections.is_empty());
+        assert_eq!(blocked.len(), 1);
+
+        // Positive control: enforcing blocks it.
+        let mut call = fetch_call("https://pastebin.com/raw/x");
+        let record = call.police_as(false, &rules, &profiles, &Default::default(), None, None, &[]);
+        assert!(call.blocked.is_some());
+        assert!(record.blocked.is_some_and(|b| !b.not_applied));
     }
 
     /// A record's place (`call_index`) names its call among the calls a whole

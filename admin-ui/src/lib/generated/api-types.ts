@@ -1141,7 +1141,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Trigger an immediate agent analysis cycle. */
+        /**
+         * Trigger an immediate agent analysis cycle for the caller's tenant — only
+         *     it: a trigger runs its tenant whatever its interval and run window, so one
+         *     tenant's request never spends another's judge model.
+         */
         post: operations["trigger_agent_run"];
         delete?: never;
         options?: never;
@@ -6131,11 +6135,39 @@ export interface components {
             /** @description `classify` | `block` | `replace`. */
             action: string;
             description?: string | null;
+            /**
+             * @description The `block` or `replace` was recorded, not applied: the workspace's
+             *     tool policy observes, so the call or reply went on as sent.
+             */
+            not_applied?: boolean;
             /** @description `request` (the message the caller sent) or `response` (the agent's reply). */
             phase: string;
             risk: string;
             rule_id?: string | null;
             title?: string | null;
+            /** @description An observed `replace`: what it would have changed, place by place. */
+            would_rewrite?: components["schemas"]["A2aRewritePreview"][] | null;
+            /**
+             * Format: int64
+             * @description The observed rewrite's size when it was past the audit payload limit
+             *     and `would_rewrite` was left out.
+             */
+            would_rewrite_omitted_bytes?: number | null;
+        };
+        /**
+         * @description One place an observed agent-call rewrite would have changed: a message's
+         *     parts array, or one string (a metadata leaf).
+         */
+        A2aRewritePreview: {
+            /**
+             * @description The parts the array would have held — each A2A part as sent, its
+             *     `text` rewritten.
+             */
+            parts?: Record<string, never>[] | null;
+            /** @description RFC 6901 pointer into the call's params (request) or the reply. */
+            pointer: string;
+            /** @description The string the leaf would have held. */
+            text?: string | null;
         };
         /**
          * @description `a2a_audit.transform_diff` — what the gateway did to an agent call.
@@ -6222,6 +6254,7 @@ export interface components {
              * @description Cache preset delete: routes that now serve uncached.
              */
             routes_uncached?: number | null;
+            tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
             /**
              * Format: int64
              * @description QoS class delete: workspaces moved to the replacement class.
@@ -6592,7 +6625,7 @@ export interface components {
          *     never on the message.
          * @enum {string}
          */
-        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden" | "sandbox_default_image_invalid" | "top_level_unsupported_with_search" | "web_credential_required" | "invalid_loop_guard" | "loop_guard_not_allowed";
+        ApiErrorCode: "tenant_not_found" | "tenant_slug_taken" | "tenant_inactive" | "tenant_system_immutable" | "invalid_credentials" | "session_expired" | "missing_auth_header" | "auth_mode_mismatch" | "oidc_email_claim_missing" | "oidc_email_not_verified" | "oidc_exchange_failed" | "oidc_not_configured" | "permission_denied" | "super_admin_required" | "domain_not_allowed" | "read_only_account" | "system_tenant_forbidden" | "user_not_found" | "user_email_taken" | "user_inactive" | "key_not_found" | "key_already_revoked" | "key_name_taken" | "server_not_found" | "downstream_not_found" | "downstream_slug_taken" | "model_not_found" | "route_not_found" | "route_alias_taken" | "route_default_tag_conflict" | "upstream_unreachable" | "upstream_credential_rejected" | "upstream_timeout" | "capability_unsupported" | "upstream_url_missing" | "builtin_provider_protected" | "catalog_entry_not_found" | "catalog_entry_taken" | "route_policy_not_found" | "transform_not_found" | "transform_validation_failed" | "suggestion_not_found" | "snippet_not_found" | "expert_not_found" | "agent_unavailable" | "session_not_found" | "audit_record_not_found" | "media_blob_not_found" | "edge_node_not_found" | "appliance_unavailable" | "host_daemon_error" | "host_daemon_bad_response" | "appliance_network_invalid" | "appliance_network_change_pending" | "appliance_rollback_unservable" | "appliance_refused" | "appliance_request_invalid" | "appliance_backup_unreachable" | "host_daemon_unreachable" | "host_daemon_refused" | "account_not_found" | "access_grant_not_found" | "cannot_delete_self" | "last_admin_account" | "invite_not_found" | "invite_expired" | "invite_already_used" | "rate_limit_exceeded" | "budget_exceeded" | "validation_failed" | "duplicate_resource" | "payload_too_large" | "setting_invalid" | "maintenance_in_progress" | "migration_failed" | "not_implemented" | "internal_error" | "auth_mode_invalid" | "oidc_issuer_requires_https" | "oidc_issuer_url_required" | "oidc_issuer_url_invalid" | "oidc_issuer_ssrf_blocked" | "password_login_disabled" | "password_too_short" | "tenant_slug_invalid" | "api_format_invalid" | "transport_invalid" | "reasoning_effort_invalid" | "route_path_pattern_invalid" | "preset_not_found" | "preset_name_taken" | "preset_settings_invalid" | "preset_default_undeletable" | "transform_phase_invalid" | "transform_scope_invalid" | "transform_script_too_large" | "transform_script_compile_error" | "transform_test_context_invalid" | "transform_trigger_invalid" | "transform_span_mode_needs_trigger" | "suggestion_status_invalid" | "suggestion_rule_invalid" | "price_negative" | "media_blob_type_invalid" | "invite_email_mismatch" | "group_role_invalid" | "tool_risk_rule_not_found" | "tool_risk_rule_id_collision" | "tool_risk_rule_id_invalid" | "tool_risk_rule_regex_invalid" | "tool_risk_rule_risk_invalid" | "tool_risk_rule_action_invalid" | "tool_risk_rule_scope_invalid" | "tool_risk_rule_target_invalid" | "tool_risk_config_read_only" | "tool_field_profile_not_found" | "tool_field_profile_id_collision" | "tool_field_profile_id_invalid" | "tool_field_profile_invalid" | "tool_field_profile_app_mcp_exclusive" | "tool_field_profile_server_type_exclusive" | "tool_field_profile_normalizer_invalid" | "time_window_conflict" | "time_window_invalid" | "mcp_catalog_entry_not_found" | "mcp_catalog_credential_required" | "mcp_catalog_adopt_failed" | "mcp_catalog_entry_invalid" | "mcp_catalog_source_name_taken" | "mcp_upstream_server_not_found" | "mcp_upstream_server_name_taken" | "mcp_virtual_server_not_found" | "mcp_virtual_server_slug_invalid" | "mcp_virtual_server_slug_taken" | "mcp_virtual_route_not_found" | "mcp_route_prefix_invalid" | "mcp_route_prefix_taken" | "mcp_upstream_credential_required" | "mcp_upstream_credential_not_allowed" | "mcp_upstream_oauth_client_incomplete" | "mcp_upstream_oauth_client_not_allowed" | "mcp_upstream_oauth_discovery_failed" | "mcp_upstream_dcr_unsupported" | "mcp_upstream_dcr_failed" | "mcp_upstream_not_per_user_oauth" | "mcp_pending_authorization_invalid" | "mcp_user_credential_not_found" | "a2a_agent_not_found" | "a2a_agent_slug_invalid" | "a2a_agent_slug_taken" | "a2a_agent_card_invalid" | "a2a_agent_card_rejected" | "a2a_credential_required" | "a2a_credential_not_allowed" | "workspace_not_found" | "workspace_membership_required" | "workspace_manager_required" | "workspace_slug_taken" | "member_defaults_not_allowed" | "member_limit_self_edit_forbidden" | "member_limit_manager_edit_forbidden" | "workspace_default_protected" | "workspace_agent_protected" | "workspace_inline_ai_protected" | "profile_not_found" | "profile_slug_taken" | "profile_name_taken" | "profile_default_protected" | "profile_kind_invalid" | "mcp_key_multi_upstream" | "mcp_upstream_server_built_in_protected" | "mcp_upstream_server_in_use" | "mcp_upstream_auth_mode_locked" | "mcp_oauth_client_not_found" | "mcp_oauth_client_id_taken" | "mcp_oauth_redirect_uri_mismatch" | "mcp_oauth_invalid_challenge_method" | "mcp_oauth_invalid_grant" | "mcp_oauth_invalid_verifier" | "mcp_oauth_invalid_resource" | "mcp_oauth_token_not_found" | "cli_session_not_found" | "mcp_oauth_slug_collision" | "mcp_oauth_redirect_uri_invalid" | "mcp_oauth_dcr_invalid_request" | "mcp_oauth_dcr_cap_reached" | "mcp_oauth_cimd_fetch_failed" | "mcp_oauth_cimd_invalid_metadata" | "mcp_sampling_misconfigured" | "client_profile_not_found" | "client_profile_not_compatible" | "client_profile_template_invalid" | "client_profile_id_exists" | "client_profile_key_unreachable" | "proxy_public_url_unset" | "admin_public_url_unset" | "api_public_url_unset" | "public_url_invalid" | "setting_not_meaningful_for_system" | "web_backend_unconfigured" | "web_test_failed" | "provision_scope_forbidden" | "oauth_client_not_found" | "oauth_invalid_challenge_method" | "oauth_redirect_uri_invalid" | "oauth_redirect_uri_mismatch" | "oauth_invalid_grant" | "oauth_invalid_verifier" | "cli_artifact_unavailable" | "oauth_authorization_pending" | "oauth_slow_down" | "oauth_access_denied" | "oauth_expired_token" | "cache_preset_not_found" | "cache_preset_name_taken" | "endpoint_not_found" | "endpoint_url_taken" | "endpoint_last_enabled" | "endpoints_unsupported" | "endpoint_invalid" | "qos_class_not_found" | "qos_class_name_taken" | "qos_class_in_use" | "qos_class_default_protected" | "qos_class_not_entitled" | "qos_class_star_taken" | "edge_token_invalid" | "edge_sync_not_ready" | "edge_node_name_taken" | "edge_blob_refused" | "edge_blob_uploads_busy" | "api_route_not_found" | "method_not_allowed" | "unsupported_media_type" | "request_refused" | "server_misconfigured" | "oidc_identity_conflict" | "account_email_taken" | "downstream_name_taken" | "server_name_taken" | "route_policy_taken" | "transform_name_taken" | "expert_axis_taken" | "tenant_seeding_incomplete" | "emergency_invite_active" | "invite_unusable" | "setup_already_completed" | "suggestion_changed" | "oidc_provider_unreachable" | "sort_unsupported_with_search" | "egress_refused" | "egress_entry_invalid" | "request_body_incomplete" | "client_disabled" | "destination_list_not_found" | "destination_list_name_taken" | "destination_entry_invalid" | "destination_list_in_use" | "appliance_operator_only" | "page_too_deep" | "search_term_too_short" | "judge_model_not_granted" | "mcp_remote_invalid" | "mcp_input_locked" | "mcp_input_unknown" | "mcp_input_required" | "mcp_client_header_collision" | "mcp_input_reserved" | "mcp_oauth_client_authorization" | "profile_choice_unsupported" | "profile_default_changed" | "mcp_local_server_not_found" | "mcp_local_server_slug_taken" | "mcp_local_server_invalid" | "mcp_server_slug_clash" | "mcp_local_server_workspace_ineligible" | "mcp_local_server_slug_immutable" | "portal_page_hidden" | "sandbox_default_image_invalid" | "top_level_unsupported_with_search" | "web_credential_required" | "invalid_loop_guard" | "loop_guard_not_allowed" | "sort_unsupported_for_kind" | "sort_needs_window";
         /** @description Structured error response body matching the proxy's `ErrorResponse` format. */
         ApiErrorResponse: {
             error: components["schemas"]["ApiErrorBody"];
@@ -7385,6 +7418,16 @@ export interface components {
             would?: components["schemas"]["ToolLoopAction"] | null;
         };
         /**
+         * @description The `code` of an [`AuditBadge`] alone — what a badge filter names.
+         *     Append-only, like the badge codes it spells. Spelled by
+         *     `rename_all`, as [`AuditBadge`]'s tags are, so the published schema
+         *     names the same codes (a per-variant rename from a macro argument is
+         *     not seen by the schema derive); the table's `$code` must equal it
+         *     (locked by `a_badge_code_spells_the_stored_tag_of_every_variant`).
+         * @enum {string}
+         */
+        AuditBadgeCode: "modified" | "modified_not_applied" | "compressed" | "json_healed" | "refusal" | "tool_blocked" | "tool_blocked_overflow" | "tool_block_not_applied" | "block_overflow" | "script_error" | "protocol_translated" | "capability_rerouted" | "catchall" | "sanitized_tool_names" | "response_sanitized_tool_names" | "agent_alert" | "session_alert" | "mcp_rpc_error" | "mcp_legacy_sse" | "mcp_sampling_intercepted" | "llm_synthetic_sampling" | "cache_hit" | "cache_observe_hit" | "cache_store_skipped" | "cache_semantic_skipped" | "queued" | "spilled" | "unpriced" | "tool_loop" | "upstream_adapted" | "web_blocked" | "web_url_filtered" | "web_all_results_filtered" | "web_rate_limited" | "web_content_stripped" | "record_stripped" | "content_unavailable" | "web_ssrf_refused" | "web_scheme_refused" | "web_substituted_server" | "web_substituted_client" | "web_substitution_max_iter" | "web_substitution_tool_error" | "web_substitution_truncated_stream" | "web_substitution_mixed_pending" | "web_substitution_forward_failed" | "web_substitution_serialize_failed" | "web_substitution_non_streaming" | "web_substitution_history_cap" | "web_substitution_cancelled" | "web_substitution_mixed_pending_spliced" | "web_substitution_mixed_pending_splice_failed" | "guardrail" | "guardrail_error";
+        /**
          * @description Discriminator for the `/audit` endpoint's row families. Defaults to
          *     [`AuditKind::Llm`] so callers that haven't migrated keep the existing
          *     shape; native MCP clients pass `kind=mcp`; `kind=web` returns
@@ -8008,6 +8051,12 @@ export interface components {
             /** @enum {string} */
             kind: "a2a";
         });
+        /**
+         * @description The order of an audit page: newest first, or the largest figure first
+         *     (newest first among equals).
+         * @enum {string}
+         */
+        AuditSort: "newest" | "cost" | "tokens" | "latency";
         AuthConfigResponse: {
             /** @description IdP group whose members get console role `Admin` (OIDC mode). */
             admin_group?: string | null;
@@ -10280,6 +10329,7 @@ export interface components {
              *     A `client_access` profile takes Standalone with `seed` or `copy` only.
              */
             start_from?: components["schemas"]["ProfileStartChoice"];
+            tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
         };
         CreateProgramRequest: {
             app_filter?: string | null;
@@ -13632,6 +13682,11 @@ export interface components {
             /** @description `"allow"` | `"classify"` | `"block"` | `"replace"`. */
             action: string;
             description?: string | null;
+            /**
+             * @description The `block` or `replace` was recorded, not applied: the workspace's
+             *     tool policy observes, so the call went on as sent.
+             */
+            not_applied?: boolean;
             profile_id?: string | null;
             risk: string;
             /**
@@ -13641,6 +13696,17 @@ export interface components {
             rule_id?: string | null;
             title?: string | null;
             tool_id?: string | null;
+            /**
+             * @description An observed `replace`: the JSON-RPC `params` the rewrite would have sent
+             *     upstream in place of the client's (the method's own params shape).
+             */
+            would_rewrite?: Record<string, never> | null;
+            /**
+             * Format: int64
+             * @description The observed rewrite's size when it was past the audit payload limit
+             *     and `would_rewrite` was left out.
+             */
+            would_rewrite_omitted_bytes?: number | null;
         };
         McpRevokeRequest: {
             /**
@@ -16055,6 +16121,7 @@ export interface components {
                 /** Format: date-time */
                 created_at: string;
                 description?: string | null;
+                effective_tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
                 /** Format: uuid */
                 id: string;
                 is_default: boolean;
@@ -16073,6 +16140,7 @@ export interface components {
                  *     standalone (it is the base).
                  */
                 standalone: boolean;
+                tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
                 /** Format: date-time */
                 updated_at: string;
             } & {
@@ -16255,6 +16323,12 @@ export interface components {
                 alert_level?: string | null;
                 alert_note?: string | null;
                 app_id?: string | null;
+                /**
+                 * @description The distinct badge codes the session's LLM turns carried (the alert
+                 *     badges excepted: the session's alert is `alert_level`), sorted. Empty on
+                 *     a session no turn has landed on since the codes were recorded.
+                 */
+                badge_codes: components["schemas"]["AuditBadgeCode"][];
                 /** Format: date-time */
                 first_timestamp: string;
                 first_user_prompt?: string | null;
@@ -16431,7 +16505,8 @@ export interface components {
                 latency_total_ms?: number | null;
                 /**
                  * @description Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-                 *     `not_applied_response`, `redacted`, `args_modified`.
+                 *     `not_applied_response`, `redacted`, `redaction_not_applied` (an
+                 *     observing policy's rewrite of the result, not applied), `args_modified`.
                  */
                 outcomes: string[];
                 redaction?: components["schemas"]["RedactedToolResultInfo"] | null;
@@ -18202,6 +18277,7 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             description?: string | null;
+            effective_tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
             /** Format: uuid */
             id: string;
             is_default: boolean;
@@ -18220,6 +18296,7 @@ export interface components {
              *     standalone (it is the base).
              */
             standalone: boolean;
+            tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
             /** Format: date-time */
             updated_at: string;
         } & {
@@ -18277,6 +18354,7 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             description?: string | null;
+            effective_tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
             /** Format: uuid */
             id: string;
             is_default: boolean;
@@ -18295,6 +18373,7 @@ export interface components {
              *     standalone (it is the base).
              */
             standalone: boolean;
+            tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
             /** Format: date-time */
             updated_at: string;
         };
@@ -18836,6 +18915,12 @@ export interface components {
          *     redacted content so the audit UI can surface the diff.
          */
         RedactedToolResultInfo: {
+            /**
+             * @description The rewrite was recorded, not applied: the workspace's tool policy
+             *     observes, so the model read `original_content`. Never counted as a
+             *     redaction.
+             */
+            not_applied?: boolean;
             original_content: string;
             reason: string;
             redacted_content: string;
@@ -20109,13 +20194,19 @@ export interface components {
          *     `updated_at`, so under a search term only `newest` and `oldest` exist.
          * @enum {string}
          */
-        SessionSort: "newest" | "oldest" | "alerts";
+        SessionSort: "newest" | "oldest" | "alerts" | "turns" | "cost" | "tokens";
         /** @description Session summary for list view. */
         SessionSummary: {
             alert_expert_axis?: string | null;
             alert_level?: string | null;
             alert_note?: string | null;
             app_id?: string | null;
+            /**
+             * @description The distinct badge codes the session's LLM turns carried (the alert
+             *     badges excepted: the session's alert is `alert_level`), sorted. Empty on
+             *     a session no turn has landed on since the codes were recorded.
+             */
+            badge_codes: components["schemas"]["AuditBadgeCode"][];
             /** Format: date-time */
             first_timestamp: string;
             first_user_prompt?: string | null;
@@ -21006,6 +21097,11 @@ export interface components {
             effective: Record<string, never>;
             /** @description Name of the mutated argument key (e.g. `command`, `file_path`). */
             field: string;
+            /**
+             * @description The rewrite was recorded, not applied: the workspace's tool policy
+             *     observes, so the call kept `original`.
+             */
+            not_applied?: boolean;
             /** @description Original value as received from the model. */
             original: Record<string, never>;
             /** @description Id of the rule that made the change. */
@@ -21086,7 +21182,8 @@ export interface components {
             latency_total_ms?: number | null;
             /**
              * @description Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-             *     `not_applied_response`, `redacted`, `args_modified`.
+             *     `not_applied_response`, `redacted`, `redaction_not_applied` (an
+             *     observing policy's rewrite of the result, not applied), `args_modified`.
              */
             outcomes: string[];
             redaction?: components["schemas"]["RedactedToolResultInfo"] | null;
@@ -21317,6 +21414,12 @@ export interface components {
             definition: Record<string, never>;
             hash: string;
         };
+        /**
+         * @description What a tool-policy profile does with a `block` or `replace` rule that
+         *     matches. `classify`, `substitute` and `intercept_only` act the same in both.
+         * @enum {string}
+         */
+        ToolEnforcement: "enforce" | "observe";
         ToolEntry: {
             app_ids: string[];
             /** Format: int64 */
@@ -21410,7 +21513,8 @@ export interface components {
             latency_total_ms?: number | null;
             /**
              * @description Outcome tags: any of `ok`, `blocked_request`, `blocked_response`,
-             *     `not_applied_response`, `redacted`, `args_modified`.
+             *     `not_applied_response`, `redacted`, `redaction_not_applied` (an
+             *     observing policy's rewrite of the result, not applied), `args_modified`.
              */
             outcomes: string[];
             redaction?: components["schemas"]["RedactedToolResultInfo"] | null;
@@ -23086,8 +23190,6 @@ export interface components {
         /** @description Transform diff — what the proxy changed (request + response sides). */
         TransformDiff: {
             blocked_tools?: components["schemas"]["BlockedToolInfo"][] | null;
-            /** @description The request's messages after transforms, when a transform changed them; `null` otherwise. */
-            effective_messages?: Record<string, never>;
             /**
              * @description Guardrail classifier findings on web tool-results folded back into the
              *     model by the substitution loop — one entry per flagged/errored scan,
@@ -23747,6 +23849,7 @@ export interface components {
              */
             model?: string | null;
             name?: string | null;
+            tool_enforcement?: components["schemas"]["ToolEnforcement"] | null;
         };
         UpdateProgramRequest: {
             app_filter?: string | null;
@@ -26919,6 +27022,20 @@ export interface operations {
                  *     unknown value can't reach the inline SQL literal.
                  */
                 task_state?: string;
+                /**
+                 * @description Rows carrying ANY of these badge codes (comma-separated). An unknown
+                 *     code is a 400, never read as no filter. Applies to every `kind`.
+                 */
+                badges?: string;
+                /** @description The API key the request authenticated with. Applies to every `kind`. */
+                key_id?: string;
+                /**
+                 * @description Order of the page. Default `newest`. `latency` needs one `kind` (not
+                 *     `all`), `cost` and `tokens` the `llm` kind (`sort_unsupported_for_kind`);
+                 *     none but `newest` takes a search term (`sort_unsupported_with_search`),
+                 *     and each needs a `start` within 31 days of its `end` (`sort_needs_window`).
+                 */
+                sort?: components["schemas"]["AuditSort"];
             };
             header?: never;
             path?: never;
@@ -26935,7 +27052,7 @@ export interface operations {
                     "application/json": components["schemas"]["OffsetPage_AuditLogRow"];
                 };
             };
-            /** @description `start` is not before `end`, a search term under 3 characters, or a `kind=all` page is too deep */
+            /** @description `start` is not before `end`, a search term under 3 characters, a `kind=all` page is too deep, an unknown or alert badge code, or a `sort` the kind, a search term or the window cannot serve */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -29622,6 +29739,15 @@ export interface operations {
             };
             /** @description Unauthorized */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description The trigger could not be queued */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -35363,7 +35489,7 @@ export interface operations {
                     "application/json": components["schemas"]["ProfileRow"];
                 };
             };
-            /** @description The judge model is not one the agent can use */
+            /** @description The judge model is not one the agent can use, or a mode the profile cannot take */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -38177,10 +38303,17 @@ export interface operations {
                 limit?: number;
                 offset?: number;
                 /**
-                 * @description Default `newest`. `alerts` is refused with a `search` term
-                 *     (`sort_unsupported_with_search`): filter on `alert_level` instead.
+                 * @description Default `newest`. Every order but `newest` and `oldest` is refused with
+                 *     a `search` term (`sort_unsupported_with_search`): filter instead.
+                 *     `turns`, `cost` and `tokens` need a `start` within 31 days of its `end`
+                 *     (`sort_needs_window`).
                  */
                 sort?: components["schemas"]["SessionSort"];
+                /**
+                 * @description Sessions whose LLM turns carried ANY of these badge codes
+                 *     (comma-separated). An unknown code is a 400.
+                 */
+                badges?: string;
                 /** @description Sessions whose alert is exactly this level. */
                 alert_level?: components["schemas"]["AlertLevel"];
                 /** @description Filter sessions updated after this timestamp (RFC3339). */
@@ -38227,7 +38360,7 @@ export interface operations {
                     "application/json": components["schemas"]["OffsetPage_SessionSummary"];
                 };
             };
-            /** @description `start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term */
+            /** @description `start` is not before `end`, a search term under 3 characters, `sort=alerts`, a sort by figure or `linked=top_level` with a search term, a sort by figure without a `start` within 31 days of its `end`, or an unknown or alert badge code */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -44881,6 +45014,13 @@ export interface operations {
                 task_state?: string;
                 /** @description Comma-separated MCP or A2A methods. */
                 methods?: string;
+                /**
+                 * @description Rows carrying ANY of these badge codes (comma-separated). An unknown
+                 *     code is a 400.
+                 */
+                badges?: string;
+                /** @description Order of the page. Default `newest`; see the console's `sort`. */
+                sort?: components["schemas"]["AuditSort"];
                 limit?: number;
                 offset?: number;
             };
@@ -44899,7 +45039,7 @@ export interface operations {
                     "application/json": components["schemas"]["OffsetPage_AuditLogRow"];
                 };
             };
-            /** @description `start` is not before `end`, a search term under 3 characters, or a `kind=all` page is too deep */
+            /** @description `start` is not before `end`, a search term under 3 characters, a `kind=all` page is too deep, an unknown or alert badge code, or a `sort` the kind, a search term or the window cannot serve */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -46338,6 +46478,11 @@ export interface operations {
                 linked?: components["schemas"]["SessionLinkage"];
                 /** @description A teammate's email (substring), in a shared-workspace view only. */
                 user_email?: string;
+                /**
+                 * @description Sessions whose LLM turns carried ANY of these badge codes
+                 *     (comma-separated). An unknown code is a 400.
+                 */
+                badges?: string;
                 limit?: number;
                 offset?: number;
             };
@@ -46356,7 +46501,7 @@ export interface operations {
                     "application/json": components["schemas"]["OffsetPage_SessionSummary"];
                 };
             };
-            /** @description `start` is not before `end`, a search term under 3 characters, or `sort=alerts` or `linked=top_level` with a search term */
+            /** @description `start` is not before `end`, a search term under 3 characters, or `sort=alerts`, a sort by figure or `linked=top_level` with a search term, a sort by figure without a `start` within 31 days of its `end`, or an unknown or alert badge code */
             400: {
                 headers: {
                     [name: string]: unknown;

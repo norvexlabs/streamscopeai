@@ -2,6 +2,7 @@
   import { adminApi } from '#lib/api-client.js';
   import ProfileDetailShell from '#lib/components/policy/ProfileDetailShell.svelte';
   import ToolRulesSection from '#lib/components/policy/ToolRulesSection.svelte';
+  import ToolEnforcementPanel from '#lib/components/policy/ToolEnforcementPanel.svelte';
   import type { PageProps } from './$types';
 
   let { params }: PageProps = $props();
@@ -12,6 +13,7 @@
   // so inherited Default rules render read-only (Default-as-base model).
   let baselineProfileId = $state<string | undefined>(undefined);
   let layered = $state(false);
+  let observing = $state(false);
 
   async function loadMeta() {
     const { data } = await adminApi.GET('/api/v1/admin/profiles', {
@@ -30,6 +32,7 @@
 
 <ProfileDetailShell kind="tools">
   {#snippet children({ id: profileId })}
-    <ToolRulesSection profileId={profileId} {baselineProfileId} {layered} activate />
+    <ToolEnforcementPanel {profileId} bind:observing />
+    <ToolRulesSection profileId={profileId} {baselineProfileId} {layered} {observing} activate />
   {/snippet}
 </ProfileDetailShell>

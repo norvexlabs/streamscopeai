@@ -45,9 +45,10 @@ pub struct ProjectGrants {
     /// Folders outside the project the agent writes: a linked worktree's
     /// common git dir (its own git dir is inside it).
     pub extra_rw: Vec<PathBuf>,
-    /// Folders the agent may look at (their attributes) but not list: a
-    /// linked worktree's main checkout, which git stats. Only Windows needs
-    /// the grant: the other backends let every path be stat'ed.
+    /// Folders the agent may look at (their attributes) but not list — unless
+    /// the project's own path crosses one, which Windows then lists: a linked
+    /// worktree's main checkout, which git stats. Only Windows needs the
+    /// grant: the other backends let every path be stat'ed.
     pub stat_only: Vec<PathBuf>,
     /// What the agent must not change, inside the project or `extra_rw`.
     pub protected: Vec<Protected>,

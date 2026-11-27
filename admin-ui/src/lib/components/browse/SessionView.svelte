@@ -97,7 +97,7 @@
     for (const ev of conversation.events) {
       const td = eventMetadata(ev)?.transform_diff;
       if (!td) continue;
-      if (td.injected_system_prompt || td.effective_messages || td.original_response_content
+      if (td.injected_system_prompt || td.original_response_content
           || (td.blocked_tools && td.blocked_tools.length > 0)
           || (td.response_blocked_tools && td.response_blocked_tools.length > 0)
           || (td.injection_blocks && td.injection_blocks.length > 0)) return true;

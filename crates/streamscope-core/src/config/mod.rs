@@ -13,6 +13,7 @@ pub mod loop_guard;
 pub mod qos;
 pub mod mcp;
 pub mod model_map;
+pub mod tool_enforcement;
 pub mod tool_names;
 pub mod tool_rules;
 pub mod tool_rules_detectors;
@@ -295,6 +296,10 @@ pub struct TenantConfig {
     /// rules (minus the ones it forked) ∪ its own; the Default and any Standalone
     /// bucket is its own rules. Built via [`Self::build_profile_buckets`].
     pub tool_rules_by_profile: HashMap<uuid::Uuid, Vec<crate::config::tool_rules::Rule>>,
+    /// The tool profiles that observe ([`tool_enforcement::resolve`], once per
+    /// snapshot): their block and rewrite rules are recorded, never applied.
+    /// Read through [`Self::effective_tool_enforcement`].
+    pub tool_observing_profiles: std::collections::HashSet<uuid::Uuid>,
     /// Client detection patterns from app registry (synced from admin-api).
     pub app_patterns: std::sync::Arc<[AppPattern]>,
     /// Active transform programs (Rhai scripts) for this tenant — the **full**
@@ -452,6 +457,7 @@ impl Default for TenantConfig {
             workspace_profiles: HashMap::new(),
             default_profiles: HashMap::new(),
             tool_rules_by_profile: HashMap::new(),
+            tool_observing_profiles: std::collections::HashSet::new(),
             app_patterns: std::sync::Arc::from([]),
             transform_programs: Vec::new(),
             transform_programs_by_profile: HashMap::new(),
@@ -580,6 +586,18 @@ impl TenantConfig {
             },
             // No profile resolvable (no default — degenerate / SYSTEM) → empty.
             EffectiveProfile::Unset => std::borrow::Cow::Borrowed(&[]),
+        }
+    }
+
+    /// Whether the tool rules of [`Self::effective_tool_rules`] for this
+    /// workspace are applied or only recorded. A workspace whose tool policy is
+    /// Off, or a tenant with none, has no rule to apply: `Enforce`.
+    pub fn effective_tool_enforcement(&self, workspace_id: uuid::Uuid) -> tool_enforcement::ToolEnforcement {
+        match self.effective_profile(workspace_id, ProfileKind::Tools) {
+            EffectiveProfile::Use(pid) if self.tool_observing_profiles.contains(&pid) => {
+                tool_enforcement::ToolEnforcement::Observe
+            }
+            _ => tool_enforcement::ToolEnforcement::Enforce,
         }
     }
 

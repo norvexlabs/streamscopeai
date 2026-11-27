@@ -42,6 +42,9 @@
   import TextInput from '#lib/components/forms/TextInput.svelte';
   import SelectInput from '#lib/components/forms/SelectInput.svelte';
   import ScopeFilters from '#lib/components/browse/ScopeFilters.svelte';
+  import BadgePicker from '#lib/components/filter/BadgePicker.svelte';
+  import { offeredBadgeFilter, type BadgeSurface } from '#lib/badges.js';
+  import { FIGURE_SORT_MAX_DAYS, figureSortFits } from '#lib/browse/sort.js';
   import DiffPanel, { type DiffDetail } from '#lib/components/browse/DiffPanel.svelte';
   import { m } from '#lib/paraglide/messages.js';
 
@@ -68,6 +71,7 @@
     upstreamServers: [],
     a2aAgents: [],
     qosClassNames: new Map(),
+    keys: [],
   });
   let loading = $state(true);
   // A refresh keeps what is shown, so a refresh never blanks it; a filter or
@@ -102,6 +106,32 @@
 
   const pager = usePagination({ limit: 50 });
   const shortSearch = $derived(!contentHidden && searchTooShort(filters.values.search));
+  // A search term is applied (long enough, content shown): the list then
+  // reads newest first, whatever the order picked.
+  const searching = $derived(!contentHidden && !shortSearch && !!filters.values.search?.trim());
+
+  // The orders the listed kind can serve: a figure needs one kind — latency
+  // any, cost and tokens an LLM request's — and none takes a search term. An
+  // order the view cannot serve is not sent (the server would refuse it).
+  type Sort = 'latency' | 'cost' | 'tokens';
+  const sorts = $derived<Sort[]>(filterKind === 'llm' ? ['cost', 'tokens', 'latency'] : filterKind === 'all' ? [] : ['latency']);
+  const sortLabel: Record<Sort, () => string> = {
+    cost: m.browse_sort_cost,
+    tokens: m.browse_sort_tokens,
+    latency: m.browse_sort_latency,
+  };
+  // A figure sorts every row of the window: offered only over a window the
+  // server serves it on (`figureSortFits`), never on a deep-linked request,
+  // which is read without one.
+  const sortWindow = $derived(figureSortFits(period.value) && !focusedRid && !filters.values.jti);
+  const sortSent = $derived.by(() => {
+    const v = filters.values.sort as Sort | undefined;
+    return v && !searching && sortWindow && sorts.includes(v) ? v : undefined;
+  });
+  /** The row kinds the badge filter's choices are narrowed to. */
+  const badgeSurfaces = $derived<BadgeSurface[]>(filterKind === 'all' ? ['llm', 'mcp', 'web', 'a2a'] : [filterKind]);
+  /** The badge codes the list sends: those the picker shows ticked. */
+  const badgesSent = $derived(offeredBadgeFilter(filters.values.badges, badgeSurfaces).join(','));
 
   usePeriodicLoad(async () => {
     try {
@@ -142,6 +172,8 @@
       // Cross-kind: a gateway column, or a badge on several arms.
       error_category: v.error_category || undefined,
       has_guardrail: v.has_guardrail === 'true' ? true : undefined,
+      badges: badgesSent || undefined,
+      sort: sortSent,
       app_id: v.app_id || undefined,
       surface: when(['web'], v.surface),
       operation: when(['web'], v.operation),
@@ -208,6 +240,15 @@
     await loadLogs();
   }
 
+  /** The kind changed: an order the new kind cannot serve is dropped, so the
+   *  URL and the sort control never name one the list does not apply. */
+  async function changeKind() {
+    if (filters.values.sort && !(sorts as string[]).includes(filters.values.sort)) filters.values.sort = '';
+    // And the badges it cannot carry: the picker offers no box to untick them.
+    filters.values.badges = badgesSent;
+    await applyFilters();
+  }
+
   async function clearFilters() {
     // The portal's Me/Team choice is not a filter: it stays.
     const keep: Record<string, string> = p.portal ? { workspace_id: filters.values.workspace_id ?? '' } : {};
@@ -261,7 +302,7 @@
        kind's own filters are hidden under `all`: narrow by kind first. -->
   <FilterBar>
     <FilterField label={m.browse_filter_kind()} class="min-w-30">
-      <SelectInput bind:value={filters.values.kind} onchange={applyFilters}>
+      <SelectInput bind:value={filters.values.kind} onchange={changeKind}>
         <option value="all">{m.browse_kind_all()}</option>
         <option value="llm">LLM</option>
         <option value="mcp">MCP</option>
@@ -295,6 +336,39 @@
       <SelectInput bind:value={filters.values.has_guardrail} onchange={applyFilters}>
         <option value="">{m.browse_all()}</option>
         <option value="true">{m.browse_filter_guardrail_flagged()}</option>
+      </SelectInput>
+    </FilterField>
+    <!-- Any of the picked badges, on every arm the kind lists. -->
+    <BadgePicker bind:value={filters.values.badges} surfaces={badgeSurfaces} onchange={applyFilters} />
+    {#if !p.portal && options.keys.length > 0}
+      <FilterField label={m.browse_filter_key()} class="min-w-40">
+        <SelectInput bind:value={filters.values.key_id} onchange={applyFilters}>
+          <option value="">{m.browse_filter_key_all()}</option>
+          {#if filters.values.key_id && !options.keys.some((k) => k.id === filters.values.key_id)}
+            <option value={filters.values.key_id}>{filters.values.key_id}</option>
+          {/if}
+          {#each options.keys as key (key.id)}
+            <option value={key.id}>{key.name}</option>
+          {/each}
+        </SelectInput>
+      </FilterField>
+    {/if}
+    <FilterField label={m.browse_sort()} class="min-w-32.5">
+      <SelectInput
+        bind:value={filters.values.sort}
+        onchange={applyFilters}
+        disabled={sorts.length === 0 || searching || !sortWindow}
+        title={searching
+          ? m.browse_sort_with_search()
+          : sorts.length === 0
+            ? m.browse_sort_pick_kind()
+            : !sortWindow
+              ? m.browse_sort_needs_window({ days: FIGURE_SORT_MAX_DAYS })
+              : undefined}>
+        <option value="">{m.browse_sort_newest()}</option>
+        {#each sorts as sort (sort)}
+          <option value={sort}>{sortLabel[sort]()}</option>
+        {/each}
       </SelectInput>
     </FilterField>
 
@@ -463,6 +537,7 @@
           onToggle={contentHidden ? undefined : () => toggleExpand(row.request_id)}
           onFilterUser={userFilter ? filterByUser : undefined}
           showKindChip={filterKind === 'all'}
+          filtered={badgesSent ? badgesSent.split(',') : []}
         />
         {#if expandedId === row.request_id && !contentHidden}
           <div class="bg-(--bg-elevated) px-5 py-4">

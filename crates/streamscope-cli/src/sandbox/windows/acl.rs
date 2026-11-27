@@ -9,7 +9,7 @@
 //! what its contents inherit: it rewrites every item below it that inherits,
 //! so on the profile it walks every file the developer has, each reported to
 //! a [`Progress`]. That walk is needed only when an inheritable entry comes or
-//! goes; a change of entries for the folder alone (the read-attributes entry
+//! goes; a change of entries for the folder alone (the open or list entry
 //! on each folder above a grant, a deny on one file) is written on an open
 //! handle to that one object, which touches nothing below it.
 //!
@@ -185,7 +185,7 @@ pub fn revoke(record_file: &Path, account_sid: &str, root: Option<&Path>, progre
         let mut failed = Vec::new();
         for entry in &paths {
             // The project's own folder is always taken back: a project
-            // inside it records it too, for its attributes only.
+            // inside it records it too, to list it only.
             if root.is_some() && entry.path.to_lowercase() != r && kept_by_others(&entry.path) {
                 continue;
             }
@@ -1276,7 +1276,7 @@ mod tests {
         }
     }
 
-    /// The read-attributes entry each folder above a grant gets reaches that
+    /// The list entry each folder above the project gets reaches that
     /// folder alone: adding and removing it rewrites nothing below (a child
     /// keeps an entry only a rewrite of its list would drop) and gives the
     /// folder back its exact list, flags included — on a folder built for
@@ -1312,11 +1312,11 @@ mod tests {
             assert!(dacl_of(&child).contains(marker));
             let before = dacl_of(dir);
             assert!(before.starts_with(flags), "{before}");
-            let aces = vec![Ace { path: dir.to_path_buf(), trustee: Trustee::Account, kind: Kind::ReadAttributes }];
+            let aces = vec![Ace { path: dir.to_path_buf(), trustee: Trustee::Account, kind: Kind::ListFolder }];
             assert_eq!(apply(&record, GUESTS, dir, &aces, &Progress::silent()).unwrap().changed.len(), 1);
             let granted = dacl_of(dir);
             assert!(granted.starts_with(flags), "{granted}");
-            assert!(entries_for(dir, "BG").contains(&"(A;;0x100080;;;BG)".to_string()), "{granted}");
+            assert!(entries_for(dir, "BG").contains(&"(A;;0x100081;;;BG)".to_string()), "{granted}");
             assert!(dacl_of(&child).contains(marker), "the child's list was rewritten by the grant");
             revoke(&record, GUESTS, Some(dir), &Progress::silent()).unwrap();
             assert_eq!(dacl_of(dir), before, "revoke gives the folder back its exact list");

@@ -2110,6 +2110,10 @@ async fn handle_authenticated_request(
     } else {
         super::policy::PolicyDecision::Allow(None)
     };
+    // Observing: a block or a rewrite is recorded on the row, and the request
+    // goes to the upstream as the client sent it.
+    let policy_decision =
+        policy_decision.under(tenant_cfg.effective_tool_enforcement(identity.user.workspace_id));
 
     // Branch on the policy decision. `Block` answers immediately: a blocked
     // `tools/call` as a tool execution error (a result with `isError` naming
@@ -4165,18 +4169,7 @@ fn stream_method_response(
         if let Some(rc) = &policy_classification
             && (rc.id.is_some() || rc.action != "allow")
         {
-            diff.insert(
-                "policy_classification".into(),
-                serde_json::json!({
-                    "rule_id": rc.id,
-                    "risk": rc.risk,
-                    "title": rc.title,
-                    "description": rc.description,
-                    "action": rc.action,
-                    "tool_id": rc.tool_id,
-                    "profile_id": rc.profile_id,
-                }),
-            );
+            diff.insert("policy_classification".into(), policy_classification_json(rc));
         }
         diff.insert(
             "mcp_stream".into(),
@@ -9256,6 +9249,42 @@ async fn emit_audit(
     .await;
 }
 
+/// An observed rewrite's `would_rewrite` on a finding, held to the surface's
+/// audit payload cap like the row's own params: past it the preview is left
+/// out and `would_rewrite_omitted_bytes` says how large it was.
+pub(crate) fn put_would_rewrite(finding: &mut serde_json::Value, would: Option<&serde_json::Value>, max_bytes: usize) {
+    let Some(would) = would else { return };
+    let size = serde_json::to_string(would).map_or(usize::MAX, |s| s.len());
+    if size <= max_bytes {
+        finding["would_rewrite"] = would.clone();
+    } else {
+        finding["would_rewrite_omitted_bytes"] = serde_json::Value::from(size);
+    }
+}
+
+/// The row's `transform_diff.policy_classification` for a rule that fired —
+/// the one shape every MCP audit writer stores (`McpPolicyClassification`).
+fn policy_classification_json(r: &streamscope_core::config::tool_rules::RiskResult) -> serde_json::Value {
+    let mut classification = serde_json::json!({
+        "rule_id": r.id,
+        "risk": r.risk,
+        "title": r.title,
+        "description": r.description,
+        "action": r.action,
+        "tool_id": r.tool_id,
+        "profile_id": r.profile_id,
+    });
+    if r.not_applied {
+        classification["not_applied"] = serde_json::Value::Bool(true);
+    }
+    put_would_rewrite(
+        &mut classification,
+        r.would_rewrite.as_ref(),
+        crate::settings::proxy_settings().mcp_audit_payload_max_bytes,
+    );
+    classification
+}
+
 /// Build the per-record badge vector from policy classification + JSON-RPC
 /// error code. Mirrors the LLM proxy's `BadgeBuilder` flow for the MCP
 /// signals operators care about today:
@@ -9277,8 +9306,27 @@ fn build_mcp_audit_badges(
     error_code: Option<i32>,
 ) -> Vec<streamscope_core::audit::AuditBadge> {
     let mut bb = streamscope_core::audit::BadgeBuilder::new();
+    if let Some(rc) = policy
+        && rc.not_applied
+    {
+        // An observing policy's decision: nothing was blocked or rewritten.
+        if rc.action == "block" {
+            bb.add_tool_block_not_applied(
+                streamscope_core::audit::Phase::Request,
+                rc.tool_id.clone().or_else(|| rc.id.clone()).unwrap_or_else(|| "<unresolved>".to_string()),
+            );
+        } else if rc.action == "replace" {
+            bb.add(streamscope_core::audit::AuditBadge::ModifiedNotApplied);
+        }
+    } else if let Some(rc) = policy
+        && rc.action == "replace"
+    {
+        // The params went upstream rewritten.
+        bb.add_modified();
+    }
     let web_blocked = if let Some(rc) = policy
         && rc.action == "block"
+        && !rc.not_applied
     {
         // Prefer the canonical tool_id; fall back to the rule id so the
         // tooltip carries SOMETHING actionable when no profile resolved.
@@ -9382,17 +9430,7 @@ async fn emit_audit_with_policy(
     // to surface.
     let transform_diff = match policy_classification.as_ref() {
         Some(r) if r.id.is_some() || r.action != "allow" => {
-            serde_json::json!({
-                "policy_classification": {
-                    "rule_id": r.id,
-                    "risk": r.risk,
-                    "title": r.title,
-                    "description": r.description,
-                    "action": r.action,
-                    "tool_id": r.tool_id,
-                    "profile_id": r.profile_id,
-                }
-            })
+            serde_json::json!({ "policy_classification": policy_classification_json(r) })
         }
         _ => serde_json::Value::Object(Default::default()),
     };
@@ -9454,6 +9492,53 @@ async fn emit_audit_with_policy(
 
 #[cfg(test)]
 mod tests {
+    /// A rewrite preview within the cap is kept; past it, left out with its
+    /// size, never cut.
+    #[test]
+    fn a_rewrite_preview_past_the_audit_cap_is_left_out_with_its_size() {
+        let would = serde_json::json!({"content": "x".repeat(100)});
+        let size = serde_json::to_string(&would).unwrap().len();
+        let mut kept = serde_json::json!({});
+        super::put_would_rewrite(&mut kept, Some(&would), size);
+        assert_eq!(kept, serde_json::json!({"would_rewrite": would}));
+        let mut omitted = serde_json::json!({});
+        super::put_would_rewrite(&mut omitted, Some(&would), size - 1);
+        assert_eq!(omitted, serde_json::json!({"would_rewrite_omitted_bytes": size}));
+        let mut none = serde_json::json!({});
+        super::put_would_rewrite(&mut none, None, 0);
+        assert_eq!(none, serde_json::json!({}));
+    }
+
+    /// An observed block badges "would have blocked" and nothing else a
+    /// block counts on; an enforced one badges `tool_blocked` (positive control).
+    #[test]
+    fn an_observed_block_is_badged_not_applied_never_blocked() {
+        use streamscope_core::audit::AuditBadge;
+        let risk = |not_applied: bool, action: &str| streamscope_core::config::tool_rules::RiskResult {
+            id: Some("R-1".into()),
+            risk: "danger".into(),
+            title: None,
+            description: None,
+            action: action.into(),
+            pattern: None,
+            profile_id: None,
+            tool_id: Some("web_fetch".into()),
+            not_applied,
+            would_rewrite: None,
+        };
+        let observed = super::build_mcp_audit_badges(Some(&risk(true, "block")), None);
+        assert!(observed.iter().any(|b| matches!(b, AuditBadge::ToolBlockNotApplied { names, .. } if names == &["web_fetch"])), "{observed:?}");
+        assert!(!observed.iter().any(|b| matches!(b, AuditBadge::ToolBlocked { .. } | AuditBadge::WebBlocked)), "{observed:?}");
+        let rewritten = super::build_mcp_audit_badges(Some(&risk(true, "replace")), None);
+        assert_eq!(rewritten, vec![AuditBadge::ModifiedNotApplied]);
+        // An applied rewrite is a modification.
+        let applied_rewrite = super::build_mcp_audit_badges(Some(&risk(false, "replace")), None);
+        assert_eq!(applied_rewrite, vec![AuditBadge::Modified]);
+        let enforced = super::build_mcp_audit_badges(Some(&risk(false, "block")), None);
+        assert!(enforced.iter().any(|b| matches!(b, AuditBadge::ToolBlocked { .. })), "{enforced:?}");
+        assert!(enforced.contains(&AuditBadge::WebBlocked), "{enforced:?}");
+    }
+
     use super::*;
 
     /// Two routes on ONE upstream, each with its own stream: each answers only

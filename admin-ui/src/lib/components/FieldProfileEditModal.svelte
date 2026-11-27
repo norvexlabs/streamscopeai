@@ -209,12 +209,7 @@
 
   <div class="grid grid-cols-2 gap-3">
     <FormField label="Tool id" for="fp-tool-id" help="Canonical concept (free-form). Pick from taxonomy or invent your own.">
-      <TextInput id="fp-tool-id" list="fp-tool-id-list" bind:value={toolId} placeholder="e.g. shell_exec" mono />
-      <datalist id="fp-tool-id-list">
-        {#each toolIds as t (t.id)}
-          <option value={t.id}>{t.description}</option>
-        {/each}
-      </datalist>
+      <TextInput id="fp-tool-id" suggestions={toolIds.map((t) => ({ value: t.id, label: t.description }))} bind:value={toolId} placeholder="e.g. shell_exec" mono />
     </FormField>
     <FormField label="Tool pattern" for="fp-pattern" help="Pipe-separated globs over wire tool names.">
       <TextInput id="fp-pattern" bind:value={toolPattern} placeholder="e.g. Bash or run_*" mono />
@@ -237,12 +232,7 @@
       <p class="text-[10px] text-(--text-secondary) mt-1">For a gateway virtual server's tool, the upstream server behind it; for a server the client runs itself, the <code>&lt;server&gt;</code> of <code>mcp__&lt;server&gt;__&lt;tool&gt;</code>.</p>
     {/if}
     {#if scopeKind === 'server'}
-      <div class="mt-2"><TextInput list="fp-server-type-list" bind:value={serverType} placeholder="e.g. web_search_preview" mono /></div>
-      <datalist id="fp-server-type-list">
-        {#each knownServerTypes as kst (kst.server_type)}
-          <option value={kst.server_type}>{kst.label}</option>
-        {/each}
-      </datalist>
+      <div class="mt-2"><TextInput id="fp-server-type" suggestions={knownServerTypes.map((k) => ({ value: k.server_type, label: k.label }))} bind:value={serverType} placeholder="e.g. web_search_preview" mono /></div>
       <p class="text-[10px] text-(--text-secondary) mt-1">
         Provider's wire tag for a native server-tool. Wins over MCP / App / Generic profiles for the same canonical <code>tool_id</code>.
         Pick a known tag or type your own for a new provider.

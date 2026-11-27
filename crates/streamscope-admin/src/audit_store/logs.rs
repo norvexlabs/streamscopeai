@@ -16,9 +16,10 @@ use super::search::{SearchRows, SearchWalk};
 use crate::sql_pattern::{contains_pattern, search_pattern};
 use crate::db::tenant::Scoped;
 use crate::routes::audit::{
-    A2aAuditLogEntry, AuditKind, AuditLogEntry, AuditLogRow, AuditQuery, McpAuditLogEntry, WebAuditLogEntry,
+    A2aAuditLogEntry, AuditKind, AuditLogEntry, AuditLogRow, AuditQuery, AuditSort, McpAuditLogEntry,
+    WebAuditLogEntry,
 };
-use crate::routes::{ApiError, OffsetPage};
+use crate::routes::{ApiError, BadgeCodes, OffsetPage};
 
 /// Whitelist for `a2a_audit.task_state` — the 1.0 task lifecycle. Anything else
 /// is rejected at the handler rather than bound, so the filter can never widen
@@ -150,7 +151,7 @@ const ALL_COLUMNS: &str = "\
     g.status_code, g.error_category, g.error_detail, g.limit_bucket, \
     a.media_call, \
     a.chat_media_summary, \
-    ct.transform_diff as transform_diff, \
+    ct.transform_diff - 'effective_messages' AS transform_diff, \
     u.email as user_email, \
     us.name as upstream_server_name, \
     a.endpoint_url, \
@@ -340,8 +341,9 @@ async fn read_llm<T: ArmRow>(
     let Some(pattern) = search_pattern(query.search.as_deref()) else {
         let (mut sql, filters) = llm_list_sql(query, scope, columns, AUDIT_LOG_JOIN, 1);
         let bind_idx = filters.next_idx;
+        let figure = figure_order(query.sort, ArmFigures::LLM);
         sql.push_str(&format!(
-            " ORDER BY g.timestamp DESC, g.request_id DESC LIMIT ${bind_idx} OFFSET ${}",
+            " ORDER BY {figure}g.timestamp DESC, g.request_id DESC LIMIT ${bind_idx} OFFSET ${}",
             bind_idx + 1
         ));
         // OffsetPage: overfetch limit+1 so `has_more` is cheap (no COUNT on partitioned table).
@@ -444,6 +446,72 @@ struct LlmFilters {
     post_filtered: bool,
 }
 
+/// The filters every arm applies the same way, appended after its own and
+/// bound by [`bind_shared_filters`] in the same order: the badge codes (any of
+/// them, on the arm's `badges` column) and the API key.
+fn push_shared_filters(sql: &mut String, query: &AuditQuery, badges: &'static str, bind_idx: &mut u32) {
+    if BadgeCodes::codes(&query.badges).is_some() {
+        // One bound `jsonb[]` of `[{"code": …}]` probes: containment matches
+        // the code whatever the badge's other fields. Not an index condition
+        // under FORCE RLS (`@>` is not leakproof): a filter on the window's rows.
+        sql.push_str(&format!(" AND {badges} @> ANY(${}::jsonb[])", *bind_idx));
+        *bind_idx += 1;
+    }
+    if query.key_id.is_some() {
+        sql.push_str(&format!(" AND g.key_id = ${}", *bind_idx));
+        *bind_idx += 1;
+    }
+}
+
+/// Bind [`push_shared_filters`]' parameters, in its order.
+fn bind_shared_filters<'q, T>(
+    mut q: sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
+    query: &AuditQuery,
+) -> sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments> {
+    if let Some(codes) = BadgeCodes::codes(&query.badges) {
+        let probes: Vec<serde_json::Value> =
+            codes.iter().map(|c| serde_json::json!([{ "code": c.as_str() }])).collect();
+        q = q.bind(probes);
+    }
+    if let Some(key_id) = query.key_id {
+        q = q.bind(key_id);
+    }
+    q
+}
+
+/// The figures an arm can be ordered by, each as the ORDER BY prefix that
+/// puts its largest first; `None` where the arm records no such figure
+/// ([`AuditSort::check`] refused that order before any arm runs).
+struct ArmFigures {
+    latency: &'static str,
+    cost: Option<&'static str>,
+    tokens: Option<&'static str>,
+}
+
+impl ArmFigures {
+    /// The LLM arm: its own cost and tokens, the gateway's latency.
+    const LLM: Self = Self {
+        latency: "g.latency_total_ms DESC, ",
+        cost: Some("a.cost DESC, "),
+        tokens: Some("(a.prompt_tokens + a.completion_tokens) DESC, "),
+    };
+    /// The MCP, web and A2A arms: the gateway's latency only.
+    const GATEWAY: Self = Self { latency: "g.latency_total_ms DESC, ", cost: None, tokens: None };
+}
+
+/// The head of an arm page's ORDER BY: the figure `sort` asks for, largest
+/// first, or nothing for `newest`. The arm's newest-first key follows it, as a
+/// literal at the splice, and breaks ties so a page boundary is stable. A
+/// constant by type: the request names the order, never its text.
+fn figure_order(sort: Option<AuditSort>, figures: ArmFigures) -> &'static str {
+    match sort.unwrap_or_default() {
+        AuditSort::Newest => "",
+        AuditSort::Latency => figures.latency,
+        AuditSort::Cost => figures.cost.unwrap_or(""),
+        AuditSort::Tokens => figures.tokens.unwrap_or(""),
+    }
+}
+
 /// The LLM audit list's filters, numbering binds from `bind_idx`;
 /// [`bind_llm_filters`] binds them in the same order.
 fn llm_filters(query: &AuditQuery, scope: &AuditScope, mut bind_idx: u32) -> LlmFilters {
@@ -535,6 +603,7 @@ fn llm_filters(query: &AuditQuery, scope: &AuditScope, mut bind_idx: u32) -> Llm
             crate::audit_store::guardrail::guardrail_badge_predicate("a")
         ));
     }
+    push_shared_filters(&mut sql, query, "a.badges", &mut bind_idx);
     let post_filtered = sql.len() > selective_end;
     LlmFilters { sql, turn_window, next_idx: bind_idx, post_filtered }
 }
@@ -584,7 +653,7 @@ fn bind_llm_filters<'q, T>(
     if let Some(av) = &query.api_version {
         q = q.bind(av.clone());
     }
-    q
+    bind_shared_filters(q, query)
 }
 
 /// Build the MCP-side audit query. The user and the workspaces come from
@@ -714,8 +783,10 @@ fn mcp_list_sql(query: &AuditQuery, scope: &AuditScope, read: ArmRead<'_>) -> St
             bind_idx += 1;
         }
     }
+    push_shared_filters(&mut sql, query, "m.badges", &mut bind_idx);
+    let figure = figure_order(query.sort, ArmFigures::GATEWAY);
     sql.push_str(&format!(
-        " ORDER BY timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
+        " ORDER BY {figure}timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
         bind_idx + 1
     ));
     sql
@@ -790,6 +861,7 @@ pub(crate) async fn read_mcp<T: ArmRow>(
     {
         q = q.bind(ec);
     }
+    q = bind_shared_filters(q, query);
     q = q.bind(limit + 1).bind(offset);
 
     q.fetch_all(&mut *conn).await.map_err(|e| {
@@ -941,8 +1013,10 @@ fn web_list_sql(
             crate::audit_store::guardrail::guardrail_badge_predicate("w")
         ));
     }
+    push_shared_filters(&mut sql, query, "w.badges", &mut bind_idx);
+    let figure = figure_order(query.sort, ArmFigures::GATEWAY);
     sql.push_str(&format!(
-        " ORDER BY timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
+        " ORDER BY {figure}timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
         bind_idx + 1
     ));
     Ok(sql)
@@ -1004,6 +1078,7 @@ pub(crate) async fn read_web<T: ArmRow>(
     {
         q = q.bind(operation.to_string());
     }
+    q = bind_shared_filters(q, query);
     q = q.bind(limit + 1).bind(offset);
 
     q.fetch_all(&mut *conn).await.map_err(|e| {
@@ -1157,8 +1232,10 @@ fn a2a_list_sql(query: &AuditQuery, scope: &AuditScope, read: ArmRead<'_>) -> Re
             bind_idx += 1;
         }
     }
+    push_shared_filters(&mut sql, query, "a2.badges", &mut bind_idx);
+    let figure = figure_order(query.sort, ArmFigures::GATEWAY);
     sql.push_str(&format!(
-        " ORDER BY timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
+        " ORDER BY {figure}timestamp DESC, request_id DESC LIMIT ${bind_idx} OFFSET ${}",
         bind_idx + 1
     ));
     Ok(sql)
@@ -1223,6 +1300,7 @@ pub(crate) async fn read_a2a<T: ArmRow>(
     {
         q = q.bind(ec);
     }
+    q = bind_shared_filters(q, query);
     q = q.bind(limit + 1).bind(offset);
 
     q.fetch_all(&mut *conn).await.map_err(|e| {
@@ -1242,6 +1320,8 @@ pub(crate) async fn list_audit_rows(
     limit: i64,
     offset: i64,
 ) -> Result<OffsetPage<AuditLogRow>, ApiError> {
+    // Both planes reach the list here: the order is checked once, for both.
+    AuditSort::check(query.sort, query.kind, query.search.as_deref(), (query.start, query.end))?;
     let wrap = |rows: Vec<AuditLogRow>| OffsetPage::from_overfetched(rows, limit, offset);
     Ok(match query.kind.unwrap_or_default() {
         AuditKind::Llm => {
@@ -1463,6 +1543,61 @@ mod tests {
             assert_eq!(select_list(&sql), whole.trim(), "{arm}: a page reads its rows whole");
         }
         assert!(MCP_COLUMNS.contains("m.params") && A2A_COLUMNS.contains("a2.stream_events"));
+    }
+
+
+    /// The placeholders a statement names, ascending, once each.
+    fn placeholders(sql: &str) -> Vec<u32> {
+        let mut found: Vec<u32> = sql
+            .split('$')
+            .skip(1)
+            .filter_map(|rest| rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok())
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found
+    }
+
+    #[test]
+    fn every_arm_applies_the_badge_and_key_filters_on_its_own_columns_and_its_order() {
+        let mut query = AuditQuery::default();
+        query.badges = Some("tool_blocked,guardrail".parse().expect("codes"));
+        query.key_id = Some(Uuid::nil());
+        query.sort = Some(AuditSort::Latency);
+        for (arm, sql, _) in arm_statements(ArmRead::Rows, &query) {
+            let alias = match arm {
+                "llm" => "a",
+                "mcp" => "m",
+                "web" => "w",
+                _ => "a2",
+            };
+            assert!(sql.contains(&format!(" AND {alias}.badges @> ANY($")), "{arm}: {sql}");
+            assert!(sql.contains(" AND g.key_id = $"), "{arm}: {sql}");
+            // The LLM statement stops before its ORDER BY: its read appends
+            // `figure_order`, held by `an_arm_orders_by_the_figure_asked_then_newest_first`.
+            if arm != "llm" {
+                assert!(sql.contains(" ORDER BY g.latency_total_ms DESC, "), "{arm}: {sql}");
+            }
+            // Every placeholder from $1 up is named: none skipped, so the binds line up.
+            let named = placeholders(&sql);
+            assert_eq!(named, (1..=named.len() as u32).collect::<Vec<_>>(), "{arm}: {sql}");
+        }
+        // Positive control: without them, no arm names either filter, and the
+        // order is by time alone.
+        for (arm, sql, _) in arm_statements(ArmRead::Rows, &AuditQuery::default()) {
+            assert!(!sql.contains(".badges @> ANY(") && !sql.contains("g.key_id = $"), "{arm}: {sql}");
+            assert!(!sql.contains("latency_total_ms DESC"), "{arm}: {sql}");
+        }
+    }
+
+    #[test]
+    fn an_arm_orders_by_the_figure_asked_then_newest_first() {
+        assert_eq!(figure_order(None, ArmFigures::LLM), "");
+        assert_eq!(figure_order(Some(AuditSort::Newest), ArmFigures::LLM), "");
+        assert_eq!(figure_order(Some(AuditSort::Cost), ArmFigures::LLM), "a.cost DESC, ");
+        assert_eq!(figure_order(Some(AuditSort::Tokens), ArmFigures::LLM), "(a.prompt_tokens + a.completion_tokens) DESC, ");
+        assert_eq!(figure_order(Some(AuditSort::Latency), ArmFigures::LLM), "g.latency_total_ms DESC, ");
+        assert_eq!(figure_order(Some(AuditSort::Latency), ArmFigures::GATEWAY), "g.latency_total_ms DESC, ");
     }
 
     #[test]

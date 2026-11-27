@@ -274,6 +274,22 @@ fn build_tenant_config(resp: &ConfigResponse) -> streamscope_core::config::Tenan
         &standalone_ids,
     );
 
+    // Tools: which reachable profiles observe — a profile's own value, a
+    // Layered one with none following the Default's.
+    let tool_observing_profiles: std::collections::HashSet<uuid::Uuid> = {
+        let own: std::collections::HashMap<uuid::Uuid, streamscope_core::config::tool_enforcement::ToolEnforcement> =
+            resp.tool_profile_enforcement.iter().copied().collect();
+        let default_tools = default_profiles.get(&ProfileKind::Tools).copied();
+        let default_mode = default_tools.and_then(|d| own.get(&d).copied());
+        reachable_of_kind(ProfileKind::Tools)
+            .into_iter()
+            .filter(|pid| {
+                let layered = Some(*pid) != default_tools && !standalone_ids.contains(pid);
+                streamscope_core::config::tool_enforcement::resolve(own.get(pid).copied(), layered, default_mode).observes()
+            })
+            .collect()
+    };
+
     // Transforms: same Default-as-base bucketing (the full flat list stays on
     // `transform_programs` for the script-engine warm-up).
     let transform_programs_by_profile =
@@ -410,6 +426,7 @@ fn build_tenant_config(resp: &ConfigResponse) -> streamscope_core::config::Tenan
         workspace_profiles,
         default_profiles,
         tool_rules_by_profile,
+        tool_observing_profiles,
         app_patterns: match s.get("app_registry") {
             Some(v) => APP_PATTERNS.get_or_parse(v, || parse_app_patterns(v)),
             None => defaults.app_patterns.clone(),
@@ -1170,6 +1187,7 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            tool_profile_enforcement: Vec::new(),
             loop_guard: Default::default(),
             workspace_loop_guard: Default::default(),
         }
@@ -1392,6 +1410,7 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            tool_profile_enforcement: Vec::new(),
             loop_guard: Default::default(),
             workspace_loop_guard: Default::default(),
         };
@@ -1663,6 +1682,7 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            tool_profile_enforcement: Vec::new(),
             loop_guard: Default::default(),
             workspace_loop_guard: Default::default(),
         };
@@ -1675,6 +1695,45 @@ pub(crate) mod tests {
         let cfg = load_system_config(&registry);
         let defaults = streamscope_core::config::TenantConfig::default();
         assert_eq!(cfg.debug_mode, defaults.debug_mode);
+    }
+
+    /// A Layered tool profile with no mode of its own follows the Default's; one
+    /// that pins a mode keeps it; a Standalone with none observes.
+    #[test]
+    fn a_tool_profile_observes_by_its_own_mode_or_a_layered_one_by_the_defaults() {
+        use streamscope_core::config::ProfileKind;
+        use streamscope_core::config::tool_enforcement::ToolEnforcement::{Enforce, Observe};
+        let id = |n: u128| uuid::Uuid::from_u128(n);
+        let (default, follows, pinned, standalone) = (id(1), id(2), id(3), id(4));
+        let body = |default_mode| {
+            let mut resp = make_response(vec![]);
+            resp.default_profiles = vec![(ProfileKind::Tools, default)];
+            resp.workspace_profiles = vec![
+                (id(10), ProfileKind::Tools, Some(follows)),
+                (id(11), ProfileKind::Tools, Some(pinned)),
+                (id(12), ProfileKind::Tools, Some(standalone)),
+            ];
+            resp.profile_modes = vec![
+                (default, ProfileKind::Tools, true),
+                (follows, ProfileKind::Tools, false),
+                (pinned, ProfileKind::Tools, false),
+                (standalone, ProfileKind::Tools, true),
+            ];
+            resp.tool_profile_enforcement = vec![(default, default_mode), (pinned, Enforce)];
+            build_tenant_config(&resp)
+        };
+        let observing = body(Observe);
+        assert_eq!(observing.effective_tool_enforcement(id(99)), Observe, "a workspace on the Default");
+        assert_eq!(observing.effective_tool_enforcement(id(10)), Observe, "a Layered profile follows");
+        assert_eq!(observing.effective_tool_enforcement(id(11)), Enforce, "a pinned mode stays");
+        assert_eq!(observing.effective_tool_enforcement(id(12)), Observe, "a Standalone with none observes");
+        // Positive control: the same profiles under an enforcing Default; the
+        // Standalone with no mode still observes.
+        let enforcing = body(Enforce);
+        for ws in [id(99), id(10), id(11)] {
+            assert_eq!(enforcing.effective_tool_enforcement(ws), Enforce);
+        }
+        assert_eq!(enforcing.effective_tool_enforcement(id(12)), Observe);
     }
 
     /// Two tenants whose bodies carry the same profiles and registry share
@@ -1749,6 +1808,7 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            tool_profile_enforcement: Vec::new(),
             loop_guard: Default::default(),
             workspace_loop_guard: Default::default(),
         };
@@ -1808,6 +1868,7 @@ pub(crate) mod tests {
             workspace_profiles: Vec::new(),
             default_profiles: Vec::new(),
             profile_modes: Vec::new(),
+            tool_profile_enforcement: Vec::new(),
             loop_guard: Default::default(),
             workspace_loop_guard: Default::default(),
         };

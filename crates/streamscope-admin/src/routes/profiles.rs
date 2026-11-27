@@ -19,6 +19,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use streamscope_core::config::ProfileKind;
+use streamscope_core::config::tool_enforcement::ToolEnforcement;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -47,6 +48,15 @@ pub struct ProfileRow {
     /// expert profile's model. Always set on the Default; other kinds carry
     /// `null`.
     pub model: Option<String>,
+    /// Tool policy only (`kind='tools'`): the profile's own Observe / Enforce
+    /// value. `null` on a Layered profile = follow the Default's; on the Default
+    /// or a Standalone = observe; other kinds carry `null`.
+    #[schema(value_type = Option<ToolEnforcement>)]
+    pub tool_enforcement: Option<String>,
+    /// Tool policy only: the mode the profile runs in — its own, else (Layered)
+    /// the Default's, else `observe`. `null` on other kinds.
+    #[schema(value_type = Option<ToolEnforcement>)]
+    pub effective_tool_enforcement: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -61,6 +71,19 @@ pub struct Profile {
     pub profile: ProfileRow,
     /// Number of profile-specific content items (tool rules) for this profile.
     pub rule_count: i64,
+}
+
+/// The columns of a [`ProfileRow`], its resolved mode included — one list for
+/// every SELECT and RETURNING that reads one (unaliased `profiles`).
+macro_rules! profile_columns {
+    () => {
+        "id, kind, name, description, is_default, standalone, model, tool_enforcement, \
+         CASE WHEN kind = 'tools' THEN COALESCE(tool_enforcement, \
+             CASE WHEN NOT standalone THEN (SELECT d.tool_enforcement FROM profiles d \
+                 WHERE d.tenant_id = profiles.tenant_id AND d.kind = 'tools' AND d.is_default) END, \
+             'observe') END AS effective_tool_enforcement, \
+         created_at, updated_at"
+    };
 }
 
 /// `kind` query filter (required) for the list endpoint. The wire string is
@@ -82,6 +105,10 @@ pub struct CreateProfileRequest {
     /// A `client_access` profile takes Standalone with `seed` or `copy` only.
     #[serde(default)]
     pub start_from: ProfileStartChoice,
+    /// Tool policy only: the new profile's mode. Absent → `observe` for a
+    /// Standalone profile, follow the Default (`null`) for a Layered one.
+    #[serde(default)]
+    pub tool_enforcement: Option<ToolEnforcement>,
 }
 
 /// New-profile inheritance mode × initial content. `mode` is the tagged
@@ -132,6 +159,12 @@ pub struct UpdateProfileRequest {
     /// Default profile's model cannot be cleared.
     #[serde(default, deserialize_with = "crate::routes::double_option::deserialize")]
     pub model: Option<Option<String>>,
+    /// Tool policy only: `enforce` or `observe`. Explicit `null` sets a Layered
+    /// profile back to following the Default; the Default and a Standalone
+    /// profile always carry a mode.
+    #[serde(default, deserialize_with = "crate::routes::double_option::deserialize")]
+    #[schema(value_type = Option<ToolEnforcement>, nullable)]
+    pub tool_enforcement: Option<Option<ToolEnforcement>>,
 }
 
 /// The refusal for a choice a profile kind does not take.
@@ -155,6 +188,17 @@ fn start_choice_allowed(kind: ProfileKind, standalone: bool, content: &StartCont
         return Err(choice_unsupported("a client-access profile starts from a copy of another or from the seed"));
     }
     Ok(())
+}
+
+fn only_layered_follows() -> ApiError {
+    ApiError::bad_request(
+        "only a Layered tool profile can follow the Default — the Default and a Standalone profile run in their own mode",
+    )
+    .code(ApiErrorCode::SettingInvalid)
+}
+
+fn tool_enforcement_unsupported() -> ApiError {
+    ApiError::bad_request("`tool_enforcement` applies only to tool policy profiles").code(ApiErrorCode::ProfileKindInvalid)
 }
 
 fn default_protected() -> ApiError {
@@ -444,7 +488,7 @@ async fn absorb_base_into(
             .map_err(absorb_failed("move tool rules"))?;
             sqlx::query(
                 "UPDATE tool_policy_rules SET forked_from = NULL \
-                 WHERE tenant_id = $1 AND profile_id = $3 AND forked_from IS NOT NULL",
+                 WHERE tenant_id = $1 AND profile_id = $2 AND forked_from IS NOT NULL",
             )
             .bind(tenant_id)
             .bind(dest_id)
@@ -534,9 +578,8 @@ pub async fn list_profiles(
     let tenant_id = db.tenant_uuid();
 
     let rows = sqlx::query_as::<_, ProfileRow>(
-        "SELECT id, kind, name, description, is_default, standalone, model, created_at, updated_at \
-         FROM profiles WHERE kind = $1 \
-         ORDER BY is_default DESC, name ASC LIMIT $2 OFFSET $3",
+        concat!("SELECT ", profile_columns!(), " FROM profiles WHERE kind = $1 \
+         ORDER BY is_default DESC, name ASC LIMIT $2 OFFSET $3"),
     )
     .bind(kind.as_str())
     .bind(limit + 1)
@@ -648,6 +691,15 @@ pub async fn create_profile(
         ProfileStartChoice::Standalone { content } => (true, content),
     };
     start_choice_allowed(kind, standalone, content)?;
+    if req.tool_enforcement.is_some() && kind != ProfileKind::Tools {
+        return Err(tool_enforcement_unsupported());
+    }
+    // A Standalone tool profile starts in Observe; a Layered one follows the Default.
+    let tool_enforcement = match (kind, req.tool_enforcement) {
+        (ProfileKind::Tools, Some(mode)) => Some(mode),
+        (ProfileKind::Tools, None) if standalone => Some(ToolEnforcement::Observe),
+        _ => None,
+    };
 
     // One transaction: insert the row and seed its content so a mid-sequence
     // failure leaves neither a row without its content nor orphaned content
@@ -657,15 +709,18 @@ pub async fn create_profile(
         ApiError::internal("failed to create profile")
     })?;
     let mut row = sqlx::query_as::<_, ProfileRow>(
-        "INSERT INTO profiles (tenant_id, kind, name, description, is_default, standalone) \
-         VALUES ($1, $2, $3, $4, false, $5) \
-         RETURNING id, kind, name, description, is_default, standalone, model, created_at, updated_at",
+        concat!(
+            "INSERT INTO profiles (tenant_id, kind, name, description, is_default, standalone, tool_enforcement) \
+             VALUES ($1, $2, $3, $4, false, $5, $6) RETURNING ",
+            profile_columns!()
+        ),
     )
     .bind(tenant_id)
     .bind(kind.as_str())
     .bind(name)
     .bind(&req.description)
     .bind(standalone)
+    .bind(tool_enforcement.map(ToolEnforcement::as_str))
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
@@ -729,8 +784,7 @@ pub async fn create_profile(
 pub async fn get_profile(mut db: TenantConn, Path(id): Path<Uuid>) -> Result<Json<Profile>, ApiError> {
     let tenant_id = db.tenant_uuid();
     let profile = sqlx::query_as::<_, ProfileRow>(
-        "SELECT id, kind, name, description, is_default, standalone, model, created_at, updated_at \
-         FROM profiles WHERE id = $1",
+        concat!("SELECT ", profile_columns!(), " FROM profiles WHERE id = $1"),
     )
     .bind(id)
     .fetch_optional(db.conn())
@@ -757,7 +811,7 @@ pub async fn get_profile(mut db: TenantConn, Path(id): Path<Uuid>) -> Result<Jso
     request_body = UpdateProfileRequest,
     responses(
         (status = 200, description = "Profile updated", body = ProfileRow),
-        (status = 400, description = "The judge model is not one the agent can use", body = ApiErrorResponse),
+        (status = 400, description = "The judge model is not one the agent can use, or a mode the profile cannot take", body = ApiErrorResponse),
         (status = 404, description = "Not found", body = ApiErrorResponse),
         (status = 500, description = "Internal server error", body = ApiErrorResponse),
     ),
@@ -804,14 +858,39 @@ pub async fn update_profile(
             crate::routes::refuse_unusable_judge_model(db.conn(), model).await?;
         }
     }
+    if let Some(mode) = &req.tool_enforcement {
+        let target: Option<(String, bool, bool)> =
+            sqlx::query_as("SELECT kind, is_default, standalone FROM profiles WHERE id = $1")
+                .bind(id)
+                .fetch_optional(db.conn())
+                .await
+                .map_err(|e| {
+                    tracing::error!("update profile (kind check): {e}");
+                    ApiError::internal("failed to update profile")
+                })?;
+        let Some((kind, is_default, standalone)) = target else {
+            return Err(ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound));
+        };
+        if kind != ProfileKind::Tools.as_str() {
+            return Err(tool_enforcement_unsupported());
+        }
+        if mode.is_none() && (is_default || standalone) {
+            return Err(only_layered_follows());
+        }
+    }
     let row = sqlx::query_as::<_, ProfileRow>(
-        "UPDATE profiles SET \
-            name = COALESCE($2, name), \
-            description = CASE WHEN $3 THEN $4 ELSE description END, \
-            model = CASE WHEN $5 THEN NULLIF(TRIM($6), '') ELSE model END, \
-            updated_at = now() \
-         WHERE id = $1 \
-         RETURNING id, kind, name, description, is_default, standalone, model, created_at, updated_at",
+        concat!(
+            "UPDATE profiles SET \
+                name = COALESCE($2, name), \
+                description = CASE WHEN $3 THEN $4 ELSE description END, \
+                model = CASE WHEN $5 THEN NULLIF(TRIM($6), '') ELSE model END, \
+                tool_enforcement = CASE WHEN $7 THEN $8 ELSE tool_enforcement END, \
+                updated_at = now() \
+             WHERE id = $1 \
+               AND NOT ($7 AND $8 IS NULL AND (is_default OR standalone)) \
+             RETURNING ",
+            profile_columns!()
+        ),
     )
     .bind(id)
     .bind(req.name.as_deref().map(str::trim))
@@ -819,13 +898,32 @@ pub async fn update_profile(
     .bind(req.description.flatten())
     .bind(req.model.is_some())
     .bind(req.model.clone().flatten())
+    .bind(req.tool_enforcement.is_some())
+    .bind(req.tool_enforcement.flatten().map(ToolEnforcement::as_str))
     .fetch_optional(db.conn())
     .await
     .map_err(|e| {
         tracing::error!("update profile: {e}");
         ApiError::internal("failed to update profile")
-    })?
-    .ok_or_else(|| ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound))?;
+    })?;
+    // The statement itself refuses to clear the mode of a profile that is the
+    // Default or Standalone — the check above read it in another statement,
+    // and a promotion may have landed since.
+    let Some(row) = row else {
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM profiles WHERE id = $1)")
+            .bind(id)
+            .fetch_one(db.conn())
+            .await
+            .map_err(|e| {
+                tracing::error!("update profile (recheck): {e}");
+                ApiError::internal("failed to update profile")
+            })?;
+        return Err(if exists && req.tool_enforcement == Some(None) {
+            only_layered_follows()
+        } else {
+            ApiError::not_found("profile not found", ApiErrorCode::ProfileNotFound)
+        });
+    };
 
     Ok(Json(row))
 }
@@ -982,6 +1080,43 @@ pub async fn set_default_profile(
     // Runs for any target (Layered or Standalone) so the builtin home always
     // follows the Default.
     let old_default = default_profile_id(&mut tx, tenant_id, kind).await?;
+    // A tool policy's mode moves with the base, as its rules do: the new
+    // Default runs in the old Default's mode, so no workspace following the
+    // Default changes behaviour. Read before the old Default is demoted, and
+    // locked: a mode change on it commits before this read or waits for the
+    // promotion, never lands between the read and the copy.
+    let base_mode: Option<String> = match (kind, old_default) {
+        (ProfileKind::Tools, Some(base_id)) => sqlx::query_scalar(
+            "SELECT COALESCE(tool_enforcement, 'observe') FROM profiles WHERE id = $1 FOR UPDATE",
+        )
+        .bind(base_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("set default profile (mode): {e}");
+            ApiError::internal("failed to set default profile")
+        })?,
+        _ => None,
+    };
+    // The mode the promoted profile's own workspaces run in now — its own,
+    // else (Layered) the Default's — to report when the promotion changes it.
+    let promoted_mode_before: Option<String> = match kind {
+        ProfileKind::Tools => sqlx::query_scalar(
+            "SELECT COALESCE(p.tool_enforcement, \
+                 CASE WHEN NOT p.standalone AND NOT p.is_default THEN d.tool_enforcement END, 'observe') \
+             FROM profiles p \
+             LEFT JOIN profiles d ON d.tenant_id = p.tenant_id AND d.kind = 'tools' AND d.is_default \
+             WHERE p.id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| {
+            tracing::error!("set default profile (promoted mode): {e}");
+            ApiError::internal("failed to set default profile")
+        })?,
+        _ => None,
+    };
     if let Some(base_id) = old_default
         && base_id != id
     {
@@ -1003,9 +1138,12 @@ pub async fn set_default_profile(
     })?;
     // Promote: the new Default is always standalone (it is the base).
     let promoted = sqlx::query(
-        "UPDATE profiles SET is_default = true, standalone = true, updated_at = now() WHERE id = $1",
+        "UPDATE profiles SET is_default = true, standalone = true, \
+            tool_enforcement = CASE WHEN kind = 'tools' THEN COALESCE($2, tool_enforcement, 'observe') END, \
+            updated_at = now() WHERE id = $1",
     )
     .bind(id)
+    .bind(base_mode.as_deref())
     .execute(&mut *tx)
     .await
     .map_err(|e| {
@@ -1036,7 +1174,22 @@ pub async fn set_default_profile(
         ApiError::internal("failed to set default profile")
     })?;
 
-    Ok(Json(ActionResponse::ok().with_message("default profile set")))
+    // A tool profile takes the base's mode: say so when its workspaces change.
+    let changed_to = base_mode
+        .as_deref()
+        .filter(|after| promoted_mode_before.as_deref() != Some(*after))
+        .and_then(ToolEnforcement::parse);
+    match changed_to {
+        Some(mode) => Ok(Json(
+            ActionResponse::ok()
+                .with_message(format!(
+                    "default profile set; it runs in the Default's mode, {}, in the workspaces that used it",
+                    mode.as_str()
+                ))
+                .with_impact(super::ActionImpact { tool_enforcement: Some(mode), ..Default::default() }),
+        )),
+        None => Ok(Json(ActionResponse::ok().with_message("default profile set"))),
+    }
 }
 
 #[utoipa::path(
